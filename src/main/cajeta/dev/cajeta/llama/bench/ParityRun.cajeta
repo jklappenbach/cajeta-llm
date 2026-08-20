@@ -1,0 +1,158 @@
+package dev.cajeta.llama.bench;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonValue;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.io.GgufFile;
+import dev.cajeta.llama.model.LlamaForCausalLM;
+import dev.cajeta.llama.model.ModelConfig;
+
+/**
+ * The parity acceptance run (plan 15.1.2/15.1.3; spec 12.1, 13.21): load
+ * the reference checkpoint, run the fixture prompt, and print the three
+ * detectors against the pinned `transformers` fp32 fixture, plus the
+ * 32-token greedy-agreement walk with top-2 gaps at every divergence.
+ *
+ * This is a MEASUREMENT INSTRUMENT, not a selftest: it needs ~35 GB of
+ * model on disk and minutes of host compute, so it never runs under the
+ * suite gate. Paths are this reference box's layout (tools/parity's
+ * fixture generator writes them); override by editing the constants.
+ * The engine's forward is f32-only today, so the checkpoint is the
+ * tools/parity/convert_f32.py output — the numbers this prints are the
+ * F32-PATH parity floor; the bf16-path threshold derives when that path
+ * exists (13.21 note in the plan).
+ *
+ * Run:  cajeta jit-run src/main/cajeta dev.cajeta.llama.bench.ParityRun.run
+ */
+public final class ParityRun {
+
+    static final String MODEL_DIR =
+        "/home/julian/models/Meta-Llama-3.1-8B-Instruct-f32";
+    static final String FIXTURE_DIR =
+        "tools/parity/fixtures/llama31-8b";
+
+    private ParityRun() { }
+
+    static #int32[] promptIds(String metaPath) {
+        int8[] raw #= File.readAllBytes(metaPath);
+        JsonValue v #= Json.parse(raw, (int64) raw.count());
+        JsonArray ids = v.object().get("prompt_token_ids").array();
+        int32 n = (int32) ids.count();
+        int32[] out #= heap int32[n];
+        int32 i = 0;
+        while (i < n) {
+            out[i] = (int32) ids.get(i).asInt64();
+            i = i + 1;
+        }
+        return #out;
+    }
+
+    static #float32[] fixtureLogits(String path, int32 vocab) {
+        int8[] raw #= File.readAllBytes(path);
+        if ((int64) raw.count() != (int64) vocab * 4L) {
+            throw heap LlamaException("fixture logits: expected "
+                + (vocab * 4) + " bytes, got " + raw.count());
+        }
+        float32[] out #= heap float32[vocab];
+        int32 i = 0;
+        while (i < vocab) {
+            // Arithmetic IEEE decode — Cajeta.bitsToF32 aborts AOT
+            // emission (cajeta specs/aot-bitcast-f32-isel-abort).
+            int64 b0 = (int64) raw[i * 4] & 255L;
+            int64 b1 = (int64) raw[i * 4 + 1] & 255L;
+            int64 b2 = (int64) raw[i * 4 + 2] & 255L;
+            int64 b3 = (int64) raw[i * 4 + 3] & 255L;
+            out[i] = GgufFile.singleBits(b0 | (b1 << 8) | (b2 << 16)
+                | (b3 << 24));
+            i = i + 1;
+        }
+        return #out;
+    }
+
+    static #int32[] fixtureGreedy(String path) {
+        int8[] raw #= File.readAllBytes(path);
+        JsonValue v #= Json.parse(raw, (int64) raw.count());
+        JsonArray g = v.object().get("greedy").array();
+        int32 n = (int32) g.count();
+        int32[] out #= heap int32[n];
+        int32 i = 0;
+        while (i < n) {
+            out[i] = (int32) g.get(i).asInt64();
+            i = i + 1;
+        }
+        return #out;
+    }
+
+    static #float32[] copyLogits(Tensor<float32> t, int32 vocab) {
+        float32[] out #= heap float32[vocab];
+        int32 i = 0;
+        while (i < vocab) {
+            out[i] = t.flatGet((int64) i);
+            i = i + 1;
+        }
+        return #out;
+    }
+
+    public static int32 run() {
+        int32[] prompt #= ParityRun.promptIds(
+            ParityRun.FIXTURE_DIR + "/meta.json");
+        int32 pn = (int32) prompt.count();
+        System.stdout.println("parity: prompt tokens " + pn);
+
+        ModelConfig cfg #= ModelConfig.parse(ParityRun.MODEL_DIR
+            + "/config.json");
+        LlamaForCausalLM m #= heap LlamaForCausalLM(#cfg, pn + 40, 1, 0);
+        Checkpoint ck #= Checkpoint.open(ParityRun.MODEL_DIR
+            + "/model.safetensors.index.json");
+        System.stdout.println("parity: binding checkpoint (f32)…");
+        m.bind(ck, false);
+        ck.close();
+        int32 vocab = m.vocabSize();
+
+        System.stdout.println("parity: prefill…");
+        int32 next = m.prefill(prompt, pn);
+        float32[] got #= ParityRun.copyLogits(m.logits(), vocab);
+        float32[] ref #= ParityRun.fixtureLogits(
+            ParityRun.FIXTURE_DIR + "/logits_last.f32", vocab);
+
+        float64 cos = Metrics.cosine(ref, got, vocab);
+        float64 kl = Metrics.softmaxKl(ref, got, vocab);
+        int32 refTop = Metrics.argmax(ref, vocab);
+        int32 gotTop = Metrics.argmax(got, vocab);
+        System.stdout.println("cosine: " + cos);
+        System.stdout.println("softmaxKL: " + kl);
+        System.stdout.println("top1.ref: " + refTop + " top1.got: " + gotTop
+            + " agree: " + (refTop == gotTop));
+
+        // Greedy continuation vs the fixture's 32 tokens, with the top-2
+        // gap logged at every divergence (13.22's instrument).
+        int32[] refG #= ParityRun.fixtureGreedy(
+            ParityRun.FIXTURE_DIR + "/greedy.json");
+        int32 gn = (int32) refG.count();
+        GreedyAgreement ga #= heap GreedyAgreement(gn);
+        int32 cur = next;
+        int32 i = 0;
+        while (i < gn) {
+            float32[] step #= ParityRun.copyLogits(m.logits(), vocab);
+            ga.add(i, refG[i], cur, Metrics.top2Gap(step, vocab));
+            if (i + 1 < gn) {
+                cur = m.decodeStep(cur);
+            }
+            i = i + 1;
+        }
+        System.stdout.println("greedy.agreement: " + ga.agreementRate()
+            + " over " + gn + " tokens, divergences: " + ga.divergences());
+        int32 d = 0;
+        while (d < ga.divergences()) {
+            System.stdout.println("  divergence @" + ga.divergencePosition(d)
+                + " top2gap " + ga.divergenceGap(d));
+            d = d + 1;
+        }
+        return 0;
+    }
+}
