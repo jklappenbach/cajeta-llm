@@ -3,6 +3,10 @@ package dev.cajeta.llama.sched;
 import cajeta.collection.ArrayList;
 import cajeta.lang.String;
 import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.gen.SampleParams;
+import dev.cajeta.llama.gen.Sampler;
+import dev.cajeta.llama.gen.TokenSink;
+import dev.cajeta.llama.tok.Tokenizer;
 import dev.cajeta.llama.model.LlamaForCausalLM;
 import dev.cajeta.llama.model.PagedKvCache;
 import dev.cajeta.llama.store.BlockKeys;
@@ -51,6 +55,11 @@ public final class Scheduler {
     int8[] blockBuf;          // one payload scratch, allocated at attach
     int32 adoptedBlocksN;
     int32 prefillRowsN;       // rows actually computed (11.3.1)
+    // Unit 14 — generation-loop attachments. Requests are stepped one at
+    // a time, so ONE detok window scratch serves the whole batch.
+    TokenSink sink;           // borrow; null = no streaming (8.8)
+    Tokenizer tok;            // borrow; null = stop strings inert (8.7)
+    int32[] tailIds;          // stop-string window scratch (16 ids)
 
     public Scheduler(LlamaForCausalLM model, int32 chunk) {
         this.model = model;
@@ -75,6 +84,21 @@ public final class Scheduler {
         this.blockBuf = null;
         this.adoptedBlocksN = 0;
         this.prefillRowsN = 0;
+        this.sink = null;
+        this.tok = null;
+        this.tailIds #= heap int32[16];
+    }
+
+    /** Streaming sink (spec 8.8): every emitted token is delivered within
+     *  the step that produced it, before the next step begins. Borrow. */
+    public void setSink(TokenSink sink) {
+        this.sink = sink;
+    }
+
+    /** Tokenizer for stop-string checks (spec 8.7) — without one, stop
+     *  strings never fire. Borrow. */
+    public void setTokenizer(Tokenizer tok) {
+        this.tok = tok;
     }
 
     /**
@@ -107,6 +131,21 @@ public final class Scheduler {
     /** Enqueue a request; returns its id. */
     public int32 submit(int32[] prompt, int32 promptLen, int32 maxNew) {
         Request r = heap Request(prompt, promptLen, maxNew);
+        this.reqs.add(#r);
+        return this.reqs.count() - 1;
+    }
+
+    /**
+     * Enqueue a SAMPLED request (Unit 14): its own parameters and its own
+     * RNG stream, so one sequence's seed never perturbs another's
+     * (14.1.8). Temperature 0 reproduces the greedy path through the
+     * sampler.
+     */
+    public int32 submitSampled(int32[] prompt, int32 promptLen, int32 maxNew,
+            #SampleParams params) {
+        Request r = heap Request(prompt, promptLen, maxNew);
+        Sampler smp #= heap Sampler(#params, this.model.vocabSize());
+        r.attachSampler(#smp);
         this.reqs.add(#r);
         return this.reqs.count() - 1;
     }
@@ -201,12 +240,35 @@ public final class Scheduler {
                 r.cachedLen = r.cachedLen + n;
                 this.prefillRowsN = this.prefillRowsN + n;
                 if (r.cachedLen == r.totalLen) {
-                    // The newest position was consumed: `ret` is the next
-                    // token (interior chunks discard it).
-                    r.all[r.totalLen] = ret;
+                    // The newest position was consumed: `ret` is the
+                    // model's argmax (interior chunks discard it). A
+                    // sampled request draws from the SAME logits instead
+                    // (they are still pooled from this stepSeq — requests
+                    // advance one at a time), with the penalty history
+                    // being its previously EMITTED tokens (8.5).
+                    int32 tok = ret;
+                    if (r.sampler != null) {
+                        tok = r.sampler.sample(this.model.logits(), r.all,
+                            r.promptLen, r.genCount);
+                    }
+                    r.all[r.totalLen] = tok;
                     r.totalLen = r.totalLen + 1;
                     r.genCount = r.genCount + 1;
-                    if (r.genCount >= r.maxNew) {
+                    // 8.8 — deliver before the next step begins.
+                    if (this.sink != null) {
+                        this.sink.onToken(i, tok);
+                    }
+                    // 8.7 — EOS, then stop strings, then the budget.
+                    int32 fin = Request.FINISH_NONE;
+                    if (r.sampler != null) {
+                        fin = this.stopReason(r);
+                    }
+                    if (fin == Request.FINISH_NONE
+                            && r.genCount >= r.maxNew) {
+                        fin = Request.FINISH_BUDGET;
+                    }
+                    if (fin != Request.FINISH_NONE) {
+                        r.finishReason = fin;
                         // A completed sequence's blocks feed the prompt
                         // cache before they free (6.16's write, and what
                         // makes 11.3.1's repeated-prefix win real).
@@ -239,6 +301,55 @@ public final class Scheduler {
     }
 
     // ── internals ───────────────────────────────────────────────────────
+
+    /**
+     * Which halting condition the newest token fired (spec 8.7): a stop
+     * TOKEN is checked directly; stop STRINGS are searched in the decode
+     * of a rolling 16-token window of the generated tail — per-token work
+     * stays bounded (13.10's small constant: one decode buffer and one
+     * candidate String per token), and a stop string spanning more than
+     * 16 tokens is not a stop string.
+     */
+    int32 stopReason(Request r) {
+        SampleParams sp = r.sampler.params();
+        int32 last = r.all[r.totalLen - 1];
+        if (sp.stopTokens != null) {
+            int32 i = 0;
+            while (i < (int32) sp.stopTokens.count()) {
+                if (sp.stopTokens[i] == last) {
+                    return Request.FINISH_EOS;
+                }
+                i = i + 1;
+            }
+        }
+        if (sp.stops != null) {
+            if (this.tok != null) {
+                if (sp.stops.count() > 0) {
+                    int32 w = r.genCount;
+                    if (w > 16) {
+                        w = 16;
+                    }
+                    int32 base = r.totalLen - w;
+                    int32 i = 0;
+                    while (i < w) {
+                        this.tailIds[i] = r.all[base + i];
+                        i = i + 1;
+                    }
+                    int8[] bytes #= this.tok.decode(this.tailIds, w);
+                    int32 bn = (int32) bytes.count();
+                    String txt #= heap String(#bytes, bn);
+                    int32 si = 0;
+                    while (si < sp.stops.count()) {
+                        if (txt.indexOf(sp.stops.get(si)) >= 0L) {
+                            return Request.FINISH_STOP;
+                        }
+                        si = si + 1;
+                    }
+                }
+            }
+        }
+        return Request.FINISH_NONE;
+    }
 
     void admitPhase() {
         PagedKvCache cache = this.model.kvCache();
