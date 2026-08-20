@@ -1,0 +1,248 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.chat.ChatTemplate;
+import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.io.GgufFile;
+import dev.cajeta.llama.model.LlamaForCausalLM;
+import dev.cajeta.llama.model.ModelConfig;
+import dev.cajeta.llama.tok.Tokenizer;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * cajeta-llama plan Unit 16 TDD — the GGUF reader (spec 9.1–9.5).
+ *
+ * Fixtures come from tools/gguf/gen_fixture.py and are validated against
+ * llama.cpp's own reader (`llama-gguf … r` parses toy.gguf clean): a toy
+ * llama across FOUR storage types (F32 + one tensor each of F16, BF16,
+ * Q8_0), full `llama.*` metadata, an embedded 266-token SP tokenizer and
+ * a chat template. The safetensors twin carries the SAME weights already
+ * rounded to each tensor's GGUF storage precision, so the 16.3.1 format
+ * gate can demand EXACT logit equality — both loaders must reach
+ * identical f32 weights, and the engine behind them is one code path.
+ */
+public class GgufTest {
+
+    static final String TOY = "src/test/fixtures/gguf/toy.gguf";
+    static final String BAD = "src/test/fixtures/gguf/toy-bad.gguf";
+    static final String ST = "src/test/fixtures/gguf/toy.safetensors";
+    static final String CFG = "src/test/fixtures/gguf/toy-config.json";
+
+    public GgufTest() { return; }
+
+    // ── 16.1.1 — magic, version, counts, KV block, directory ───────────
+
+    @Test
+    public void headerKvBlockAndDirectoryParse() {
+        GgufFile g #= heap GgufFile(GgufTest.TOY);
+        Assert.equals(21L, g.tensorCount());
+        Assert.equals(17L, g.kvCount());
+        Assert.equals("llama", g.metaString("general.architecture"));
+        Assert.equals("cajeta-toy", g.metaString("general.name"));
+        Assert.equals(16L, g.metaInt("llama.embedding_length", -1L));
+        Assert.equals(2L, g.metaInt("llama.block_count", -1L));
+        Assert.isTrue(g.hasKey("tokenizer.ggml.tokens"));
+        // Directory: shapes arrive in TORCH order (reversed ggml ne).
+        int32 ti = g.tensorIndexOf("token_embd.weight");
+        Assert.isTrue(ti >= 0);
+        int64[] shp = g.shapeOf(ti);
+        Assert.equals(2L, (int64) shp.count());
+        Assert.equals(96L, shp[0]);
+        Assert.equals(16L, shp[1]);
+        Assert.isTrue(g.contains("blk.1.ffn_down.weight"));
+        Assert.isFalse(g.contains("no.such.tensor"));
+        g.close();
+    }
+
+    // ── 16.1.2 — F32, F16, BF16, Q8_0 all load ─────────────────────────
+
+    static void tensorsMatch(Tensor<float32> a, Tensor<float32> b) {
+        int64 n = 1;
+        int32 d = 0;
+        while (d < (int32) a.ndim()) {
+            Assert.equals(a.shapeAt(d), b.shapeAt(d));
+            n = n * a.shapeAt(d);
+            d = d + 1;
+        }
+        int64 i = 0;
+        while (i < n) {
+            if (a.flatGet(i) != b.flatGet(i)) {
+                Assert.fail("element " + i + " differs: " + a.flatGet(i)
+                    + " vs " + b.flatGet(i));
+            }
+            i = i + 1;
+        }
+    }
+
+    @Test
+    public void allFourStorageTypesLoadToF32() {
+        // The safetensors twin holds the identical (pre-rounded) values
+        // at F32 — every dequantized element must match EXACTLY. One
+        // tensor per storage type: attn_q F16 (type 1), attn_k BF16
+        // (type 30), ffn_down Q8_0 (type 8), embed F32 (type 0).
+        GgufFile g #= heap GgufFile(GgufTest.TOY);
+        Checkpoint st #= Checkpoint.open(GgufTest.ST);
+        Assert.equals(1L, (int64) g.typeOf(
+            g.tensorIndexOf("blk.0.attn_q.weight")));
+        Assert.equals(30L, (int64) g.typeOf(
+            g.tensorIndexOf("blk.0.attn_k.weight")));
+        Assert.equals(8L, (int64) g.typeOf(
+            g.tensorIndexOf("blk.0.ffn_down.weight")));
+        Assert.equals(0L, (int64) g.typeOf(
+            g.tensorIndexOf("token_embd.weight")));
+
+        Tensor<float32> q #= g.loadF32("blk.0.attn_q.weight");
+        Tensor<float32> qs #= st.loadF32("model.layers.0.self_attn.q_proj.weight");
+        GgufTest.tensorsMatch(q, qs);
+        Tensor<float32> k #= g.loadF32("blk.0.attn_k.weight");
+        Tensor<float32> ks #= st.loadF32("model.layers.0.self_attn.k_proj.weight");
+        GgufTest.tensorsMatch(k, ks);
+        Tensor<float32> dn #= g.loadF32("blk.0.ffn_down.weight");
+        Tensor<float32> dns #= st.loadF32("model.layers.0.mlp.down_proj.weight");
+        GgufTest.tensorsMatch(dn, dns);
+        Tensor<float32> e #= g.loadF32("token_embd.weight");
+        Tensor<float32> es #= st.loadF32("model.embed_tokens.weight");
+        GgufTest.tensorsMatch(e, es);
+        g.close();
+        st.close();
+    }
+
+    // ── 16.1.3 — metadata populates the config, no config.json ─────────
+
+    @Test
+    public void metadataPopulatesConfigWithoutJson() {
+        GgufFile g #= heap GgufFile(GgufTest.TOY);
+        ModelConfig fromMeta #= ModelConfig.fromGguf(g);
+        ModelConfig fromJson #= ModelConfig.parse(GgufTest.CFG);
+        Assert.equals(fromJson.architecture, fromMeta.architecture);
+        Assert.equals((int64) fromJson.hiddenSize, (int64) fromMeta.hiddenSize);
+        Assert.equals((int64) fromJson.intermediateSize,
+            (int64) fromMeta.intermediateSize);
+        Assert.equals((int64) fromJson.numLayers, (int64) fromMeta.numLayers);
+        Assert.equals((int64) fromJson.numHeads, (int64) fromMeta.numHeads);
+        Assert.equals((int64) fromJson.numKvHeads, (int64) fromMeta.numKvHeads);
+        Assert.equals((int64) fromJson.headDim, (int64) fromMeta.headDim);
+        Assert.equals((int64) fromJson.vocabSize, (int64) fromMeta.vocabSize);
+        Assert.equals((int64) fromJson.maxPositionEmbeddings,
+            (int64) fromMeta.maxPositionEmbeddings);
+        Assert.isTrue(fromMeta.rmsNormEps == fromJson.rmsNormEps);
+        Assert.isTrue(fromMeta.ropeTheta == fromJson.ropeTheta);
+        g.close();
+    }
+
+    // ── 16.1.4 — the embedded tokenizer, no external file ──────────────
+
+    @Test
+    public void embeddedTokenizerRoundTrips() {
+        GgufFile g #= heap GgufFile(GgufTest.TOY);
+        Tokenizer t #= g.tokenizer();
+        Assert.equals(277L, (int64) t.vocabSize());
+        int8[] lower #= heap int8[8];
+        lower[0] = (int8) 0xE2;   // U+2581 LOWER SEVEN EIGHTHS BLOCK
+        lower[1] = (int8) 0x96;
+        lower[2] = (int8) 0x81;
+        lower[3] = (int8) 104;    // h
+        lower[4] = (int8) 101;    // e
+        lower[5] = (int8) 108;    // l
+        lower[6] = (int8) 108;    // l
+        lower[7] = (int8) 111;    // o
+        String piece = heap String(#lower, 8);
+        Assert.isTrue(t.idOf(piece) >= 0);
+        int32[] ids #= t.encode("hello world");
+        Assert.isTrue((int64) ids.count() > 0L);
+        int8[] back #= t.decode(ids, (int32) ids.count());
+        String s = heap String(#back, (int32) back.count());
+        Assert.equals("hello world", s);
+        g.close();
+    }
+
+    // ── 16.1.5 — the embedded chat template drives Unit 13 ─────────────
+
+    @Test
+    public void embeddedChatTemplateDrivesInterpreter() {
+        GgufFile g #= heap GgufFile(GgufTest.TOY);
+        String tpl = g.chatTemplate();
+        Assert.isTrue(tpl != null);
+        ChatTemplate ct #= ChatTemplate.fromString(tpl, "toy", "<s>", "</s>");
+        String outS #= ct.renderJson(
+            "[{\"role\": \"user\", \"content\": \"hi\"}]", null, true);
+        Assert.equals("<|user|>hi<|end|><|assistant|>", outS);
+        g.close();
+    }
+
+    // ── 16.1.6 — unsupported quantization names type and tensor ────────
+
+    @Test
+    public void unsupportedTypeNamesTypeAndTensor() {
+        GgufFile g #= heap GgufFile(GgufTest.BAD);
+        // The directory parses — the bad type only bites at load (9.5:
+        // dispatch is per tensor).
+        Assert.equals(21L, g.tensorCount());
+        boolean threw = false;
+        String msg = null;
+        try {
+            Tensor<float32> t #= g.loadF32("blk.1.ffn_up.weight");
+        } catch (LlamaException e) {
+            threw = true;
+            msg = "" + e.message;
+        }
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.contains("q4_k"));
+        Assert.isTrue(msg.contains("blk.1.ffn_up.weight"));
+        g.close();
+    }
+
+    // ── 16.3.1 — same model, either format, logits agree ───────────────
+
+    @Test
+    public void safetensorsAndGgufReachTheSameLogits() {
+        // Both checkpoints hold identical f32 weights by construction
+        // (the twin is pre-rounded), and one engine runs both — the
+        // comparison is EXACT equality, not a tolerance.
+        ModelConfig cfgA #= ModelConfig.parse(GgufTest.CFG);
+        cfgA.blockTokens = 4;
+        LlamaForCausalLM a #= heap LlamaForCausalLM(#cfgA, 64, 1, 0);
+        Checkpoint ckA #= Checkpoint.open(GgufTest.ST);
+        a.bind(ckA, false);
+        ckA.close();
+
+        Checkpoint ckB #= Checkpoint.open(GgufTest.TOY);
+        ModelConfig cfgB #= ModelConfig.fromGguf(ckB.gguf());
+        cfgB.blockTokens = 4;
+        LlamaForCausalLM b #= heap LlamaForCausalLM(#cfgB, 64, 1, 0);
+        b.bind(ckB, false);
+        ckB.close();
+
+        int32[] prompt #= heap int32[7];
+        int32 i = 0;
+        while (i < 7) {
+            prompt[i] = (i * 11 + 3) % 96;
+            i = i + 1;
+        }
+        int32 nextA = a.prefill(prompt, 7);
+        Tensor<float32> la = a.logits();
+        int32 nextB = b.prefill(prompt, 7);
+        Tensor<float32> lb = b.logits();
+        Assert.equals((int64) nextA, (int64) nextB);
+        i = 0;
+        while (i < 96) {
+            if (la.flatGet((int64) i) != lb.flatGet((int64) i)) {
+                Assert.fail("logit " + i + " differs: "
+                    + la.flatGet((int64) i) + " vs " + lb.flatGet((int64) i));
+            }
+            i = i + 1;
+        }
+        // Greedy continuation stays in lockstep for a few steps too.
+        int32 ca = nextA;
+        int32 cb = nextB;
+        i = 0;
+        while (i < 4) {
+            ca = a.decodeStep(ca);
+            cb = b.decodeStep(cb);
+            Assert.equals((int64) ca, (int64) cb);
+            i = i + 1;
+        }
+    }
+}
