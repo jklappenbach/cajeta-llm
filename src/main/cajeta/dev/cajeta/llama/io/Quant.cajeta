@@ -1,0 +1,322 @@
+package dev.cajeta.llama.io;
+
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import dev.cajeta.llama.LlamaException;
+
+/**
+ * The ggml block-quantization family (cajeta-llama plan Unit 18; spec
+ * 10.1–10.10): scalar shift-and-mask decoders for Q8_0, Q4_0 and the
+ * k-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, each transcribed from llama.cpp's
+ * reference layout and pinned BIT-EXACT against gguf-py dequantization of
+ * REAL blocks pulled from the published Llama-3.1-8B builds
+ * (`QuantTest`, fixtures from tools/gguf/gen_kquant_fixture.py). A
+ * `Q4_K_M` file mixes Q4_K/Q5_K/Q6_K by tensor sensitivity, so dispatch
+ * is per tensor (spec 9.5) — `blockBytes`/`blockElems` describe a TYPE,
+ * `dequantize` decodes one TENSOR.
+ *
+ * Sub-byte weights are STORAGE, not arithmetic (spec §10): everything
+ * lands in f32 here (or int8 + block scale in {@link #q8MatVec}, which
+ * consumes Q8_0 without materializing a full f32 weight tensor —
+ * 18.1.1's shape). The vectorized Q4_0 unpack rides Unit 17's Vector
+ * toolkit and must agree with the scalar path exactly (18.1.7).
+ */
+public final class Quant {
+
+    public static final int32 GG_Q4_0 = 2;
+    public static final int32 GG_Q8_0 = 8;
+    public static final int32 GG_Q2_K = 10;
+    public static final int32 GG_Q3_K = 11;
+    public static final int32 GG_Q4_K = 12;
+    public static final int32 GG_Q5_K = 13;
+    public static final int32 GG_Q6_K = 14;
+
+    private Quant() { }
+
+    public static boolean supported(int32 ty) {
+        return ty == Quant.GG_Q4_0 || ty == Quant.GG_Q8_0
+            || ty == Quant.GG_Q2_K || ty == Quant.GG_Q3_K
+            || ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
+            || ty == Quant.GG_Q6_K;
+    }
+
+    /** Elements per block for `ty`; -1 when unsupported. */
+    public static int32 blockElems(int32 ty) {
+        if (ty == Quant.GG_Q4_0 || ty == Quant.GG_Q8_0) { return 32; }
+        if (Quant.supported(ty)) { return 256; }
+        return -1;
+    }
+
+    /** Packed bytes per block for `ty`; -1 when unsupported. */
+    public static int32 blockBytes(int32 ty) {
+        if (ty == Quant.GG_Q4_0) { return 18; }
+        if (ty == Quant.GG_Q8_0) { return 34; }
+        if (ty == Quant.GG_Q2_K) { return 84; }
+        if (ty == Quant.GG_Q3_K) { return 110; }
+        if (ty == Quant.GG_Q4_K) { return 144; }
+        if (ty == Quant.GG_Q5_K) { return 176; }
+        if (ty == Quant.GG_Q6_K) { return 210; }
+        return -1;
+    }
+
+    static int32 u8(int8[] raw, int64 off) {
+        return (int32) raw[off] & 255;
+    }
+
+    static float32 f16At(int8[] raw, int64 off) {
+        int32 h = Quant.u8(raw, off) | (Quant.u8(raw, off + 1L) << 8);
+        return GgufFile.halfBitsToF32(h);
+    }
+
+    /**
+     * Decode `nBlocks` packed blocks of `ty` at `raw[rawOff…)` into
+     * `out[outOff…)`. The per-format bodies below follow llama.cpp's
+     * element ordering exactly — the fixtures are the proof, not this
+     * comment.
+     */
+    public static void dequantize(int32 ty, int8[] raw, int64 rawOff,
+            int64 nBlocks, float32[] out, int64 outOff) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be = (int64) Quant.blockElems(ty);
+        if (bb < 0) {
+            throw heap LlamaException("quant: unsupported ggml type " + ty);
+        }
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 ro = rawOff + b * bb;
+            int64 oo = outOff + b * be;
+            if (ty == Quant.GG_Q4_0) { Quant.q4_0Block(raw, ro, out, oo); }
+            else if (ty == Quant.GG_Q8_0) { Quant.q8_0Block(raw, ro, out, oo); }
+            else if (ty == Quant.GG_Q2_K) { Quant.q2_kBlock(raw, ro, out, oo); }
+            else if (ty == Quant.GG_Q3_K) { Quant.q3_kBlock(raw, ro, out, oo); }
+            else if (ty == Quant.GG_Q4_K) { Quant.q4_kBlock(raw, ro, out, oo); }
+            else if (ty == Quant.GG_Q5_K) { Quant.q5_kBlock(raw, ro, out, oo); }
+            else { Quant.q6_kBlock(raw, ro, out, oo); }
+            b = b + 1;
+        }
+    }
+
+    // ── Q8_0: { f16 d; int8 qs[32] } ────────────────────────────────────
+
+    static void q8_0Block(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        int32 j = 0;
+        while (j < 32) {
+            out[oo + (int64) j] = d * (float32) ((int32) raw[ro + 2L + (int64) j]);
+            j = j + 1;
+        }
+    }
+
+    // ── Q4_0: { f16 d; u8 qs[16] } — lo nibbles then hi, biased -8 ─────
+
+    static void q4_0Block(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        int32 j = 0;
+        while (j < 16) {
+            int32 q = Quant.u8(raw, ro + 2L + (int64) j);
+            out[oo + (int64) j] = d * (float32) ((q & 15) - 8);
+            out[oo + (int64) (j + 16)] = d * (float32) ((q >> 4) - 8);
+            j = j + 1;
+        }
+    }
+
+    /**
+     * The VECTORIZED Q4_0 unpack (18.2.5): Unit 17's toolkit — one
+     * vload16, nibble split by mask/shift, -8 bias — with the scale
+     * applied per lane. Must equal {@link #q4_0Block} bit for bit
+     * (18.1.7); QuantTest asserts it on the real fixture.
+     */
+    static void q4_0BlockVec(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        Vector<int8,16> v = Cajeta.vload16(raw, ro + 2L);
+        Vector<int8,16> lo = (v & 15) - 8;
+        Vector<int8,16> hi = ((v >> 4) & 15) - 8;
+        int32 j = 0;
+        while (j < 16) {
+            out[oo + (int64) j] = d * (float32) ((int32) lo[j]);
+            out[oo + (int64) (j + 16)] = d * (float32) ((int32) hi[j]);
+            j = j + 1;
+        }
+    }
+
+    // ── Q2_K: { u8 scales[16]; u8 qs[64]; f16 d; f16 dmin } ────────────
+
+    static void q2_kBlock(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro + 80L);
+        float32 dmin = Quant.f16At(raw, ro + 82L);
+        int32 e = 0;
+        while (e < 256) {
+            int32 g = e / 128;
+            int32 r = e - g * 128;
+            int32 s = r / 32;
+            int32 l = r - s * 32;
+            int32 q = (Quant.u8(raw, ro + (int64) (16 + 32 * g + l))
+                >> (2 * s)) & 3;
+            int32 sb = Quant.u8(raw, ro + (int64) (e / 16));
+            out[oo + (int64) e] = d * (float32) (sb & 15) * (float32) q
+                - dmin * (float32) (sb >> 4);
+            e = e + 1;
+        }
+    }
+
+    // ── Q3_K: { u8 hmask[32]; u8 qs[64]; u8 scales[12]; f16 d } ────────
+
+    static void q3_kBlock(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro + 108L);
+        // 12 packed bytes → 16 six-bit scales, then − 32. Lane order per
+        // the reference: low nibbles of bytes 0..7 fill lanes 0..7, high
+        // nibbles fill 8..15; the top two bits come from bytes 8..11 in
+        // (shift-major) order — lane k reads byte 8+(k&3) at shift 2·(k/4).
+        int32[] sc = heap int32[16];
+        int32 k = 0;
+        while (k < 8) {
+            int32 b0 = Quant.u8(raw, ro + (int64) (96 + k));
+            sc[k] = b0 & 15;
+            sc[k + 8] = b0 >> 4;
+            k = k + 1;
+        }
+        k = 0;
+        while (k < 16) {
+            int32 hb = Quant.u8(raw, ro + (int64) (104 + (k & 3)));
+            int32 hs = (hb >> (2 * (k / 4))) & 3;
+            sc[k] = (sc[k] | (hs << 4)) - 32;
+            k = k + 1;
+        }
+        int32 e = 0;
+        while (e < 256) {
+            int32 g = e / 128;
+            int32 r = e - g * 128;
+            int32 s = r / 32;
+            int32 l = r - s * 32;
+            int32 ql = (Quant.u8(raw, ro + (int64) (32 + 32 * g + l))
+                >> (2 * s)) & 3;
+            int32 hbit = (Quant.u8(raw, ro + (int64) (e - (e / 32) * 32))
+                >> (e / 32)) & 1;
+            int32 q = ql - ((hbit ^ 1) << 2);
+            out[oo + (int64) e] = d * (float32) sc[e / 16] * (float32) q;
+            e = e + 1;
+        }
+    }
+
+    // ── Q4_K/Q5_K shared: 12 bytes → 8 six-bit scales + 8 mins ─────────
+
+    static void scaleMinK4(int8[] raw, int64 so, int32[] sc, int32[] mn) {
+        int32 j = 0;
+        while (j < 4) {
+            int32 dj = Quant.u8(raw, so + (int64) j);
+            int32 mj = Quant.u8(raw, so + (int64) (j + 4));
+            int32 md = Quant.u8(raw, so + (int64) (j + 8));
+            sc[j] = dj & 63;
+            mn[j] = mj & 63;
+            sc[j + 4] = (md & 15) | ((dj >> 2) & 48);
+            mn[j + 4] = (md >> 4) | ((mj >> 2) & 48);
+            j = j + 1;
+        }
+    }
+
+    // ── Q4_K: { f16 d; f16 dmin; u8 scales[12]; u8 qs[128] } ───────────
+
+    static void q4_kBlock(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        float32 dmin = Quant.f16At(raw, ro + 2L);
+        int32[] sc = heap int32[8];
+        int32[] mn = heap int32[8];
+        Quant.scaleMinK4(raw, ro + 4L, sc, mn);
+        int32 e = 0;
+        while (e < 256) {
+            int32 g = e / 64;
+            int32 r = e - g * 64;
+            int32 s = r / 32;
+            int32 l = r - s * 32;
+            int32 q = (Quant.u8(raw, ro + (int64) (16 + 32 * g + l))
+                >> (4 * s)) & 15;
+            int32 sb = e / 32;
+            out[oo + (int64) e] = d * (float32) sc[sb] * (float32) q
+                - dmin * (float32) mn[sb];
+            e = e + 1;
+        }
+    }
+
+    // ── Q5_K: { f16 d; f16 dmin; u8 scales[12]; u8 qh[32]; u8 qs[128] } ─
+
+    static void q5_kBlock(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        float32 dmin = Quant.f16At(raw, ro + 2L);
+        int32[] sc = heap int32[8];
+        int32[] mn = heap int32[8];
+        Quant.scaleMinK4(raw, ro + 4L, sc, mn);
+        int32 e = 0;
+        while (e < 256) {
+            int32 g = e / 64;
+            int32 r = e - g * 64;
+            int32 s = r / 32;
+            int32 l = r - s * 32;
+            int32 ql = (Quant.u8(raw, ro + (int64) (48 + 32 * g + l))
+                >> (4 * s)) & 15;
+            int32 hbit = (Quant.u8(raw, ro + (int64) (16 + (e - (e / 32) * 32)))
+                >> (e / 32)) & 1;
+            int32 q = ql | (hbit << 4);
+            int32 sb = e / 32;
+            out[oo + (int64) e] = d * (float32) sc[sb] * (float32) q
+                - dmin * (float32) mn[sb];
+            e = e + 1;
+        }
+    }
+
+    // ── Q6_K: { u8 ql[128]; u8 qh[64]; i8 scales[16]; f16 d } ──────────
+
+    static void q6_kBlock(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro + 208L);
+        int32 e = 0;
+        while (e < 256) {
+            int32 g = e / 128;
+            int32 r = e - g * 128;
+            int32 sl = r / 64;
+            int32 l64 = r - sl * 64;
+            int32 ql = (Quant.u8(raw, ro + (int64) (64 * g + l64))
+                >> (4 * sl)) & 15;
+            int32 sh = r / 32;
+            int32 l32 = r - sh * 32;
+            int32 qh = (Quant.u8(raw, ro + (int64) (128 + 32 * g + l32))
+                >> (2 * sh)) & 3;
+            int32 q = (ql | (qh << 4)) - 32;
+            int32 scb = (int32) raw[ro + (int64) (192 + e / 16)];  // int8, signed
+            out[oo + (int64) e] = d * (float32) scb * (float32) q;
+            e = e + 1;
+        }
+    }
+
+    // ── 18.1.1 — Q8_0 mat-vec that never materializes f32 weights ──────
+
+    /**
+     * y = W·x where W is `rows × cols` of PACKED Q8_0 blocks (row-major,
+     * cols a multiple of 32): each block contributes
+     * `d · Σ q_j · x_j` — int8 weights consumed against f32 activations
+     * with one scale per 32, no dequantized weight tensor anywhere.
+     */
+    public static void q8MatVec(int8[] packed, int64 rows, int64 cols,
+            float32[] x, float32[] y) {
+        int64 blocksPerRow = cols / 32L;
+        int64 rowBytes = blocksPerRow * 34L;
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 34L;
+                float32 dv = Quant.f16At(packed, ro);
+                float32 dot = 0.0f;
+                int32 j = 0;
+                while (j < 32) {
+                    dot = dot + (float32) ((int32) packed[ro + 2L + (int64) j])
+                        * x[b * 32L + (int64) j];
+                    j = j + 1;
+                }
+                acc = acc + dv * dot;
+                b = b + 1;
+            }
+            y[i] = acc;
+            i = i + 1;
+        }
+    }
+}

@@ -27,7 +27,7 @@ H, L, NH, NKV, HD, IT, V, CTX = 16, 2, 4, 2, 4, 32, 96, 64
 
 GGUF_MAGIC = 0x46554747
 T_U32, T_F32, T_STR, T_ARR, T_U64, T_I32 = 4, 6, 8, 9, 10, 5
-GG_F32, GG_F16, GG_Q8_0, GG_Q4_K, GG_BF16 = 0, 1, 8, 12, 30
+GG_F32, GG_F16, GG_Q8_0, GG_IQ2_XXS, GG_BF16 = 0, 1, 8, 16, 30
 
 def s(x):  # gguf string
     b = x.encode("utf-8")
@@ -149,7 +149,7 @@ def build(path, bad=False):
     dirs, off = [], 0
     for (hf, gg, a, ty), pay in zip(tensors, payloads):
         ne = list(reversed(a.shape))        # ggml ne: fastest dim first
-        t = GG_Q4_K if (bad and gg == "blk.1.ffn_up.weight") else ty
+        t = GG_IQ2_XXS if (bad and gg == "blk.1.ffn_up.weight") else ty
         d = s(gg) + struct.pack("<I", len(ne)) \
             + b"".join(struct.pack("<Q", n) for n in ne) \
             + struct.pack("<IQ", t, off)

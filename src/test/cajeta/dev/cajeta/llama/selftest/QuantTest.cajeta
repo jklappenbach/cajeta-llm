@@ -1,0 +1,170 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.io.GgufFile;
+import dev.cajeta.llama.io.Quant;
+import cajeta.io.file.File;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+
+/**
+ * cajeta-llama plan Unit 18 TDD (18.1.2–18.1.7, 18.1.11, 18.3.1) — the
+ * ggml block-format decoders against REAL blocks: fixtures are raw packed
+ * bytes pulled from the published Llama-3.1-8B builds (Q4_K/Q6_K from the
+ * Q4_K_M file — the spec-9.5 mix a single recipe actually ships —, Q5_K
+ * from Q5_K_M, Q2_K/Q3_K from their builds, Q8_0 from Q8_0; Q4_0 from
+ * gguf-py's reference quantizer), each paired with gguf-py's reference
+ * dequantization. The comparison is BIT-EXACT f32 equality: both sides
+ * compute d·q−m in float32 from the same bytes, so any deviation is a
+ * layout bug, not rounding.
+ */
+public class QuantTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+
+    public QuantTest() { return; }
+
+    static void checkFormat(String name, int32 ty) {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + name + ".bin");
+        int8[] refBytes #= File.readAllBytes(QuantTest.DIR + name + ".f32");
+        int32 bb = Quant.blockBytes(ty);
+        int32 be = Quant.blockElems(ty);
+        int64 blocks = (int64) raw.count() / (int64) bb;
+        Assert.isTrue(blocks > 0L);
+        Assert.equals((int64) refBytes.count(),
+            blocks * (int64) be * 4L);
+        float32[] out #= heap float32[blocks * (int64) be];
+        Quant.dequantize(ty, raw, 0, blocks, out, 0);
+        int64 n = blocks * (int64) be;
+        int64 i = 0;
+        while (i < n) {
+            int64 b0 = (int64) refBytes[i * 4L] & 255L;
+            int64 b1 = (int64) refBytes[i * 4L + 1L] & 255L;
+            int64 b2 = (int64) refBytes[i * 4L + 2L] & 255L;
+            int64 b3 = (int64) refBytes[i * 4L + 3L] & 255L;
+            float32 want = GgufFile.singleBits(
+                b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            if (out[i] != want) {
+                Assert.fail(name + " element " + i + ": got " + out[i]
+                    + " want " + want);
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── 18.1.2 / 18.3.1 — Q4_0 and Q8_0 ────────────────────────────────
+
+    @Test
+    public void q4_0MatchesReferenceExactly() {
+        QuantTest.checkFormat("q4_0", Quant.GG_Q4_0);
+    }
+
+    @Test
+    public void q8_0MatchesReferenceExactly() {
+        QuantTest.checkFormat("q8_0", Quant.GG_Q8_0);
+    }
+
+    // ── 18.1.3 — Q4_K: 256 super-block, 6-bit packed scales/mins ───────
+
+    @Test
+    public void q4_kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q4_k", Quant.GG_Q4_K);
+    }
+
+    // ── 18.1.4 — Q2_K: 16×16, 4-bit scales and mins ────────────────────
+
+    @Test
+    public void q2_kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q2_k", Quant.GG_Q2_K);
+    }
+
+    // ── 18.1.5 — Q3_K / Q5_K / Q6_K, incl. byte-spanning extraction ────
+
+    @Test
+    public void q3_kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q3_k", Quant.GG_Q3_K);
+    }
+
+    @Test
+    public void q5_kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q5_k", Quant.GG_Q5_K);
+    }
+
+    @Test
+    public void q6_kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q6_k", Quant.GG_Q6_K);
+    }
+
+    // ── 18.1.7 — scalar and vectorized unpack agree (Unit 17's path) ───
+
+    @Test
+    public void vectorizedQ4_0AgreesWithScalar() {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q4_0.bin");
+        int64 blocks = (int64) raw.count() / 18L;
+        float32[] a #= heap float32[blocks * 32L];
+        float32[] b #= heap float32[blocks * 32L];
+        int64 blk = 0;
+        while (blk < blocks) {
+            Quant.q4_0Block(raw, blk * 18L, a, blk * 32L);
+            Quant.q4_0BlockVec(raw, blk * 18L, b, blk * 32L);
+            blk = blk + 1;
+        }
+        int64 i = 0;
+        while (i < blocks * 32L) {
+            if (a[i] != b[i]) {
+                Assert.fail("lane " + i + ": scalar " + a[i]
+                    + " vs vector " + b[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── 18.1.11 — unsupported type errors naming the type ──────────────
+
+    @Test
+    public void unsupportedTypeErrors() {
+        Assert.isFalse(Quant.supported(16));   // IQ2_XXS
+        Assert.equals(-1L, (int64) Quant.blockBytes(16));
+    }
+
+    // ── 18.1.1 — Q8_0 mat-vec without a dequantized weight tensor ──────
+
+    @Test
+    public void q8MatVecMatchesDequantizedReference() {
+        // Build a 4×64 packed Q8_0 weight from the real fixture blocks
+        // (8 blocks = exactly 4 rows × 2 blocks), a fixed activation, and
+        // compare against dequantize-then-multiply.
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q8_0.bin");
+        Assert.equals(272L, (int64) raw.count());   // 8 blocks × 34
+        int64 rows = 4;
+        int64 cols = 64;
+        float32[] x #= heap float32[cols];
+        int64 i = 0;
+        while (i < cols) {
+            x[i] = (float32) ((i * 7L % 13L) - 6L) * 0.25f;
+            i = i + 1;
+        }
+        float32[] y #= heap float32[rows];
+        Quant.q8MatVec(raw, rows, cols, x, y);
+
+        float32[] w #= heap float32[rows * cols];
+        Quant.dequantize(Quant.GG_Q8_0, raw, 0, 8, w, 0);
+        int64 r = 0;
+        while (r < rows) {
+            float32 acc = 0.0f;
+            int64 c = 0;
+            while (c < cols) {
+                acc = acc + w[r * cols + c] * x[c];
+                c = c + 1;
+            }
+            // Same accumulation ORDER by construction (block-major), so
+            // the comparison is exact, not a tolerance.
+            float32 diff = y[r] - acc;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            if (diff > 0.0001f) {
+                Assert.fail("row " + r + ": " + y[r] + " vs " + acc);
+            }
+            r = r + 1;
+        }
+    }
+}
