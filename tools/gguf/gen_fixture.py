@@ -23,7 +23,7 @@ import numpy as np
 OUT = os.path.join(os.path.dirname(__file__), "..", "..",
                    "src", "test", "fixtures", "gguf")
 
-H, L, NH, NKV, HD, IT, V, CTX = 16, 2, 4, 2, 4, 32, 96, 64
+H, L, NH, NKV, HD, IT, V, CTX = 16, 2, 4, 2, 4, 32, 277, 64
 
 GGUF_MAGIC = 0x46554747
 T_U32, T_F32, T_STR, T_ARR, T_U64, T_I32 = 4, 6, 8, 9, 10, 5
