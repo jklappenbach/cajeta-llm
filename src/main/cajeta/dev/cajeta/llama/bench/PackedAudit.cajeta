@@ -1,0 +1,92 @@
+package dev.cajeta.llama.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.io.GgufFile;
+import dev.cajeta.llama.io.Quant;
+
+/**
+ * Compare the block-direct mat-vec against dequantize-then-multiply for
+ * REAL tensors at REAL dimensions, straight out of the shipped model.
+ * The unit tests use 2048-element fixtures at rows=2; a 4096x14336
+ * projection is a different animal.
+ */
+public class PackedAudit {
+    static void audit(GgufFile g, String name) {
+        int32 idx = g.tensorIndexOf(name);
+        if (idx < 0) {
+            System.stdout.println(name + ": ABSENT");
+            return;
+        }
+        int32 ty = g.typeOf(idx);
+        int64[] shp = g.shapeOf(idx);
+        // ggml ne[0] is the fastest (contiguous) dim = cols = inDim.
+        int64 cols = shp[0];
+        int64 rows = shp[1];
+        if (cols % 256L != 0L || !Quant.supported(ty)) {
+            System.stdout.println(name + ": ty=" + ty + " cols=" + cols
+                + " (skipped)");
+            return;
+        }
+        int8[] packed #= g.loadPacked(name);
+        Tensor<float32> deq #= g.loadF32(name);
+
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) {
+            x[c] = (float32) ((c % 13L) - 6L) * 0.125f;
+            c = c + 1;
+        }
+        int64 probe = rows < 8L ? rows : 8L;
+        float32[] got #= heap float32[rows];
+        if (ty == Quant.GG_Q4_K) {
+            Quant.q4kMatVec(packed, rows, cols, x, got);
+        } else if (ty == Quant.GG_Q5_K) {
+            Quant.q5kMatVec(packed, rows, cols, x, got);
+        } else if (ty == Quant.GG_Q6_K) {
+            Quant.q6kMatVec(packed, rows, cols, x, got);
+        } else if (ty == Quant.GG_Q8_0) {
+            Quant.q8MatVec(packed, rows, cols, x, got);
+        } else {
+            System.stdout.println(name + ": ty=" + ty + " unhandled");
+            return;
+        }
+
+        float64 worst = 0.0;
+        int64 r = 0;
+        while (r < probe) {
+            float32 acc = 0.0f;
+            c = 0;
+            while (c < cols) {
+                acc = acc + deq.flatGet(r * cols + c) * x[c];
+                c = c + 1;
+            }
+            float64 a = (float64) acc;
+            float64 b = (float64) got[r];
+            float64 d = a - b;
+            if (d < 0.0) { d = 0.0 - d; }
+            float64 m = a < 0.0 ? 0.0 - a : a;
+            if (m < 1.0) { m = 1.0; }
+            if (d / m > worst) { worst = d / m; }
+            r = r + 1;
+        }
+        System.stdout.println(name + ": ty=" + ty + " [" + rows + "x" + cols
+            + "] worst relerr over " + probe + " rows = " + worst);
+        return;
+    }
+
+    public static void run(String[] args) {
+        Checkpoint ck #= Checkpoint.open(args[0]);
+        GgufFile g = ck.gguf();
+        PackedAudit.audit(g, "blk.0.attn_q.weight");
+        PackedAudit.audit(g, "blk.0.attn_k.weight");
+        PackedAudit.audit(g, "blk.0.ffn_down.weight");
+        PackedAudit.audit(g, "blk.0.ffn_gate.weight");
+        PackedAudit.audit(g, "token_embd.weight");
+        PackedAudit.audit(g, "output.weight");
+        ck.close();
+        return;
+    }
+}
