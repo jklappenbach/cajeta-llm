@@ -4,6 +4,7 @@ import cajeta.lang.String;
 import cajeta.math.Tensor;
 import dev.cajeta.llama.LlamaException;
 import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.io.Quant;
 
 /**
  * A bias-free linear projection. The weight is held in cajeta orientation
@@ -13,17 +14,47 @@ import dev.cajeta.llama.io.Checkpoint;
  * the `Checkpoints.transposeLinearWeights` discipline).
  */
 public final class Linear extends InfModule {
-    Tensor<float32> weight;
+    Tensor<float32> weight;     // f32 path: [in, out] (transposed on import)
+    int8[] packed;              // packed path: file bytes, [out, in] blocks
+    int32 packedTy;             // ggml type of `packed`, or -1
     int32 inDim;
     int32 outDim;
 
     Linear(int32 inDim, int32 outDim) {
         this.weight = null;
+        this.packed = null;
+        this.packedTy = -1;
         this.inDim = inDim;
         this.outDim = outDim;
     }
 
+    /** True when the weight is held in its PACKED block form and consumed
+     *  without ever materializing an f32 tensor. */
+    public boolean isPacked() {
+        return this.packedTy >= 0;
+    }
+
     void bind(Checkpoint ckpt, String name, boolean toDevice) {
+        // Packed path (spec §10): a Q8_0 weight stays in its block form and
+        // is consumed as `d · Σ q·x` per 32 — no f32 weight tensor is ever
+        // materialized. Decode is memory-bandwidth bound, so reading 1 byte
+        // per weight instead of 4 is the win; the unpack rides in registers
+        // where the block scale is already hot. Device placement still needs
+        // the f32 tensor, so `toDevice` keeps the old path for now.
+        if (!toDevice && ckpt.packedTypeOf(name) == Quant.GG_Q8_0
+                && (int64) this.inDim % 32L == 0L) {
+            int8[] p #= ckpt.loadPacked(name);
+            int64 want = (int64) this.outDim * ((int64) this.inDim / 32L) * 34L;
+            if ((int64) p.count() != want) {
+                throw heap LlamaException("weight binding: '" + name
+                    + "' packed Q8_0 is " + (int64) p.count()
+                    + " bytes; expected " + want + " for [" + this.outDim
+                    + ", " + this.inDim + "]");
+            }
+            this.packed #= p;
+            this.packedTy = Quant.GG_Q8_0;
+            return;
+        }
         Tensor<float32> t = ckpt.loadF32(name);
         if (t.ndim() != 2) {
             throw heap LlamaException("weight binding: '" + name
@@ -42,5 +73,22 @@ public final class Linear extends InfModule {
             c.gpu();
         }
         this.weight #= c;
+    }
+
+    /**
+     * `dst[dstOff .. +outDim) = src[srcOff .. +inDim) · W` — the ONE place
+     * the forward path asks a projection to multiply, so the packed and
+     * f32 weights differ only here.
+     */
+    void matvecInto(Tensor<float32> src, int64 srcOff,
+            Tensor<float32> dst, int64 dstOff) {
+        if (this.packedTy == Quant.GG_Q8_0) {
+            Quant.q8MatVecInto(this.packed, (int64) this.outDim,
+                (int64) this.inDim, src.hostBuffer(), src.hostBase() + srcOff,
+                dst.hostBuffer(), dst.hostBase() + dstOff);
+            return;
+        }
+        HostOps.matvecRow(src, srcOff, this.weight, dst, dstOff,
+            this.inDim, this.outDim);
     }
 }
