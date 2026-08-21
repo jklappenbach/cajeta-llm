@@ -1,0 +1,142 @@
+package dev.cajeta.llama.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import cajeta.time.Clock;
+
+/**
+ * Why the f32 parity run takes hours: HostOps.matvecRow's INNER loop walks
+ * the input dim, reading w.get2(i, o) from a weight stored [in, out]
+ * contiguous — so each step strides outDim*4 bytes. This times that access
+ * order against the contiguous one on a realistic projection shape.
+ */
+public class MatvecProbe {
+
+    // The current shape: inner loop over i, strided reads down a column.
+    static float64 strided(Tensor<float32> src, Tensor<float32> w,
+            Tensor<float32> dst, int32 inDim, int32 outDim) {
+        int64 t0 = Clock.nanoTime();
+        int64 o = 0;
+        while (o < (int64) outDim) {
+            float32 acc = 0.0f;
+            int64 i = 0;
+            while (i < (int64) inDim) {
+                acc = acc + src.flatGet(i) * w.get2(i, o);
+                i = i + 1;
+            }
+            dst.flatSet(o, acc);
+            o = o + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0;
+    }
+
+    // Same math, contiguous: broadcast src[i] and accumulate across o, which
+    // walks w in storage order.
+    static float64 contiguous(Tensor<float32> src, Tensor<float32> w,
+            Tensor<float32> dst, int32 inDim, int32 outDim) {
+        int64 t0 = Clock.nanoTime();
+        int64 o = 0;
+        while (o < (int64) outDim) { dst.flatSet(o, 0.0f); o = o + 1; }
+        int64 i = 0;
+        while (i < (int64) inDim) {
+            float32 s = src.flatGet(i);
+            int64 base = i * (int64) outDim;
+            int64 oo = 0;
+            while (oo < (int64) outDim) {
+                dst.flatSet(oo, dst.flatGet(oo) + s * w.flatGet(base + oo));
+                oo = oo + 1;
+            }
+            i = i + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0;
+    }
+
+    // Identical arithmetic over RAW arrays: no Tensor/Storage accessors, no
+    // placement check, no stride reads. Isolates the per-element overhead.
+    static float64 rawArrays(float32[] src, float32[] w, float32[] dst,
+            int32 inDim, int32 outDim) {
+        int64 t0 = Clock.nanoTime();
+        int64 o = 0;
+        while (o < (int64) outDim) {
+            float32 acc = 0.0f;
+            int64 i = 0;
+            while (i < (int64) inDim) {
+                acc = acc + src[i] * w[i * (int64) outDim + o];
+                i = i + 1;
+            }
+            dst[o] = acc;
+            o = o + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0;
+    }
+
+    static #Tensor<float32> mk2(int32 r, int32 c) {
+        int64[] shp #= heap int64[2];
+        shp[0] = (int64) r;
+        shp[1] = (int64) c;
+        Tensor<float32> t #= Tensor.zeros<float32>(shp);
+        int64 i = 0;
+        while (i < (int64) r * (int64) c) {
+            t.flatSet(i, (float32) ((i % 13) - 6) * 0.125f);
+            i = i + 1;
+        }
+        return #t;
+    }
+
+    static #Tensor<float32> mk1(int32 n) {
+        int64[] shp #= heap int64[1];
+        shp[0] = (int64) n;
+        Tensor<float32> t #= Tensor.zeros<float32>(shp);
+        int64 i = 0;
+        while (i < (int64) n) {
+            t.flatSet(i, (float32) ((i % 7) - 3) * 0.25f);
+            i = i + 1;
+        }
+        return #t;
+    }
+
+    public static void run() {
+        int32 inDim = 4096;
+        int32 outDim = 4096;          // Llama-3.1-8B q_proj / o_proj shape
+        Tensor<float32> src #= MatvecProbe.mk1(inDim);
+        Tensor<float32> w #= MatvecProbe.mk2(inDim, outDim);
+        Tensor<float32> d1 #= MatvecProbe.mk1(outDim);
+        Tensor<float32> d2 #= MatvecProbe.mk1(outDim);
+
+        float64 ms1 = MatvecProbe.strided(src, w, d1, inDim, outDim);
+        float64 ms2 = MatvecProbe.contiguous(src, w, d2, inDim, outDim);
+
+        // Same answer either way (float addition order differs, so compare
+        // with a tolerance rather than bitwise).
+        float64 maxAbs = 0.0;
+        int64 o = 0;
+        while (o < (int64) outDim) {
+            float64 diff = (float64) d1.flatGet(o) - (float64) d2.flatGet(o);
+            if (diff < 0.0) { diff = 0.0 - diff; }
+            if (diff > maxAbs) { maxAbs = diff; }
+            o = o + 1;
+        }
+        // Raw-array control, same access order as `strided`.
+        float32[] rs #= heap float32[inDim];
+        float32[] rw #= heap float32[inDim * outDim];
+        float32[] rd #= heap float32[outDim];
+        int64 z = 0;
+        while (z < (int64) inDim) { rs[z] = src.flatGet(z); z = z + 1; }
+        z = 0;
+        while (z < (int64) inDim * (int64) outDim) {
+            rw[z] = w.flatGet(z); z = z + 1;
+        }
+        float64 ms3 = MatvecProbe.rawArrays(rs, rw, rd, inDim, outDim);
+
+        System.stdout.println("shape: " + inDim + "x" + outDim
+            + "  (one projection, ONE token)");
+        System.stdout.println("raw float32[] arrays    : " + ms3 + " ms");
+        System.stdout.println("Tensor overhead factor  : " + (ms1 / ms3) + "x");
+        System.stdout.println("strided  (HostOps today): " + ms1 + " ms");
+        System.stdout.println("contiguous             : " + ms2 + " ms");
+        System.stdout.println("speedup: " + (ms1 / ms2) + "x");
+        System.stdout.println("maxAbsDiff: " + maxAbs);
+        return;
+    }
+}
