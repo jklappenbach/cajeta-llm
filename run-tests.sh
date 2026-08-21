@@ -147,15 +147,12 @@ echo ">> building + running the test binary"
 # Override it to run the SAME suite on real silicon (plan 7.3.1's deferred
 # follow-up, the Unit 15 gate's "runs on real silicon by definition"):
 #
-#   XPU_BACKEND=amdgpu,cpu CAJETA_GPU_COOPMATRIX_IMPL=software ./run-tests.sh
+#   XPU_BACKEND=amdgpu,cpu ./run-tests.sh
 #
-# The coop-matrix override is required on amdgpu today: f32 A/B operands have
-# no native WMMA config (Portable tier) while the f32 ACCUMULATOR does (it is
-# the accumulator of f16/bf16 WMMA, Native tier), so the all-f32 GEMM straddles
-# tiers and KernelLowering skips it with [xpu-kernel-skipped]. Forcing the
-# portable tile makes all three tiles agree — which is what Ewise.matmulF32
-# documents as its intended AMD behaviour anyway ("bit-identical to the CPU
-# floor").
+# No coop-matrix override is needed: a kernel whose tiles straddle tiers (on
+# amdgpu, f32 A/B operands are Portable while the f32 ACCUMULATOR is Native —
+# it is the accumulator of f16/bf16 WMMA) now demotes to the portable tile as
+# a GROUP and lowers, rather than being skipped. Fixed in cajeta 2026-08-21.
 "$CAJETA" --emit=exe --profile=test --xpu-backend="${XPU_BACKEND:-cpu}" \
     --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja" \
     -o "$out/llamatests" \

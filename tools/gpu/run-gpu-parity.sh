@@ -15,10 +15,11 @@
 #   XPU=nvptx tools/gpu/run-gpu-parity.sh       # NVIDIA
 #   XPU=vulkan tools/gpu/run-gpu-parity.sh      # SPIR-V
 #
-# CAJETA_GPU_COOPMATRIX_IMPL=software is required on amdgpu today: the
-# all-f32 GEMM straddles cooperative-matrix tiers there and is skipped
-# without it. See specs/amdgpu-coopmatrix-tier-straddle-spec.md (in the
-# compiler repo); drop this line when that lands.
+# No CAJETA_GPU_COOPMATRIX_IMPL override: the straddling-tier defect that
+# made it necessary is fixed (cajeta, 2026-08-21) — a kernel whose tiles
+# straddle tiers now demotes to the portable tile as a GROUP and lowers,
+# instead of being skipped. Set the variable by hand only to force the
+# portable path on a backend that would otherwise go native.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -30,7 +31,6 @@ out="$here/tmp/gpu-parity"
 mkdir -p "$out"
 
 echo ">> building GpuParity for --xpu-backend=$XPU (no cpu fallback)"
-CAJETA_GPU_COOPMATRIX_IMPL="${CAJETA_GPU_COOPMATRIX_IMPL:-software}" \
 CAJETA_OWNED_BIND=warn CAJETA_CAPTURED_BORROW=warn \
 "$CAJETA" --emit=exe --xpu-backend="$XPU" \
     --classpath="$CODEC_CJA,$JINJA_CJA" \
