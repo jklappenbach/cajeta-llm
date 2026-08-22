@@ -175,6 +175,80 @@ public final class Checkpoint {
         return this.gg.shapeOfName(gn);
     }
 
+    /**
+     * How many heads the GGUF rope permutation used for `hfName`, or 0 when
+     * the tensor is stored in HF layout and needs no correction.
+     *
+     * `convert_hf_to_gguf.py` reorders `attn_q` / `attn_k` rows so that
+     * llama.cpp's INTERLEAVED rope (pairs 2i, 2i+1) reproduces HF's
+     * HALF-SPLIT rope (pairs i, i+d/2). `Prim.ropeRowHost` implements the
+     * HALF-SPLIT form, so a GGUF-sourced Q or K must be put back into HF
+     * order at the boundary or every rotation reads the wrong pair.
+     *
+     * ARCHITECTURE-GATED, and that gate is load-bearing: llama.cpp permutes
+     * for LLM_ARCH_LLAMA, whose rope type is NORM. Qwen2/Qwen3 are NEOX
+     * natively and are NOT permuted, so applying this to them would BREAK a
+     * model that works today. Safetensors is never permuted -- that path is
+     * the one measured correct against transformers (plan 15.1.2).
+     */
+    int32 ropePermuteHeads(String hfName) {
+        if (this.gg == null) {
+            return 0;
+        }
+        String arch #= this.gg.metaString("general.architecture");
+        if (arch == null || !arch.equals("llama")) {
+            return 0;
+        }
+        if (hfName.endsWith("self_attn.q_proj.weight")) {
+            return (int32) this.gg.metaInt("llama.attention.head_count", 0L);
+        }
+        if (hfName.endsWith("self_attn.k_proj.weight")) {
+            return (int32) this.gg.metaInt("llama.attention.head_count_kv", 0L);
+        }
+        return 0;
+    }
+
+    /**
+     * Undo the rope permutation IN PLACE over `rows` fixed-size row spans.
+     *
+     * The permutation only ever reorders whole rows -- it reshapes
+     * (nHead, 2, headDim/2, cols) and swaps the middle axes, leaving `cols`
+     * alone -- so this works on PACKED block bytes without dequantizing, as
+     * long as a block never spans a row boundary (it cannot: rows are a whole
+     * number of blocks).
+     *
+     * Forward: GGUF row (head*headDim + b*2 + a) holds HF row
+     * (head*headDim + a*half + b). This walks HF order and pulls from GGUF.
+     */
+    static void unpermuteRows(int8[] src, int8[] dst, int64 rows,
+            int64 rowBytes, int32 nHead) {
+        int64 headDim = rows / (int64) nHead;
+        int64 half = headDim / 2L;
+        int32 h = 0;
+        while (h < nHead) {
+            int64 hbase = (int64) h * headDim;
+            int32 a = 0;
+            while (a < 2) {
+                int64 b = 0L;
+                while (b < half) {
+                    int64 dstRow = hbase + (int64) a * half + b;
+                    int64 srcRow = hbase + b * 2L + (int64) a;
+                    int64 so = srcRow * rowBytes;
+                    int64 dofs = dstRow * rowBytes;
+                    int64 k = 0L;
+                    while (k < rowBytes) {
+                        dst[dofs + k] = src[so + k];
+                        k = k + 1L;
+                    }
+                    b = b + 1L;
+                }
+                a = a + 1;
+            }
+            h = h + 1;
+        }
+        return;
+    }
+
     /** The packed block bytes of `name`, undecoded — see
      *  {@link GgufFile#loadPacked}. */
     public #int8[] loadPacked(String name) {
@@ -183,16 +257,84 @@ public final class Checkpoint {
                 + "' has no packed form (safetensors carries no block types)");
         }
         String gn #= Checkpoint.ggufNameOf(name);
-        return this.gg.loadPacked(gn);
+        int8[] raw #= this.gg.loadPacked(gn);
+        int32 nHead = this.ropePermuteHeads(name);
+        if (nHead <= 0) {
+            return #raw;
+        }
+        // shapeOfName is TORCH order: [rows, cols].
+        int64[] shp = this.gg.shapeOfName(gn);
+        if (shp == null || shp.count() != 2L) {
+            return #raw;
+        }
+        int64 rows = shp[0];
+        if (rows <= 0L || rows % (int64) nHead != 0L) {
+            throw heap LlamaException("gguf: '" + gn + "' has " + rows
+                + " rows, not a multiple of head count " + nHead
+                + " — cannot undo the rope permutation");
+        }
+        int64 rowBytes = ((int64) raw.count()) / rows;
+        int8[] fixed #= heap int8[(int64) raw.count()];
+        Checkpoint.unpermuteRows(raw, fixed, rows, rowBytes, nHead);
+        return #fixed;
     }
 
     public #Tensor<float32> loadF32(String name) {
         if (this.gg != null) {
             String gn #= Checkpoint.ggufNameOf(name);
-            return this.gg.loadF32(gn);
+            Tensor<float32> t #= this.gg.loadF32(gn);
+            int32 nHead = this.ropePermuteHeads(name);
+            if (nHead <= 0) {
+                return #t;
+            }
+            return #Checkpoint.unpermuteF32(#t, nHead);
         }
         SafetensorsFile f = this.shardFor(name);
         return f.loadF32(name);
+    }
+
+    /** The f32 twin of {@link #unpermuteRows} — same row mapping, elements
+     *  instead of bytes. */
+    static #Tensor<float32> unpermuteF32(#Tensor<float32> t, int32 nHead) {
+        // shape() is a VIEW of the tensor's interior (CLAUDE.md 3) -- read it,
+        // never take a title to it.
+        int64[] shp = t.shape();
+        if (shp.count() != 2L) {
+            return #t;
+        }
+        int64 rows = shp[0];
+        int64 cols = shp[1];
+        if (rows <= 0L || rows % (int64) nHead != 0L) {
+            return #t;
+        }
+        int64[] oshape #= heap int64[2];
+        oshape[0] = rows;
+        oshape[1] = cols;
+        Tensor<float32> out #= Tensor.zeros<float32>(#oshape);
+        int64 headDim = rows / (int64) nHead;
+        int64 half = headDim / 2L;
+        int32 h = 0;
+        while (h < nHead) {
+            int64 hbase = (int64) h * headDim;
+            int32 a = 0;
+            while (a < 2) {
+                int64 b = 0L;
+                while (b < half) {
+                    int64 dstRow = hbase + (int64) a * half + b;
+                    int64 srcRow = hbase + b * 2L + (int64) a;
+                    int64 c = 0L;
+                    while (c < cols) {
+                        out.flatSet(dstRow * cols + c,
+                            t.flatGet(srcRow * cols + c));
+                        c = c + 1L;
+                    }
+                    b = b + 1L;
+                }
+                a = a + 1;
+            }
+            h = h + 1;
+        }
+        return #out;
     }
 
     /** Stored dtype of `name` — for the binding layer's loader pick. */

@@ -72,16 +72,33 @@ rng = np.random.default_rng(42)
 def W(*shape, scale=0.05):
     return (rng.standard_normal(shape) * scale).astype(np.float32)
 
-# (hf_name, gguf_name, array, ggml_type)
+def rope_permute(w, n_head):
+    """convert_hf_to_gguf.py's permute, verbatim.
+
+    llama.cpp's LLM_ARCH_LLAMA uses INTERLEAVED rope (pairs 2i, 2i+1); HF uses
+    HALF-SPLIT (pairs i, i+d/2). The converter reorders attn_q / attn_k rows so
+    the two agree, which means a real llama GGUF NEVER stores Q/K in HF layout.
+    This fixture used to, while still declaring general.architecture=llama --
+    so the 16.3.1 loader-equality gate compared the reader against itself and
+    could not see a missing un-permute. Applying it here makes the fixture
+    faithful to the format it claims to be.
+    """
+    return (w.reshape(n_head, 2, w.shape[0] // n_head // 2, *w.shape[1:])
+             .swapaxes(1, 2)
+             .reshape(w.shape))
+
+# (hf_name, gguf_name, array, ggml_type, rope_permute_heads)
+# rope_permute_heads: 0 for every tensor the converter leaves alone (which is
+# all of them except attn_q / attn_k -- attn_v is the standing control).
 tensors = []
-def add(hf, gg, arr, ty): tensors.append([hf, gg, arr, ty])
+def add(hf, gg, arr, ty, heads=0): tensors.append([hf, gg, arr, ty, heads])
 
 add("model.embed_tokens.weight", "token_embd.weight", W(V, H), GG_F32)
 for i in range(L):
     p, g = f"model.layers.{i}.", f"blk.{i}."
     add(p+"input_layernorm.weight", g+"attn_norm.weight", 1.0 + W(H, scale=0.01), GG_F32)
-    add(p+"self_attn.q_proj.weight", g+"attn_q.weight", W(NH*HD, H), GG_F16 if i == 0 else GG_F32)
-    add(p+"self_attn.k_proj.weight", g+"attn_k.weight", W(NKV*HD, H), GG_BF16 if i == 0 else GG_F32)
+    add(p+"self_attn.q_proj.weight", g+"attn_q.weight", W(NH*HD, H), GG_F16 if i == 0 else GG_F32, NH)
+    add(p+"self_attn.k_proj.weight", g+"attn_k.weight", W(NKV*HD, H), GG_BF16 if i == 0 else GG_F32, NKV)
     add(p+"self_attn.v_proj.weight", g+"attn_v.weight", W(NKV*HD, H), GG_F32)
     add(p+"self_attn.o_proj.weight", g+"attn_output.weight", W(H, NH*HD), GG_F32)
     add(p+"post_attention_layernorm.weight", g+"ffn_norm.weight", 1.0 + W(H, scale=0.01), GG_F32)
@@ -95,16 +112,28 @@ add("lm_head.weight", "output.weight", W(V, H), GG_F32)
 # twin carries the identical dequantized values (the 16.3.1 exactness).
 payloads = []
 for t in tensors:
-    hf, gg, a, ty = t
+    hf, gg, a, ty, heads = t
+    # Round to storage precision in HF order FIRST, so the safetensors twin
+    # and the GGUF dequantize to identical values (the 16.3.1 exactness).
     if ty == GG_F16:
-        a = f16_round(a); pay = a.astype(np.float16).tobytes()
+        a = f16_round(a)
     elif ty == GG_BF16:
-        a = bf16_round(a); pay = bf16_bytes(a)
+        a = bf16_round(a)
     elif ty == GG_Q8_0:
-        pay, a = q8_quant(a)
+        _, a = q8_quant(a)
+    t[2] = a                      # safetensors keeps HF layout
+    # The GGUF side carries the rope permutation. It reorders whole ROWS, and
+    # a Q8_0 block never spans a row boundary here, so permuting the ROUNDED
+    # array re-serializes bit-exactly -- no second rounding.
+    g_arr = rope_permute(a, heads) if heads else a
+    if ty == GG_F16:
+        pay = g_arr.astype(np.float16).tobytes()
+    elif ty == GG_BF16:
+        pay = bf16_bytes(g_arr)
+    elif ty == GG_Q8_0:
+        pay, _ = q8_quant(g_arr)
     else:
-        pay = a.astype("<f4").tobytes()
-    t[2] = a
+        pay = g_arr.astype("<f4").tobytes()
     payloads.append(pay)
 
 # Tiny SP tokenizer: unk/bos/eos, 256 byte tokens, a few pieces.
@@ -147,7 +176,7 @@ def build(path, bad=False):
     kv_blob = b"".join(kvs)
     ALIGN = 32
     dirs, off = [], 0
-    for (hf, gg, a, ty), pay in zip(tensors, payloads):
+    for (hf, gg, a, ty, _heads), pay in zip(tensors, payloads):
         ne = list(reversed(a.shape))        # ggml ne: fastest dim first
         t = GG_IQ2_XXS if (bad and gg == "blk.1.ffn_up.weight") else ty
         d = s(gg) + struct.pack("<I", len(ne)) \
@@ -170,7 +199,7 @@ build(os.path.join(OUT, "toy-bad.gguf"), bad=True)
 
 # Safetensors twin + config.json.
 st_meta, st_data, off = {}, b"", 0
-for hf, gg, a, ty in tensors:
+for hf, gg, a, ty, _heads in tensors:
     b = a.astype("<f4").tobytes()
     st_meta[hf] = {"dtype": "F32", "shape": list(a.shape),
                    "data_offsets": [off, off + len(b)]}
