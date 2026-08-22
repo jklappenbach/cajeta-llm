@@ -369,6 +369,40 @@ public final class Quant {
     }
 
     /**
+     * 32 quantized values dotted with 32 floats of x, at 512-bit width
+     * (plan 15.1.18a).
+     *
+     * The widen ladder is WIDTH-PRESERVING and lane-halving: int8x64 ->
+     * int16x32 -> int32x16 -> f32x16. So 16 float lanes require a 64-byte
+     * source, and each quarter of that source lands on exactly one Q4_K
+     * sub-block. Measured ceiling for a plain f32 dot on this box:
+     * f32x4 9.95 ms, f32x8 5.09 ms, f32x16 3.43 ms over 16.7M elements --
+     * the last is at the ~39 GB/s memory floor, so width is worth taking
+     * all the way.
+     */
+    /**
+     * Accumulate one Q4_K sub-block INTO A VECTOR (plan 15.1.18a).
+     *
+     * The per-sub-block scalars fold in before accumulation, so the whole
+     * 256-element block reduces ONCE instead of sixteen times. That matters
+     * more than width: a first 512-bit attempt that reduced per sub-block ran
+     * 70.7 ms against the 128-bit version's 37.7 ms, because a 16-lane
+     * horizontal sum every 32 elements costs more than the width saves.
+     *
+     * `d·sc·Σq·x − dmin·mn·Σx` factors per lane to `x · (q·term − mterm)`, so
+     * both terms ride one x load and one chain.
+     */
+    static Vector<float32,16> q4kAcc(Vector<float32,16> acc,
+            Vector<int16,32> q, float32 term, float32 mterm,
+            float32[] x, int64 xo) {
+        acc = acc + x.vload<16>(xo)
+            * (q.widenLo().toF32() * term - mterm);
+        acc = acc + x.vload<16>(xo + 16L)
+            * (q.widenHi().toF32() * term - mterm);
+        return acc;
+    }
+
+    /**
      * Vectorized Q4_K block-direct mat-vec (plan 15.1.16, Unit 17's toolkit).
      *
      * The scalar form recomputed `e/64`, `e%64`, `r/32`, `r%32`, a byte load,
@@ -400,51 +434,34 @@ public final class Quant {
                 float32 dmin = Quant.f16At(packed, ro + 2L);
                 Quant.scaleMinK4(packed, ro + 4L, sc, mn);
                 int64 xb = xOff + b * 256L;
-                int32 sb = 0;
-                while (sb < 8) {
-                    int64 bo = ro + 16L + 32L * (int64) (sb / 2);
-                    int64 xo = xb + (int64) (sb * 32);
-                    Vector<int8,16> r0 = packed.vload<16>(bo);
-                    Vector<int8,16> r1 = packed.vload<16>(bo + 16L);
-                    Vector<int8,16> n0 = r0 & 15;
-                    Vector<int8,16> n1 = r1 & 15;
-                    if ((sb - (sb / 2) * 2) == 1) {
-                        n0 = (r0 >> 4) & 15;
-                        n1 = (r1 >> 4) & 15;
-                    }
-                    // Seed both accumulators from their FIRST term. A zero
-                    // `heap Vector<float32,4>` here is a HEAP ALLOCATION per
-                    // sub-block -- ~524k of them per 4096x4096 mat-vec, which
-                    // is what made Q4_K slower than Q6_K despite unpacking
-                    // fewer bits.
-                    Vector<int16,8> h0 = n0.widenLo();
-                    Vector<int16,8> h1 = n0.widenHi();
-                    Vector<float32,4> x0 = x.vload<4>(xo);
-                    Vector<float32,4> x1 = x.vload<4>(xo + 4L);
-                    Vector<float32,4> x2 = x.vload<4>(xo + 8L);
-                    Vector<float32,4> x3 = x.vload<4>(xo + 12L);
-                    Vector<float32,4> qv = h0.widenLo().toF32() * x0;
-                    qv = qv + h0.widenHi().toF32() * x1;
-                    qv = qv + h1.widenLo().toF32() * x2;
-                    qv = qv + h1.widenHi().toF32() * x3;
-                    Vector<float32,4> sv = x0 + x1 + x2 + x3;
-                    Vector<int16,8> h2 = n1.widenLo();
-                    Vector<int16,8> h3 = n1.widenHi();
-                    Vector<float32,4> x4 = x.vload<4>(xo + 16L);
-                    Vector<float32,4> x5 = x.vload<4>(xo + 20L);
-                    Vector<float32,4> x6 = x.vload<4>(xo + 24L);
-                    Vector<float32,4> x7 = x.vload<4>(xo + 28L);
-                    qv = qv + h2.widenLo().toF32() * x4;
-                    qv = qv + h2.widenHi().toF32() * x5;
-                    qv = qv + h3.widenLo().toF32() * x6;
-                    qv = qv + h3.widenHi().toF32() * x7;
-                    sv = sv + x4 + x5 + x6 + x7;
-                    float32 qx = qv[0] + qv[1] + qv[2] + qv[3];
-                    float32 sx = sv[0] + sv[1] + sv[2] + sv[3];
-                    acc = acc + d * (float32) sc[sb] * qx
-                              - dmin * (float32) mn[sb] * sx;
-                    sb = sb + 1;
+                // Zero accumulator without a heap allocation.
+                Vector<float32,16> accv = x.vload<16>(xb) * 0.0f;
+                // One 64-byte load serves FOUR sub-blocks: bytes [0,32) low
+                // nibbles are sub-block 4h+0, [32,64) low are 4h+2, and the
+                // high nibbles of each are 4h+1 and 4h+3.
+                int32 h = 0;
+                while (h < 2) {
+                    Vector<int8,64> raw64 = packed.vload<64>(
+                        ro + 16L + 64L * (int64) h);
+                    Vector<int8,64> lo = raw64 & 15;
+                    Vector<int8,64> hi = (raw64 >> 4) & 15;
+                    int32 s0 = 4 * h;
+                    accv = Quant.q4kAcc(accv, lo.widenLo(),
+                        d * (float32) sc[s0], dmin * (float32) mn[s0],
+                        x, xb + (int64) (s0 * 32));
+                    accv = Quant.q4kAcc(accv, hi.widenLo(),
+                        d * (float32) sc[s0 + 1], dmin * (float32) mn[s0 + 1],
+                        x, xb + (int64) ((s0 + 1) * 32));
+                    accv = Quant.q4kAcc(accv, lo.widenHi(),
+                        d * (float32) sc[s0 + 2], dmin * (float32) mn[s0 + 2],
+                        x, xb + (int64) ((s0 + 2) * 32));
+                    accv = Quant.q4kAcc(accv, hi.widenHi(),
+                        d * (float32) sc[s0 + 3], dmin * (float32) mn[s0 + 3],
+                        x, xb + (int64) ((s0 + 3) * 32));
+                    h = h + 1;
                 }
+                int32 lane = 0;
+                while (lane < 16) { acc = acc + accv[lane]; lane = lane + 1; }
                 b = b + 1;
             }
             y[yOff + i] = acc;
