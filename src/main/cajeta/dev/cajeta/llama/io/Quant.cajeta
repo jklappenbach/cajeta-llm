@@ -469,6 +469,157 @@ public final class Quant {
         }
     }
 
+    // ── q8_K activations: the integer path (simd-fused-integer-madd Unit 3) ──
+    //
+    // `dotAccum` needs int8 on BOTH sides, so the activations have to be
+    // quantized too. That changes what this COMPUTES: `q4kMatVecInto` above is
+    // exact against the scalar floor, and this is not — it carries q8_K's
+    // quantization error. It is the trade `llama.cpp` makes, and it is what
+    // buys a whole 256-element block staying in integer space with a single
+    // f32 conversion at the end instead of one per sub-block.
+    //
+    // Lives BESIDE the f32 kernel rather than replacing it. Nothing routes
+    // here until it is measured faster (plan 3.3.1 — a regression is a failed
+    // unit, and 15.1.18(b)'s int8 attempt already measured 26.0 ms against
+    // 24.2 and was reverted).
+
+    /**
+     * Quantize `n` activations (a multiple of 256) into q8_K form: int8
+     * quants, one f32 scale per 256-element block, and the sum of each
+     * 16-element group's quants so Q4_K's `dmin` term stays in integer space.
+     *
+     * `q` holds `n` bytes, `d` holds `n/256` scales, `bsums` holds `n/16`
+     * group sums.
+     */
+    public static void q8kQuantize(float32[] x, int64 xOff, int64 n,
+            int8[] q, float32[] d, int32[] bsums) {
+        int64 blocks = n / 256L;
+        int64 b = 0;
+        while (b < blocks) {
+            int64 xb = xOff + b * 256L;
+            float32 amax = 0.0f;
+            int32 i = 0;
+            while (i < 256) {
+                float32 v = x[xb + (int64) i];
+                float32 av = v < 0.0f ? 0.0f - v : v;
+                if (av > amax) { amax = av; }
+                i = i + 1;
+            }
+            // An all-zero block quantizes to all-zero with a zero scale; the
+            // reciprocal has to be guarded or it is inf * 0.
+            float32 inv = 0.0f;
+            if (amax > 0.0f) { inv = 127.0f / amax; }
+            d[b] = amax / 127.0f;
+            int32 g = 0;
+            while (g < 16) {
+                int32 s = 0;
+                int32 k = 0;
+                while (k < 16) {
+                    int64 idx = (int64) (g * 16 + k);
+                    int32 qi = (int32) Math.round(x[xb + idx] * inv);
+                    q[b * 256L + idx] = (int8) qi;
+                    s = s + qi;
+                    k = k + 1;
+                }
+                bsums[b * 16L + (int64) g] = s;
+                g = g + 1;
+            }
+            b = b + 1;
+        }
+    }
+
+    /**
+     * y = W·x for PACKED Q4_K rows against q8_K-quantized activations.
+     *
+     * One `dotAccum` per 32-element sub-block, scaled in INTEGER space and
+     * accumulated into a single lane vector, so the whole 256-element block
+     * costs one reduce and one f32 conversion. 15.1.18(a) measured that reduce
+     * frequency is what costs — the same kernel reducing per sub-block ran
+     * 70.7 ms against 24.2 ms reducing once per block.
+     */
+    public static void q4kMatVecIntoQ8(int8[] packed, int64 rows, int64 cols,
+            int8[] xq, float32[] xd, int32[] xbsums,
+            float32[] y, int64 yOff) {
+        int64 blocksPerRow = cols / 256L;
+        int64 rowBytes = blocksPerRow * 144L;
+        int32[] sc #= heap int32[8];
+        int32[] mn #= heap int32[8];
+        int32[] zeros #= heap int32[8];
+        int32 z = 0;
+        while (z < 8) { zeros[z] = 0; z = z + 1; }
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 144L;
+                float32 d = Quant.f16At(packed, ro);
+                float32 dmin = Quant.f16At(packed, ro + 2L);
+                Quant.scaleMinK4(packed, ro + 4L, sc, mn);
+                int64 xb = b * 256L;
+
+                // Chunk g covers bytes [32g, 32g+32): its LOW nibbles are
+                // sub-block 2g and its HIGH nibbles are sub-block 2g+1 — the
+                // same layout the f32 kernel reaches via widenLo/widenHi over
+                // a 64-byte load.
+                Vector<int32,8> tot = zeros.vload<8>(0);
+                int32 g = 0;
+                while (g < 4) {
+                    // asUnsigned: the nibbles are 0..15, but they arrive in an
+                    // int8[], and dotAccum picks its tier from the element
+                    // type — vpdpbusd is unsigned x signed.
+                    Vector<uint8,32> raw = packed.vload<32>(
+                        ro + 16L + (int64) (32 * g)).asUnsigned();
+                    Vector<uint8,32> lo = raw & 15;
+                    Vector<uint8,32> hi = (raw >> 4) & 15;
+                    Vector<int8,32> a0 = xq.vload<32>(xb + (int64) (64 * g));
+                    Vector<int8,32> a1 = xq.vload<32>(
+                        xb + (int64) (64 * g + 32));
+                    // Scale in INTEGER space, so the block converts once.
+                    tot = tot + lo.dotAccum(a0, zeros.vload<8>(0)) * sc[2 * g];
+                    tot = tot + hi.dotAccum(a1, zeros.vload<8>(0))
+                        * sc[2 * g + 1];
+                    g = g + 1;
+                }
+                int32 sumi = 0;
+                int32 lane = 0;
+                while (lane < 8) { sumi = sumi + tot[lane]; lane = lane + 1; }
+
+                // The dmin term reads the precomputed group sums, so it never
+                // leaves integer space either. Each 32-element sub-block spans
+                // two 16-element groups.
+                int32 dmins = 0;
+                int32 sb = 0;
+                while (sb < 8) {
+                    dmins = dmins + mn[sb]
+                        * (xbsums[b * 16L + (int64) (2 * sb)]
+                         + xbsums[b * 16L + (int64) (2 * sb + 1)]);
+                    sb = sb + 1;
+                }
+
+                float32 xs = xd[b];
+                acc = acc + d * xs * (float32) sumi
+                          - dmin * xs * (float32) dmins;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
+        }
+    }
+
+    /** Quantize `x` then multiply — the drop-in shape for comparing against
+     *  {@link #q4kMatVec}. Real callers quantize ONCE and reuse across
+     *  projections that share an activation vector. */
+    public static void q4kMatVecQ8(int8[] packed, int64 rows, int64 cols,
+            float32[] x, float32[] y) {
+        int64 blocks = cols / 256L;
+        int8[] xq #= heap int8[cols];
+        float32[] xd #= heap float32[blocks];
+        int32[] xbs #= heap int32[blocks * 16L];
+        Quant.q8kQuantize(x, 0L, cols, xq, xd, xbs);
+        Quant.q4kMatVecIntoQ8(packed, rows, cols, xq, xd, xbs, y, 0L);
+    }
+
     public static void q4kMatVec(int8[] packed, int64 rows, int64 cols,
             float32[] x, float32[] y) {
         Quant.q4kMatVecInto(packed, rows, cols, x, 0L, y, 0L);
