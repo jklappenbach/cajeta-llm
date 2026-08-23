@@ -1,0 +1,197 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.io.Quant;
+import dev.cajeta.llama.io.QuantKernel;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+
+/**
+ * threaded-forward-path plan 3.1 — the Q4_K mat-vec as an `@Kernel`,
+ * against the serial reference it was lifted from.
+ *
+ * The bar is BIT-IDENTICAL, not a tolerance, and that is a deliberate
+ * choice rather than an optimistic one: the kernel body is
+ * `q4kMatVecInto`'s body re-homed one work item per row, so it performs
+ * the same float operations in the same order on the same bytes. A
+ * tolerance here would hide exactly the class of bug this unit can
+ * introduce — a row computed twice, a row skipped, a sub-block paired
+ * with the wrong scale — because all of those land close to the right
+ * answer on smooth data.
+ *
+ * Every test also asserts the answer is NON-ZERO. A kernel that fails to
+ * lower does not fail the build: the launch finds nothing registered and
+ * every output buffer reads back zero (plan 8.11). Comparing two things
+ * that are both zero is how XpuScheduleTests came to pass while running
+ * no kernel at all, and this suite will not repeat it.
+ */
+public class QuantKernelTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+
+    public QuantKernelTest() { return; }
+
+    /** Fails unless `v` has at least one non-zero entry — the guard against
+     *  a silent no-op launch reading as agreement. */
+    static void assertLive(float32[] v, String what) {
+        int64 i = 0;
+        while (i < (int64) v.count()) {
+            if (v[i] != 0.0f) { return; }
+            i = i + 1;
+        }
+        Assert.fail(what + ": every value is zero, which is what a kernel "
+            + "that never ran produces");
+    }
+
+    /** Mixed signs and magnitudes: an all-positive x hides sign handling in
+     *  the nibble widen, and a constant x hides lane misordering. */
+    static #float32[] activations(int64 n) {
+        float32[] x #= heap float32[n];
+        int64 c = 0;
+        while (c < n) {
+            x[c] = (float32) ((c % 11L) - 5L) * 0.375f;
+            c = c + 1;
+        }
+        return #x;
+    }
+
+    /** `reps` copies of the fixture's blocks, so a test can ask for more
+     *  rows than the 8 blocks on disk. */
+    static #int8[] tiled(int8[] raw, int64 reps) {
+        int64 n = (int64) raw.count();
+        int8[] out #= heap int8[n * reps];
+        int64 r = 0;
+        while (r < reps) {
+            int64 i = 0;
+            while (i < n) { out[r * n + i] = raw[i]; i = i + 1; }
+            r = r + 1;
+        }
+        return #out;
+    }
+
+    /**
+     * 3.1.1 — the kernel agrees with `q4kMatVecInto` bit for bit on the
+     * real Q4_K_M bytes.
+     */
+    @Test
+    public void q4kKernelIsBitIdenticalToSerial() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        Quant.q4kMatVecInto(raw, rows, cols, x, 0L, want, 0L);
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, x, 0L, got, 0L);
+
+        QuantKernelTest.assertLive(want, "serial reference");
+        QuantKernelTest.assertLive(got, "kernel");
+        int64 r = 0;
+        while (r < rows) {
+            if (got[r] != want[r]) {
+                Assert.fail("row " + r + ": kernel " + got[r]
+                    + " vs serial " + want[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    /**
+     * 3.1.2 — 520 rows over a 64-wide block is 9 grid blocks with the last
+     * one 56/64 masked off, and 9 blocks over the CPU backend's workers
+     * divides evenly for no worker count it is likely to pick. A row
+     * computed twice or skipped shows up as a mismatch at that row.
+     */
+    @Test
+    public void q4kKernelCoversEveryRowWhenRowsDoNotFillTheGrid() {
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 rows = 520L;
+        int64 cols = 256L;                       // one block per row
+        int64 blocksOnDisk = (int64) one.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int8[] raw #= QuantKernelTest.tiled(one, (rows + blocksOnDisk - 1L)
+            / blocksOnDisk);
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        Quant.q4kMatVecInto(raw, rows, cols, x, 0L, want, 0L);
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, x, 0L, got, 0L);
+
+        QuantKernelTest.assertLive(got, "kernel");
+        int64 r = 0;
+        while (r < rows) {
+            if (got[r] != want[r]) {
+                Assert.fail("row " + r + " of " + rows + ": kernel "
+                    + got[r] + " vs serial " + want[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    /**
+     * 3.1.3 — `kQuantMatVecHonoursOffsets`' guarantee through the kernel:
+     * a non-zero `xOff`/`yOff` reads and writes the same values, shifted.
+     */
+    @Test
+    public void q4kKernelHonoursOffsets() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] flat #= heap float32[rows];
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, x, 0L, flat, 0L);
+
+        float32[] bigX #= heap float32[cols + 8L];
+        int64 c = 0;
+        while (c < cols) { bigX[c + 5L] = x[c]; c = c + 1; }
+        float32[] bigY #= heap float32[rows + 4L];
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, bigX, 5L, bigY, 3L);
+
+        QuantKernelTest.assertLive(flat, "kernel at offset 0");
+        int64 r = 0;
+        while (r < rows) {
+            if (bigY[r + 3L] != flat[r]) {
+                Assert.fail("row " + r + " at offset: " + bigY[r + 3L]
+                    + " vs flat " + flat[r]);
+            }
+            r = r + 1;
+        }
+        // The untouched margins must stay untouched — a yOff the kernel
+        // ignored would still match above while scribbling at index 0.
+        Assert.equals((int64) (bigY[0] * 1000000.0f), 0L);
+        Assert.equals((int64) (bigY[rows + 3L] * 1000000.0f), 0L);
+    }
+
+    /**
+     * 3.1.4 — a single-row grid, the serial-cutover shape: one work item,
+     * one grid block, and the same answer as the full run's row 0.
+     */
+    @Test
+    public void q4kKernelSingleRowGridMatchesTheFullGrid() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] full #= heap float32[rows];
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, x, 0L, full, 0L);
+
+        float32[] one #= heap float32[1];
+        QuantKernel.q4kMatVecIntoDevice(raw, 1L, cols, x, 0L, one, 0L);
+
+        QuantKernelTest.assertLive(one, "single-row kernel");
+        if (one[0] != full[0]) {
+            Assert.fail("single-row grid " + one[0]
+                + " vs full grid row 0 " + full[0]);
+        }
+    }
+}

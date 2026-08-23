@@ -1,0 +1,203 @@
+package dev.cajeta.llama.io;
+
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelThread;
+
+/**
+ * The packed mat-vecs as XPU kernels (threaded-forward-path plan Unit 3;
+ * spec §4.1, §4.2).
+ *
+ * The decomposition is one work item per OUTPUT ROW. That is not a choice
+ * so much as a reading of the existing loop: `Quant.q4kMatVecInto`'s row
+ * loop already touches nothing but its own row's blocks and its own
+ * `y[i]`, so the rows are independent by construction and the work is
+ * re-homing the body, not rewriting it. Everything inside one row —
+ * the header decode, the four sub-block folds, the final horizontal sum —
+ * is left in the order the serial form performs it, which is what lets
+ * `QuantKernelTest` demand BIT-IDENTICAL agreement rather than a
+ * tolerance.
+ *
+ * `Quant.q4kMatVecInto` stays as the serial reference (spec §4.5). It is
+ * what these are checked against, and it is the fallback when a backend
+ * cannot take the kernel.
+ */
+public final class QuantKernel {
+
+    /**
+     * One Q4_K sub-block folded into the running vector — `Quant.q4kAcc`
+     * with a `KernelBuffer` in place of the host array.
+     *
+     * `@Device` means this is inlined at the call site, so the four calls
+     * below cost no more than the four inline copies would, and the two
+     * spellings of the fold stay one piece of arithmetic in two places
+     * rather than two pieces that can drift apart.
+     */
+    @Device
+    static Vector<float32,16> q4kAccDev(Vector<float32,16> acc,
+            Vector<int16,32> q, float32 term, float32 mterm,
+            KernelBuffer<float32> x, int64 xo) {
+        acc = acc + x.vload<16>(xo)
+            * (q.widenLo().toF32() * term - mterm);
+        acc = acc + x.vload<16>(xo + 16L)
+            * (q.widenHi().toF32() * term - mterm);
+        return acc;
+    }
+
+    /**
+     * `y[yOff + i] = W[i]·x` for one row per work item, W packed Q4_K.
+     *
+     * The block header is decoded into NAMED LOCALS rather than the
+     * `int32[8]` scratch arrays `Quant.headK4` fills: a work item has no
+     * heap, and a runtime index into a per-thread array would round-trip
+     * through memory the values that want to stay in registers. That is
+     * also why the `h` loop of the serial form is unrolled here into its
+     * two iterations — with `h` gone the eight scale indices are
+     * constants, so the eight `term`/`mterm` locals are just eight
+     * registers.
+     *
+     * The bit layout is `Quant.headK4`'s, transcribed. The two must agree;
+     * `QuantKernelTest.q4kKernelIsBitIdenticalToSerial` is what says so.
+     */
+    @Kernel
+    public static void q4kMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 144L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 144L;
+
+                // ── header: { f16 d; f16 dmin; u8 scales[12] } = 16 bytes ──
+                Vector<int8,16> hv = packed.vload<16>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                int32 d0 = (int32) hv[4] & 255;
+                int32 d1 = (int32) hv[5] & 255;
+                int32 d2 = (int32) hv[6] & 255;
+                int32 d3 = (int32) hv[7] & 255;
+                int32 m0 = (int32) hv[8] & 255;
+                int32 m1 = (int32) hv[9] & 255;
+                int32 m2 = (int32) hv[10] & 255;
+                int32 m3 = (int32) hv[11] & 255;
+                int32 k0 = (int32) hv[12] & 255;
+                int32 k1 = (int32) hv[13] & 255;
+                int32 k2 = (int32) hv[14] & 255;
+                int32 k3 = (int32) hv[15] & 255;
+
+                // The per-sub-block scalars fold in BEFORE accumulation, so
+                // the 256-element block reduces once instead of sixteen
+                // times — the serial form's measured win, kept.
+                float32 t0 = d * (float32) (d0 & 63);
+                float32 t1 = d * (float32) (d1 & 63);
+                float32 t2 = d * (float32) (d2 & 63);
+                float32 t3 = d * (float32) (d3 & 63);
+                float32 t4 = d * (float32) ((k0 & 15) | ((d0 >> 2) & 48));
+                float32 t5 = d * (float32) ((k1 & 15) | ((d1 >> 2) & 48));
+                float32 t6 = d * (float32) ((k2 & 15) | ((d2 >> 2) & 48));
+                float32 t7 = d * (float32) ((k3 & 15) | ((d3 >> 2) & 48));
+                float32 u0 = dmin * (float32) (m0 & 63);
+                float32 u1 = dmin * (float32) (m1 & 63);
+                float32 u2 = dmin * (float32) (m2 & 63);
+                float32 u3 = dmin * (float32) (m3 & 63);
+                float32 u4 = dmin * (float32) ((k0 >> 4) | ((m0 >> 2) & 48));
+                float32 u5 = dmin * (float32) ((k1 >> 4) | ((m1 >> 2) & 48));
+                float32 u6 = dmin * (float32) ((k2 >> 4) | ((m2 >> 2) & 48));
+                float32 u7 = dmin * (float32) ((k3 >> 4) | ((m3 >> 2) & 48));
+
+                int64 xb = xOff + b * 256L;
+                // Zero accumulator without an allocation.
+                Vector<float32,16> accv = x.vload<16>(xb) * 0.0f;
+
+                // One 64-byte load serves FOUR sub-blocks: within a
+                // 64-element group the SAME 32 bytes are the low nibbles of
+                // elements 0..31 and the high nibbles of 32..63.
+                Vector<int8,64> r0 = packed.vload<64>(ro + 16L);
+                Vector<int8,64> lo0 = r0 & 15;
+                Vector<int8,64> hi0 = (r0 >> 4) & 15;
+                accv = QuantKernel.q4kAccDev(accv, lo0.widenLo(), t0, u0,
+                    x, xb);
+                accv = QuantKernel.q4kAccDev(accv, hi0.widenLo(), t1, u1,
+                    x, xb + 32L);
+                accv = QuantKernel.q4kAccDev(accv, lo0.widenHi(), t2, u2,
+                    x, xb + 64L);
+                accv = QuantKernel.q4kAccDev(accv, hi0.widenHi(), t3, u3,
+                    x, xb + 96L);
+
+                Vector<int8,64> r1 = packed.vload<64>(ro + 80L);
+                Vector<int8,64> lo1 = r1 & 15;
+                Vector<int8,64> hi1 = (r1 >> 4) & 15;
+                accv = QuantKernel.q4kAccDev(accv, lo1.widenLo(), t4, u4,
+                    x, xb + 128L);
+                accv = QuantKernel.q4kAccDev(accv, hi1.widenLo(), t5, u5,
+                    x, xb + 160L);
+                accv = QuantKernel.q4kAccDev(accv, lo1.widenHi(), t6, u6,
+                    x, xb + 192L);
+                accv = QuantKernel.q4kAccDev(accv, hi1.widenHi(), t7, u7,
+                    x, xb + 224L);
+
+                int32 lane = 0;
+                while (lane < 16) { acc = acc + accv[lane]; lane = lane + 1; }
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
+    /** Rows per grid block. One work item is a whole row, so this is a
+     *  scheduling width, not a tile size. */
+    static final int32 ROWS_PER_BLOCK = 64;
+
+    /**
+     * Launch {@link #q4kMatVecKernel} over device-resident buffers.
+     *
+     * The grid is `ceil(rows / 64)` blocks of 64, so a row count that does
+     * not fill the last block is normal rather than exceptional — the
+     * kernel's `gi < rows` guard is the only thing that handles it, and
+     * `QuantKernelTest.q4kKernelCoversEveryRowWhenRowsDoNotFillTheGrid`
+     * is what proves it does.
+     */
+    public static void q4kMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s #= KernelStream.current();
+        q4kMatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, x, ur, cols / 256L, xOff, yOff);
+        s.sync();
+        return;
+    }
+
+    /**
+     * `Quant.q4kMatVecInto`'s signature over host arrays, via the kernel —
+     * uploading, launching and downloading on every call.
+     *
+     * That upload is the whole cost of a decode step and then some, so
+     * this is a TEST and BRING-UP shape, not the routing Unit 4 installs:
+     * a real caller uploads the weight ONCE at bind time and keeps the
+     * buffer resident, because the weight is the only operand that does
+     * not change between tokens.
+     */
+    public static void q4kMatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<float32> xb #= heap KernelBuffer<float32>(
+            (uint64) x.count());
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>(
+            (uint64) y.count());
+        pb.upload(packed);
+        xb.upload(x);
+        yb.upload(y);
+        QuantKernel.q4kMatVecLaunch(yb, pb, xb, rows, cols, xOff, yOff);
+        yb.download(y);
+        return;
+    }
+}
