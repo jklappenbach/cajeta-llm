@@ -1,0 +1,262 @@
+package dev.cajeta.llama.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.io.Quant;
+import dev.cajeta.llama.io.QuantKernel;
+import dev.cajeta.llama.model.Linear;
+import cajeta.math.Tensor;
+import cajeta.lang.String;
+
+/**
+ * threaded-forward-path plan 4.1 — `Linear.matvecInto` routed through the
+ * Q4_K kernel.
+ *
+ * Unit 3 already settled the arithmetic: the kernel is bit-identical to
+ * `Quant.q4kMatVecInto` over the same bytes. What is new here is the
+ * PLUMBING — a weight uploaded once and kept resident, activations copied
+ * in and out through fixed-size scratch, offsets that no longer reach the
+ * kernel because the scratch is exactly one row wide. Those are the things
+ * that can be wrong while the arithmetic stays right, so every test below
+ * compares ROUTED against FORCED-SERIAL on the same `Linear`, and the bar
+ * is again bit-identity rather than a tolerance.
+ *
+ * The fixture is `toy-q4k.gguf` (tools/gguf/gen_q4k_linear_fixture.py):
+ * one Q4_K tensor built from the REAL Q4_K_M blocks already checked in
+ * under kquant/, and its gguf-py dequantized twin as F32, both shaped
+ * [out=8, in=256].
+ */
+public class LinearKernelRouteTest {
+
+    static final String Q4K = "src/test/fixtures/gguf/toy-q4k.gguf";
+    static final String Q4K_NAME = "model.layers.0.mlp.down_proj.weight";
+    static final String TOY = "src/test/fixtures/gguf/toy.gguf";
+    static final String Q8_NAME = "model.layers.0.mlp.down_proj.weight";
+
+    public LinearKernelRouteTest() { return; }
+
+    static #Tensor<float32> ramp(int64 n, int64 pad) {
+        int64[] shp #= heap int64[1];
+        shp[0] = n + pad;
+        Tensor<float32> t #= Tensor.zeros<float32>(shp);
+        int64 i = 0;
+        while (i < n) {
+            t.flatSet(i, (float32) ((i % 11L) - 5L) * 0.375f);
+            i = i + 1;
+        }
+        return #t;
+    }
+
+    static void assertLive(Tensor<float32> t, int64 n, String what) {
+        int64 i = 0;
+        while (i < n) {
+            if (t.flatGet(i) != 0.0f) { return; }
+            i = i + 1;
+        }
+        Assert.fail(what + ": every value is zero, which is what a kernel "
+            + "that never ran produces");
+    }
+
+    /**
+     * 4.1.1 — routed and serial agree bit for bit through `matvecInto`.
+     *
+     * Serial runs FIRST and routed SECOND, deliberately: the routed path
+     * builds its resident device buffer on first use, so this ordering is
+     * the one where a bad upload shows up.
+     */
+    @Test
+    public void routedMatvecMatchesSerialForQ4K() {
+        Checkpoint ck #= Checkpoint.open(LinearKernelRouteTest.Q4K);
+        int64[] shp #= ck.shapeOf(LinearKernelRouteTest.Q4K_NAME);
+        int32 outDim = (int32) shp[0];
+        int32 inDim = (int32) shp[1];
+
+        Linear lin #= heap Linear(inDim, outDim);
+        lin.bind(ck, LinearKernelRouteTest.Q4K_NAME, false);
+        Assert.isTrue(lin.isPacked());
+        Assert.equals((int64) Quant.GG_Q4_K, (int64) lin.packedType());
+
+        Tensor<float32> src #= LinearKernelRouteTest.ramp((int64) inDim, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L,
+            (int64) outDim);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L, (int64) outDim);
+
+        QuantKernel.setRoutingEnabled(false);
+        lin.matvecInto(src, 0L, want, 0L);
+        QuantKernel.setRoutingEnabled(true);
+        lin.matvecInto(src, 0L, got, 0L);
+
+        LinearKernelRouteTest.assertLive(want, (int64) outDim, "serial");
+        LinearKernelRouteTest.assertLive(got, (int64) outDim, "routed");
+        int64 o = 0;
+        while (o < (int64) outDim) {
+            if (got.flatGet(o) != want.flatGet(o)) {
+                Assert.fail("row " + o + ": routed " + got.flatGet(o)
+                    + " vs serial " + want.flatGet(o));
+            }
+            o = o + 1;
+        }
+        ck.close();
+    }
+
+    /**
+     * 4.1.1 — the resident weight survives repeated calls with DIFFERENT
+     * activations.
+     *
+     * The upload happens once; everything after it reuses the buffer. A
+     * scratch that is filled once and then reused stale, or a device
+     * buffer uploaded from the wrong array, passes the single-call test
+     * above and fails this one.
+     */
+    @Test
+    public void routedMatvecIsCorrectOnRepeatedCallsWithNewActivations() {
+        Checkpoint ck #= Checkpoint.open(LinearKernelRouteTest.Q4K);
+        int64[] shp #= ck.shapeOf(LinearKernelRouteTest.Q4K_NAME);
+        int32 outDim = (int32) shp[0];
+        int32 inDim = (int32) shp[1];
+
+        Linear lin #= heap Linear(inDim, outDim);
+        lin.bind(ck, LinearKernelRouteTest.Q4K_NAME, false);
+
+        int64[] ishp #= heap int64[1];
+        ishp[0] = (int64) inDim;
+        int64[] oshp #= heap int64[1];
+        oshp[0] = (int64) outDim;
+
+        int32 call = 0;
+        while (call < 3) {
+            Tensor<float32> src #= Tensor.zeros<float32>(ishp);
+            int64 i = 0;
+            while (i < (int64) inDim) {
+                src.flatSet(i, (float32) ((i + (int64) call * 3L) % 13L - 6L)
+                    * 0.25f);
+                i = i + 1;
+            }
+            Tensor<float32> want #= Tensor.zeros<float32>(oshp);
+            Tensor<float32> got #= Tensor.zeros<float32>(oshp);
+
+            QuantKernel.setRoutingEnabled(false);
+            lin.matvecInto(src, 0L, want, 0L);
+            QuantKernel.setRoutingEnabled(true);
+            lin.matvecInto(src, 0L, got, 0L);
+
+            LinearKernelRouteTest.assertLive(got, (int64) outDim,
+                "routed call " + call);
+            int64 o = 0;
+            while (o < (int64) outDim) {
+                if (got.flatGet(o) != want.flatGet(o)) {
+                    Assert.fail("call " + call + " row " + o + ": routed "
+                        + got.flatGet(o) + " vs serial " + want.flatGet(o));
+                }
+                o = o + 1;
+            }
+            call = call + 1;
+        }
+        ck.close();
+    }
+
+    /**
+     * 4.1.1 — non-zero `srcOff`/`dstOff` into larger tensors, and the
+     * margins of `dst` left alone.
+     *
+     * The routed path copies one row's worth of activations through
+     * fixed-size scratch, so the offsets never reach the kernel. That is a
+     * reasonable design and an easy place to drop an offset entirely; a
+     * routed path that ignored `dstOff` would still match on the values
+     * and scribble over index 0.
+     */
+    @Test
+    public void routedMatvecHonoursOffsets() {
+        Checkpoint ck #= Checkpoint.open(LinearKernelRouteTest.Q4K);
+        int64[] shp #= ck.shapeOf(LinearKernelRouteTest.Q4K_NAME);
+        int32 outDim = (int32) shp[0];
+        int32 inDim = (int32) shp[1];
+
+        Linear lin #= heap Linear(inDim, outDim);
+        lin.bind(ck, LinearKernelRouteTest.Q4K_NAME, false);
+
+        Tensor<float32> src #= LinearKernelRouteTest.ramp((int64) inDim, 0L);
+        int64[] oshp #= heap int64[1];
+        oshp[0] = (int64) outDim;
+        Tensor<float32> flat #= Tensor.zeros<float32>(oshp);
+        QuantKernel.setRoutingEnabled(true);
+        lin.matvecInto(src, 0L, flat, 0L);
+        LinearKernelRouteTest.assertLive(flat, (int64) outDim, "routed");
+
+        // Same activations, shifted inside bigger tensors.
+        int64[] bishp #= heap int64[1];
+        bishp[0] = (int64) inDim + 8L;
+        Tensor<float32> bigSrc #= Tensor.zeros<float32>(bishp);
+        int64 i = 0;
+        while (i < (int64) inDim) {
+            bigSrc.flatSet(i + 5L, src.flatGet(i));
+            i = i + 1;
+        }
+        int64[] boshp #= heap int64[1];
+        boshp[0] = (int64) outDim + 4L;
+        Tensor<float32> bigDst #= Tensor.zeros<float32>(boshp);
+        lin.matvecInto(bigSrc, 5L, bigDst, 3L);
+
+        int64 o = 0;
+        while (o < (int64) outDim) {
+            if (bigDst.flatGet(o + 3L) != flat.flatGet(o)) {
+                Assert.fail("row " + o + " at offset: "
+                    + bigDst.flatGet(o + 3L) + " vs flat " + flat.flatGet(o));
+            }
+            o = o + 1;
+        }
+        // Margins untouched.
+        Assert.equals((int64) (bigDst.flatGet(0L) * 1000000.0f), 0L);
+        Assert.equals((int64) (bigDst.flatGet(1L) * 1000000.0f), 0L);
+        Assert.equals((int64) (bigDst.flatGet(2L) * 1000000.0f), 0L);
+        Assert.equals(
+            (int64) (bigDst.flatGet((int64) outDim + 3L) * 1000000.0f), 0L);
+        ck.close();
+    }
+
+    /**
+     * 4.1.2 — only Q4_K is routed in this unit. A Q8_0 weight must be
+     * unaffected by the switch: same answer with routing on and off,
+     * because it never sees the kernel at all.
+     *
+     * This is the does-NOT-fire half. A dispatch written as "packed →
+     * kernel" rather than "Q4_K → kernel" would send Q8_0 bytes through a
+     * Q4_K decoder and produce garbage; without this test the Q4_K tests
+     * above would still pass.
+     */
+    @Test
+    public void q8WeightIsUnaffectedByTheQ4KRoute() {
+        Checkpoint ck #= Checkpoint.open(LinearKernelRouteTest.TOY);
+        int64[] shp #= ck.shapeOf(LinearKernelRouteTest.Q8_NAME);
+        int32 outDim = (int32) shp[0];
+        int32 inDim = (int32) shp[1];
+
+        Linear lin #= heap Linear(inDim, outDim);
+        lin.bind(ck, LinearKernelRouteTest.Q8_NAME, false);
+        Assert.isTrue(lin.isPacked());
+        Assert.equals((int64) Quant.GG_Q8_0, (int64) lin.packedType());
+
+        Tensor<float32> src #= LinearKernelRouteTest.ramp((int64) inDim, 0L);
+        int64[] oshp #= heap int64[1];
+        oshp[0] = (int64) outDim;
+        Tensor<float32> off #= Tensor.zeros<float32>(oshp);
+        Tensor<float32> on #= Tensor.zeros<float32>(oshp);
+
+        QuantKernel.setRoutingEnabled(false);
+        lin.matvecInto(src, 0L, off, 0L);
+        QuantKernel.setRoutingEnabled(true);
+        lin.matvecInto(src, 0L, on, 0L);
+
+        LinearKernelRouteTest.assertLive(off, (int64) outDim, "q8 serial");
+        int64 o = 0;
+        while (o < (int64) outDim) {
+            if (on.flatGet(o) != off.flatGet(o)) {
+                Assert.fail("q8 row " + o + ": routing-on " + on.flatGet(o)
+                    + " changed a NON-Q4_K weight (was " + off.flatGet(o)
+                    + ")");
+            }
+            o = o + 1;
+        }
+        ck.close();
+    }
+}

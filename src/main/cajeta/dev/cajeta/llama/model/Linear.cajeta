@@ -2,9 +2,11 @@ package dev.cajeta.llama.model;
 
 import cajeta.lang.String;
 import cajeta.math.Tensor;
+import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llama.LlamaException;
 import dev.cajeta.llama.io.Checkpoint;
 import dev.cajeta.llama.io.Quant;
+import dev.cajeta.llama.io.QuantKernel;
 
 /**
  * A bias-free linear projection. The weight is held in cajeta orientation
@@ -20,12 +22,37 @@ public final class Linear extends InfModule {
     int32 inDim;
     int32 outDim;
 
+    // ── the routed (kernel) path's resident state ───────────────────────
+    //
+    // `packedDev` is the one that matters: the weight is the only operand
+    // that does not change between tokens, so it is uploaded ONCE and kept.
+    // Uploading it per call would cost more than the mat-vec it feeds.
+    //
+    // The activation buffers are a bridge, not a design. `matvecInto` is
+    // handed a row inside a possibly much larger `[rows, dim]` tensor, and
+    // `KernelBuffer.upload` takes a whole array of matching length, so one
+    // row is copied through fixed-size scratch rather than uploading the
+    // caller's whole tensor (which would be O(rows) work inside an O(1)
+    // call). The copies are 2·(inDim + outDim) floats against a weight read
+    // of inDim·outDim/2 bytes; they go away when the activations themselves
+    // become device-resident.
+    KernelBuffer<int8> packedDev;
+    KernelBuffer<float32> xDev;
+    KernelBuffer<float32> yDev;
+    float32[] xScratch;
+    float32[] yScratch;
+
     Linear(int32 inDim, int32 outDim) {
         this.weight = null;
         this.packed = null;
         this.packedTy = -1;
         this.inDim = inDim;
         this.outDim = outDim;
+        this.packedDev = null;
+        this.xDev = null;
+        this.yDev = null;
+        this.xScratch = null;
+        this.yScratch = null;
     }
 
     /** True when the weight is held in its PACKED block form and consumed
@@ -125,6 +152,15 @@ public final class Linear extends InfModule {
             float32[] db = dst.hostBuffer();
             int64 so = src.hostBase() + srcOff;
             int64 doff = dst.hostBase() + dstOff;
+            // Q4_K through the kernel (plan 4.2.1). Only Q4_K: the other
+            // three formats have no kernel yet (Unit 6), and dispatching on
+            // "is packed" rather than on the TYPE would feed Q8_0 bytes to a
+            // Q4_K decoder.
+            if (this.packedTy == Quant.GG_Q4_K
+                    && QuantKernel.routingEnabled()) {
+                this.matvecIntoDevice(sb, so, db, doff);
+                return;
+            }
             if (this.packedTy == Quant.GG_Q8_0) {
                 Quant.q8MatVecInto(this.packed, (int64) this.outDim,
                     (int64) this.inDim, sb, so, db, doff);
@@ -142,5 +178,43 @@ public final class Linear extends InfModule {
         }
         HostOps.matvecRow(src, srcOff, this.weight, dst, dstOff,
             this.inDim, this.outDim);
+    }
+
+    /**
+     * The routed Q4_K mat-vec: one row of activations in, one row of
+     * results out, over buffers this Linear keeps.
+     *
+     * Built on FIRST routed call rather than at bind time, because the
+     * routing switch is flippable at run time (plan 4.2.2) and a Linear
+     * that is never routed should not pay for a second copy of its weight.
+     */
+    void matvecIntoDevice(float32[] sb, int64 so, float32[] db, int64 doff) {
+        if (this.packedDev == null) {
+            this.packedDev #= heap KernelBuffer<int8>(
+                (uint64) this.packed.count());
+            this.packedDev.upload(this.packed);
+            this.xScratch #= heap float32[(int64) this.inDim];
+            this.yScratch #= heap float32[(int64) this.outDim];
+            this.xDev #= heap KernelBuffer<float32>((uint64) this.inDim);
+            this.yDev #= heap KernelBuffer<float32>((uint64) this.outDim);
+        }
+        int64 i = 0;
+        while (i < (int64) this.inDim) {
+            this.xScratch[i] = sb[so + i];
+            i = i + 1;
+        }
+        this.xDev.upload(this.xScratch);
+        // Offsets are zero HERE and not dropped: the scratch is exactly one
+        // row wide, so the caller's `so`/`doff` are consumed by the copies
+        // above and below.
+        QuantKernel.q4kMatVecLaunch(this.yDev, this.packedDev, this.xDev,
+            (int64) this.outDim, (int64) this.inDim, 0L, 0L);
+        this.yDev.download(this.yScratch);
+        i = 0;
+        while (i < (int64) this.outDim) {
+            db[doff + i] = this.yScratch[i];
+            i = i + 1;
+        }
+        return;
     }
 }
