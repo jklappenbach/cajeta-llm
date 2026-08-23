@@ -6,6 +6,7 @@ import cajeta.xpu.Device;
 import cajeta.xpu.MemoryKind;
 import cajeta.math.Tensor;
 import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
 import dev.cajeta.llama.LlamaException;
 import dev.cajeta.llama.io.Checkpoint;
 import dev.cajeta.llama.io.Quant;
@@ -40,10 +41,9 @@ public final class Linear extends InfModule {
     // of inDim·outDim/2 bytes; they go away when the activations themselves
     // become device-resident.
     KernelBuffer<int8> packedDev;
-    KernelBuffer<float32> xDev;
     KernelBuffer<float32> yDev;
     boolean unified;
-    float32[] xScratch;
+    boolean q8;
     float32[] yScratch;
 
     // ── device-path phase timers (MEASUREMENT INSTRUMENT, plan 9.1) ──────
@@ -164,6 +164,158 @@ public final class Linear extends InfModule {
 
     public static void setTransferReps(int32 n) { Linear.xferReps = n; }
 
+    // ── shared activation staging ───────────────────────────────────────
+    //
+    // q, k and v are three Linears reading the SAME `xn` at the same offset;
+    // gate and up are two more. Staged per Linear, that activation is
+    // quantized and uploaded 5 times a layer when twice would do — and under
+    // the integer route a staging is THREE uploads, so a layer pays 21 where
+    // 12 would do. Uploads are 8.83 ms of a 50.25 ms token.
+    //
+    // One shared set of buffers, sized to the largest inDim ever asked for,
+    // plus a validity triple. It is deliberately a SINGLE set rather than one
+    // per dimension: the forward path never interleaves two live activations,
+    // it just walks hidden -> intermediate -> hidden, so a second set would
+    // buy nothing and add a way to be stale.
+    //
+    // SHARING IS OPT-IN, and the default is to stage every time.
+    //
+    // The first cut had it the other way: cache always, and let the caller
+    // declare `activationChanged()` when the contents moved. That is the
+    // wrong default, and a test caught it rather than a review —
+    // `routedMatvecIsCorrectOnRepeatedCallsWithNewActivations` writes new
+    // activations into the same tensor at the same offset without declaring
+    // anything, which is a perfectly reasonable thing for a caller to do, and
+    // it silently got the previous call's answer. A contract where FORGETTING
+    // to call something yields a wrong number instead of a slow one does not
+    // belong in a library.
+    //
+    // So: a caller that says nothing always gets a fresh staging. The forward
+    // path opens a window around the runs it knows share an activation — q/k/v
+    // off one `xn`, gate/up off another — and closes it immediately after.
+    static boolean stShare;
+    static int64 stOff;
+    static int32 stDim;
+    // WHICH REPRESENTATION is staged, and it belongs in the key.
+    //
+    // A Q4_K weight stages the integer form (quants + scales + group sums);
+    // a Q6_K weight beside it stages the f32 form. Both come out of the SAME
+    // activation, so tag, offset and dimension all match — and without this
+    // flag the Q6_K projection takes a hit on a staging that only ever filled
+    // the integer buffers, and multiplies against whatever the f32 buffer
+    // last held. Measured: a Q4_K_M has Q6_K k/v beside Q4_K q in some
+    // layers, and the decode produced `15 13 40 13 40` instead of
+    // `15 198 334 62 334` — the counts were exactly right (96 hits, 129
+    // misses per token) while the answer was wrong, which is why the token
+    // sequence is printed on every arm and not just the clock.
+    static boolean stQ8;
+    static boolean stValid;
+    static int32 stCap;
+    static KernelBuffer<float32> stX;
+    static KernelBuffer<int8> stXq;
+    static KernelBuffer<float32> stXd;
+    static KernelBuffer<int32> stXbs;
+    static float32[] stXh;
+    static int8[] stXqh;
+    static float32[] stXdh;
+    static int32[] stXbsh;
+    static int64 stHits;
+    static int64 stMisses;
+
+    /**
+     * Open a window in which consecutive projections read the SAME activation
+     * window, so it is staged once. Everything staged before is discarded, so
+     * opening a window can never serve an older entry.
+     */
+    public static void beginSharedActivation() {
+        Linear.stValid = false;
+        Linear.stShare = true;
+    }
+
+    /** Close the window. Nothing is cached again until the next
+     *  {@link #beginSharedActivation}. */
+    public static void endSharedActivation() {
+        Linear.stShare = false;
+        Linear.stValid = false;
+    }
+
+    public static int64 stageHits() { return Linear.stHits; }
+    public static int64 stageMisses() { return Linear.stMisses; }
+    public static void resetStageCounts() {
+        Linear.stHits = 0L; Linear.stMisses = 0L;
+    }
+
+    // ── the q8_K integer route (Q4_K weights only) ──────────────────────
+    //
+    // Quantizes the activations to int8 so the nibbles never leave integer
+    // space: `dotAccum` becomes `vpdpbusd` on x86 with VNNI, measured 2.9x
+    // over the f32 arm on the host form with the instruction confirmed in
+    // the disassembly.
+    //
+    // IT CHANGES THE ANSWER. The f32 path is exact against the scalar
+    // floor; this one carries q8_K's activation-quantization error. That is
+    // the trade llama.cpp makes by default, and it is why this is a switch
+    // rather than a replacement — and why the arm is reported with its
+    // token sequence, not only its clock.
+    static boolean q8Want;
+    static boolean q8Set;
+
+    // STREAM-ORDERED transfers instead of the default synchronous ones.
+    //
+    // The phase clocks say an upload costs 22.9 us for a 16 KB payload —
+    // about 93% overhead at any plausible bandwidth, which is the signature
+    // of a synchronous hipMemcpy rather than of moving bytes. Enqueuing on
+    // the launch stream lets the copy ride the same submission the kernel
+    // does, and the sync that already follows the launch covers it.
+    //
+    // It matters twice over: it is worth something on the f32 path we ship,
+    // and it decides whether the integer route is viable on the GPU at all,
+    // since that one needs three uploads per projection where f32 needs one.
+    // MEASURED AND REJECTED, kept as an arm so it is not re-proposed:
+    // no change on the f32 path (56.89/56.70 sync against 56.01/56.73
+    // async) and 1.7x WORSE on the integer one (50.4 -> 87.2). Both host
+    // scratch arrays are pageable, so hipMemcpyHtoDAsync stages through a
+    // bounce buffer instead of doing DMA, and the download then needs its
+    // own stream sync per projection on top. It would need MemoryKind.Pinned
+    // host staging to be worth anything.
+    static boolean asyncXfer;
+
+    public static void setAsyncTransfers(boolean on) { Linear.asyncXfer = on; }
+
+    public static void setQ8Route(boolean on) {
+        Linear.q8Want = on;
+        Linear.q8Set = true;
+    }
+
+    /**
+     * Whether to take the integer route, resolved once from the backend.
+     *
+     * ON BOTH BACKENDS, measured — the transfer-shape argument for keeping
+     * it off the GPU turned out to be wrong, and it was worth checking
+     * rather than reasoning about. The route does need THREE device buffers
+     * per activation where f32 needs one, and on the GPU a transfer really
+     * is a ~23 us driver call. But the kernel is 1.47x there (110 -> 165
+     * GB/s, within 3% of a read-only kernel over the same blocks, so it is
+     * fully memory-bound), and 1.47x on 43.4 ms of launch beats the ~6.8 ms
+     * the two extra uploads cost. End to end, alternating arm order:
+     * 56.89/56.70 f32 against 50.39/50.51 q8.
+     *
+     * Still resolved per backend rather than hardcoded on, because the two
+     * win for DIFFERENT reasons and by different amounts — 1.47x on the CPU
+     * (VNNI removes the decode) and 1.13x on the GPU (the kernel is at its
+     * roofline and pays back some of it in transfers) — so a backend where
+     * neither holds should be able to answer no.
+     */
+    static boolean q8Route() {
+        if (!Linear.q8Set) {
+            String be #= Device.activeBackend();
+            Linear.q8Want = be.equals("cpu") || be.equals("hip")
+                || be.equals("cuda");
+            Linear.q8Set = true;
+        }
+        return Linear.q8Want;
+    }
+
     public static void setUnifiedActivations(boolean on) {
         Linear.wantUnified = on;
     }
@@ -273,11 +425,10 @@ public final class Linear extends InfModule {
         this.inDim = inDim;
         this.outDim = outDim;
         this.packedDev = null;
-        this.xDev = null;
         this.yDev = null;
-        this.xScratch = null;
         this.yScratch = null;
         this.unified = false;
+        this.q8 = false;
     }
 
     /** True when the weight is held in its PACKED block form and consumed
@@ -425,28 +576,32 @@ public final class Linear extends InfModule {
             this.packedDev #= heap KernelBuffer<int8>(
                 (uint64) this.packed.count());
             this.packedDev.upload(this.packed);
-            this.xScratch #= heap float32[(int64) this.inDim];
+            // Only the OUTPUT is per-Linear now; the activation side is
+            // shared (see ensureStage), because that is the half that is
+            // identical across q/k/v and across gate/up.
             this.yScratch #= heap float32[(int64) this.outDim];
-            this.xDev #= heap KernelBuffer<float32>((uint64) this.inDim);
             this.yDev #= heap KernelBuffer<float32>((uint64) this.outDim);
+            Linear.ensureStage(this.inDim);
             // Latched per Linear at build time, not read per call: the
             // store/load spelling below must match how the buffer was
             // allocated, and flipping the static mid-run would desynchronize
             // the two into a silent no-op.
             this.unified = Linear.wantUnified;
-            if (this.unified) {
-                this.xDev.allocate(MemoryKind.Unified);
-                this.yDev.allocate(MemoryKind.Unified);
-            }
+            this.q8 = Linear.q8Route() && this.packedTy == Quant.GG_Q4_K;
+            if (this.unified) { this.yDev.allocate(MemoryKind.Unified); }
         }
         if (!Linear.timeDev) {
             int64 i = 0;
             // Hoisted: the bound, not the body. A static read per element in
             // a per-token copy loop is exactly the kind of overhead that
             // shows up as a mysterious percent.
-            int64 nIn = Linear.skipTransfers ? 0L : (int64) this.inDim;
+            // Skipped entirely on a stage hit: the shared host scratch
+            // already holds this exact window, so re-copying it would be the
+            // work the cache exists to avoid.
+            int64 nIn = (Linear.skipTransfers || this.stageHit(so))
+                ? 0L : (int64) this.inDim;
             while (i < nIn) {
-                this.xScratch[i] = sb[so + i];
+                Linear.stXh[i] = sb[so + i];
                 i = i + 1;
             }
             // Offsets are zero HERE and not dropped: the scratch is exactly
@@ -455,8 +610,7 @@ public final class Linear extends InfModule {
             if (!Linear.skipTransfers) {
                 int32 rep = 0;
                 while (rep <= Linear.xferReps) {
-                    if (this.unified) { this.xDev.hostStore(this.xScratch); }
-                    else { this.xDev.upload(this.xScratch); }
+                    this.sendActivations(so);
                     rep = rep + 1;
                 }
             }
@@ -464,8 +618,7 @@ public final class Linear extends InfModule {
             if (!Linear.skipTransfers) {
                 int32 rep2 = 0;
                 while (rep2 <= Linear.xferReps) {
-                    if (this.unified) { this.yDev.hostLoad(this.yScratch); }
-                    else { this.yDev.download(this.yScratch); }
+                    this.fetchResult();
                     rep2 = rep2 + 1;
                 }
             }
@@ -482,18 +635,17 @@ public final class Linear extends InfModule {
         // no branch per phase and the two cannot drift in what they compute.
         int64 c0 = Clock.nanoTime();
         int64 i = 0;
-        while (i < (int64) this.inDim) {
-            this.xScratch[i] = sb[so + i];
+        int64 nIn2 = this.stageHit(so) ? 0L : (int64) this.inDim;
+        while (i < nIn2) {
+            Linear.stXh[i] = sb[so + i];
             i = i + 1;
         }
         int64 c1 = Clock.nanoTime();
-        if (this.unified) { this.xDev.hostStore(this.xScratch); }
-        else { this.xDev.upload(this.xScratch); }
+        this.sendActivations(so);
         int64 c2 = Clock.nanoTime();
         this.launchRows();
         int64 c3 = Clock.nanoTime();
-        if (this.unified) { this.yDev.hostLoad(this.yScratch); }
-        else { this.yDev.download(this.yScratch); }
+        this.fetchResult();
         int64 c4 = Clock.nanoTime();
         i = 0;
         while (i < (int64) this.outDim) {
@@ -509,6 +661,87 @@ public final class Linear extends InfModule {
         Linear.nDevCalls = Linear.nDevCalls + 1L;
         Linear.recordLaunch((int64) this.packed.count(),
             (int64) this.outDim, c3 - c2);
+        return;
+    }
+
+    /** Is the shared stage already holding exactly this window? Used by BOTH
+     *  the host copy and the upload, so the two cannot disagree about whether
+     *  a staging happened. */
+    boolean stageHit(int64 srcOff) {
+        return Linear.stShare && Linear.stValid
+            && Linear.stOff == srcOff && Linear.stDim == this.inDim
+            && Linear.stQ8 == this.q8 && Linear.stCap >= this.inDim;
+    }
+
+    /** Grow the shared staging buffers to hold `n` activations. Sized to
+     *  the LARGEST inDim seen, so a smaller projection simply uses a
+     *  prefix — the kernels index by block and never read past `cols`. */
+    static void ensureStage(int32 n) {
+        if (Linear.stCap >= n) { return; }
+        int64 ln = (int64) n;
+        Linear.stXh #= heap float32[ln];
+        Linear.stX #= heap KernelBuffer<float32>((uint64) ln);
+        Linear.stXqh #= heap int8[ln];
+        Linear.stXdh #= heap float32[ln / 256L];
+        Linear.stXbsh #= heap int32[ln / 16L];
+        Linear.stXq #= heap KernelBuffer<int8>((uint64) ln);
+        Linear.stXd #= heap KernelBuffer<float32>((uint64) (ln / 256L));
+        Linear.stXbs #= heap KernelBuffer<int32>((uint64) (ln / 16L));
+        Linear.stCap = n;
+        // A resize invalidates whatever was staged: the buffers are new.
+        Linear.stValid = false;
+        return;
+    }
+
+    /** Stage this call's activations on the device. */
+    void sendActivations(int64 srcOff) {
+        Linear.ensureStage(this.inDim);
+        // The staged copy is reusable only if the forward path has not
+        // declared a change AND this projection wants the same window of it.
+        if (this.stageHit(srcOff)) {
+            Linear.stHits = Linear.stHits + 1L;
+            return;
+        }
+        Linear.stMisses = Linear.stMisses + 1L;
+        if (this.q8) {
+            Quant.q8kQuantize(Linear.stXh, 0L, (int64) this.inDim,
+                Linear.stXqh, Linear.stXdh, Linear.stXbsh);
+            if (Linear.asyncXfer) {
+                KernelStream s #= KernelStream.current();
+                Linear.stXq.uploadAsync(Linear.stXqh, s);
+                Linear.stXd.uploadAsync(Linear.stXdh, s);
+                Linear.stXbs.uploadAsync(Linear.stXbsh, s);
+            } else {
+                Linear.stXq.upload(Linear.stXqh);
+                Linear.stXd.upload(Linear.stXdh);
+                Linear.stXbs.upload(Linear.stXbsh);
+            }
+        } else if (this.unified) {
+            Linear.stX.hostStore(Linear.stXh);
+        } else if (Linear.asyncXfer) {
+            KernelStream s #= KernelStream.current();
+            Linear.stX.uploadAsync(Linear.stXh, s);
+        } else {
+            Linear.stX.upload(Linear.stXh);
+        }
+        Linear.stOff = srcOff;
+        Linear.stDim = this.inDim;
+        Linear.stQ8 = this.q8;
+        Linear.stValid = true;
+        return;
+    }
+
+    /** Read this call's result back. The async form needs its own sync: the
+     *  launch's sync happened BEFORE the copy was enqueued. */
+    void fetchResult() {
+        if (this.unified) { this.yDev.hostLoad(this.yScratch); return; }
+        if (Linear.asyncXfer) {
+            KernelStream s #= KernelStream.current();
+            this.yDev.downloadAsync(this.yScratch, s);
+            s.sync();
+            return;
+        }
+        this.yDev.download(this.yScratch);
         return;
     }
 
@@ -532,8 +765,15 @@ public final class Linear extends InfModule {
         if (want > 0L) { chunk = want; }
         if (chunk >= rows) {
             Linear.nLaunches = Linear.nLaunches + 1L;
-            QuantKernel.matVecLaunch(this.packedTy, this.yDev, this.packedDev,
-                this.xDev, rows, (int64) this.inDim, 0L, 0L);
+            if (this.q8) {
+                QuantKernel.q4kQ8MatVecLaunch(this.yDev, this.packedDev,
+                    Linear.stXq, Linear.stXd, Linear.stXbs, rows,
+                    (int64) this.inDim, 0L);
+            } else {
+                QuantKernel.matVecLaunch(this.packedTy, this.yDev,
+                    this.packedDev, Linear.stX, rows, (int64) this.inDim,
+                    0L, 0L);
+            }
             return;
         }
         int64 r0 = 0L;
@@ -543,8 +783,13 @@ public final class Linear extends InfModule {
             Linear.nLaunches = Linear.nLaunches + 1L;
             KernelBuffer<int8> sub #= this.packedDev.slice(
                 (uint64) (r0 * rowBytes), (uint64) (nr * rowBytes));
-            QuantKernel.matVecLaunch(this.packedTy, this.yDev, sub,
-                this.xDev, nr, (int64) this.inDim, 0L, r0);
+            if (this.q8) {
+                QuantKernel.q4kQ8MatVecLaunch(this.yDev, sub, Linear.stXq,
+                    Linear.stXd, Linear.stXbs, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.matVecLaunch(this.packedTy, this.yDev, sub,
+                    Linear.stX, nr, (int64) this.inDim, 0L, r0);
+            }
             r0 = r0 + nr;
         }
         return;
