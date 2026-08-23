@@ -357,6 +357,26 @@ public final class Linear extends InfModule {
     static boolean packSet;
     static boolean packWant;
 
+    /**
+     * ONE sync per projection instead of one per dispatch (plan 10.3).
+     *
+     * `launchRows` issues a weight in row slices, and every slice used to
+     * end in a wait for the device to go idle. The slices are independent
+     * and nothing reads the result until `fetchResult`, so all but the last
+     * wait bought nothing — 378 dispatches a token, of which ~153 are
+     * intermediate.
+     *
+     * An ARM rather than a rewrite, because "the sync was not needed" is a
+     * claim about the driver's ordering guarantees and this codebase
+     * measures those instead of reading them. `oneSync(false)` restores the
+     * shipped behaviour in the same binary.
+     */
+    static boolean oneSync = true;
+
+    public static void setOneSyncPerProjection(boolean on) {
+        Linear.oneSync = on;
+    }
+
     static boolean q8Route() {
         if (!Linear.q8Set) {
             String be #= Device.activeBackend();
@@ -842,21 +862,8 @@ public final class Linear extends InfModule {
         if (want > 0L) { chunk = want; }
         if (chunk >= rows) {
             Linear.nLaunches = Linear.nLaunches + 1L;
-            if (this.q8) {
-                if (this.packed1) {
-                    QuantKernel.q4kQ8PackedMatVecLaunch(this.yDev,
-                        this.packedDev, Linear.stXp, rows,
-                        (int64) this.inDim, 0L);
-                } else {
-                    QuantKernel.q4kQ8MatVecLaunch(this.yDev, this.packedDev,
-                        Linear.stXq, Linear.stXd, Linear.stXbs, rows,
-                        (int64) this.inDim, 0L);
-                }
-            } else {
-                QuantKernel.matVecLaunch(this.packedTy, this.yDev,
-                    this.packedDev, Linear.stX, rows, (int64) this.inDim,
-                    0L, 0L);
-            }
+            this.launchOne(this.packedDev, rows, 0L);
+            this.syncLaunches();
             return;
         }
         int64 r0 = 0L;
@@ -866,20 +873,47 @@ public final class Linear extends InfModule {
             Linear.nLaunches = Linear.nLaunches + 1L;
             KernelBuffer<int8> sub #= this.packedDev.slice(
                 (uint64) (r0 * rowBytes), (uint64) (nr * rowBytes));
-            if (this.q8) {
-                if (this.packed1) {
-                    QuantKernel.q4kQ8PackedMatVecLaunch(this.yDev, sub,
-                        Linear.stXp, nr, (int64) this.inDim, r0);
-                } else {
-                    QuantKernel.q4kQ8MatVecLaunch(this.yDev, sub, Linear.stXq,
-                        Linear.stXd, Linear.stXbs, nr, (int64) this.inDim, r0);
-                }
-            } else {
-                QuantKernel.matVecLaunch(this.packedTy, this.yDev, sub,
-                    Linear.stX, nr, (int64) this.inDim, 0L, r0);
-            }
+            this.launchOne(sub, nr, r0);
             r0 = r0 + nr;
         }
+        this.syncLaunches();
+        return;
+    }
+
+    /** One dispatch over `nr` rows of `w` starting at output row `r0`.
+     *  Whether it waits is `oneSync`'s business, not this method's. */
+    void launchOne(KernelBuffer<int8> w, int64 nr, int64 r0) {
+        if (this.q8) {
+            if (this.packed1) {
+                if (Linear.oneSync) {
+                    QuantKernel.q4kQ8PackedMatVecLaunchNoSync(this.yDev, w,
+                        Linear.stXp, nr, (int64) this.inDim, r0);
+                } else {
+                    QuantKernel.q4kQ8PackedMatVecLaunch(this.yDev, w,
+                        Linear.stXp, nr, (int64) this.inDim, r0);
+                }
+            } else if (Linear.oneSync) {
+                QuantKernel.q4kQ8MatVecLaunchNoSync(this.yDev, w, Linear.stXq,
+                    Linear.stXd, Linear.stXbs, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q4kQ8MatVecLaunch(this.yDev, w, Linear.stXq,
+                    Linear.stXd, Linear.stXbs, nr, (int64) this.inDim, r0);
+            }
+        } else if (Linear.oneSync) {
+            QuantKernel.matVecLaunchNoSync(this.packedTy, this.yDev, w,
+                Linear.stX, nr, (int64) this.inDim, 0L, r0);
+        } else {
+            QuantKernel.matVecLaunch(this.packedTy, this.yDev, w,
+                Linear.stX, nr, (int64) this.inDim, 0L, r0);
+        }
+        return;
+    }
+
+    /** The one wait a projection owes, when the dispatches skipped theirs. */
+    void syncLaunches() {
+        if (!Linear.oneSync) { return; }
+        KernelStream s #= KernelStream.current();
+        s.sync();
         return;
     }
 }
