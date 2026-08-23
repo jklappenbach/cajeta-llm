@@ -1,0 +1,182 @@
+package dev.cajeta.llama.bench;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelThread;
+import dev.cajeta.llama.io.Quant;
+import dev.cajeta.llama.io.QuantKernel;
+
+/**
+ * Is it better to EXPAND the weights once at load than to unpack them in
+ * registers on every use?
+ *
+ * The case for expanding is real and worth testing rather than dismissing:
+ * batch-1 decode has NO intra-token reuse — each weight is read once per
+ * token and multiplied by one activation — so the unpack is paid per
+ * token, not amortized. Expanding once at load would pay it once, forever.
+ *
+ * The case against is the traffic that buys: Q4_K is 4.5 bits per weight,
+ * f16 is 16, f32 is 32. Per token, expansion moves 3.55x (f16) or 7.1x
+ * (f32) more bytes than packed, every token, forever.
+ *
+ * Which wins is not a matter of opinion — it depends on whether the kernel
+ * is compute-bound on the unpack or bandwidth-bound on the read, and THAT
+ * changes with worker count. So all three are measured at 1 worker and at
+ * full width, on the same shape, cold.
+ */
+public class ExpandProbe {
+
+    static final int32 ROWS = 4096;
+    static final int32 COLS = 4096;
+    static final int32 ITERS = 32;
+    static final int32 COPIES = 4;
+
+    static float64 med3(float64 a, float64 b, float64 c) {
+        if (a > b) { float64 t = a; a = b; b = t; }
+        if (b > c) { float64 t = b; b = c; c = t; }
+        if (a > b) { float64 t = a; a = b; b = t; }
+        return b;
+    }
+
+    /** f32 weights, [out, in] row-major: the shape the DEVICE path already
+     *  materializes today (`Linear.bind` disables packing when toDevice). */
+    @Kernel
+    public static void f32MatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<float32> w, KernelBuffer<float32> x,
+            uint32 rows, int64 cols) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 base = i * cols;
+            Vector<float32,4> acc = x.vload<4>(0L) * 0.0f;
+            int64 c = 0;
+            while (c < cols) {
+                acc = acc + w.vload<4>(base + c) * x.vload<4>(c);
+                c = c + 4L;
+            }
+            y[i] = acc[0] + acc[1] + acc[2] + acc[3];
+        }
+    }
+
+    // NOTE: an f16 arm was written and REMOVED. `Vector<float16,N>` has no
+    // f16->f32 lane conversion in the language yet (the build said so:
+    // `[xpu-kernel-skipped] f16MatVecKernel: unknown Vector method`), and
+    // adding one to answer a bandwidth question would be the wrong order of
+    // work. The f32 arm below bounds it anyway: f32 does the LEAST work per
+    // byte of any arm here — one multiply-add, no unpack — so its GB/s is
+    // this access pattern's streaming ceiling, and an f16 weight (half f32's
+    // bytes, 3.55x packed's) cannot beat that ceiling.
+
+    public static void run() {
+        int64 blocksPerRow = 4096L / 256L;
+        int64 qbytes = 4096L * blocksPerRow * 144L;
+        int64 n = 4096L * 4096L;
+        float64 qmb = (float64) qbytes / 1048576.0;
+        float64 f32mb = (float64) (n * 4L) / 1048576.0;
+        float64 f16mb = (float64) (n * 2L) / 1048576.0;
+
+        float32[] hx #= heap float32[4096L];
+        int64 i = 0;
+        while (i < 4096L) {
+            hx[i] = (float32) ((i % 11L) - 5L) * 0.375f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> xb #= heap KernelBuffer<float32>(
+            (uint64) 4096);
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>(
+            (uint64) 4096);
+        xb.upload(hx);
+
+        ArrayList<KernelBuffer<int8>> qs #= heap ArrayList<KernelBuffer<int8>>();
+        ArrayList<KernelBuffer<float32>> f32s
+            #= heap ArrayList<KernelBuffer<float32>>();
+        int32 cp = 0;
+        while (cp < 4) {
+            int8[] packed #= heap int8[qbytes];
+            ScalingProbe.fillBlocks(packed, Quant.GG_Q4_K, cp);
+            KernelBuffer<int8> pb #= heap KernelBuffer<int8>((uint64) qbytes);
+            pb.upload(packed);
+            qs.add(#pb);
+
+            // The SAME weights, dequantized — this is what expanding at load
+            // would leave resident.
+            float32[] deq #= heap float32[n];
+            Quant.dequantize(Quant.GG_Q4_K, packed, 0L,
+                4096L * blocksPerRow, deq, 0L);
+            KernelBuffer<float32> fb #= heap KernelBuffer<float32>((uint64) n);
+            fb.upload(deq);
+            f32s.add(#fb);
+            cp = cp + 1;
+        }
+
+        System.stdout.println("Q4_K [" + 4096 + " x "
+            + 4096 + "]  packed " + qmb + " MB   f16 " + f16mb
+            + " MB   f32 " + f32mb + " MB");
+        System.stdout.println("workers | packed ms (GB/s) | f32 ms (GB/s) "
+            + "| packed vs f32");
+
+        int32[] caps #= heap int32[2];
+        caps[0] = 1; caps[1] = 0;
+        int32 ci = 0;
+        while (ci < 2) {
+            Device.setCpuWorkerCap(caps[ci]);
+            float64[] pq #= heap float64[3];
+            float64[] pf #= heap float64[3];
+            int32 rep = 0;
+            while (rep < 3) {
+                if (rep % 2 == 0) {
+                    pq[rep] = ExpandProbe.timeQ(yb, qs, xb);
+                    pf[rep] = ExpandProbe.timeF32(yb, f32s, xb);
+                } else {
+                    pf[rep] = ExpandProbe.timeF32(yb, f32s, xb);
+                    pq[rep] = ExpandProbe.timeQ(yb, qs, xb);
+                }
+                rep = rep + 1;
+            }
+            float64 mq = ExpandProbe.med3(pq[0], pq[1], pq[2]);
+            float64 mf = ExpandProbe.med3(pf[0], pf[1], pf[2]);
+            System.stdout.println("   " + Device.lastLaunchWorkers()
+                + "    |  " + mq + " (" + (qmb / 1024.0 / (mq / 1000.0))
+                + ")  |  " + mf + " (" + (f32mb / 1024.0 / (mf / 1000.0))
+                + ")  |  " + (mf / mq) + "x");
+            ci = ci + 1;
+        }
+        Device.setCpuWorkerCap(0);
+        return;
+    }
+
+    static float64 timeQ(KernelBuffer<float32> y,
+            ArrayList<KernelBuffer<int8>> ps, KernelBuffer<float32> x) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 32) {
+            QuantKernel.q4kMatVecLaunch(y, ps.get(k % 4), x,
+                4096L, 4096L, 0L, 0L);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) 32;
+    }
+
+    static float64 timeF32(KernelBuffer<float32> y,
+            ArrayList<KernelBuffer<float32>> ws, KernelBuffer<float32> x) {
+        uint32 ur = (uint32) 4096;
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 32) {
+            KernelStream s #= KernelStream.current();
+            f32MatVecKernel.launch(s, grid: [(ur + 63) / 64], block: [64])
+                (y, ws.get(k % 4), x, ur,
+                 4096L);
+            s.sync();
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) 32;
+    }
+}
