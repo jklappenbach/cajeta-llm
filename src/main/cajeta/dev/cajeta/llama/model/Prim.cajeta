@@ -23,6 +23,30 @@ import cajeta.xpu.KernelThread;
  */
 public final class Prim {
 
+    /**
+     * MEASUREMENT INSTRUMENT, not a feature. Bits select host primitives to
+     * SKIP so a forward pass can be timed with each one removed:
+     * 1 rmsnorm, 2 glu, 4 rope, 8 attend.
+     *
+     * The projections already have such a switch
+     * (`QuantKernel.setSkipMatvecForMeasurement`), and it showed that 56% of
+     * a decode token is NOT the mat-vec — 149 ms of 267. That remainder is
+     * far larger than the arithmetic in these primitives can account for
+     * (64 RMSNorm rows of 4096 elements is under a millisecond), so the
+     * question of WHERE it goes has to be answered by measurement before
+     * anything is optimized. Guessing produced "route the primitives", which
+     * may well be the wrong target.
+     *
+     * Output is garbage whenever any bit is set. Timings taken with it on
+     * describe cost, never correctness.
+     */
+    static int32 skipMask = 0;
+
+    public static void setSkipMaskForMeasurement(int32 m) {
+        Prim.skipMask = m;
+    }
+
+
     // ── RMSNorm (5.1, 5.12) ─────────────────────────────────────────────
 
     /**
@@ -89,21 +113,31 @@ public final class Prim {
     static void rmsnormRowHost(Tensor<float32> src, int64 srcOff,
             Tensor<float32> w, float32 eps,
             Tensor<float32> dst, int64 dstOff, int32 dim, int32 form) {
+        if ((Prim.skipMask & 1) != 0) { return; }
+        // RAW BUFFERS, not `flatGet`/`flatSet` — the same change that took
+        // `PagedKvCache.attendRow` from 105 ms/token to ~2. The accessor,
+        // not the arithmetic, is what these row loops cost.
+        float32[] sb = src.hostBuffer();
+        int64 so = src.hostBase() + srcOff;
+        float32[] wb = w.hostBuffer();
+        int64 wo = w.hostBase();
+        float32[] db = dst.hostBuffer();
+        int64 dof = dst.hostBase() + dstOff;
         float32 ss = 0.0f;
         int64 i = 0;
         while (i < (int64) dim) {
-            float32 v = src.flatGet(srcOff + i);
+            float32 v = sb[so + i];
             ss = ss + v * v;
             i = i + 1;
         }
         float32 scale = 1.0f / Math.sqrt(ss / (float32) dim + eps);
         i = 0;
         while (i < (int64) dim) {
-            float32 wi = w.flatGet(i);
+            float32 wi = wb[wo + i];
             if (form == 1) {
                 wi = 1.0f + wi;
             }
-            dst.flatSet(dstOff + i, src.flatGet(srcOff + i) * scale * wi);
+            db[dof + i] = sb[so + i] * scale * wi;
             i = i + 1;
         }
         return;
@@ -158,9 +192,16 @@ public final class Prim {
     static void gluRowHost(Tensor<float32> g, int64 gOff,
             Tensor<float32> u, int64 uOff,
             Tensor<float32> dst, int64 dstOff, int32 n, int32 act) {
+        if ((Prim.skipMask & 2) != 0) { return; }
+        float32[] gb = g.hostBuffer();
+        int64 go = g.hostBase() + gOff;
+        float32[] ub = u.hostBuffer();
+        int64 uo = u.hostBase() + uOff;
+        float32[] db = dst.hostBuffer();
+        int64 dof = dst.hostBase() + dstOff;
         int64 i = 0;
         while (i < (int64) n) {
-            float32 x = g.flatGet(gOff + i);
+            float32 x = gb[go + i];
             float32 a = 0.0f;
             if (act == 1) {
                 float32 t = 0.7978845608f * (x + 0.044715f * x * x * x);
@@ -169,7 +210,7 @@ public final class Prim {
             } else {
                 a = x / (1.0f + Math.exp(0.0f - x));
             }
-            dst.flatSet(dstOff + i, a * u.flatGet(uOff + i));
+            db[dof + i] = a * ub[uo + i];
             i = i + 1;
         }
         return;
@@ -245,19 +286,22 @@ public final class Prim {
      */
     static void ropeRowHost(Tensor<float32> t, int64 off, int32 nHeads,
             int32 headDim, int32 pos, float32[] invFreq) {
+        if ((Prim.skipMask & 4) != 0) { return; }
         int32 half = headDim / 2;
+        float32[] tb = t.hostBuffer();
+        int64 tbase = t.hostBase() + off;
         int32 h = 0;
         while (h < nHeads) {
-            int64 base = off + (int64) (h * headDim);
+            int64 base = tbase + (int64) (h * headDim);
             int32 d = 0;
             while (d < half) {
                 float32 ang = (float32) pos * invFreq[d];
                 float32 c = Math.cos(ang);
                 float32 s = Math.sin(ang);
-                float32 a = t.flatGet(base + (int64) d);
-                float32 b = t.flatGet(base + (int64) (d + half));
-                t.flatSet(base + (int64) d, a * c - b * s);
-                t.flatSet(base + (int64) (d + half), a * s + b * c);
+                float32 a = tb[base + (int64) d];
+                float32 b = tb[base + (int64) (d + half)];
+                tb[base + (int64) d] = a * c - b * s;
+                tb[base + (int64) (d + half)] = a * s + b * c;
                 d = d + 1;
             }
             h = h + 1;
@@ -349,6 +393,7 @@ public final class Prim {
             int32 from, int32 p, float32 scale, Tensor<float32> scores,
             Tensor<float32> outv, int64 outOff,
             int32 nHeads, int32 nKv, int32 headDim) {
+        if ((Prim.skipMask & 8) != 0) { return; }
         int32 kvDim = nKv * headDim;
         int32 group = nHeads / nKv;
         int32 h = 0;

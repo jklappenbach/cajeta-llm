@@ -160,6 +160,8 @@ public final class PagedKvCache {
      */
     public boolean appendRow(int32 seq, int32 layer, Tensor<float32> k,
             int64 kOff, Tensor<float32> v, int64 vOff, int32 p) {
+        // Measurement instrument (Prim.skipMask bit 16).
+        if ((Prim.skipMask & 16) != 0) { return true; }
         int32 sl = seq * this.layers + layer;
         if (p != this.lenSL[sl]) {
             throw heap LlamaException("kv append: position " + p
@@ -294,6 +296,8 @@ public final class PagedKvCache {
             int64 qOff, float32 scale, Tensor<float32> scores,
             Tensor<float32> outv, int64 outOff,
             int32 nHeads, int32 nKv, int32 headDim) {
+        // Measurement instrument (Prim.skipMask bit 32).
+        if ((Prim.skipMask & 32) != 0) { return; }
         int32 sl = seq * this.layers + layer;
         int32 p = this.lenSL[sl] - 1;
         int32 w = this.layerWindow[layer];
@@ -303,6 +307,32 @@ public final class PagedKvCache {
         }
         int32 group = nHeads / nKv;
         int32 count = p + 1 - from;
+        // `srcOf` depends only on (sl, isV) — hoisted out of every loop.
+        // It was called once per (h, t) for K and once per (h, t, d) for V.
+        Tensor<float32> srcK = this.srcOf(sl, false);
+        Tensor<float32> srcV = this.srcOf(sl, true);
+        // RAW BUFFERS, not `flatGet`/`flatSet`. This loop performs ~3.1M
+        // multiply-accumulates per token (12 positions x 32 heads x 128 dims
+        // x 32 layers, K and V), which is ~6M accessor calls — and the
+        // accessor, not the arithmetic, was the cost: it measured 105
+        // ms/token, more than all 224 projections together. `MatvecProbe`
+        // already carries a "raw arrays, no Tensor/Storage accessors" arm
+        // for exactly this reason, and `Linear.matvecInto` already reads
+        // `hostBuffer()`/`hostBase()`.
+        //
+        // Hoisting `srcOf`/`rowBase` out of the inner body was tried FIRST
+        // and changed nothing (272.5 vs 263.8 ms) — LLVM was already
+        // sinking them. The accessors were what remained.
+        float32[] kb = srcK.hostBuffer();
+        int64 kbase = srcK.hostBase();
+        float32[] vb = srcV.hostBuffer();
+        int64 vbase = srcV.hostBase();
+        float32[] qb = q.hostBuffer();
+        int64 qbase0 = q.hostBase();
+        float32[] sb = scores.hostBuffer();
+        int64 sbase = scores.hostBase();
+        float32[] ob = outv.hostBuffer();
+        int64 obase0 = outv.hostBase();
         int32 h = 0;
         while (h < nHeads) {
             int32 kvh = h / group;
@@ -312,20 +342,20 @@ public final class PagedKvCache {
             while (t < (int64) count) {
                 int32 tp = from + (int32) t;
                 float32 s = 0.0f;
-                int64 kRow = this.rowBase(sl, tp, false) + kvHead;
-                Tensor<float32> src = this.srcOf(sl, false);
+                int64 kRow = kbase + this.rowBase(sl, tp, false) + kvHead;
+                int64 qr = qbase0 + qBase;
                 int64 d = 0;
                 while (d < (int64) headDim) {
-                    s = s + q.flatGet(qBase + d) * src.flatGet(kRow + d);
+                    s = s + qb[qr + d] * kb[kRow + d];
                     d = d + 1;
                 }
-                scores.flatSet(t, s * scale);
+                sb[sbase + t] = s * scale;
                 t = t + 1;
             }
-            float32 mx = scores.flatGet(0);
+            float32 mx = sb[sbase];
             t = 1;
             while (t < (int64) count) {
-                float32 sv = scores.flatGet(t);
+                float32 sv = sb[sbase + t];
                 if (sv > mx) {
                     mx = sv;
                 }
@@ -334,24 +364,45 @@ public final class PagedKvCache {
             float32 sum = 0.0f;
             t = 0;
             while (t < (int64) count) {
-                float32 e = Math.exp(scores.flatGet(t) - mx);
-                scores.flatSet(t, e);
+                float32 e = Math.exp(sb[sbase + t] - mx);
+                sb[sbase + t] = e;
                 sum = sum + e;
                 t = t + 1;
             }
             float32 rs = 1.0f / sum;
+            // POSITION-OUTER, not dim-outer. The dim-outer form called
+            // `srcOf` and `rowBase` from the INNERMOST body, where both are
+            // invariant in `d` — 128 x count of them per head, ~1.57M
+            // `rowBase` calls per token, each a modulo plus two array reads
+            // plus a branch. It measured 105 ms/token, more than all 224
+            // projections put together, for twelve positions of context.
+            //
+            // Bit-identity is preserved and that is why this shape was
+            // chosen over a wider rewrite: each output element still
+            // accumulates `t = 0..count-1` ASCENDING starting from 0.0f and
+            // is scaled by `rs` at the end, exactly as before. Only the
+            // traversal order of independent elements changed.
+            int64 obase = obase0 + outOff + (int64) (h * headDim);
             int64 d = 0;
             while (d < (int64) headDim) {
-                float32 acc = 0.0f;
-                t = 0;
-                while (t < (int64) count) {
-                    int32 tp = from + (int32) t;
-                    Tensor<float32> src = this.srcOf(sl, true);
-                    acc = acc + scores.flatGet(t) * src.flatGet(
-                        this.rowBase(sl, tp, true) + kvHead + d);
-                    t = t + 1;
+                ob[obase + d] = 0.0f;
+                d = d + 1;
+            }
+            t = 0;
+            while (t < (int64) count) {
+                int32 tp = from + (int32) t;
+                int64 vRow = vbase + this.rowBase(sl, tp, true) + kvHead;
+                float32 sc = sb[sbase + t];
+                d = 0;
+                while (d < (int64) headDim) {
+                    ob[obase + d] = ob[obase + d] + sc * vb[vRow + d];
+                    d = d + 1;
                 }
-                outv.flatSet(outOff + (int64) (h * headDim) + d, acc * rs);
+                t = t + 1;
+            }
+            d = 0;
+            while (d < (int64) headDim) {
+                ob[obase + d] = ob[obase + d] * rs;
                 d = d + 1;
             }
             h = h + 1;
