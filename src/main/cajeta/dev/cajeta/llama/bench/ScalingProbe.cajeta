@@ -1,0 +1,252 @@
+package dev.cajeta.llama.bench;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llama.io.Quant;
+import dev.cajeta.llama.io.QuantKernel;
+
+/**
+ * threaded-forward-path plan Unit 5 — the Q4_K scaling curve.
+ *
+ * Shape is Llama-3.1-8B's q_proj: [4096, 4096] Q4_K, 9.4 MB of weight per
+ * mat-vec, which is the whole reason this is worth threading — decode is
+ * bandwidth-bound and one core cannot saturate the bus.
+ *
+ * TWO SWEEPS, and the difference between them is the point. A single 9.4 MB
+ * weight fits in this box's 64 MiB L3, so hammering one matrix measures a
+ * CACHE-RESIDENT mat-vec. Real decode reads ~224 distinct projections
+ * totalling ~4.5 GB per token, each exactly once, from DRAM. The `hot`
+ * sweep reuses one weight; the `cold` sweep rotates through {@link #COPIES}
+ * distinct weights whose total exceeds L3, so every launch starts cold.
+ * Reading the hot curve as if it predicted decode would overstate the low
+ * worker counts, which are the ones cache rescues.
+ *
+ * The measurement discipline is the one this project arrived at the hard
+ * way (spec §7.6), and each piece is here because its absence produced a
+ * wrong answer once:
+ *
+ *   * ARMS ALTERNATE. Odd repetitions walk the worker counts backwards.
+ *     A fixed arm order let a decaying background load read as a speedup
+ *     in the Unit 1 spike; the first run of a round is measurably slower
+ *     than the rest regardless of which arm it is.
+ *   * MEDIAN OF 3, not mean: one descheduled sample should not move the
+ *     number.
+ *   * AN UNTOUCHED CONTROL runs in every repetition — the HOST serial
+ *     mat-vec, which the worker cap cannot reach. If the control drifts
+ *     across repetitions the box was not idle and the run is void. This
+ *     is stronger than checking idleness beforehand, because it checks the
+ *     window the measurement actually occupied.
+ *
+ *     The control takes its turn IN THE ROTATION rather than leading every
+ *     round. A control pinned to first position eats the
+ *     first-run-of-a-round penalty every time — measured at +3.7% in the
+ *     Unit 1 spike — which inflates every speedup computed against it.
+ *   * EVERY TIMING CARRIES ITS WORKER COUNT, read back from the runtime
+ *     rather than from what was requested (5.1.1). A number whose worker
+ *     count is assumed is not a data point.
+ */
+public class ScalingProbe {
+
+    /**
+     * One host weight. A wrapper, not a convenience: `ArrayList<int8[]>`
+     * double-frees at teardown once it holds ~11 owned arrays (plan 8.13 —
+     * the adds succeed, the list reads back correctly, and the process dies
+     * in `free` on the way out), while a list of CLASS elements is clean.
+     * Filed rather than dodged; the rotation it holds is load-bearing.
+     */
+    public static class HostWeight {
+        public int8[] a;
+        public HostWeight(int8[] a) {
+            this.a #= a;
+            return;
+        }
+    }
+
+    static final int32 ROWS = 4096;
+    static final int32 COLS = 4096;
+    static final int32 ITERS = 32;
+    static final int32 CTRL_ITERS = 16;
+    static final int32 REPS = 3;
+
+    /** Distinct weights in the cold sweep. 16 x 9.4 MB = 150 MB, comfortably
+     *  past the 64 MiB L3, so a launch never finds its weight cached. */
+    static final int32 COPIES = 16;
+
+    /** Median of three, without sorting machinery. */
+    static float64 med3(float64 a, float64 b, float64 c) {
+        if (a > b) { float64 t = a; a = b; b = t; }
+        if (b > c) { float64 t = b; b = c; c = t; }
+        if (a > b) { float64 t = a; a = b; b = t; }
+        return b;
+    }
+
+    /** ms per launch at the current worker cap, rotating over `n` weights. */
+    static float64 timeKernel(KernelBuffer<float32> y,
+            ArrayList<KernelBuffer<int8>> ps, int32 n,
+            KernelBuffer<float32> x) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < ScalingProbe.ITERS) {
+            QuantKernel.q4kMatVecLaunch(y, ps.get(k % n), x,
+                (int64) ScalingProbe.ROWS, (int64) ScalingProbe.COLS, 0L, 0L);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) ScalingProbe.ITERS;
+    }
+
+    /** ms per call for the host serial path — the control, and the baseline
+     *  every speedup is measured against. */
+    static float64 timeSerial(ArrayList<HostWeight> hs, int32 n, float32[] x,
+            float32[] y) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < ScalingProbe.CTRL_ITERS) {
+            Quant.q4kMatVecInto(hs.get(k % n).a, (int64) ScalingProbe.ROWS,
+                (int64) ScalingProbe.COLS, x, 0L, y, 0L);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) ScalingProbe.CTRL_ITERS;
+    }
+
+    static void sweep(String label, int32 n, ArrayList<HostWeight> hs,
+            ArrayList<KernelBuffer<int8>> ps, KernelBuffer<float32> xb,
+            KernelBuffer<float32> yb, float32[] hx, float32[] hy,
+            float64 mbPerCall) {
+        // Index 6 is the CONTROL: the host serial path, which no cap reaches.
+        int32[] arms #= heap int32[7];
+        arms[0] = 1; arms[1] = 2; arms[2] = 4; arms[3] = 8;
+        arms[4] = 16; arms[5] = 0; arms[6] = -1;
+        int32 nArms = 7;
+        int32 ctrlArm = 6;
+
+        float64[] samples #= heap float64[(int64) nArms * 3L];
+        int32[] workers #= heap int32[nArms];
+
+        // Warm: first touch pays one-time costs (pool spin-up, page faults)
+        // that belong to neither arm.
+        Device.setCpuWorkerCap(0);
+        ScalingProbe.timeKernel(yb, ps, n, xb);
+        ScalingProbe.timeSerial(hs, n, hx, hy);
+
+        int32 rep = 0;
+        while (rep < ScalingProbe.REPS) {
+            int32 k = 0;
+            while (k < nArms) {
+                int32 a = rep % 2 == 0 ? k : nArms - 1 - k;
+                float64 ms = 0.0;
+                if (a == ctrlArm) {
+                    ms = ScalingProbe.timeSerial(hs, n, hx, hy);
+                    workers[a] = 0;
+                } else {
+                    Device.setCpuWorkerCap(arms[a]);
+                    ms = ScalingProbe.timeKernel(yb, ps, n, xb);
+                    workers[a] = Device.lastLaunchWorkers();
+                }
+                samples[(int64) a * 3L + (int64) rep] = ms;
+                k = k + 1;
+            }
+            rep = rep + 1;
+        }
+        Device.setCpuWorkerCap(0);
+
+        int64 cb = (int64) ctrlArm * 3L;
+        float64 c = ScalingProbe.med3(samples[cb], samples[cb + 1L],
+            samples[cb + 2L]);
+        float64 cLo = samples[cb];
+        float64 cHi = samples[cb];
+        int32 r2 = 1;
+        while (r2 < 3) {
+            float64 v = samples[cb + (int64) r2];
+            if (v < cLo) { cLo = v; }
+            if (v > cHi) { cHi = v; }
+            r2 = r2 + 1;
+        }
+        float64 drift = (cHi - cLo) / cLo * 100.0;
+
+        System.stdout.println("");
+        System.stdout.println("== " + label + " ==");
+        System.stdout.println("control (host serial, untouched by the cap): "
+            + c + " ms   spread across reps " + drift + "%");
+        if (drift > 5.0) {
+            System.stdout.println("*** RUN VOID: the control moved " + drift
+                + "% across repetitions, so the box was not idle for the "
+                + "window this measurement occupied. The arm numbers below "
+                + "are not comparable. ***");
+        }
+        System.stdout.println(
+            "workers |    ms    |   GB/s   | vs serial | vs 1 worker");
+        float64 one = ScalingProbe.med3(samples[0], samples[1], samples[2]);
+        int32 a2 = 0;
+        while (a2 < nArms) {
+            float64 m = ScalingProbe.med3(samples[(int64) a2 * 3L],
+                samples[(int64) a2 * 3L + 1L],
+                samples[(int64) a2 * 3L + 2L]);
+            String who = a2 == ctrlArm ? "serial" : "" + workers[a2];
+            System.stdout.println("  " + who + "  |  " + m + "  |  "
+                + (mbPerCall / 1024.0 / (m / 1000.0)) + "  |  " + (c / m)
+                + "x  |  " + (one / m) + "x");
+            a2 = a2 + 1;
+        }
+        return;
+    }
+
+    public static void run() {
+        int64 blocksPerRow = (int64) ScalingProbe.COLS / 256L;
+        int64 nbytes = (int64) ScalingProbe.ROWS * blocksPerRow * 144L;
+        float64 mb = (float64) nbytes / 1048576.0;
+
+        float32[] hx #= heap float32[ScalingProbe.COLS];
+        int64 i = 0;
+        while (i < (int64) ScalingProbe.COLS) {
+            hx[i] = (float32) ((i % 11L) - 5L) * 0.375f;
+            i = i + 1;
+        }
+        float32[] hy #= heap float32[ScalingProbe.ROWS];
+
+        ArrayList<HostWeight> hs #= heap ArrayList<HostWeight>();
+        ArrayList<KernelBuffer<int8>> ps #= heap ArrayList<KernelBuffer<int8>>();
+        int32 cp = 0;
+        while (cp < ScalingProbe.COPIES) {
+            int8[] packed #= heap int8[nbytes];
+            int64 z = 0;
+            // Timing is data-independent here (no branches on the values),
+            // so the pattern only has to be well-defined and distinct per
+            // copy — distinct so nothing can be shared or folded.
+            while (z < nbytes) {
+                packed[z] = (int8) ((z * 31L + (int64) cp * 7L) % 251L);
+                z = z + 1;
+            }
+            KernelBuffer<int8> pb #= heap KernelBuffer<int8>((uint64) nbytes);
+            pb.upload(packed);
+            hs.add(heap HostWeight(#packed));
+            ps.add(#pb);
+            cp = cp + 1;
+        }
+
+        KernelBuffer<float32> xb #= heap KernelBuffer<float32>(
+            (uint64) ScalingProbe.COLS);
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>(
+            (uint64) ScalingProbe.ROWS);
+        xb.upload(hx);
+        yb.upload(hy);
+
+        System.stdout.println("Q4_K [" + ScalingProbe.ROWS + " x "
+            + ScalingProbe.COLS + "] = " + mb + " MB per mat-vec, "
+            + ScalingProbe.ITERS + " launches per sample, median of "
+            + ScalingProbe.REPS + ", arms alternated");
+
+        ScalingProbe.sweep("HOT: one weight, re-read (fits L3)", 1, hs, ps,
+            xb, yb, hx, hy, mb);
+        ScalingProbe.sweep("COLD: " + ScalingProbe.COPIES
+            + " distinct weights in rotation (exceeds L3) - this is the one "
+            + "that predicts decode", ScalingProbe.COPIES, hs, ps, xb, yb,
+            hx, hy, mb);
+        return;
+    }
+}
