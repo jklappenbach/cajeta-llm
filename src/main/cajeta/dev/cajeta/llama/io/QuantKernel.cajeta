@@ -1,8 +1,11 @@
 package dev.cajeta.llama.io;
 
+import cajeta.xpu.Barrier;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelThread;
+import cajeta.xpu.Shared;
+import cajeta.xpu.Wave;
 
 /**
  * The packed mat-vecs as XPU kernels (threaded-forward-path plan Unit 3;
@@ -778,6 +781,310 @@ public final class QuantKernel {
         return;
     }
 
+
+    /**
+     * WAVE-COOPERATIVE Q4_K x q8_K — llama.cpp's mmvq decomposition
+     * (plan 11.1).
+     *
+     * Every mat-vec kernel here so far gives ONE OUTPUT ROW to ONE WORK
+     * ITEM. llama.cpp gives one output row to one WAVE. On gfx1151 that is
+     * not a guess: RDNA3.5 takes their MMVQ_PARAMETERS_RDNA2 table, which
+     * resolves `nwarps = 1` and `rows_per_cuda_block = 1`, so a CUDA block
+     * is 32 threads = one wave32 = one row, the lanes split each weight
+     * block between them, and the row finishes with a wave reduction.
+     *
+     * Two things follow, and they are the two problems 10.5's buckets
+     * found:
+     *
+     *   OCCUPANCY. One item per row gives a 1024-row weight 32 waves for
+     *   160 SIMDs. One wave per row gives it 1024 — the wave count stops
+     *   being rows/32 and becomes rows.
+     *
+     *   LOCALITY. Under one-item-per-row a wave's 32 lanes read 32
+     *   addresses `rowBytes` apart. Here four consecutive lanes read one
+     *   block's 128 contiguous quant bytes, so a wave reads eight runs of
+     *   128 bytes. 9.6 refuted "uncoalesced reads are the problem" by
+     *   moving the BYTES while keeping one item per row; this moves the
+     *   decomposition instead, which is the variable that test held fixed.
+     *
+     * The lane split is chosen so that no byte is read twice: lane `l`
+     * takes block `l/4` of the eight in flight and, within it, the
+     * 32-byte chunk `l%4` — which is exactly one iteration of the serial
+     * kernel's `g` loop, carrying sub-blocks 2g and 2g+1. Four lanes
+     * therefore cover a block's 128 quant bytes and its 256 activation
+     * bytes exactly once each.
+     */
+    @Kernel
+    public static void q4kQ8WaveMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        Shared<float32> part = shared float32[32];
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 32;
+        int64 rowBytes = blocksPerRow * 144L;
+        float32 acc = 0.0f;
+        if (row < rows) {
+            int64 i = (int64) row;
+            int32 g = (int32) (lane % 4);
+            int64 b = (int64) (lane / 4);
+            Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 144L;
+
+                // The header — { f16 d; f16 dmin; u8 scales[12] } = 16 bytes.
+                // Read by all four lanes of the block; it is 16 bytes and it
+                // is in cache after the first.
+                Vector<int8,16> hv = packed.vload<16>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                // Only THIS lane's two sub-blocks are unpacked, where the
+                // serial kernel unpacks all eight — and the two forms are
+                // NOT interchangeable. Q4_K packs sub-blocks 0-3 and 4-7 in
+                // different fields, and a lane owning `g` needs sub-blocks
+                // 2g and 2g+1, so g < 2 lands entirely in the first field
+                // and g >= 2 entirely in the second. Reading field `g`
+                // instead of sub-block `2g` is the shape of the first
+                // version of this kernel, which was wrong on every row.
+                int32 sc0 = 0;
+                int32 sc1 = 0;
+                int32 mn0 = 0;
+                int32 mn1 = 0;
+                if (g < 2) {
+                    int32 j = 2 * g;
+                    sc0 = (int32) hv[4 + j] & 63;
+                    sc1 = (int32) hv[5 + j] & 63;
+                    mn0 = (int32) hv[8 + j] & 63;
+                    mn1 = (int32) hv[9 + j] & 63;
+                } else {
+                    int32 j = 2 * g - 4;
+                    int32 k0 = (int32) hv[12 + j] & 255;
+                    int32 k1 = (int32) hv[13 + j] & 255;
+                    int32 d0 = (int32) hv[4 + j] & 255;
+                    int32 d1 = (int32) hv[5 + j] & 255;
+                    int32 m0 = (int32) hv[8 + j] & 255;
+                    int32 m1 = (int32) hv[9 + j] & 255;
+                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
+                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                }
+
+                Vector<uint8,32> raw = packed.vload<32>(
+                    ro + 16L + (int64) (32 * g)).asUnsigned();
+                Vector<uint8,32> lo = raw & 15;
+                Vector<uint8,32> hi = (raw >> 4) & 15;
+                int64 xb = b * 320L + (int64) (64 * g);
+                Vector<int8,32> a0 = xp.vload<32>(xb);
+                Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
+                Vector<int32,8> tot = lo.dotAccum(a0, zv) * sc0
+                                    + hi.dotAccum(a1, zv) * sc1;
+                int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
+                           + tot[4] + tot[5] + tot[6] + tot[7];
+
+                // The dmin term needs the sum of THIS LANE's activations,
+                // and the packed block's precomputed sums are per 32-element
+                // sub-block — which only helps a lane that owns a whole one.
+                // llama.cpp does not read a precomputed sum at all: it takes
+                // `dp4a(0x01010101, u)`, so any lane granularity is free.
+                // Same trick here, and it drops a 32-byte load per lane per
+                // block as well.
+                Vector<uint8,32> ones = (lo ^ lo) | 1;
+                Vector<int32,8> tot2 = ones.dotAccum(a0, zv) * mn0
+                                     + ones.dotAccum(a1, zv) * mn1;
+                int32 dmins = tot2[0] + tot2[1] + tot2[2] + tot2[3]
+                            + tot2[4] + tot2[5] + tot2[6] + tot2[7];
+
+                Vector<int8,4> dv = xp.vload<4>(b * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+
+                acc = acc + d * xs * (float32) sumi
+                          - dmin * xs * (float32) dmins;
+                b = b + 8L;
+            }
+        }
+        // The wave reduction, as a shared-memory tree.
+        //
+        // llama.cpp uses a shuffle butterfly (warp_reduce_sum) here and this
+        // was written that way first. Two things came back: the shuffle form
+        // was WRONG on every row, and it was exactly as FAST — 89.1 against
+        // 88.5 GB/s at 1024 rows, 128.5 against 127.9 at 14336. So the
+        // reduction is not what this kernel spends its time on, and the
+        // correct-and-simple form is kept until something says otherwise.
+        part[lane] = acc;
+        Barrier.workgroup();
+        uint32 s = 16;
+        while (s > 0) {
+            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
+            Barrier.workgroup();
+            s = s / 2;
+        }
+        if (lane == 0 && row < rows) {
+            y[yOff + (int64) row] = part[0];
+        }
+    }
+
+    /** One WORKGROUP per output row, 32 threads each — the geometry is the
+     *  point, so it is not chunked and not tunable. */
+    public static void q4kQ8WaveMatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        KernelStream s #= KernelStream.current();
+        q4kQ8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+            (y, packed, xp, ur, cols / 256L, yOff);
+        return;
+    }
+
+    public static void q4kQ8WaveMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q4kQ8WaveMatVecLaunchNoSync(y, packed, xp, rows, cols,
+            yOff);
+        KernelStream s #= KernelStream.current();
+        s.sync();
+        return;
+    }
+
+
+    /**
+     * WAVE-COOPERATIVE Q6_K x q8_K (plan 11.2).
+     *
+     * The Q4_K twin's decomposition applied to Q6_K's shape: one workgroup
+     * of 32 threads per output row, and here SIXTEEN lanes to a block
+     * rather than four, because Q6_K's natural unit is its 16-element
+     * sub-block — one per lane, two blocks in flight per wave.
+     *
+     * Q6_K quants are `(lo | hi<<4) - 32`, i.e. signed after the bias. The
+     * bias is NOT applied per element: dotAccum's fast tier is unsigned x
+     * signed, so the raw 0..63 value goes in and the bias leaves as
+     * `-32 * (sum of this lane's activations)`. That sum is taken the way
+     * llama.cpp takes it — a dot against all-ones — rather than read from a
+     * precomputed table, which is what frees the lane granularity.
+     *
+     * 10.5 measured a one-item-per-row Q6_K integer kernel as SLOWER than
+     * the f32 body it would replace, and 10.6 showed the format was not
+     * misaligned but ALU-bound. Neither says anything about this: 11.0's
+     * probe puts one-item-per-row's ceiling at ~162-170 GB/s and a
+     * coalesced pattern's at ~208, so the decomposition is the variable
+     * both of those held fixed.
+     *
+     * Every intermediate stays inside int32: a quant caps at 63 and an
+     * activation quant at 127, so a 16-element dot caps at 128016, the
+     * bias term at 65024, and a signed 8-bit scale takes the pair to about
+     * 24.5M — two orders inside int32, which matters because cajeta TRAPS
+     * on signed overflow rather than wrapping.
+     */
+    @Kernel
+    public static void q6kQ8WaveMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        Shared<float32> part = shared float32[32];
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 32;
+        int64 rowBytes = blocksPerRow * 210L;
+        float32 acc = 0.0f;
+        if (row < rows) {
+            int64 i = (int64) row;
+            int32 sb = (int32) (lane % 16);
+            int64 b = (int64) (lane / 16);
+            Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 210L;
+                float32 d = QuantKernel.f16AtDev(packed, ro + 208L);
+                int64 xb = b * 320L;
+
+                // The serial kernel's sub-block index maths, unchanged —
+                // one iteration of its `sb` loop is one lane here.
+                int32 g = sb / 8;
+                int32 r0 = sb * 16 - g * 128;
+                int32 sl = r0 / 64;
+                int32 l64 = r0 - sl * 64;
+                int32 shi = r0 / 32;
+                int32 l32 = r0 - shi * 32;
+                Vector<int8,16> qlv = packed.vload<16>(
+                    ro + (int64) (64 * g + l64));
+                Vector<int8,16> qhv = packed.vload<16>(
+                    ro + (int64) (128 + 32 * g + l32));
+                Vector<int8,16> lo = qlv & 15;
+                if (sl == 1) { lo = (qlv >> 4) & 15; }
+                Vector<int8,16> hi = (qhv >> (2 * shi)) & 3;
+                Vector<uint8,16> qu = (lo | (hi << 4)).asUnsigned();
+                Vector<int8,16> a = xp.vload<16>(xb + (int64) (sb * 16));
+                Vector<uint8,16> ones = (qu ^ qu) | 1;
+
+                Vector<int32,4> dv = qu.dotAccum(a, z4);
+                Vector<int32,4> sv = ones.dotAccum(a, z4);
+                int32 dot = dv[0] + dv[1] + dv[2] + dv[3];
+                int32 asum = sv[0] + sv[1] + sv[2] + sv[3];
+                int32 sc = (int32) packed[ro + (int64) (192 + sb)];
+
+                Vector<int8,4> dvs = xp.vload<4>(xb + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
+                    | (((int32) dvs[1] & 255) << 8)
+                    | (((int32) dvs[2] & 255) << 16)
+                    | (((int32) dvs[3] & 255) << 24));
+
+                acc = acc + d * xs * (float32) (sc * (dot - 32 * asum));
+                b = b + 2L;
+            }
+        }
+        part[lane] = acc;
+        Barrier.workgroup();
+        uint32 s = 16;
+        while (s > 0) {
+            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
+            Barrier.workgroup();
+            s = s / 2;
+        }
+        if (lane == 0 && row < rows) {
+            y[yOff + (int64) row] = part[0];
+        }
+    }
+
+    public static void q6kQ8WaveMatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        KernelStream s #= KernelStream.current();
+        q6kQ8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+            (y, packed, xp, ur, cols / 256L, yOff);
+        return;
+    }
+
+    public static void q6kQ8WaveMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q6kQ8WaveMatVecLaunchNoSync(y, packed, xp, rows, cols,
+            yOff);
+        KernelStream s #= KernelStream.current();
+        s.sync();
+        return;
+    }
+
+    /** {@link #q6kQ8WaveMatVecKernel} over HOST arrays. */
+    public static void q6kQ8WaveMatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, xOff, cols, xp);
+        float32[] yh #= heap float32[rows];
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        pb.upload(packed);
+        xpb.upload(xp);
+        QuantKernel.q6kQ8WaveMatVecLaunch(yb, pb, xpb, rows, cols, 0L);
+        yb.download(yh);
+        int64 i = 0;
+        while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
+        return;
+    }
+
     /**
      * `q4kMatVecKernel` over an INTERLEAVED weight (Quant.interleaveRows16).
      *
@@ -1158,6 +1465,26 @@ public final class QuantKernel {
         xdb.upload(xd);
         xbb.upload(xbs);
         QuantKernel.q4kQ8MatVecLaunch(yb, pb, xqb, xdb, xbb, rows, cols, 0L);
+        yb.download(yh);
+        int64 i = 0;
+        while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
+        return;
+    }
+
+    /** {@link #q4kQ8WaveMatVecKernel} over HOST arrays. */
+    public static void q4kQ8WaveMatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, xOff, cols, xp);
+        float32[] yh #= heap float32[rows];
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>(
+            (uint64) xp.count());
+        pb.upload(packed);
+        xpb.upload(xp);
+        QuantKernel.q4kQ8WaveMatVecLaunch(yb, pb, xpb, rows, cols, 0L);
         yb.download(yh);
         int64 i = 0;
         while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }

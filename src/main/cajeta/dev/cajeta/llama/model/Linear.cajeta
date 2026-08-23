@@ -48,6 +48,9 @@ public final class Linear extends InfModule {
     // the launch must agree, and flipping the static mid-run would put one
     // buffer's bytes under the other's kernel.
     boolean packed1;
+    boolean wave;
+    boolean wave6;
+    boolean packedAct;
     float32[] yScratch;
 
     // ── device-path phase timers (MEASUREMENT INSTRUMENT, plan 9.1) ──────
@@ -358,6 +361,36 @@ public final class Linear extends InfModule {
     static boolean packWant;
 
     /**
+     * The WAVE-COOPERATIVE mat-vec (plan 11.1) — one workgroup of 32
+     * threads per output row instead of one work item.
+     *
+     * Backend-resolved for two reasons, not one. It is a device
+     * optimization: 11.0 measured this machine's read ceiling at ~208 GB/s
+     * for a coalesced pattern against ~162-170 for one-row-per-work-item,
+     * so the whole point is a lane mapping the CPU backend has no analogue
+     * for. And it is presently WRONG on that backend — every row comes back
+     * exactly 0.0 (plan 11.5) — so this is a correctness gate as much as a
+     * performance one.
+     */
+    static boolean waveMv() {
+        if (!Linear.waveSet) {
+            String be #= Device.activeBackend();
+            Linear.waveWant = !(be.equals("cpu") || be.equals("none"));
+            Linear.waveSet = true;
+        }
+        return Linear.waveWant;
+    }
+
+    static boolean waveSet;
+    static boolean waveWant;
+
+    /** Arm for 11.1: force the one-item-per-row kernel back on. */
+    public static void setWaveMatVec(boolean on) {
+        Linear.waveWant = on;
+        Linear.waveSet = true;
+    }
+
+    /**
      * ONE sync per projection instead of one per dispatch (plan 10.3).
      *
      * `launchRows` issues a weight in row slices, and every slice used to
@@ -664,6 +697,29 @@ public final class Linear extends InfModule {
             this.unified = Linear.wantUnified;
             this.q8 = Linear.q8Route() && this.packedTy == Quant.GG_Q4_K;
             this.packed1 = Linear.packedActivations();
+            // `q8` is part of the condition, not an accident of ordering:
+            // the wave kernel is the INTEGER route's kernel, and a Q6_K
+            // weight beside it still dispatches the f32 one — which is
+            // chunked, and collapses to 9.6 GB/s if this flag turns
+            // chunking off on its behalf.
+            this.wave = Linear.waveMv() && this.packed1 && this.q8;
+            // Q6_K gets the wave decomposition too (plan 11.2), on its own
+            // kernel and WITHOUT the q8 integer route's activation switch —
+            // it reads the same packed q8_K block.
+            // Behind `q8Route` like every other route that CHANGES THE
+            // ANSWER (9.4's rule). Q6_K's wave kernel reads q8_K-quantized
+            // activations, so it carries the same approximation the Q4_K
+            // integer route does — measured at 0.028% on a real v_proj —
+            // and a caller that pins the switch off must still get the
+            // exact path.
+            this.wave6 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+                && this.packedTy == Quant.GG_Q6_K;
+            // WHAT THE KERNEL READS, which is not the same question as
+            // whether the integer route is on. A Q6_K wave weight has
+            // `q8 == false` — it makes no activation-quantization switch —
+            // and still reads the PACKED block. Keying the staging off `q8`
+            // fed it the f32 buffer instead.
+            this.packedAct = (this.q8 || this.wave6) && this.packed1;
             if (this.unified) { this.yDev.allocate(MemoryKind.Unified); }
         }
         if (!Linear.timeDev) {
@@ -746,7 +802,7 @@ public final class Linear extends InfModule {
     boolean stageHit(int64 srcOff) {
         return Linear.stShare && Linear.stValid
             && Linear.stOff == srcOff && Linear.stDim == this.inDim
-            && Linear.stQ8 == this.q8 && Linear.stCap >= this.inDim;
+            && Linear.stQ8 == this.packedAct && Linear.stCap >= this.inDim;
     }
 
     /** Grow the shared staging buffers to hold `n` activations. Sized to
@@ -784,7 +840,7 @@ public final class Linear extends InfModule {
             return;
         }
         Linear.stMisses = Linear.stMisses + 1L;
-        if (this.q8 && this.packed1) {
+        if (this.packedAct) {
             int64 p0 = Clock.nanoTime();
             Quant.q8kPack(Linear.stXh, 0L, (int64) this.inDim, Linear.stXph);
             Linear.tPack = Linear.tPack + (Clock.nanoTime() - p0);
@@ -823,7 +879,7 @@ public final class Linear extends InfModule {
         }
         Linear.stOff = srcOff;
         Linear.stDim = this.inDim;
-        Linear.stQ8 = this.q8;
+        Linear.stQ8 = this.packedAct;
         Linear.stValid = true;
         return;
     }
@@ -860,6 +916,13 @@ public final class Linear extends InfModule {
         int64 chunk = rows;
         int64 want = Linear.effectiveChunkRows();
         if (want > 0L) { chunk = want; }
+        // 9.1's chunking is a property of the ONE-ITEM-PER-ROW kernel, not
+        // of the dispatch. That kernel gives 5120 rows = 160 waves = one per
+        // SIMD, and slows down in both directions from there. The wave
+        // kernel puts one workgroup on each row, so 14336 rows is already
+        // 14336 workgroups and splitting them costs: measured 185.9 GB/s
+        // chunked against 197.3 whole, on the same weight in the same run.
+        if (this.wave || this.wave6) { chunk = rows; }
         if (chunk >= rows) {
             Linear.nLaunches = Linear.nLaunches + 1L;
             this.launchOne(this.packedDev, rows, 0L);
@@ -884,7 +947,15 @@ public final class Linear extends InfModule {
      *  Whether it waits is `oneSync`'s business, not this method's. */
     void launchOne(KernelBuffer<int8> w, int64 nr, int64 r0) {
         if (this.q8) {
-            if (this.packed1) {
+            if (this.wave) {
+                if (Linear.oneSync) {
+                    QuantKernel.q4kQ8WaveMatVecLaunchNoSync(this.yDev, w,
+                        Linear.stXp, nr, (int64) this.inDim, r0);
+                } else {
+                    QuantKernel.q4kQ8WaveMatVecLaunch(this.yDev, w,
+                        Linear.stXp, nr, (int64) this.inDim, r0);
+                }
+            } else if (this.packed1) {
                 if (Linear.oneSync) {
                     QuantKernel.q4kQ8PackedMatVecLaunchNoSync(this.yDev, w,
                         Linear.stXp, nr, (int64) this.inDim, r0);
@@ -898,6 +969,14 @@ public final class Linear extends InfModule {
             } else {
                 QuantKernel.q4kQ8MatVecLaunch(this.yDev, w, Linear.stXq,
                     Linear.stXd, Linear.stXbs, nr, (int64) this.inDim, r0);
+            }
+        } else if (this.wave6) {
+            if (Linear.oneSync) {
+                QuantKernel.q6kQ8WaveMatVecLaunchNoSync(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q6kQ8WaveMatVecLaunch(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
             }
         } else if (Linear.oneSync) {
             QuantKernel.matVecLaunchNoSync(this.packedTy, this.yDev, w,
