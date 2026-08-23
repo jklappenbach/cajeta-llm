@@ -3,6 +3,7 @@ package dev.cajeta.llama.model;
 import cajeta.lang.String;
 import cajeta.time.Clock;
 import cajeta.xpu.Device;
+import cajeta.xpu.MemoryKind;
 import cajeta.math.Tensor;
 import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llama.LlamaException;
@@ -41,6 +42,7 @@ public final class Linear extends InfModule {
     KernelBuffer<int8> packedDev;
     KernelBuffer<float32> xDev;
     KernelBuffer<float32> yDev;
+    boolean unified;
     float32[] xScratch;
     float32[] yScratch;
 
@@ -116,6 +118,56 @@ public final class Linear extends InfModule {
     // tell "the answer matched because slicing is correct" apart from "the
     // answer matched because slicing never happened".
     static int64 nLaunches;
+
+    // Activation residency: Unified (managed) instead of Device, so the two
+    // per-projection transfers become plain memcpys in the shared address
+    // space rather than driver calls.
+    //
+    // Worth trying because the phase split says so, not because an APU has
+    // unified memory in principle: at the new baseline an upload costs 22.9
+    // us for a 16 KB payload and a download 9.0 us, which is fixed cost, not
+    // bandwidth — 8.4 ms of a 56 ms token spent moving 4 MB.
+    //
+    // A HARD REQUIREMENT comes with it. `__cajeta_xpu_buffer_host_copy`
+    // returns silently when the buffer is not host-accessible, so a
+    // mis-allocated buffer does not fail — it feeds the kernel stale bytes.
+    // Any measurement of this arm has to check the OUTPUT, never just the
+    // clock.
+    static boolean wantUnified;
+
+    // CEILING INSTRUMENT, not a feature: skip the host<->device transfers
+    // and the scratch copies, keeping the launches. The output is garbage by
+    // construction (the kernel reads whatever x last held), so any timing
+    // taken with this set describes COST and never correctness.
+    //
+    // It exists because "device-resident activations are worth 8.4 ms" is
+    // otherwise a sum of five clock brackets, and the last time a token split
+    // was derived rather than observed it was wrong three times running.
+    // Removing the transfers can also move the launches — a cache is shared —
+    // which a sum of brackets cannot show.
+    static boolean skipTransfers;
+
+    public static void setSkipTransfersForMeasurement(boolean on) {
+        Linear.skipTransfers = on;
+    }
+
+    // The instrument that actually works. `skipTransfers` above REMOVES the
+    // uploads, which leaves uninitialized bytes in x — and the token then
+    // costs 94.95 ms against a 56.5 ms baseline, because denormal arithmetic
+    // is slower than the transfers it saved. Removing a thing changed two
+    // variables, so it bounds nothing.
+    //
+    // Repeating the transfers changes ONE. Same data, same arithmetic, same
+    // launches; only the number of transfer calls moves. The token's rise
+    // per extra round is the per-round cost, directly.
+    static int32 xferReps;
+
+    public static void setTransferReps(int32 n) { Linear.xferReps = n; }
+
+    public static void setUnifiedActivations(boolean on) {
+        Linear.wantUnified = on;
+    }
+    public static boolean unifiedActivations() { return Linear.wantUnified; }
 
     public static int64 launchCount() { return Linear.nLaunches; }
     public static void resetLaunchCount() { Linear.nLaunches = 0L; }
@@ -225,6 +277,7 @@ public final class Linear extends InfModule {
         this.yDev = null;
         this.xScratch = null;
         this.yScratch = null;
+        this.unified = false;
     }
 
     /** True when the weight is held in its PACKED block form and consumed
@@ -376,21 +429,49 @@ public final class Linear extends InfModule {
             this.yScratch #= heap float32[(int64) this.outDim];
             this.xDev #= heap KernelBuffer<float32>((uint64) this.inDim);
             this.yDev #= heap KernelBuffer<float32>((uint64) this.outDim);
+            // Latched per Linear at build time, not read per call: the
+            // store/load spelling below must match how the buffer was
+            // allocated, and flipping the static mid-run would desynchronize
+            // the two into a silent no-op.
+            this.unified = Linear.wantUnified;
+            if (this.unified) {
+                this.xDev.allocate(MemoryKind.Unified);
+                this.yDev.allocate(MemoryKind.Unified);
+            }
         }
         if (!Linear.timeDev) {
             int64 i = 0;
-            while (i < (int64) this.inDim) {
+            // Hoisted: the bound, not the body. A static read per element in
+            // a per-token copy loop is exactly the kind of overhead that
+            // shows up as a mysterious percent.
+            int64 nIn = Linear.skipTransfers ? 0L : (int64) this.inDim;
+            while (i < nIn) {
                 this.xScratch[i] = sb[so + i];
                 i = i + 1;
             }
-            this.xDev.upload(this.xScratch);
             // Offsets are zero HERE and not dropped: the scratch is exactly
             // one row wide, so the caller's `so`/`doff` are consumed by the
             // copies above and below.
+            if (!Linear.skipTransfers) {
+                int32 rep = 0;
+                while (rep <= Linear.xferReps) {
+                    if (this.unified) { this.xDev.hostStore(this.xScratch); }
+                    else { this.xDev.upload(this.xScratch); }
+                    rep = rep + 1;
+                }
+            }
             this.launchRows();
-            this.yDev.download(this.yScratch);
+            if (!Linear.skipTransfers) {
+                int32 rep2 = 0;
+                while (rep2 <= Linear.xferReps) {
+                    if (this.unified) { this.yDev.hostLoad(this.yScratch); }
+                    else { this.yDev.download(this.yScratch); }
+                    rep2 = rep2 + 1;
+                }
+            }
             i = 0;
-            while (i < (int64) this.outDim) {
+            int64 nOut = Linear.skipTransfers ? 0L : (int64) this.outDim;
+            while (i < nOut) {
                 db[doff + i] = this.yScratch[i];
                 i = i + 1;
             }
@@ -406,11 +487,13 @@ public final class Linear extends InfModule {
             i = i + 1;
         }
         int64 c1 = Clock.nanoTime();
-        this.xDev.upload(this.xScratch);
+        if (this.unified) { this.xDev.hostStore(this.xScratch); }
+        else { this.xDev.upload(this.xScratch); }
         int64 c2 = Clock.nanoTime();
         this.launchRows();
         int64 c3 = Clock.nanoTime();
-        this.yDev.download(this.yScratch);
+        if (this.unified) { this.yDev.hostLoad(this.yScratch); }
+        else { this.yDev.download(this.yScratch); }
         int64 c4 = Clock.nanoTime();
         i = 0;
         while (i < (int64) this.outDim) {
