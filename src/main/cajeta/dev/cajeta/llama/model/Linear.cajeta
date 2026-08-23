@@ -44,6 +44,10 @@ public final class Linear extends InfModule {
     KernelBuffer<float32> yDev;
     boolean unified;
     boolean q8;
+    // Latched beside `q8` and for the same reason: the staging spelling and
+    // the launch must agree, and flipping the static mid-run would put one
+    // buffer's bytes under the other's kernel.
+    boolean packed1;
     float32[] yScratch;
 
     // ── device-path phase timers (MEASUREMENT INSTRUMENT, plan 9.1) ──────
@@ -58,6 +62,14 @@ public final class Linear extends InfModule {
     // thing being measured.
     static int64 tCopyIn;
     static int64 tUpload;
+    // The upload phase is not one thing. Quantizing an activation into
+    // packed form is HOST arithmetic over 4096-14336 floats and sits inside
+    // the same window as the driver call, so a change that removes driver
+    // calls can look like it did almost nothing. Split, so the two are
+    // attributable separately.
+    static int64 tPack;
+    static int64 nPack;
+    static int64 nUploadCalls;
     static int64 tLaunch;
     static int64 tDownload;
     static int64 tCopyOut;
@@ -212,10 +224,16 @@ public final class Linear extends InfModule {
     static boolean stValid;
     static int32 stCap;
     static KernelBuffer<float32> stX;
+    // ONE buffer for the integer form (plan 10.1). It was three — quants,
+    // scales, group sums — and three is three driver calls per distinct
+    // activation, where the block layout `Quant.q8kPack` writes is
+    // self-contained.
+    static KernelBuffer<int8> stXp;
     static KernelBuffer<int8> stXq;
     static KernelBuffer<float32> stXd;
     static KernelBuffer<int32> stXbs;
     static float32[] stXh;
+    static int8[] stXph;
     static int8[] stXqh;
     static float32[] stXdh;
     static int32[] stXbsh;
@@ -306,6 +324,39 @@ public final class Linear extends InfModule {
      * roofline and pays back some of it in transfers) — so a backend where
      * neither holds should be able to answer no.
      */
+    /**
+     * Does the integer route stage its activation as ONE packed buffer
+     * (plan 10.1) or as the three typed ones?
+     *
+     * A DEVICE property crossed with a KERNEL property, resolved the same
+     * way 9.1's launch geometry is, and for the same reason. Packing trades
+     * driver calls for arithmetic: the block's scale and eight sub-block
+     * sums are rebuilt from bytes on every block of every row.
+     *
+     * On a real device that trade is free on the compute side and worth
+     * ~2.7%: the scalars' addresses do not depend on the work item, so the
+     * assembly is uniform and runs on the scalar unit beside the vector
+     * loads, while three uploads at ~23us each become one.
+     *
+     * On the CPU backend there is nothing to buy. An "upload" is a memcpy,
+     * so collapsing three into one saves nothing — and the decode is redone
+     * per ROW, because each work item is its own call and there is no
+     * scalar unit to hide it behind. MEASURED at 76.6/75.9 ms/token against
+     * the three-buffer form's 73.6/71.0, in both arm orders. So the CPU
+     * keeps the typed buffers.
+     */
+    static boolean packedActivations() {
+        if (!Linear.packSet) {
+            String be #= Device.activeBackend();
+            Linear.packWant = !(be.equals("cpu") || be.equals("none"));
+            Linear.packSet = true;
+        }
+        return Linear.packWant;
+    }
+
+    static boolean packSet;
+    static boolean packWant;
+
     static boolean q8Route() {
         if (!Linear.q8Set) {
             String be #= Device.activeBackend();
@@ -375,6 +426,7 @@ public final class Linear extends InfModule {
         if (on) { Linear.resetDeviceTimers(); }
     }
     public static void resetDeviceTimers() {
+        Linear.tPack = 0L; Linear.nPack = 0L; Linear.nUploadCalls = 0L;
         Linear.tCopyIn = 0L; Linear.tUpload = 0L; Linear.tLaunch = 0L;
         Linear.tDownload = 0L; Linear.tCopyOut = 0L; Linear.nDevCalls = 0L;
         Linear.bkBytes #= heap int64[16];
@@ -413,6 +465,9 @@ public final class Linear extends InfModule {
     }
     public static int64 devCopyInNs()   { return Linear.tCopyIn; }
     public static int64 devUploadNs()   { return Linear.tUpload; }
+    public static int64 devPackNs()     { return Linear.tPack; }
+    public static int64 devPackCalls()  { return Linear.nPack; }
+    public static int64 devUploadCalls(){ return Linear.nUploadCalls; }
     public static int64 devLaunchNs()   { return Linear.tLaunch; }
     public static int64 devDownloadNs() { return Linear.tDownload; }
     public static int64 devCopyOutNs()  { return Linear.tCopyOut; }
@@ -588,6 +643,7 @@ public final class Linear extends InfModule {
             // the two into a silent no-op.
             this.unified = Linear.wantUnified;
             this.q8 = Linear.q8Route() && this.packedTy == Quant.GG_Q4_K;
+            this.packed1 = Linear.packedActivations();
             if (this.unified) { this.yDev.allocate(MemoryKind.Unified); }
         }
         if (!Linear.timeDev) {
@@ -679,8 +735,13 @@ public final class Linear extends InfModule {
     static void ensureStage(int32 n) {
         if (Linear.stCap >= n) { return; }
         int64 ln = (int64) n;
+        int64 pb = Quant.q8kPackedBytes(ln);
         Linear.stXh #= heap float32[ln];
         Linear.stX #= heap KernelBuffer<float32>((uint64) ln);
+        // Both integer stagings are allocated; which one is FILLED is the
+        // backend's answer (packedActivations). ~18 KB for the unused one.
+        Linear.stXph #= heap int8[pb];
+        Linear.stXp #= heap KernelBuffer<int8>((uint64) pb);
         Linear.stXqh #= heap int8[ln];
         Linear.stXdh #= heap float32[ln / 256L];
         Linear.stXbsh #= heap int32[ln / 16L];
@@ -703,26 +764,42 @@ public final class Linear extends InfModule {
             return;
         }
         Linear.stMisses = Linear.stMisses + 1L;
-        if (this.q8) {
+        if (this.q8 && this.packed1) {
+            int64 p0 = Clock.nanoTime();
+            Quant.q8kPack(Linear.stXh, 0L, (int64) this.inDim, Linear.stXph);
+            Linear.tPack = Linear.tPack + (Clock.nanoTime() - p0);
+            Linear.nPack = Linear.nPack + 1L;
+            Linear.nUploadCalls = Linear.nUploadCalls + 1L;
+            // ONE call, and only over this projection's OWN bytes.
+            //
+            // The stage is sized to the largest inDim ever seen, so a plain
+            // `upload(host)` would ship 17920 bytes where 5120 are live —
+            // charged for capacity rather than content. Measured: with the
+            // whole buffer going, three small uploads were CHEAPER than one
+            // big one, and 10.1 read as a 1.5% win instead of what it is.
+            Linear.stXp.upload(Linear.stXph,
+                Quant.q8kPackedBytes((int64) this.inDim));
+        } else if (this.q8) {
+            int64 p0 = Clock.nanoTime();
             Quant.q8kQuantize(Linear.stXh, 0L, (int64) this.inDim,
                 Linear.stXqh, Linear.stXdh, Linear.stXbsh);
-            if (Linear.asyncXfer) {
-                KernelStream s #= KernelStream.current();
-                Linear.stXq.uploadAsync(Linear.stXqh, s);
-                Linear.stXd.uploadAsync(Linear.stXdh, s);
-                Linear.stXbs.uploadAsync(Linear.stXbsh, s);
-            } else {
-                Linear.stXq.upload(Linear.stXqh);
-                Linear.stXd.upload(Linear.stXdh);
-                Linear.stXbs.upload(Linear.stXbsh);
-            }
+            Linear.tPack = Linear.tPack + (Clock.nanoTime() - p0);
+            Linear.nPack = Linear.nPack + 1L;
+            Linear.nUploadCalls = Linear.nUploadCalls + 3L;
+            int64 n = (int64) this.inDim;
+            Linear.stXq.upload(Linear.stXqh, n);
+            Linear.stXd.upload(Linear.stXdh, n / 256L);
+            Linear.stXbs.upload(Linear.stXbsh, n / 16L);
         } else if (this.unified) {
             Linear.stX.hostStore(Linear.stXh);
-        } else if (Linear.asyncXfer) {
-            KernelStream s #= KernelStream.current();
-            Linear.stX.uploadAsync(Linear.stXh, s);
         } else {
-            Linear.stX.upload(Linear.stXh);
+            // Same prefix, same reason — and this path had the bug FIRST.
+            // Before the shared stage each Linear owned an `xScratch` sized
+            // to its own inDim, so the f32 upload was exactly right; making
+            // the stage shared silently made every 4096-wide projection ship
+            // a 14336-wide buffer. The staging win covered for it.
+            Linear.nUploadCalls = Linear.nUploadCalls + 1L;
+            Linear.stX.upload(Linear.stXh, (int64) this.inDim);
         }
         Linear.stOff = srcOff;
         Linear.stDim = this.inDim;
@@ -766,9 +843,15 @@ public final class Linear extends InfModule {
         if (chunk >= rows) {
             Linear.nLaunches = Linear.nLaunches + 1L;
             if (this.q8) {
-                QuantKernel.q4kQ8MatVecLaunch(this.yDev, this.packedDev,
-                    Linear.stXq, Linear.stXd, Linear.stXbs, rows,
-                    (int64) this.inDim, 0L);
+                if (this.packed1) {
+                    QuantKernel.q4kQ8PackedMatVecLaunch(this.yDev,
+                        this.packedDev, Linear.stXp, rows,
+                        (int64) this.inDim, 0L);
+                } else {
+                    QuantKernel.q4kQ8MatVecLaunch(this.yDev, this.packedDev,
+                        Linear.stXq, Linear.stXd, Linear.stXbs, rows,
+                        (int64) this.inDim, 0L);
+                }
             } else {
                 QuantKernel.matVecLaunch(this.packedTy, this.yDev,
                     this.packedDev, Linear.stX, rows, (int64) this.inDim,
@@ -784,8 +867,13 @@ public final class Linear extends InfModule {
             KernelBuffer<int8> sub #= this.packedDev.slice(
                 (uint64) (r0 * rowBytes), (uint64) (nr * rowBytes));
             if (this.q8) {
-                QuantKernel.q4kQ8MatVecLaunch(this.yDev, sub, Linear.stXq,
-                    Linear.stXd, Linear.stXbs, nr, (int64) this.inDim, r0);
+                if (this.packed1) {
+                    QuantKernel.q4kQ8PackedMatVecLaunch(this.yDev, sub,
+                        Linear.stXp, nr, (int64) this.inDim, r0);
+                } else {
+                    QuantKernel.q4kQ8MatVecLaunch(this.yDev, sub, Linear.stXq,
+                        Linear.stXd, Linear.stXbs, nr, (int64) this.inDim, r0);
+                }
             } else {
                 QuantKernel.matVecLaunch(this.packedTy, this.yDev, sub,
                     Linear.stX, nr, (int64) this.inDim, 0L, r0);

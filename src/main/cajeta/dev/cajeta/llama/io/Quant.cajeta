@@ -694,6 +694,134 @@ public final class Quant {
     }
 
     /**
+     * The PACKED q8_K activation block — llama.cpp's `block_q8_1` idea
+     * carried to q8_K's 256-element block: one self-contained buffer
+     * holding the quants AND their scalars, so a device stage is ONE
+     * upload instead of three (plan 10.1).
+     *
+     * 320 bytes per 256 activations:
+     *
+     * | bytes | holds |
+     * |---|---|
+     * | [0, 256)   | the 256 int8 quants |
+     * | [256, 288) | 8 x int32 SUB-BLOCK sums |
+     * | [288, 292) | the block scale, as its IEEE-754 f32 bits |
+     * | [292, 320) | pad |
+     *
+     * Two things in that table are load-bearing rather than arbitrary.
+     *
+     * EIGHT sub-block sums, where {@link #q8kQuantize} produces sixteen
+     * group sums. Both consumers — the host `q4kMatVecIntoQ8` and the
+     * kernel — only ever read them as `bsums[2sb] + bsums[2sb+1]`, because
+     * Q4_K's mins are per 32-element sub-block. Folding the pair here is
+     * the same int32 addition moved off the inner loop, so the packed form
+     * is BIT-IDENTICAL to the three-array form, not merely close.
+     *
+     * The 320-byte STRIDE, where the payload is 292. The kernel reads the
+     * quants with 32-byte vector loads, so a block must start on a 32-byte
+     * boundary; 320 is the next multiple of 32. Even padded, the buffer is
+     * smaller than the three arrays it replaces (n + n/64 + n/4 bytes).
+     *
+     * The sums sit at 256 and the scale after them, rather than the other
+     * way round, so all eight arrive in ONE 32-byte aligned load.
+     */
+    public static int64 q8kPackedBytes(int64 n) {
+        return (n / 256L) * 320L;
+    }
+
+    /** Byte offset of block `b`'s scale bits within a packed buffer. */
+    public static int64 q8kScaleOffset(int64 b) { return b * 320L + 288L; }
+
+    /** Byte offset of block `b`'s sub-block sum `sb` (0..7). */
+    public static int64 q8kSumOffset(int64 b, int64 sb) {
+        return b * 320L + 256L + sb * 4L;
+    }
+
+    /**
+     * Quantize `n` activations straight into {@link #q8kPackedBytes} form.
+     *
+     * One pass, no intermediate arrays: this runs per distinct activation
+     * per token, and the three-array form existed only because the device
+     * side wanted three buffers.
+     */
+    public static void q8kPack(float32[] x, int64 xOff, int64 n, int8[] out) {
+        int64 blocks = n / 256L;
+        int64 b = 0;
+        while (b < blocks) {
+            int64 xb = xOff + b * 256L;
+            int64 ob = b * 320L;
+            float32 amax = 0.0f;
+            int32 i = 0;
+            while (i < 256) {
+                float32 v = x[xb + (int64) i];
+                float32 av = v < 0.0f ? 0.0f - v : v;
+                if (av > amax) { amax = av; }
+                i = i + 1;
+            }
+            // An all-zero block quantizes to all-zero with a zero scale; the
+            // reciprocal has to be guarded or it is inf * 0.
+            float32 inv = 0.0f;
+            if (amax > 0.0f) { inv = 127.0f / amax; }
+            int32 sb = 0;
+            while (sb < 8) {
+                int32 s = 0;
+                int32 k = 0;
+                while (k < 32) {
+                    int64 idx = (int64) (sb * 32 + k);
+                    int32 qi = (int32) Math.round(x[xb + idx] * inv);
+                    out[ob + idx] = (int8) qi;
+                    s = s + qi;
+                    k = k + 1;
+                }
+                Quant.storeI32LE(out, ob + 256L + (int64) (sb * 4), s);
+                sb = sb + 1;
+            }
+            // The scale is amax/127, so it is NEVER negative — which is why
+            // the kernel may rebuild these four bytes with a plain shifted
+            // OR without the top byte overflowing int32.
+            Quant.storeI32LE(out, ob + 288L, Cajeta.f32ToBits(amax / 127.0f));
+            b = b + 1;
+        }
+    }
+
+    /** Little-endian int32 into a byte array, wrapping each byte into
+     *  int8's range explicitly rather than relying on a narrowing cast. */
+    static void storeI32LE(int8[] o, int64 at, int32 v) {
+        Quant.storeByte(o, at, v & 255);
+        Quant.storeByte(o, at + 1L, (v >> 8) & 255);
+        Quant.storeByte(o, at + 2L, (v >> 16) & 255);
+        Quant.storeByte(o, at + 3L, (v >> 24) & 255);
+    }
+
+    static void storeByte(int8[] o, int64 at, int32 u) {
+        int32 w = u;
+        if (w > 127) { w = w - 256; }
+        o[at] = (int8) w;
+    }
+
+    /** Read block `b`'s scale back out of a packed buffer — the HOST twin
+     *  of what the kernel does, so a round-trip test can assert the layout
+     *  rather than only the result. */
+    public static float32 q8kPackedScale(int8[] p, int64 b) {
+        return Cajeta.bitsToF32(Quant.loadI32LE(p, b * 320L + 288L));
+    }
+
+    /** Read block `b`'s sub-block sum `sb` back out of a packed buffer. */
+    public static int32 q8kPackedSum(int8[] p, int64 b, int64 sb) {
+        return Quant.loadI32LE(p, b * 320L + 256L + sb * 4L);
+    }
+
+    static int32 loadI32LE(int8[] p, int64 at) {
+        // The top byte keeps its SIGN EXTENSION rather than being masked:
+        // `(b3 & 255) << 24` would overflow int32 for a negative word, and
+        // `b3 << 24` for b3 in [-128,127] lands exactly on the right bits.
+        return ((int32) p[at] & 255)
+            | (((int32) p[at + 1L] & 255) << 8)
+            | (((int32) p[at + 2L] & 255) << 16)
+            | (((int32) p[at + 3L]) << 24);
+    }
+
+    /**
      * y = W·x for PACKED Q4_K rows against q8_K-quantized activations.
      *
      * One `dotAccum` per 32-element sub-block, scaled in INTEGER space and

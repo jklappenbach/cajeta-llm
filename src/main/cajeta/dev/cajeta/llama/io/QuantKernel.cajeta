@@ -612,6 +612,147 @@ public final class QuantKernel {
         return;
     }
 
+
+    /**
+     * The integer path over ONE packed activation buffer (plan 10.1).
+     *
+     * Body for body the same arithmetic as {@link #q4kQ8MatVecKernel} —
+     * same loads of the weight, same dotAccum tiers, same order of sums —
+     * with the activation's three buffers replaced by `Quant.q8kPack`'s
+     * self-contained 320-byte block. That is a TRANSFER change, not a
+     * compute one: three driver calls per distinct activation become one,
+     * and the results stay bit-identical because folding q8_K's group sums
+     * into sub-block pairs is the same int32 addition performed earlier.
+     *
+     * The scalars are rebuilt from bytes here rather than read from typed
+     * buffers. They are UNIFORM across the dispatch — their address does
+     * not depend on the work item — so the assembly is scalar-unit work
+     * beside the vector loads it accompanies.
+     */
+    @Kernel
+    public static void q4kQ8PackedMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 144L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 144L;
+
+                // The header — { f16 d; f16 dmin; u8 scales[12] } = 16 bytes.
+                Vector<int8,16> hv = packed.vload<16>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                int32 d0 = (int32) hv[4] & 255;
+                int32 d1 = (int32) hv[5] & 255;
+                int32 d2 = (int32) hv[6] & 255;
+                int32 d3 = (int32) hv[7] & 255;
+                int32 m0 = (int32) hv[8] & 255;
+                int32 m1 = (int32) hv[9] & 255;
+                int32 m2 = (int32) hv[10] & 255;
+                int32 m3 = (int32) hv[11] & 255;
+                int32 k0 = (int32) hv[12] & 255;
+                int32 k1 = (int32) hv[13] & 255;
+                int32 k2 = (int32) hv[14] & 255;
+                int32 k3 = (int32) hv[15] & 255;
+
+                // No int32 buffer to borrow a zero from any more, now that
+                // the sums arrive as bytes — so the accumulator seed is
+                // constructed rather than loaded.
+                Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0,
+                                                          0, 0, 0, 0);
+                Vector<int32,8> scv = zv;
+                Vector<int32,8> mnv = zv;
+                scv[0] = d0 & 63;
+                scv[1] = d1 & 63;
+                scv[2] = d2 & 63;
+                scv[3] = d3 & 63;
+                scv[4] = (k0 & 15) | ((d0 >> 2) & 48);
+                scv[5] = (k1 & 15) | ((d1 >> 2) & 48);
+                scv[6] = (k2 & 15) | ((d2 >> 2) & 48);
+                scv[7] = (k3 & 15) | ((d3 >> 2) & 48);
+                mnv[0] = m0 & 63;
+                mnv[1] = m1 & 63;
+                mnv[2] = m2 & 63;
+                mnv[3] = m3 & 63;
+                mnv[4] = (k0 >> 4) | ((m0 >> 2) & 48);
+                mnv[5] = (k1 >> 4) | ((m1 >> 2) & 48);
+                mnv[6] = (k2 >> 4) | ((m2 >> 2) & 48);
+                mnv[7] = (k3 >> 4) | ((m3 >> 2) & 48);
+
+                // The activation block: quants at [0,256), sums at [256,288),
+                // scale bits at [288,292), stride 320.
+                int64 xb = b * 320L;
+                Vector<int32,8> tot = zv;
+                int32 g = 0;
+                while (g < 4) {
+                    Vector<uint8,32> raw = packed.vload<32>(
+                        ro + 16L + (int64) (32 * g)).asUnsigned();
+                    Vector<uint8,32> lo = raw & 15;
+                    Vector<uint8,32> hi = (raw >> 4) & 15;
+                    Vector<int8,32> a0 = xp.vload<32>(xb + (int64) (64 * g));
+                    Vector<int8,32> a1 = xp.vload<32>(
+                        xb + (int64) (64 * g + 32));
+                    tot = tot + lo.dotAccum(a0, zv) * scv[2 * g];
+                    tot = tot + hi.dotAccum(a1, zv) * scv[2 * g + 1];
+                    g = g + 1;
+                }
+                int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
+                           + tot[4] + tot[5] + tot[6] + tot[7];
+
+                // All eight sub-block sums in ONE aligned 32-byte load —
+                // which is why they sit before the scale in the block.
+                Vector<int8,32> sv = xp.vload<32>(xb + 256L);
+                int32 dmins = 0;
+                int32 sb = 0;
+                while (sb < 8) {
+                    int32 sbb = sb * 4;
+                    // The top byte keeps its sign extension: `& 255` then
+                    // `<< 24` would overflow int32 on a negative sum, and
+                    // cajeta TRAPS rather than wrapping.
+                    int32 ps = ((int32) sv[sbb] & 255)
+                        | (((int32) sv[sbb + 1] & 255) << 8)
+                        | (((int32) sv[sbb + 2] & 255) << 16)
+                        | (((int32) sv[sbb + 3]) << 24);
+                    dmins = dmins + mnv[sb] * ps;
+                    sb = sb + 1;
+                }
+
+                // The scale is amax/127 and so never negative, which is what
+                // lets the top byte be masked and shifted like the others.
+                Vector<int8,16> dv = xp.vload<16>(xb + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+
+                acc = acc + d * xs * (float32) sumi
+                          - dmin * xs * (float32) dmins;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
+    /** {@link #q4kQ8MatVecLaunch} over the packed activation buffer. */
+    public static void q4kQ8PackedMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s #= KernelStream.current();
+        q4kQ8PackedMatVecKernel.launch(s,
+            grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, xp, ur, cols / 256L, yOff);
+        s.sync();
+        return;
+    }
+
     /**
      * `q4kMatVecKernel` over an INTERLEAVED weight (Quant.interleaveRows16).
      *
@@ -936,6 +1077,31 @@ public final class QuantKernel {
         xdb.upload(xd);
         xbb.upload(xbs);
         QuantKernel.q4kQ8MatVecLaunch(yb, pb, xqb, xdb, xbb, rows, cols, 0L);
+        yb.download(yh);
+        int64 i = 0;
+        while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
+        return;
+    }
+
+    /**
+     * `q4kQ8PackedMatVecKernel` over HOST arrays — the shape a test can
+     * call, and the twin of {@link #q4kQ8MatVecIntoDevice} so the two
+     * routes can be compared with everything but the activation layout
+     * held fixed.
+     */
+    public static void q4kQ8PackedMatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, xOff, cols, xp);
+        float32[] yh #= heap float32[rows];
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>(
+            (uint64) xp.count());
+        pb.upload(packed);
+        xpb.upload(xp);
+        QuantKernel.q4kQ8PackedMatVecLaunch(yb, pb, xpb, rows, cols, 0L);
         yb.download(yh);
         int64 i = 0;
         while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
