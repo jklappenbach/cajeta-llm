@@ -18,8 +18,19 @@ import cajeta.lang.String;
  * in and out through fixed-size scratch, offsets that no longer reach the
  * kernel because the scratch is exactly one row wide. Those are the things
  * that can be wrong while the arithmetic stays right, so every test below
- * compares ROUTED against FORCED-SERIAL on the same `Linear`, and the bar
- * is again bit-identity rather than a tolerance.
+ * compares ROUTED against FORCED-SERIAL on the same `Linear`.
+ *
+ * The bar there is a TOLERANCE, and that is a correction. The file was
+ * written when the kernel summed 16 lanes like `Quant.q4kMatVecInto` and
+ * demanded bit-identity of the pair; the kernel went to 4 lanes for a 3.7x
+ * (plan 6.3.3) and the two now reassociate the same products differently by
+ * construction. Nothing caught the stale bar because this file called an
+ * `assertClose` that was never defined, so it has not compiled — and none
+ * of these tests has run — since commit 08b7bcd.
+ *
+ * Bit-identity is still the bar wherever the lane counts actually match:
+ * `QuantKernelTest` holds each kernel against `q4kMatVecIntoLanes4`, and
+ * the routed-vs-routed comparisons below (offsets, row slicing) are exact.
  *
  * The fixture is `toy-q4k.gguf` (tools/gguf/gen_q4k_linear_fixture.py): a
  * Q4_K tensor and a Q6_K tensor built from the REAL blocks already checked
@@ -47,6 +58,38 @@ public class LinearKernelRouteTest {
             i = i + 1;
         }
         return #t;
+    }
+
+    /**
+     * The file's comparison bar, factored out.
+     *
+     * NOT NEW BEHAVIOUR — `q8WeightIsUnaffectedByTheQ4KRoute` has called
+     * this since it was written and it was never defined, so this file has
+     * not compiled since commit 08b7bcd and NONE of its routing tests have
+     * ever run. A test that cannot compile fails exactly like a test that
+     * does not exist.
+     *
+     * `exact` is what the surrounding tests demand of a kernel checked
+     * against a serial reference over the same bytes in the same order:
+     * bit-identity, not a tolerance. The tolerant branch exists for
+     * comparisons that legitimately reassociate.
+     */
+    static void assertClose(float32 got, float32 want, boolean exact,
+            String what) {
+        if (exact) {
+            if (got != want) {
+                Assert.fail(what + ": got " + got + " want " + want
+                    + " (bit-identity required)");
+            }
+            return;
+        }
+        float32 d = got - want;
+        if (d < 0.0f) { d = 0.0f - d; }
+        float32 scale = want < 0.0f ? 0.0f - want : want;
+        if (d > 0.000001f + scale * 0.000001f) {
+            Assert.fail(what + ": got " + got + " want " + want);
+        }
+        return;
     }
 
     static void assertLive(Tensor<float32> t, int64 n, String what) {
@@ -92,10 +135,15 @@ public class LinearKernelRouteTest {
         LinearKernelRouteTest.assertLive(got, (int64) outDim, "routed");
         int64 o = 0;
         while (o < (int64) outDim) {
-            if (got.flatGet(o) != want.flatGet(o)) {
-                Assert.fail("row " + o + ": routed " + got.flatGet(o)
-                    + " vs serial " + want.flatGet(o));
-            }
+            // TOLERANCE, not bit-identity, and only for routed-vs-SERIAL:
+            // the kernel sums 4 lanes wide and `Quant.q4kMatVecInto` sums 16,
+            // so they reassociate the same products differently by design
+            // (plan 6.3.3 — the 4-lane shape is 3.7x faster). Bit-identity
+            // still holds where the lane counts match, and that is where it
+            // is asserted: QuantKernelTest against `q4kMatVecIntoLanes4`,
+            // and routed-vs-routed below.
+            LinearKernelRouteTest.assertClose(got.flatGet(o),
+                want.flatGet(o), false, "row " + o);
             o = o + 1;
         }
         ck.close();
@@ -146,10 +194,8 @@ public class LinearKernelRouteTest {
                 "routed call " + call);
             int64 o = 0;
             while (o < (int64) outDim) {
-                if (got.flatGet(o) != want.flatGet(o)) {
-                    Assert.fail("call " + call + " row " + o + ": routed "
-                        + got.flatGet(o) + " vs serial " + want.flatGet(o));
-                }
+                LinearKernelRouteTest.assertClose(got.flatGet(o),
+                    want.flatGet(o), false, "call " + call + " row " + o);
                 o = o + 1;
             }
             call = call + 1;
@@ -261,10 +307,8 @@ public class LinearKernelRouteTest {
                 "routed " + nm);
             int64 o = 0;
             while (o < (int64) outDim) {
-                if (got.flatGet(o) != want.flatGet(o)) {
-                    Assert.fail(nm + " row " + o + ": routed "
-                        + got.flatGet(o) + " vs serial " + want.flatGet(o));
-                }
+                LinearKernelRouteTest.assertClose(got.flatGet(o),
+                    want.flatGet(o), false, nm + " row " + o);
                 o = o + 1;
             }
             pass = pass + 1;
@@ -312,6 +356,106 @@ public class LinearKernelRouteTest {
                 off.flatGet(o), true, "q8 row " + o);
             o = o + 1;
         }
+        ck.close();
+    }
+
+    /**
+     * A ROW-SLICED launch computes exactly what a whole-weight launch does.
+     *
+     * Splitting one dispatch into row slices is worth 1.74x on gfx1151 (98.8
+     * to 56.7 ms/token) because the kernel's speed is set by its grid, not by
+     * the weight's size. It is only worth anything if the answer is
+     * unchanged, and the slice has two adjustments that can each be wrong on
+     * their own: the packed buffer is re-based to the chunk's first row, and
+     * `yOff` carries the chunk's offset into the output.
+     *
+     * The bar is bit-identity against BOTH the whole-weight route and the
+     * serial reference, and the launch COUNT is asserted alongside the
+     * values — 4 dispatches for 8 rows in chunks of 2, and 1 without. A test
+     * that checked only the numbers would pass just as happily against a
+     * build where chunking silently never engaged, which is the failure this
+     * exists to catch.
+     */
+    @Test
+    public void rowSlicedLaunchesMatchAWholeWeightLaunch() {
+        Checkpoint ck #= Checkpoint.open(LinearKernelRouteTest.Q4K);
+        int64[] shp #= ck.shapeOf(LinearKernelRouteTest.Q4K_NAME);
+        int32 outDim = (int32) shp[0];
+        int32 inDim = (int32) shp[1];
+
+        Linear lin #= heap Linear(inDim, outDim);
+        lin.bind(ck, LinearKernelRouteTest.Q4K_NAME, false);
+        Assert.isTrue(lin.isPacked());
+
+        Tensor<float32> src #= LinearKernelRouteTest.ramp((int64) inDim, 0L);
+        int64[] oshp #= heap int64[1];
+        oshp[0] = (int64) outDim;
+        Tensor<float32> ser #= Tensor.zeros<float32>(oshp);
+        Tensor<float32> whole #= Tensor.zeros<float32>(oshp);
+        Tensor<float32> sliced #= Tensor.zeros<float32>(oshp);
+
+        QuantKernel.setRoutingEnabled(false);
+        lin.matvecInto(src, 0L, ser, 0L);
+
+        QuantKernel.setRoutingEnabled(true);
+        Linear.setLaunchChunkRows(0L);              // one dispatch
+        Linear.resetLaunchCount();
+        lin.matvecInto(src, 0L, whole, 0L);
+        int64 nWhole = Linear.launchCount();
+
+        Linear.setLaunchChunkRows(2L);              // 8 rows -> 4 dispatches
+        Linear.resetLaunchCount();
+        lin.matvecInto(src, 0L, sliced, 0L);
+        int64 nSliced = Linear.launchCount();
+
+        LinearKernelRouteTest.assertLive(whole, (int64) outDim, "whole");
+        LinearKernelRouteTest.assertLive(sliced, (int64) outDim, "sliced");
+        // The mechanism moved, and it moved by the amount the chunk size
+        // implies -- not merely "more than one".
+        Assert.equals(1L, nWhole);
+        Assert.equals(((int64) outDim + 1L) / 2L, nSliced);
+
+        int64 o = 0;
+        while (o < (int64) outDim) {
+            LinearKernelRouteTest.assertClose(sliced.flatGet(o),
+                whole.flatGet(o), true, "sliced vs whole row " + o);
+            // Against the SERIAL path the bar is a tolerance for the lane
+            // reason above; against the whole-weight LAUNCH it is exact,
+            // because that pair differs only in grid.
+            LinearKernelRouteTest.assertClose(sliced.flatGet(o),
+                ser.flatGet(o), false, "sliced vs serial row " + o);
+            o = o + 1;
+        }
+        Linear.setLaunchChunkRows(0L);
+        ck.close();
+    }
+
+    /**
+     * A chunk size at or above the row count leaves ONE dispatch — the
+     * does-not-fire half. Without it, "chunking is correct" and "chunking is
+     * unreachable" look the same from the outside.
+     */
+    @Test
+    public void aChunkLargerThanTheWeightIssuesASingleLaunch() {
+        Checkpoint ck #= Checkpoint.open(LinearKernelRouteTest.Q4K);
+        int64[] shp #= ck.shapeOf(LinearKernelRouteTest.Q4K_NAME);
+        int32 outDim = (int32) shp[0];
+        int32 inDim = (int32) shp[1];
+
+        Linear lin #= heap Linear(inDim, outDim);
+        lin.bind(ck, LinearKernelRouteTest.Q4K_NAME, false);
+        Tensor<float32> src #= LinearKernelRouteTest.ramp((int64) inDim, 0L);
+        int64[] oshp #= heap int64[1];
+        oshp[0] = (int64) outDim;
+        Tensor<float32> y #= Tensor.zeros<float32>(oshp);
+
+        QuantKernel.setRoutingEnabled(true);
+        Linear.setLaunchChunkRows((int64) outDim * 4L);
+        Linear.resetLaunchCount();
+        lin.matvecInto(src, 0L, y, 0L);
+        Assert.equals(1L, Linear.launchCount());
+        LinearKernelRouteTest.assertLive(y, (int64) outDim, "oversized chunk");
+        Linear.setLaunchChunkRows(0L);
         ck.close();
     }
 }

@@ -1,6 +1,8 @@
 package dev.cajeta.llama.model;
 
 import cajeta.lang.String;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
 import cajeta.math.Tensor;
 import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llama.LlamaException;
@@ -41,6 +43,176 @@ public final class Linear extends InfModule {
     KernelBuffer<float32> yDev;
     float32[] xScratch;
     float32[] yScratch;
+
+    // ── device-path phase timers (MEASUREMENT INSTRUMENT, plan 9.1) ──────
+    //
+    // The GPU arm runs at the same ~48 GB/s as the CPU on hardware with
+    // roughly 5x the bandwidth, which is the signature of launch-bound
+    // rather than bandwidth-bound. That is a DERIVED claim, so it gets
+    // measured directly: each of the five phases a routed projection walks
+    // through is timed separately and the totals printed per run. The
+    // clock reads cost ~10 calls x 25 ns x 224 projections = ~56 us per
+    // token against a ~100 ms token, i.e. below the noise floor of the
+    // thing being measured.
+    static int64 tCopyIn;
+    static int64 tUpload;
+    static int64 tLaunch;
+    static int64 tDownload;
+    static int64 tCopyOut;
+    static int64 nDevCalls;
+    static boolean timeDev;
+
+    // Launch time bucketed by WEIGHT SIZE, which is what separates a fixed
+    // per-launch overhead from real memory traffic. A token's projections
+    // span 2.36 MB (k/v) to 33 MB (ffn); if launch cost were fixed the
+    // per-call times would be flat across those, and if it were bandwidth
+    // they would scale with the bytes. One run answers it either way,
+    // whereas a synthetic probe would only measure a synthetic launch.
+    static int64[] bkBytes;      // packed bytes of the bucket's weight
+    // ROWS is part of the key, not decoration: `gate` is 14336 rows x 3360 B
+    // and `down` is 4096 rows x 11760 B — the SAME 45.9375 MB, at opposite
+    // ends of the rows-per-launch curve. Keyed on bytes alone the two fold
+    // into one bucket and the average reads as a middling number that
+    // neither shape ever achieves.
+    static int64[] bkRows;
+    static int64[] bkCount;
+    static int64[] bkNs;
+    // MIN and MAX per bucket, because an AVERAGE over 4 launches cannot
+    // distinguish a steady 40 ms from one 120 ms first touch and three
+    // 13 ms steady reads — and those two readings call for opposite fixes.
+    static int64[] bkMin;
+    static int64[] bkMax;
+    static int32 bkUsed;
+
+    // Output ROWS per dispatch (0 = one launch per weight).
+    //
+    // ROWS, not bytes, and that is measured (LaunchShapeProbe, on an idle
+    // box, one weight, one variable). Both a 420 MB and a 46 MB Q6_K weight
+    // peak at the SAME absolute row count — ~5120 — and fall away in both
+    // directions from it, so what the dispatch costs is set by its GRID and
+    // not by how much memory the weight occupies:
+    //
+    //   420 MB   1 launch  10.7 GB/s      46 MB   1 launch  20.3 GB/s
+    //           26 launches 102.9                 3 launches 106.0
+    //          128 launches  41.5                14 launches  38.5
+    //
+    // 5120 rows / 64 rows per workgroup = 80 workgroups x 2 wave32 waves
+    // = 160 waves = exactly one per SIMD on this part's 40 CUs. Below that
+    // the machine is not full; above it the waves share L1/L2 and each one's
+    // 64-lane stride of 3360 bytes evicts the others.
+    //
+    // So this is a DEVICE property (CU count) crossed with a KERNEL property
+    // (per-wave footprint), not a model or format property — which is why it
+    // is a settable constant with its derivation recorded rather than a
+    // ratio of the weight size.
+    // 80 workgroups is the target, not 5120 rows — the row count is what
+    // that many workgroups covers at this kernel's block size.
+    static final int32 TARGET_BLOCKS = 80;
+
+    static int64 chunkRows;
+    static boolean chunkSet;
+
+    // Dispatches issued by `launchRows`. Not a timer: it is how a test can
+    // tell "the answer matched because slicing is correct" apart from "the
+    // answer matched because slicing never happened".
+    static int64 nLaunches;
+
+    public static int64 launchCount() { return Linear.nLaunches; }
+    public static void resetLaunchCount() { Linear.nLaunches = 0L; }
+
+    /** Override the resolved default; 0 disables chunking. */
+    public static void setLaunchChunkRows(int64 r) {
+        Linear.chunkRows = r;
+        Linear.chunkSet = true;
+    }
+
+    /**
+     * The chunk size for the backend actually in use, resolved once.
+     *
+     * MEASURED both ways, on the same binary one call apart. gfx1151:
+     * 98.8 ms/token in one dispatch per weight, 56.7 chunked — 1.74x. CPU
+     * backend, alternating the arm order across two rounds: 108.5 / 110.0
+     * unchunked against 117.9 / 116.0 chunked, i.e. 6% the WRONG way. The
+     * CPU backend fans a launch across a persistent worker pool and pays a
+     * dispatch for each one; it has no occupancy cliff to stay under, so
+     * splitting a weight buys nothing and costs the extra dispatches.
+     *
+     * Hence {@link Device#activeBackend} rather than a build-time constant:
+     * one binary can bundle several backends and pick at run time, so the
+     * geometry has to be picked there too.
+     */
+    static int64 effectiveChunkRows() {
+        if (!Linear.chunkSet) {
+            Linear.chunkRows = (int64) Linear.TARGET_BLOCKS
+                * (int64) QuantKernel.rowsPerBlock();
+            String be #= Device.activeBackend();
+            if (be.equals("cpu") || be.equals("none")) { Linear.chunkRows = 0L; }
+            Linear.chunkSet = true;
+        }
+        return Linear.chunkRows;
+    }
+
+    public static int64 launchChunkRows() { return Linear.effectiveChunkRows(); }
+
+    public static int32 devBucketCount() { return Linear.bkUsed; }
+    public static int64 devBucketBytes(int32 i) { return Linear.bkBytes[(int64) i]; }
+    public static int64 devBucketRows(int32 i)  { return Linear.bkRows[(int64) i]; }
+    public static int64 devBucketCalls(int32 i) { return Linear.bkCount[(int64) i]; }
+    public static int64 devBucketNs(int32 i)    { return Linear.bkNs[(int64) i]; }
+    public static int64 devBucketMinNs(int32 i) { return Linear.bkMin[(int64) i]; }
+    public static int64 devBucketMaxNs(int32 i) { return Linear.bkMax[(int64) i]; }
+
+    public static void setDeviceTimingEnabled(boolean on) {
+        Linear.timeDev = on;
+        // Allocate the buckets HERE, not at first use: enabling timing is
+        // what arms `recordLaunch`, and prefill runs through it long before
+        // the decode-loop reset. A null-array read is a segfault, not a
+        // wrong number, so the two must be armed together.
+        if (on) { Linear.resetDeviceTimers(); }
+    }
+    public static void resetDeviceTimers() {
+        Linear.tCopyIn = 0L; Linear.tUpload = 0L; Linear.tLaunch = 0L;
+        Linear.tDownload = 0L; Linear.tCopyOut = 0L; Linear.nDevCalls = 0L;
+        Linear.bkBytes #= heap int64[16];
+        Linear.bkRows #= heap int64[16];
+        Linear.bkCount #= heap int64[16];
+        Linear.bkNs #= heap int64[16];
+        Linear.bkMin #= heap int64[16];
+        Linear.bkMax #= heap int64[16];
+        Linear.bkUsed = 0;
+    }
+
+    /** Fold one launch into the bucket for its weight size (linear scan —
+     *  there are under a dozen distinct shapes in a transformer). */
+    static void recordLaunch(int64 bytes, int64 rows, int64 ns) {
+        int32 i = 0;
+        while (i < Linear.bkUsed) {
+            if (Linear.bkBytes[(int64) i] == bytes
+                    && Linear.bkRows[(int64) i] == rows) {
+                Linear.bkCount[(int64) i] = Linear.bkCount[(int64) i] + 1L;
+                Linear.bkNs[(int64) i] = Linear.bkNs[(int64) i] + ns;
+                if (ns < Linear.bkMin[(int64) i]) { Linear.bkMin[(int64) i] = ns; }
+                if (ns > Linear.bkMax[(int64) i]) { Linear.bkMax[(int64) i] = ns; }
+                return;
+            }
+            i = i + 1;
+        }
+        if (Linear.bkUsed >= 16) { return; }
+        Linear.bkBytes[(int64) Linear.bkUsed] = bytes;
+        Linear.bkRows[(int64) Linear.bkUsed] = rows;
+        Linear.bkCount[(int64) Linear.bkUsed] = 1L;
+        Linear.bkNs[(int64) Linear.bkUsed] = ns;
+        Linear.bkMin[(int64) Linear.bkUsed] = ns;
+        Linear.bkMax[(int64) Linear.bkUsed] = ns;
+        Linear.bkUsed = Linear.bkUsed + 1;
+        return;
+    }
+    public static int64 devCopyInNs()   { return Linear.tCopyIn; }
+    public static int64 devUploadNs()   { return Linear.tUpload; }
+    public static int64 devLaunchNs()   { return Linear.tLaunch; }
+    public static int64 devDownloadNs() { return Linear.tDownload; }
+    public static int64 devCopyOutNs()  { return Linear.tCopyOut; }
+    public static int64 devCalls()      { return Linear.nDevCalls; }
 
     Linear(int32 inDim, int32 outDim) {
         this.weight = null;
@@ -205,22 +377,92 @@ public final class Linear extends InfModule {
             this.xDev #= heap KernelBuffer<float32>((uint64) this.inDim);
             this.yDev #= heap KernelBuffer<float32>((uint64) this.outDim);
         }
+        if (!Linear.timeDev) {
+            int64 i = 0;
+            while (i < (int64) this.inDim) {
+                this.xScratch[i] = sb[so + i];
+                i = i + 1;
+            }
+            this.xDev.upload(this.xScratch);
+            // Offsets are zero HERE and not dropped: the scratch is exactly
+            // one row wide, so the caller's `so`/`doff` are consumed by the
+            // copies above and below.
+            this.launchRows();
+            this.yDev.download(this.yScratch);
+            i = 0;
+            while (i < (int64) this.outDim) {
+                db[doff + i] = this.yScratch[i];
+                i = i + 1;
+            }
+            return;
+        }
+        // Timed twin of the block above. Kept as a SEPARATE arm rather than
+        // one body with conditional clock reads, so the untimed path carries
+        // no branch per phase and the two cannot drift in what they compute.
+        int64 c0 = Clock.nanoTime();
         int64 i = 0;
         while (i < (int64) this.inDim) {
             this.xScratch[i] = sb[so + i];
             i = i + 1;
         }
+        int64 c1 = Clock.nanoTime();
         this.xDev.upload(this.xScratch);
-        // Offsets are zero HERE and not dropped: the scratch is exactly one
-        // row wide, so the caller's `so`/`doff` are consumed by the copies
-        // above and below.
-        QuantKernel.matVecLaunch(this.packedTy, this.yDev, this.packedDev,
-            this.xDev, (int64) this.outDim, (int64) this.inDim, 0L, 0L);
+        int64 c2 = Clock.nanoTime();
+        this.launchRows();
+        int64 c3 = Clock.nanoTime();
         this.yDev.download(this.yScratch);
+        int64 c4 = Clock.nanoTime();
         i = 0;
         while (i < (int64) this.outDim) {
             db[doff + i] = this.yScratch[i];
             i = i + 1;
+        }
+        int64 c5 = Clock.nanoTime();
+        Linear.tCopyIn = Linear.tCopyIn + (c1 - c0);
+        Linear.tUpload = Linear.tUpload + (c2 - c1);
+        Linear.tLaunch = Linear.tLaunch + (c3 - c2);
+        Linear.tDownload = Linear.tDownload + (c4 - c3);
+        Linear.tCopyOut = Linear.tCopyOut + (c5 - c4);
+        Linear.nDevCalls = Linear.nDevCalls + 1L;
+        Linear.recordLaunch((int64) this.packed.count(),
+            (int64) this.outDim, c3 - c2);
+        return;
+    }
+
+    /**
+     * Launch this weight's mat-vec over the output rows, in one dispatch or
+     * in row slices of `chunkBytes` packed bytes each.
+     *
+     * The slice is a VIEW of the resident weight (`KernelBuffer.slice` is
+     * non-owning), so chunking changes the grid and the per-launch footprint
+     * and nothing else — no extra copy, no second residency. That is what
+     * makes it a clean experiment as well as a candidate fix: the bytes read
+     * and the arithmetic performed are identical either way, and the kernel
+     * indexes `packed` from its own base and writes `y[yOff + i]`, which is
+     * exactly the pair of adjustments a row slice needs.
+     */
+    void launchRows() {
+        int64 rows = (int64) this.outDim;
+        int64 rowBytes = (int64) this.packed.count() / rows;
+        int64 chunk = rows;
+        int64 want = Linear.effectiveChunkRows();
+        if (want > 0L) { chunk = want; }
+        if (chunk >= rows) {
+            Linear.nLaunches = Linear.nLaunches + 1L;
+            QuantKernel.matVecLaunch(this.packedTy, this.yDev, this.packedDev,
+                this.xDev, rows, (int64) this.inDim, 0L, 0L);
+            return;
+        }
+        int64 r0 = 0L;
+        while (r0 < rows) {
+            int64 nr = chunk;
+            if (r0 + nr > rows) { nr = rows - r0; }
+            Linear.nLaunches = Linear.nLaunches + 1L;
+            KernelBuffer<int8> sub #= this.packedDev.slice(
+                (uint64) (r0 * rowBytes), (uint64) (nr * rowBytes));
+            QuantKernel.matVecLaunch(this.packedTy, this.yDev, sub,
+                this.xDev, nr, (int64) this.inDim, 0L, r0);
+            r0 = r0 + nr;
         }
         return;
     }
