@@ -3,7 +3,8 @@
 #
 #   src/test/fixtures/gguf/toy-q4k.gguf
 #
-# A two-tensor GGUF carrying ONE Q4_K weight and its dequantized F32 twin,
+# A four-tensor GGUF carrying a Q4_K and a Q6_K weight, each with its
+# dequantized F32 twin,
 # so a test can bind a PACKED Linear and a reference Linear from the same
 # numbers and compare them.
 #
@@ -27,7 +28,7 @@ KQ = os.path.join(OUT, "kquant")
 
 GGUF_MAGIC = 0x46554747
 T_U32, T_F32, T_STR = 4, 6, 8
-GG_F32, GG_Q4_K = 0, 12
+GG_F32, GG_Q4_K, GG_Q6_K = 0, 12, 14
 OUT_DIM, IN_DIM = 8, 256
 
 def s(x):
@@ -39,16 +40,29 @@ def kv_u32(k, v):  return s(k) + struct.pack("<II", T_U32, v)
 def kv_f32(k, v):  return s(k) + struct.pack("<I", T_F32) + struct.pack("<f", v)
 
 q4k = open(os.path.join(KQ, "q4_k.bin"), "rb").read()
-deq = np.frombuffer(open(os.path.join(KQ, "q4_k.f32"), "rb").read(),
-                    dtype="<f4")
+deq4 = np.frombuffer(open(os.path.join(KQ, "q4_k.f32"), "rb").read(),
+                     dtype="<f4")
+q6k = open(os.path.join(KQ, "q6_k.bin"), "rb").read()
+deq6 = np.frombuffer(open(os.path.join(KQ, "q6_k.f32"), "rb").read(),
+                     dtype="<f4")
 assert len(q4k) == 8 * 144, len(q4k)
-assert deq.size == OUT_DIM * IN_DIM, deq.size
+assert len(q6k) == 8 * 210, len(q6k)
+assert deq4.size == OUT_DIM * IN_DIM, deq4.size
+assert deq6.size == OUT_DIM * IN_DIM, deq6.size
 
+# Q4_K and Q6_K in ONE file, which is the shape a real Q4_K_M ships:
+# measured on Meta-Llama-3.1-8B-Instruct-Q4_K_M, 74.4% of bytes are Q4_K
+# and 25.6% are Q6_K (attn_v and output.weight), with no Q5_K and no Q8_0.
+# A mix is therefore the normal case, not an edge case.
+#
 # (gguf_name, ne (fastest dim first), ggml type, payload)
 tensors = [
     ("blk.0.ffn_down.weight", [IN_DIM, OUT_DIM], GG_Q4_K, q4k),
     ("blk.0.ffn_up.weight",   [IN_DIM, OUT_DIM], GG_F32,
-     deq.astype("<f4").tobytes()),
+     deq4.astype("<f4").tobytes()),
+    ("blk.0.attn_v.weight",   [IN_DIM, OUT_DIM], GG_Q6_K, q6k),
+    ("blk.0.attn_output.weight", [IN_DIM, OUT_DIM], GG_F32,
+     deq6.astype("<f4").tobytes()),
 ]
 
 kvs = [

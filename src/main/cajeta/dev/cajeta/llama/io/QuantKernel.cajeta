@@ -170,6 +170,251 @@ public final class QuantKernel {
         }
     }
 
+    // ── Q6_K (plan 6.2.1) ───────────────────────────────────────────────
+    //
+    // Q6_K carries 25.6% of a Q4_K_M file by bytes (measured on
+    // Meta-Llama-3.1-8B-Instruct-Q4_K_M: 74.4% Q4_K, 25.6% Q6_K, no Q5_K
+    // and no Q8_0), and it is what `output.weight` and `attn_v` are stored
+    // as — so it runs for every token. With Q4_K routed and Q6_K left
+    // serial, Amdahl caps the end-to-end gain at about 3x however well the
+    // Q4_K kernel scales. Routing it too is what makes the ~10x reachable.
+
+    /** The f16 block scale at `off`, from a device buffer. */
+    @Device
+    static float32 f16AtDev(KernelBuffer<int8> raw, int64 off) {
+        int32 h = ((int32) raw[off] & 255)
+            | (((int32) raw[off + 1L] & 255) << 8);
+        return GgufFile.halfBitsToF32(h);
+    }
+
+    /**
+     * `y[yOff + i] = W[i]·x` for one row per work item, W packed Q6_K.
+     *
+     * Lifted from `Quant.q6kMatVecInto` with its 16-way sub-block loop
+     * INTACT — unlike Q4_K, nothing here needs unrolling: the per-sub-block
+     * scale is read straight out of the buffer (`packed[ro + 192 + sb]`)
+     * rather than out of a decoded header, so there is no scratch array to
+     * turn into registers and no runtime index into one.
+     */
+    @Kernel
+    public static void q6kMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 210L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 210L;
+                float32 d = QuantKernel.f16AtDev(packed, ro + 208L);
+                int64 xb = xOff + b * 256L;
+                Vector<float32,4> accv = x.vload<4>(xb) * 0.0f;
+                int32 sb = 0;
+                while (sb < 16) {
+                    int32 g = sb / 8;
+                    int32 r0 = sb * 16 - g * 128;
+                    int32 sl = r0 / 64;
+                    int32 l64 = r0 - sl * 64;
+                    int32 shi = r0 / 32;
+                    int32 l32 = r0 - shi * 32;
+                    Vector<int8,16> qlv = packed.vload<16>(
+                        ro + (int64) (64 * g + l64));
+                    Vector<int8,16> qhv = packed.vload<16>(
+                        ro + (int64) (128 + 32 * g + l32));
+                    Vector<int8,16> lo = qlv & 15;
+                    if (sl == 1) { lo = (qlv >> 4) & 15; }
+                    Vector<int8,16> hi = (qhv >> (2 * shi)) & 3;
+                    // 0..63 biased by -32 -> -32..31, still int8; the widen
+                    // below is SIGNED, which is what carries the bias up.
+                    Vector<int8,16> q = (lo | (hi << 4)) - 32;
+                    Vector<int16,8> w0 = q.widenLo();
+                    Vector<int16,8> w1 = q.widenHi();
+                    int64 xo = xb + (int64) (sb * 16);
+                    // Fold the scale in BEFORE accumulating, so the block
+                    // reduces once instead of once per sub-block.
+                    float32 sc = d * (float32) packed[ro + (int64) (192 + sb)];
+                    accv = accv + x.vload<4>(xo)
+                        * (w0.widenLo().toF32() * sc);
+                    accv = accv + x.vload<4>(xo + 4L)
+                        * (w0.widenHi().toF32() * sc);
+                    accv = accv + x.vload<4>(xo + 8L)
+                        * (w1.widenLo().toF32() * sc);
+                    accv = accv + x.vload<4>(xo + 12L)
+                        * (w1.widenHi().toF32() * sc);
+                    sb = sb + 1;
+                }
+                acc = acc + accv[0] + accv[1] + accv[2] + accv[3];
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
+    // ── Q8_0 (plan 6.2.1) ───────────────────────────────────────────────
+
+    /**
+     * `y[yOff + i] = W[i]·x` for one row per work item, W packed Q8_0.
+     * `Quant.q8MatVecInto`'s body verbatim — no header to decode at all,
+     * just one f16 scale per 32 elements.
+     */
+    @Kernel
+    public static void q8MatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 34L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 34L;
+                float32 dv = QuantKernel.f16AtDev(packed, ro);
+                int64 xo = xOff + b * 32L;
+                Vector<int8,16> q0 = packed.vload<16>(ro + 2L);
+                Vector<int8,16> q1 = packed.vload<16>(ro + 18L);
+                Vector<int16,8> a0 = q0.widenLo();
+                Vector<int16,8> a1 = q0.widenHi();
+                Vector<int16,8> a2 = q1.widenLo();
+                Vector<int16,8> a3 = q1.widenHi();
+                Vector<float32,4> p = a0.widenLo().toF32() * x.vload<4>(xo);
+                p = p + a0.widenHi().toF32() * x.vload<4>(xo + 4L);
+                p = p + a1.widenLo().toF32() * x.vload<4>(xo + 8L);
+                p = p + a1.widenHi().toF32() * x.vload<4>(xo + 12L);
+                p = p + a2.widenLo().toF32() * x.vload<4>(xo + 16L);
+                p = p + a2.widenHi().toF32() * x.vload<4>(xo + 20L);
+                p = p + a3.widenLo().toF32() * x.vload<4>(xo + 24L);
+                p = p + a3.widenHi().toF32() * x.vload<4>(xo + 28L);
+                acc = acc + dv * (p[0] + p[1] + p[2] + p[3]);
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
+    // ── Q5_K (plan 6.2.1) ───────────────────────────────────────────────
+    //
+    // Q4_K's nibble structure plus a 5th bit held apart: the high bits for
+    // the WHOLE super-block live in bytes 16..47, one bit per element, and
+    // sub-block `sb` is bit `sb` of each.
+    //
+    // The sub-block loop stays a LOOP here rather than unrolling 8 ways
+    // like Q4_K's. Q4_K unrolled because its per-sub-block scales came out
+    // of `headK4`'s heap scratch arrays, which a work item has no room for;
+    // Q5_K reads the same header, so the eight scales and eight minima are
+    // built ONCE per block into two VECTORS and indexed by the running
+    // `sb`. A vector lane read with a runtime index is a register
+    // operation, an `int32[8]` in thread memory is not.
+
+    /**
+     * `y[yOff + i] = W[i]·x` for one row per work item, W packed Q5_K.
+     */
+    @Kernel
+    public static void q5kMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 176L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 176L;
+
+                // The Q4_K header, byte for byte (see q4kMatVecKernel).
+                Vector<int8,16> hv = packed.vload<16>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                int32 d0 = (int32) hv[4] & 255;
+                int32 d1 = (int32) hv[5] & 255;
+                int32 d2 = (int32) hv[6] & 255;
+                int32 d3 = (int32) hv[7] & 255;
+                int32 m0 = (int32) hv[8] & 255;
+                int32 m1 = (int32) hv[9] & 255;
+                int32 m2 = (int32) hv[10] & 255;
+                int32 m3 = (int32) hv[11] & 255;
+                int32 k0 = (int32) hv[12] & 255;
+                int32 k1 = (int32) hv[13] & 255;
+                int32 k2 = (int32) hv[14] & 255;
+                int32 k3 = (int32) hv[15] & 255;
+
+                // Eight scales and eight minima as VECTOR lanes, so the
+                // sub-block loop can index them with a runtime `sb` without
+                // any of it reaching memory.
+                int64 xb = xOff + b * 256L;
+                Vector<float32,8> tv = x.vload<8>(xb) * 0.0f;
+                Vector<float32,8> uv = tv;
+                tv[0] = d * (float32) (d0 & 63);
+                tv[1] = d * (float32) (d1 & 63);
+                tv[2] = d * (float32) (d2 & 63);
+                tv[3] = d * (float32) (d3 & 63);
+                tv[4] = d * (float32) ((k0 & 15) | ((d0 >> 2) & 48));
+                tv[5] = d * (float32) ((k1 & 15) | ((d1 >> 2) & 48));
+                tv[6] = d * (float32) ((k2 & 15) | ((d2 >> 2) & 48));
+                tv[7] = d * (float32) ((k3 & 15) | ((d3 >> 2) & 48));
+                uv[0] = dmin * (float32) (m0 & 63);
+                uv[1] = dmin * (float32) (m1 & 63);
+                uv[2] = dmin * (float32) (m2 & 63);
+                uv[3] = dmin * (float32) (m3 & 63);
+                uv[4] = dmin * (float32) ((k0 >> 4) | ((m0 >> 2) & 48));
+                uv[5] = dmin * (float32) ((k1 >> 4) | ((m1 >> 2) & 48));
+                uv[6] = dmin * (float32) ((k2 >> 4) | ((m2 >> 2) & 48));
+                uv[7] = dmin * (float32) ((k3 >> 4) | ((m3 >> 2) & 48));
+
+                Vector<int8,16> hbA = packed.vload<16>(ro + 16L);
+                Vector<int8,16> hbB = packed.vload<16>(ro + 32L);
+                int32 sb = 0;
+                while (sb < 8) {
+                    int64 bo = ro + 48L + 32L * (int64) (sb / 2);
+                    Vector<int8,16> r0 = packed.vload<16>(bo);
+                    Vector<int8,16> r1 = packed.vload<16>(bo + 16L);
+                    Vector<int8,16> n0 = r0 & 15;
+                    Vector<int8,16> n1 = r1 & 15;
+                    if ((sb - (sb / 2) * 2) == 1) {
+                        n0 = (r0 >> 4) & 15;
+                        n1 = (r1 >> 4) & 15;
+                    }
+                    Vector<int8,16> q0 = n0 | (((hbA >> sb) & 1) << 4);
+                    Vector<int8,16> q1 = n1 | (((hbB >> sb) & 1) << 4);
+                    int64 xo = xb + (int64) (sb * 32);
+                    Vector<int16,8> a0 = q0.widenLo();
+                    Vector<int16,8> a1 = q0.widenHi();
+                    Vector<int16,8> a2 = q1.widenLo();
+                    Vector<int16,8> a3 = q1.widenHi();
+                    Vector<float32,4> x0 = x.vload<4>(xo);
+                    Vector<float32,4> x1 = x.vload<4>(xo + 4L);
+                    Vector<float32,4> x2 = x.vload<4>(xo + 8L);
+                    Vector<float32,4> x3 = x.vload<4>(xo + 12L);
+                    Vector<float32,4> x4 = x.vload<4>(xo + 16L);
+                    Vector<float32,4> x5 = x.vload<4>(xo + 20L);
+                    Vector<float32,4> x6 = x.vload<4>(xo + 24L);
+                    Vector<float32,4> x7 = x.vload<4>(xo + 28L);
+                    Vector<float32,4> p = a0.widenLo().toF32() * x0;
+                    p = p + a0.widenHi().toF32() * x1;
+                    p = p + a1.widenLo().toF32() * x2;
+                    p = p + a1.widenHi().toF32() * x3;
+                    p = p + a2.widenLo().toF32() * x4;
+                    p = p + a2.widenHi().toF32() * x5;
+                    p = p + a3.widenLo().toF32() * x6;
+                    p = p + a3.widenHi().toF32() * x7;
+                    Vector<float32,4> sv = x0 + x1 + x2 + x3;
+                    sv = sv + x4 + x5 + x6 + x7;
+                    float32 qx = p[0] + p[1] + p[2] + p[3];
+                    float32 sx = sv[0] + sv[1] + sv[2] + sv[3];
+                    acc = acc + tv[sb] * qx - uv[sb] * sx;
+                    sb = sb + 1;
+                }
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
     /** Rows per grid block. One work item is a whole row, so this is a
      *  scheduling width, not a tile size. */
     static final int32 ROWS_PER_BLOCK = 64;
@@ -195,6 +440,70 @@ public final class QuantKernel {
         return;
     }
 
+    /** {@link #q4kMatVecLaunch} for Q6_K — 210-byte blocks, same grid. */
+    public static void q6kMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s #= KernelStream.current();
+        q6kMatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, x, ur, cols / 256L, xOff, yOff);
+        s.sync();
+        return;
+    }
+
+    /** {@link #q4kMatVecLaunch} for Q5_K — 176-byte blocks, same grid. */
+    public static void q5kMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s #= KernelStream.current();
+        q5kMatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, x, ur, cols / 256L, xOff, yOff);
+        s.sync();
+        return;
+    }
+
+    /** {@link #q4kMatVecLaunch} for Q8_0 — 34-byte blocks of 32 elements,
+     *  so the block count per row is cols/32, not cols/256. */
+    public static void q8MatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s #= KernelStream.current();
+        q8MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, x, ur, cols / 32L, xOff, yOff);
+        s.sync();
+        return;
+    }
+
+    /** True when `ty` has a kernel here. The dispatch is on the TYPE, never
+     *  on "is packed" — a route written the other way would feed one
+     *  format's bytes to another's decoder. */
+    public static boolean hasKernel(int32 ty) {
+        return ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
+            || ty == Quant.GG_Q6_K || ty == Quant.GG_Q8_0;
+    }
+
+    /** Launch the kernel for `ty` over device-resident buffers. */
+    public static void matVecLaunch(int32 ty, KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        if (ty == Quant.GG_Q4_K) {
+            QuantKernel.q4kMatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
+        } else if (ty == Quant.GG_Q5_K) {
+            QuantKernel.q5kMatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
+        } else if (ty == Quant.GG_Q6_K) {
+            QuantKernel.q6kMatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
+        } else {
+            QuantKernel.q8MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
+        }
+        return;
+    }
+
     /**
      * `Quant.q4kMatVecInto`'s signature over host arrays, via the kernel —
      * uploading, launching and downloading on every call.
@@ -205,7 +514,7 @@ public final class QuantKernel {
      * buffer resident, because the weight is the only operand that does
      * not change between tokens.
      */
-    public static void q4kMatVecIntoDevice(int8[] packed, int64 rows,
+    public static void matVecIntoDevice(int32 ty, int8[] packed, int64 rows,
             int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
         KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
             (uint64) packed.count());
@@ -216,8 +525,16 @@ public final class QuantKernel {
         pb.upload(packed);
         xb.upload(x);
         yb.upload(y);
-        QuantKernel.q4kMatVecLaunch(yb, pb, xb, rows, cols, xOff, yOff);
+        QuantKernel.matVecLaunch(ty, yb, pb, xb, rows, cols, xOff, yOff);
         yb.download(y);
+        return;
+    }
+
+    /** Q4_K-only alias kept for the Unit 3 tests that name it. */
+    public static void q4kMatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        QuantKernel.matVecIntoDevice(Quant.GG_Q4_K, packed, rows, cols, x,
+            xOff, y, yOff);
         return;
     }
 }

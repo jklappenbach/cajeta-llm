@@ -21,15 +21,17 @@ import cajeta.lang.String;
  * compares ROUTED against FORCED-SERIAL on the same `Linear`, and the bar
  * is again bit-identity rather than a tolerance.
  *
- * The fixture is `toy-q4k.gguf` (tools/gguf/gen_q4k_linear_fixture.py):
- * one Q4_K tensor built from the REAL Q4_K_M blocks already checked in
- * under kquant/, and its gguf-py dequantized twin as F32, both shaped
- * [out=8, in=256].
+ * The fixture is `toy-q4k.gguf` (tools/gguf/gen_q4k_linear_fixture.py): a
+ * Q4_K tensor and a Q6_K tensor built from the REAL blocks already checked
+ * in under kquant/, each with its gguf-py dequantized twin as F32, all
+ * shaped [out=8, in=256]. Both formats in ONE file on purpose — that is
+ * what a Q4_K_M ships.
  */
 public class LinearKernelRouteTest {
 
     static final String Q4K = "src/test/fixtures/gguf/toy-q4k.gguf";
     static final String Q4K_NAME = "model.layers.0.mlp.down_proj.weight";
+    static final String Q6K_NAME = "model.layers.0.self_attn.v_proj.weight";
     static final String TOY = "src/test/fixtures/gguf/toy.gguf";
     static final String Q8_NAME = "model.layers.0.mlp.down_proj.weight";
 
@@ -215,14 +217,70 @@ public class LinearKernelRouteTest {
     }
 
     /**
-     * 4.1.2 — only Q4_K is routed in this unit. A Q8_0 weight must be
-     * unaffected by the switch: same answer with routing on and off,
-     * because it never sees the kernel at all.
+     * 6.1.2 — a Q4_K_M-shaped MIX: a Q4_K weight and a Q6_K weight bound
+     * from one checkpoint, both routed, both matching serial.
      *
-     * This is the does-NOT-fire half. A dispatch written as "packed →
-     * kernel" rather than "Q4_K → kernel" would send Q8_0 bytes through a
-     * Q4_K decoder and produce garbage; without this test the Q4_K tests
-     * above would still pass.
+     * The mix is the normal case, not an edge case: a real Q4_K_M is
+     * 74.4% Q4_K and 25.6% Q6_K by bytes (measured on
+     * Meta-Llama-3.1-8B-Instruct-Q4_K_M), with `attn_v` and
+     * `output.weight` carrying the Q6_K. Per-format tests each pass under
+     * a dispatch that ignores the type; this one does not.
+     */
+    @Test
+    public void q4kAndQ6kInOneCheckpointBothRouteCorrectly() {
+        Checkpoint ck #= Checkpoint.open(LinearKernelRouteTest.Q4K);
+        int32 pass = 0;
+        while (pass < 2) {
+            String nm = pass == 0 ? LinearKernelRouteTest.Q4K_NAME
+                                  : LinearKernelRouteTest.Q6K_NAME;
+            int32 wantTy = pass == 0 ? Quant.GG_Q4_K : Quant.GG_Q6_K;
+            int64[] shp #= ck.shapeOf(nm);
+            int32 outDim = (int32) shp[0];
+            int32 inDim = (int32) shp[1];
+
+            Linear lin #= heap Linear(inDim, outDim);
+            lin.bind(ck, nm, false);
+            Assert.isTrue(lin.isPacked());
+            Assert.equals((int64) wantTy, (int64) lin.packedType());
+
+            Tensor<float32> src #= LinearKernelRouteTest.ramp((int64) inDim,
+                0L);
+            int64[] oshp #= heap int64[1];
+            oshp[0] = (int64) outDim;
+            Tensor<float32> want #= Tensor.zeros<float32>(oshp);
+            Tensor<float32> got #= Tensor.zeros<float32>(oshp);
+
+            QuantKernel.setRoutingEnabled(false);
+            lin.matvecInto(src, 0L, want, 0L);
+            QuantKernel.setRoutingEnabled(true);
+            lin.matvecInto(src, 0L, got, 0L);
+
+            LinearKernelRouteTest.assertLive(want, (int64) outDim,
+                "serial " + nm);
+            LinearKernelRouteTest.assertLive(got, (int64) outDim,
+                "routed " + nm);
+            int64 o = 0;
+            while (o < (int64) outDim) {
+                if (got.flatGet(o) != want.flatGet(o)) {
+                    Assert.fail(nm + " row " + o + ": routed "
+                        + got.flatGet(o) + " vs serial " + want.flatGet(o));
+                }
+                o = o + 1;
+            }
+            pass = pass + 1;
+        }
+        ck.close();
+    }
+
+    /**
+     * 4.1.2 / 6.1.2 — a Q8_0 weight gives the SAME answer routed and
+     * serial.
+     *
+     * This was the does-NOT-fire half while Q8_0 had no kernel: a dispatch
+     * written as "packed → kernel" rather than per-TYPE would have fed
+     * Q8_0 bytes to the Q4_K decoder. Q8_0 now has its own kernel, so the
+     * test still catches exactly that mistake — as a wrong answer from the
+     * wrong decoder rather than as an unexpected change.
      */
     @Test
     public void q8WeightIsUnaffectedByTheQ4KRoute() {
@@ -251,9 +309,8 @@ public class LinearKernelRouteTest {
         int64 o = 0;
         while (o < (int64) outDim) {
             if (on.flatGet(o) != off.flatGet(o)) {
-                Assert.fail("q8 row " + o + ": routing-on " + on.flatGet(o)
-                    + " changed a NON-Q4_K weight (was " + off.flatGet(o)
-                    + ")");
+                Assert.fail("q8 row " + o + ": routed " + on.flatGet(o)
+                    + " vs serial " + off.flatGet(o));
             }
             o = o + 1;
         }
