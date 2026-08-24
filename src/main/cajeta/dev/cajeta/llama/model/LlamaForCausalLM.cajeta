@@ -755,20 +755,31 @@ public final class LlamaForCausalLM extends InfModule {
                     .prefillAttendResident(l, a.qProj.yBatch,
                         a.kProj.yBatch, a.vProj.yBatch, rows, startPos,
                         a.scale);
-                int64 kvn = (int64) rows * (int64) kvd;
-                this.ensurePrefillKv(kvn);
-                a.kProj.yBatch.download(this.pfKScr, kvn);
-                a.vProj.yBatch.download(this.pfVScr, kvn);
-                r = 0;
-                while (r < rows) {
-                    if (!this.cache.appendRowRaw(seq, l, this.pfKScr,
-                            (int64) r * (int64) kvd, this.pfVScr,
-                            (int64) r * (int64) kvd, startPos + r)) {
-                        throw heap LlamaException("kv pool exhausted at "
-                            + "layer " + l + " position "
-                            + (startPos + r));
+                // Cache authority (10.12.30): at startPos == 0 the k/v
+                // download + paged append are DEFERRED to one pass
+                // after the layer loop, reading the persistent planes
+                // — the loop stays launch-only and the GPU never waits
+                // for the host between layers. Mid-sequence prefill
+                // keeps the in-loop path (the planes hold absolute
+                // positions; a prefix download cannot reach them).
+                if (startPos != 0) {
+                    KernelStream as #= KernelStream.current();
+                    as.sync();
+                    int64 kvn = (int64) rows * (int64) kvd;
+                    this.ensurePrefillKv(kvn);
+                    a.kProj.yBatch.download(this.pfKScr, kvn);
+                    a.vProj.yBatch.download(this.pfVScr, kvn);
+                    r = 0;
+                    while (r < rows) {
+                        if (!this.cache.appendRowRaw(seq, l, this.pfKScr,
+                                (int64) r * (int64) kvd, this.pfVScr,
+                                (int64) r * (int64) kvd, startPos + r)) {
+                            throw heap LlamaException("kv pool exhausted"
+                                + " at layer " + l + " position "
+                                + (startPos + r));
+                        }
+                        r = r + 1;
                     }
-                    r = r + 1;
                 }
                 LlamaForCausalLM.pfAttendNs = LlamaForCausalLM.pfAttendNs
                     + (Clock.nanoTime() - ta0);
@@ -940,6 +951,36 @@ public final class LlamaForCausalLM extends InfModule {
                 hb2[hb02 + c2] = this.pfHsHost[c2];
                 c2 = c2 + 1;
             }
+        }
+
+        if (resAttn && startPos == 0) {
+            // The deferred cache-authority pass (10.12.30): ONE sync,
+            // then every layer's roped k/v out of the persistent
+            // planes into the paged cache. Position dr IS the row
+            // index here — that is what the startPos == 0 guard buys.
+            int64 tda = Clock.nanoTime();
+            KernelStream ks #= KernelStream.current();
+            ks.sync();
+            int64 kvnD = (int64) rows * (int64) kvd;
+            this.ensurePrefillKv(kvnD);
+            int32 dl = 0;
+            while (dl < this.model.numLayers) {
+                this.dkv.kPlane(dl).download(this.pfKScr, kvnD);
+                this.dkv.vPlane(dl).download(this.pfVScr, kvnD);
+                int32 dr = 0;
+                while (dr < rows) {
+                    if (!this.cache.appendRowRaw(seq, dl, this.pfKScr,
+                            (int64) dr * (int64) kvd, this.pfVScr,
+                            (int64) dr * (int64) kvd, dr)) {
+                        throw heap LlamaException("kv pool exhausted at "
+                            + "layer " + dl + " position " + dr);
+                    }
+                    dr = dr + 1;
+                }
+                dl = dl + 1;
+            }
+            LlamaForCausalLM.pfAttendNs = LlamaForCausalLM.pfAttendNs
+                + (Clock.nanoTime() - tda);
         }
 
         if (this.dkv != null && !LlamaForCausalLM.forceReseed) {

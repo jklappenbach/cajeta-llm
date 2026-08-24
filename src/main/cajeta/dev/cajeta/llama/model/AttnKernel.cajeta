@@ -329,6 +329,83 @@ public final class AttnKernel {
         }
     }
 
+    /**
+     * Prefill scores, reshaped (10.12.29, attempt 2): ONE single-wave
+     * workgroup per (query row, head), key positions looped INSIDE.
+     * Attempt 1 put lanes on the t axis and was REFUTED +154 ms — each
+     * lane streamed a 4 KB-strided k row, the gpu-matvec-lane-mapping
+     * lesson verbatim. This keeps the original kernel's coalesced
+     * lanes-on-d inner dot (and its cheap single-wave reduction) but
+     * fixes what actually cost the 205 ms: 8.4M one-dot workgroups,
+     * the q row re-read from global once per position, and ~half the
+     * launches dead by causality. Here the q row sits in 4 registers
+     * per lane for the whole causal range, the grid is rows x nH, and
+     * nothing launches dead. hd is 128 for every model we run; the
+     * loop handles the general case anyway.
+     */
+    @Kernel
+    public static void attnScorePrefillRowKernel(
+            KernelBuffer<float32> scores, KernelBuffer<float32> q,
+            KernelBuffer<float32> kPool, uint32 rows, uint32 nH,
+            uint32 nKv, uint32 hd, uint32 startPos, uint32 stride,
+            float32 scale) {
+        Shared<float32> part = shared float32[32];
+        uint32 lane = KernelThread.x();
+        uint32 wv = KernelThread.globalIdX() / 32;
+        if (wv < rows * nH) {
+            uint32 r = wv / nH;
+            uint32 h = wv % nH;
+            uint32 kvDim = nKv * hd;
+            uint32 kvh = h / (nH / nKv);
+            uint32 qBase = r * (nH * hd) + h * hd;
+            uint32 sBase = (r * nH + h) * stride;
+            uint32 count = startPos + r + 1;
+            float32 q0 = 0.0f;
+            float32 q1 = 0.0f;
+            float32 q2 = 0.0f;
+            float32 q3 = 0.0f;
+            if (lane < hd) { q0 = q[qBase + lane]; }
+            if (lane + 32 < hd) { q1 = q[qBase + lane + 32]; }
+            if (lane + 64 < hd) { q2 = q[qBase + lane + 64]; }
+            if (lane + 96 < hd) { q3 = q[qBase + lane + 96]; }
+            uint32 t = 0;
+            while (t < count) {
+                uint32 kRow = t * kvDim + kvh * hd;
+                float32 s = 0.0f;
+                if (lane < hd) { s = q0 * kPool[kRow + lane]; }
+                if (lane + 32 < hd) {
+                    s = s + q1 * kPool[kRow + lane + 32];
+                }
+                if (lane + 64 < hd) {
+                    s = s + q2 * kPool[kRow + lane + 64];
+                }
+                if (lane + 96 < hd) {
+                    s = s + q3 * kPool[kRow + lane + 96];
+                }
+                uint32 d = lane + 128;
+                while (d < hd) {
+                    s = s + q[qBase + d] * kPool[kRow + d];
+                    d = d + 32;
+                }
+                part[lane] = s;
+                Barrier.workgroup();
+                uint32 rr = 16;
+                while (rr > 0) {
+                    if (lane < rr) {
+                        part[lane] = part[lane] + part[lane + rr];
+                    }
+                    Barrier.workgroup();
+                    rr = rr / 2;
+                }
+                if (lane == 0) {
+                    scores[sBase + t] = part[0] * scale;
+                }
+                Barrier.workgroup();
+                t = t + 1;
+            }
+        }
+    }
+
     /** Prefill softmax and V combine: one workgroup of 128 per
      *  `(query row, head)`, over that row's causal range. */
     @Kernel
@@ -417,23 +494,59 @@ public final class AttnKernel {
         return;
     }
 
+    // 10.12.29: the wave-per-(row,head) score kernel. Attempt 1
+    // (lanes on t) was REFUTED +154 ms — 4 KB-strided k streams;
+    // attempt 2 (lanes on d kept, t looped in-wave, q in registers)
+    // measured 1062 vs 1181 ms prefill(512) — DEFAULT ON; `oldscore`
+    // reverts to the wave-per-position kernel.
+    static boolean rowScoreOn = true;
+    public static void setRowScore(boolean on) {
+        AttnKernel.rowScoreOn = on;
+    }
+
     public static void attendPrefillLaunch(KernelBuffer<float32> out,
+            KernelBuffer<float32> scores, KernelBuffer<float32> q,
+            KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
+            int32 rows, int32 nH, int32 nKv, int32 hd, int32 startPos,
+            int32 stride, float32 scale) {
+        AttnKernel.attendPrefillLaunchNoSync(out, scores, q, kPool,
+            vPool, rows, nH, nKv, hd, startPos, stride, scale);
+        KernelStream s #= KernelStream.current();
+        s.sync();
+        return;
+    }
+
+    /** As {@link #attendPrefillLaunch} but without the trailing sync
+     *  (10.12.30): the fully resident layer loop is launch-only — its
+     *  ONE sync happens after the last layer, so the GPU runs layer to
+     *  layer without a host round-trip. Callers that download right
+     *  after (the non-resident path) use the syncing wrapper. */
+    public static void attendPrefillLaunchNoSync(KernelBuffer<float32> out,
             KernelBuffer<float32> scores, KernelBuffer<float32> q,
             KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
             int32 rows, int32 nH, int32 nKv, int32 hd, int32 startPos,
             int32 stride, float32 scale) {
         KernelStream s #= KernelStream.current();
         int32 tMax = startPos + rows;
-        int64 waves = (int64) rows * (int64) nH * (int64) tMax;
-        attnScorePrefillKernel.launch(s, grid: [(uint32) waves], block: [32])
-            (scores, q, kPool, (uint32) rows, (uint32) nH, (uint32) nKv,
-             (uint32) hd, (uint32) tMax, (uint32) startPos,
-             (uint32) stride, scale);
+        if (AttnKernel.rowScoreOn) {
+            int64 wv = (int64) rows * (int64) nH;
+            attnScorePrefillRowKernel.launch(s,
+                grid: [(uint32) wv], block: [32])
+                (scores, q, kPool, (uint32) rows, (uint32) nH,
+                 (uint32) nKv, (uint32) hd, (uint32) startPos,
+                 (uint32) stride, scale);
+        } else {
+            int64 waves = (int64) rows * (int64) nH * (int64) tMax;
+            attnScorePrefillKernel.launch(s, grid: [(uint32) waves],
+                block: [32])
+                (scores, q, kPool, (uint32) rows, (uint32) nH,
+                 (uint32) nKv, (uint32) hd, (uint32) tMax,
+                 (uint32) startPos, (uint32) stride, scale);
+        }
         attnCombinePrefillKernel.launch(s,
             grid: [(uint32) (rows * nH)], block: [128])
             (out, scores, vPool, (uint32) rows, (uint32) nH, (uint32) nKv,
              (uint32) hd, (uint32) startPos, (uint32) stride);
-        s.sync();
         return;
     }
 
