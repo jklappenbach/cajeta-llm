@@ -2236,6 +2236,317 @@ public final class WmmaKernel {
         return;
     }
 
+    /**
+     * 10.12.27 — the ONE-TIME Q6_K widen: signed q-32 values (they fit
+     * int8 exactly) out to the same TILE-MAJOR layout as the Q4 widen,
+     * so the Q6 deq GEMM shares the Q4 kernel's B addressing verbatim.
+     * The per-slice scales and d stay in the packed buffer, applied at
+     * the epilogue. One thread per ql byte (128 per block), producing
+     * the lo/hi pair exactly as q6kWmmaEpiKernel's in-LDS widen does —
+     * which this replaces, along with its 32x re-widen per prefill.
+     */
+    @Kernel
+    public static void q6kWidenKernel(KernelBuffer<int8> deq,
+            KernelBuffer<int8> packed, uint32 total, int64 blocksPerRow) {
+        uint32 tid = KernelThread.globalIdX();
+        if (tid < total) {
+            uint32 perRow = (uint32) blocksPerRow * 128;
+            uint32 ii = tid / perRow;
+            uint32 rem = tid % perRow;
+            uint32 b = rem / 128;
+            uint32 byteIdx = rem % 128;
+            int64 ro = (int64) ii * (blocksPerRow * 210L)
+                + (int64) b * 210L;
+            int32 qlb = (int32) packed[ro + (int64) byteIdx] & 255;
+            uint32 h = byteIdx / 64;
+            uint32 l64 = byteIdx % 64;
+            int32 qhb = (int32) packed[ro + 128L
+                + (int64) (32 * h) + (int64) (l64 % 32)] & 255;
+            uint32 sh = 2 * (l64 / 32);
+            int32 vLo = ((qlb & 15)
+                | (((qhb >> sh) & 3) << 4)) - 32;
+            int32 vHi = (((qlb >> 4) & 15)
+                | (((qhb >> (sh + 4)) & 3) << 4)) - 32;
+            int64 tilesK = blocksPerRow * 16L;
+            int64 kLo = (int64) b * 256L + (int64) (128 * h + l64);
+            int64 kHi = kLo + 64L;
+            int64 tI = (int64) (ii / 16);
+            int64 iIn = (int64) (ii % 16);
+            deq[(tI * tilesK + kLo / 16L) * 256L
+                + iIn * 16L + (kLo % 16L)] = (int8) vLo;
+            deq[(tI * tilesK + kHi / 16L) * 256L
+                + iIn * 16L + (kHi % 16L)] = (int8) vHi;
+        }
+    }
+
+    public static void q6kWidenLaunch(KernelBuffer<int8> deq,
+            KernelBuffer<int8> packed, int64 outDim, int64 cols) {
+        int64 bpr = cols / 256L;
+        int64 total = outDim * bpr * 128L;
+        KernelStream s #= KernelStream.current();
+        q6kWidenKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
+            block: [256])
+            (deq, packed, (uint32) total, bpr);
+        return;
+    }
+
+    /**
+     * 10.12.27 — the Q6_K token-blocked multi-wave deq GEMM: the Mw4
+     * transform applied to `q6kWmmaEpiKernel`, which the profile put
+     * at ITS memory wall (49 GB packed / 323 ms = 152 GB/s, one
+     * 16-token tile per WG re-reading and RE-WIDENING the matrix 32x).
+     * Q6 is the simpler epilogue: signed q-32 (baked into the widen),
+     * one scale per 16-wide K-slice, NO dmin — so no rank-1 term, no
+     * group sums, single-verb `scaledAccumInto` per tile. Per-lane
+     * header registers (d + 16 signed slice scales), per-tile token
+     * vectors (xs), per-wave row vectors (cf — the barrier-free drift
+     * rule), 4 mmas per weight fragment.
+     */
+    @Kernel
+    public static void q6kWmmaDeqMw4Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, uint32 rows, uint32 outDim,
+            uint32 tilesN8, int64 blocksPerRow) {
+        Shared<float32> xsA = shared float32[16];
+        Shared<float32> xsB = shared float32[16];
+        Shared<float32> xsC = shared float32[16];
+        Shared<float32> xsD = shared float32[16];
+        Shared<float32> cf0 = shared float32[16];
+        Shared<float32> cf1 = shared float32[16];
+        Shared<float32> cf2 = shared float32[16];
+        Shared<float32> cf3 = shared float32[16];
+        Shared<float32> cf4 = shared float32[16];
+        Shared<float32> cf5 = shared float32[16];
+        Shared<float32> cf6 = shared float32[16];
+        Shared<float32> cf7 = shared float32[16];
+
+        uint32 tid = KernelThread.x();
+        uint32 lane = tid % 32;
+        uint32 wid = tid / 32;
+        uint32 lane16 = lane % 16;
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 tileT = wg / tilesN8;
+        uint32 tileI8 = wg % tilesN8;
+        uint32 t0 = tileT * 64;
+        uint32 i0 = tileI8 * 128 + wid * 16;
+        if (t0 < rows && i0 < outDim) {
+            int64 rowBytes = blocksPerRow * 210L;
+            int64 xRowBytes = blocksPerRow * 320L;
+            int64 myRo = (int64) (i0 + lane16) * rowBytes;
+
+            CooperativeMatrix<int8,16,16,0> ma;
+            CooperativeMatrix<int8,16,16,1> mb;
+            CooperativeMatrix<int32,16,16,2> mc0;
+            CooperativeMatrix<int32,16,16,2> mc1;
+            CooperativeMatrix<int32,16,16,2> mc2;
+            CooperativeMatrix<int32,16,16,2> mc3;
+            CooperativeMatrix<float32,16,16,2> facc0;
+            CooperativeMatrix<float32,16,16,2> facc1;
+            CooperativeMatrix<float32,16,16,2> facc2;
+            CooperativeMatrix<float32,16,16,2> facc3;
+            facc0.splat(0.0f);
+            facc1.splat(0.0f);
+            facc2.splat(0.0f);
+            facc3.splat(0.0f);
+
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                // Token staging: waves 0-3, one token-tile each — only
+                // the per-token q8 scale; Q6 needs no group sums.
+                if (wid < 4 && lane < 16) {
+                    int64 xb = (int64) (t0 + wid * 16 + lane)
+                        * xRowBytes + b * 320L;
+                    float32 xv = Cajeta.bitsToF32(
+                        ((int32) xp[xb + 288L] & 255)
+                        | (((int32) xp[xb + 289L] & 255) << 8)
+                        | (((int32) xp[xb + 290L] & 255) << 16)
+                        | (((int32) xp[xb + 291L] & 255) << 24));
+                    if (wid == 0) { xsA[lane] = xv; }
+                    else if (wid == 1) { xsB[lane] = xv; }
+                    else if (wid == 2) { xsC[lane] = xv; }
+                    else { xsD[lane] = xv; }
+                }
+                Barrier.workgroup();
+
+                // Weight-side header: d and 16 SIGNED slice scales in
+                // per-lane registers.
+                int64 ro = myRo + b * 210L;
+                float32 dv = GgufFile.halfBitsToF32(
+                    ((int32) packed[ro + 208L] & 255)
+                    | (((int32) packed[ro + 209L] & 255) << 8));
+                int32 s0 = (int32) packed[ro + 192L];
+                int32 s1 = (int32) packed[ro + 193L];
+                int32 s2 = (int32) packed[ro + 194L];
+                int32 s3 = (int32) packed[ro + 195L];
+                int32 s4 = (int32) packed[ro + 196L];
+                int32 s5 = (int32) packed[ro + 197L];
+                int32 s6 = (int32) packed[ro + 198L];
+                int32 s7 = (int32) packed[ro + 199L];
+                int32 s8 = (int32) packed[ro + 200L];
+                int32 s9 = (int32) packed[ro + 201L];
+                int32 s10 = (int32) packed[ro + 202L];
+                int32 s11 = (int32) packed[ro + 203L];
+                int32 s12 = (int32) packed[ro + 204L];
+                int32 s13 = (int32) packed[ro + 205L];
+                int32 s14 = (int32) packed[ro + 206L];
+                int32 s15 = (int32) packed[ro + 207L];
+
+                uint32 j = 0;
+                while (j < 16) {
+                    int32 scj = s0;
+                    if (j == 1) { scj = s1; }
+                    else if (j == 2) { scj = s2; }
+                    else if (j == 3) { scj = s3; }
+                    else if (j == 4) { scj = s4; }
+                    else if (j == 5) { scj = s5; }
+                    else if (j == 6) { scj = s6; }
+                    else if (j == 7) { scj = s7; }
+                    else if (j == 8) { scj = s8; }
+                    else if (j == 9) { scj = s9; }
+                    else if (j == 10) { scj = s10; }
+                    else if (j == 11) { scj = s11; }
+                    else if (j == 12) { scj = s12; }
+                    else if (j == 13) { scj = s13; }
+                    else if (j == 14) { scj = s14; }
+                    else if (j == 15) { scj = s15; }
+                    float32 cfv = dv * (float32) scj;
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
+                    uint32 kBase = 16 * j;
+                    int64 aOff = (int64) t0 * xRowBytes + b * 320L
+                        + (int64) kBase;
+                    int64 kAbs = b * 256L + (int64) kBase;
+                    int64 bOff = ((int64) (i0 / 16)
+                        * (blocksPerRow * 16L) + kAbs / 16L) * 256L;
+                    // ONE weight fragment, four mmas.
+                    mb.load(deq, (uint32) bOff, 1, 16);
+                    ma.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
+                    mc0.mma(ma, mb);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 16L), 0,
+                        (uint32) xRowBytes);
+                    mc1.mma(ma, mb);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 32L), 0,
+                        (uint32) xRowBytes);
+                    mc2.mma(ma, mb);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 48L), 0,
+                        (uint32) xRowBytes);
+                    mc3.mma(ma, mb);
+                    // Wave-uniform 8-way select of this wave's cf.
+                    if (wid == 0) {
+                        if (lane < 16) { cf0[lane] = cfv; }
+                        mc0.scaledAccumInto(facc0, xsA, cf0);
+                        mc1.scaledAccumInto(facc1, xsB, cf0);
+                        mc2.scaledAccumInto(facc2, xsC, cf0);
+                        mc3.scaledAccumInto(facc3, xsD, cf0);
+                    } else if (wid == 1) {
+                        if (lane < 16) { cf1[lane] = cfv; }
+                        mc0.scaledAccumInto(facc0, xsA, cf1);
+                        mc1.scaledAccumInto(facc1, xsB, cf1);
+                        mc2.scaledAccumInto(facc2, xsC, cf1);
+                        mc3.scaledAccumInto(facc3, xsD, cf1);
+                    } else if (wid == 2) {
+                        if (lane < 16) { cf2[lane] = cfv; }
+                        mc0.scaledAccumInto(facc0, xsA, cf2);
+                        mc1.scaledAccumInto(facc1, xsB, cf2);
+                        mc2.scaledAccumInto(facc2, xsC, cf2);
+                        mc3.scaledAccumInto(facc3, xsD, cf2);
+                    } else if (wid == 3) {
+                        if (lane < 16) { cf3[lane] = cfv; }
+                        mc0.scaledAccumInto(facc0, xsA, cf3);
+                        mc1.scaledAccumInto(facc1, xsB, cf3);
+                        mc2.scaledAccumInto(facc2, xsC, cf3);
+                        mc3.scaledAccumInto(facc3, xsD, cf3);
+                    } else if (wid == 4) {
+                        if (lane < 16) { cf4[lane] = cfv; }
+                        mc0.scaledAccumInto(facc0, xsA, cf4);
+                        mc1.scaledAccumInto(facc1, xsB, cf4);
+                        mc2.scaledAccumInto(facc2, xsC, cf4);
+                        mc3.scaledAccumInto(facc3, xsD, cf4);
+                    } else if (wid == 5) {
+                        if (lane < 16) { cf5[lane] = cfv; }
+                        mc0.scaledAccumInto(facc0, xsA, cf5);
+                        mc1.scaledAccumInto(facc1, xsB, cf5);
+                        mc2.scaledAccumInto(facc2, xsC, cf5);
+                        mc3.scaledAccumInto(facc3, xsD, cf5);
+                    } else if (wid == 6) {
+                        if (lane < 16) { cf6[lane] = cfv; }
+                        mc0.scaledAccumInto(facc0, xsA, cf6);
+                        mc1.scaledAccumInto(facc1, xsB, cf6);
+                        mc2.scaledAccumInto(facc2, xsC, cf6);
+                        mc3.scaledAccumInto(facc3, xsD, cf6);
+                    } else {
+                        if (lane < 16) { cf7[lane] = cfv; }
+                        mc0.scaledAccumInto(facc0, xsA, cf7);
+                        mc1.scaledAccumInto(facc1, xsB, cf7);
+                        mc2.scaledAccumInto(facc2, xsC, cf7);
+                        mc3.scaledAccumInto(facc3, xsD, cf7);
+                    }
+                    j = j + 1;
+                }
+                Barrier.workgroup();
+                b = b + 1;
+            }
+
+            facc0.store(y, (uint32) ((int64) t0 * (int64) outDim
+                + (int64) i0), 0, outDim);
+            facc1.store(y, (uint32) ((int64) (t0 + 16) * (int64) outDim
+                + (int64) i0), 0, outDim);
+            facc2.store(y, (uint32) ((int64) (t0 + 32) * (int64) outDim
+                + (int64) i0), 0, outDim);
+            facc3.store(y, (uint32) ((int64) (t0 + 48) * (int64) outDim
+                + (int64) i0), 0, outDim);
+        }
+    }
+
+    public static void q6kWmmaDeqMw4Launch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
+        int64 tilesM4 = rows / 64L;
+        int64 tilesN8 = outDim / 128L;
+        KernelStream s #= KernelStream.current();
+        q6kWmmaDeqMw4Kernel.launch(s,
+            grid: [(uint32) (tilesM4 * tilesN8)], block: [256])
+            (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
+             (uint32) tilesN8, cols / 256L);
+        return;
+    }
+
+    /** Batch kernel vs the Q6 token-blocked deq kernel — harness. */
+    public static void compareQ6Mw4Into(int8[] rawW, float32[] x,
+            int64 rows, int64 outDim, int64 cols, float32[] want,
+            float32[] got) {
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int8[] xph #= heap int8[rows * pb];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q8kPack(x, r * cols, cols, xph, r * pb);
+            r = r + 1;
+        }
+        KernelBuffer<int8> wDev #= heap KernelBuffer<int8>(
+            (uint64) rawW.count());
+        KernelBuffer<int8> xDev #= heap KernelBuffer<int8>(
+            (uint64) (rows * pb));
+        KernelBuffer<float32> yDev #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        wDev.upload(rawW);
+        xDev.upload(xph);
+        KernelStream s #= KernelStream.current();
+        QuantKernel.q6kQ8BatchMatMulLaunchNoSync(yDev, wDev, xDev, rows,
+            outDim, cols);
+        s.sync();
+        yDev.download(want, rows * outDim);
+        KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+            (uint64) (outDim * cols));
+        WmmaKernel.q6kWidenLaunch(deqDev, wDev, outDim, cols);
+        WmmaKernel.q6kWmmaDeqMw4Launch(yDev, wDev, deqDev, xDev, rows,
+            outDim, cols);
+        s.sync();
+        yDev.download(got, rows * outDim);
+        return;
+    }
+
     /** True when the N4 tiling applies. */
     public static boolean fitsN4(int64 rows, int64 outDim) {
         return rows % 16L == 0L && outDim % 64L == 0L;
