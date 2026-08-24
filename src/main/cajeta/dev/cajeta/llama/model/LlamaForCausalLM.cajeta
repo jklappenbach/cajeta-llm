@@ -134,7 +134,7 @@ public final class LlamaForCausalLM extends InfModule {
      */
     public int32 prefill(int32[] tokens, int32 n) {
         int32 r = this.stepSeq(0, tokens, 0, n);
-        this.pos = this.cache.lengthOf(0, 0);
+        this.pos = this.seqLength(0);
         return r;
     }
 
@@ -152,7 +152,7 @@ public final class LlamaForCausalLM extends InfModule {
         if (n <= 0) {
             throw heap LlamaException("step: token count must be positive");
         }
-        int32 seqPos = this.cache.lengthOf(seq, 0);
+        int32 seqPos = this.seqLength(seq);
         if (seqPos + n > this.maxSeq) {
             throw heap LlamaException("step: " + n
                 + " tokens at position " + seqPos
@@ -188,7 +188,7 @@ public final class LlamaForCausalLM extends InfModule {
                 (int64) r * h, this.cfg.hiddenSize);
             r = r + 1;
         }
-        int32 seqPos2 = this.cache.lengthOf(seq, 0);
+        int32 seqPos2 = this.seqLength(seq);
         this.forwardRows(seq, hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
             n, seqPos2);
         return HostOps.argmaxRow(this.pool.logits, this.cfg.vocabSize);
@@ -201,14 +201,14 @@ public final class LlamaForCausalLM extends InfModule {
      */
     public int32 decodeStep(int32 token) {
         int32 r = this.stepOne(0, token);
-        this.pos = this.cache.lengthOf(0, 0);
+        this.pos = this.seqLength(0);
         return r;
     }
 
     /** The N=1 specialization of {@link #stepSeq}: pooled buffers, zero
      *  heap allocations, same `forwardRows`. */
     int32 stepOne(int32 seq, int32 token) {
-        int32 seqPos = this.cache.lengthOf(seq, 0);
+        int32 seqPos = this.seqLength(seq);
         if (seqPos >= this.maxSeq) {
             throw heap LlamaException("decode: context is full (maxSeq "
                 + this.maxSeq + ")");
@@ -250,8 +250,15 @@ public final class LlamaForCausalLM extends InfModule {
         // worst of both. rows==1 because only decode has a residual chain
         // short enough for one buffer.
         boolean resident = rows == 1 && this.deviceResidentReady();
+        if (!resident) {
+            // The host path reads K/V bytes, so the device planes owe the
+            // cache whatever they hold beyond it (10.11.2). Prefill, a
+            // non-Llama layout and a disabled route all land here.
+            this.syncKvToHost(seq);
+        }
         if (resident) {
             this.ensureResidentBuffers(h);
+            this.ensureDeviceKv(seq);
             float32[] hb = hs.hostBuffer();
             int64 hbase = hs.hostBase();
             int64 ci = 0;
@@ -382,6 +389,12 @@ public final class LlamaForCausalLM extends InfModule {
         }
 
         if (resident) {
+            if (this.dkv != null) {
+                // One position was appended to every layer's device
+                // planes. The paged cache is NOT advanced — see
+                // `seqLength`.
+                this.dkv.notePosition(startPos);
+            }
             // Back to the host once, for the final norm and lm_head.
             this.hsDev.download(this.hsHost);
             float32[] hb2 = hs.hostBuffer();
@@ -412,6 +425,48 @@ public final class LlamaForCausalLM extends InfModule {
     KernelBuffer<float32> xnDev;
     float32[] hsHost;
 
+    // Device attention (plan 10.11): RoPE, the KV planes and the attend.
+    DeviceKv dkv;
+
+    static boolean devAttnOn = true;
+
+    /** Arm for 10.11 — the attention tail on the device. On by default:
+     *  the host tail is 3 ms of a 32 ms token at 12 positions of context
+     *  but 97 ms of a 125 ms token at 512, and it is the only part of a
+     *  decode token that grows with context. */
+    public static void setDeviceAttention(boolean on) {
+        LlamaForCausalLM.devAttnOn = on;
+    }
+
+    public static boolean deviceAttentionEnabled() {
+        return LlamaForCausalLM.devAttnOn;
+    }
+
+    /**
+     * The sequence's length in POSITIONS, device-held rows included.
+     *
+     * While the device owns rows the paged cache is deliberately behind —
+     * its length and its bytes stay consistent with each other, and
+     * `DeviceKv.writeback` catches it up in one pass (10.11.2). Every
+     * position decision has to ask here rather than the cache, or a
+     * device-resident generation would emit the same position forever.
+     */
+    int32 seqLength(int32 seq) {
+        if (this.dkv != null && this.dkv.owns() && this.dkv.seq == seq) {
+            return this.dkv.length();
+        }
+        return this.cache.lengthOf(seq, 0);
+    }
+
+    /** Bring the paged cache back up to date, so a host-path token — or
+     *  anything that reads K/V — sees real bytes. */
+    void syncKvToHost(int32 seq) {
+        if (this.dkv != null && this.dkv.owns()) {
+            this.dkv.writeback(this.cache, seq);
+        }
+        return;
+    }
+
     /** Is every projection in the stack on a device route, and is the
      *  layout the plain Llama one the resident path implements? */
     boolean deviceResidentReady() {
@@ -432,6 +487,32 @@ public final class LlamaForCausalLM extends InfModule {
             l = l + 1;
         }
         return true;
+    }
+
+    /**
+     * Allocate the device K/V planes on first use and make them agree
+     * with the paged cache (plan 10.11.2).
+     *
+     * A configuration the flat planes cannot serve — a windowed layer, a
+     * head wider than the combine kernel's workgroup — leaves `dkv` null,
+     * and `residentLayer` then runs its host attention tail. Falling back
+     * is checked rather than assumed: both of those produce a silently
+     * wrong answer, not a crash.
+     */
+    void ensureDeviceKv(int32 seq) {
+        if (!LlamaForCausalLM.devAttnOn || !DeviceKv.supports(this.cfg)) {
+            this.syncKvToHost(seq);
+            this.dkv = null;
+            return;
+        }
+        if (this.dkv == null) {
+            this.dkv #= heap DeviceKv(this.cfg, this.maxSeq);
+            this.dkv.bindRope(this.model);
+        }
+        if (!this.dkv.isCurrentFor(this.cache, seq)) {
+            this.dkv.seed(this.cache, seq);
+        }
+        return;
     }
 
     void ensureResidentBuffers(int32 h) {
@@ -462,20 +543,38 @@ public final class LlamaForCausalLM extends InfModule {
             d.inputLayernorm.deviceWeight(), (int64) h,
             d.inputLayernorm.eps, d.normForm);
         Linear.stageDeviceActivation(this.xnDev, (int64) h);
-        a.qProj.matvecStaged(q, 0L);
-        a.kProj.matvecStaged(k, 0L);
-        a.vProj.matvecStaged(v, 0L);
-
-        Prim.ropeRowHost(q, 0L, nH, hd, p, a.ropeInv);
-        Prim.ropeRowHost(k, 0L, nKv, hd, p, a.ropeInv);
-        if (!this.cache.appendRow(seq, li, k, 0L, v, 0L, p)) {
-            throw heap LlamaException("kv pool exhausted at layer "
-                + li + " position " + p);
+        if (this.dkv != null) {
+            // THE ATTENTION TAIL NEVER LEAVES THE DEVICE (plan 10.11).
+            // q, k and v stay in the projections' own output buffers;
+            // RoPE rotates them there, the append writes the K/V planes
+            // there, the attend reads them there, and o_proj quantizes
+            // the result there. Nothing in this branch crosses the bus.
+            //
+            // Ordering is the stream's, not a sync's: append writes the
+            // planes the attend reads and rope rewrites the q the attend
+            // reads, and all of them are NoSync launches on one stream.
+            a.qProj.matvecStagedKeep();
+            a.kProj.matvecStagedKeep();
+            a.vProj.matvecStagedKeep();
+            this.dkv.rope(li, a.qProj.out(), a.kProj.out(), p);
+            this.dkv.append(li, a.kProj.out(), a.vProj.out(), p);
+            this.dkv.attend(li, a.qProj.out(), p, a.scale);
+            Linear.stageDeviceActivation(this.dkv.out(), (int64) qd);
+            a.oProj.matvecStagedKeep();
+        } else {
+            a.qProj.matvecStaged(q, 0L);
+            a.kProj.matvecStaged(k, 0L);
+            a.vProj.matvecStaged(v, 0L);
+            Prim.ropeRowHost(q, 0L, nH, hd, p, a.ropeInv);
+            Prim.ropeRowHost(k, 0L, nKv, hd, p, a.ropeInv);
+            if (!this.cache.appendRow(seq, li, k, 0L, v, 0L, p)) {
+                throw heap LlamaException("kv pool exhausted at layer "
+                    + li + " position " + p);
+            }
+            this.cache.attendRow(seq, li, q, 0L, a.scale, scores,
+                ao, 0L, nH, nKv, hd);
+            a.oProj.matvecKeepOnDevice(ao, 0L);
         }
-        this.cache.attendRow(seq, li, q, 0L, a.scale, scores,
-            ao, 0L, nH, nKv, hd);
-
-        a.oProj.matvecKeepOnDevice(ao, 0L);
         Prim.addDevice(this.hsDev, a.oProj.out(), (int64) h);
 
         // MLP sublayer.

@@ -1,0 +1,387 @@
+package dev.cajeta.llama.model;
+
+import cajeta.lang.Math;
+import cajeta.xpu.Barrier;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.Shared;
+import cajeta.xpu.KernelThread;
+
+/**
+ * The DECODE attention tail on the device (plan 10.11): RoPE, the KV
+ * append and the attend, for one query row.
+ *
+ * Why this exists next to {@link Prim}'s `attendF32` rather than routing
+ * that one. `attendF32` gives one work item per OUTPUT ELEMENT `(row, h,
+ * d)`, so all `headDim` lanes of a head recompute the same `count x
+ * headDim` score dot — the arithmetic is done 128 times over — and every
+ * K read is a broadcast of one float rather than a coalesced line. That
+ * is the one-row-per-work-item shape 11.0 measured at 155-172 GB/s
+ * against 205-210 for the coalesced form, in its worst version. The
+ * decode shape here is the one llama.cpp uses:
+ *
+ *   scores   one WAVE per (head, position), lanes striding headDim
+ *   combine  one WORKGROUP per head: softmax, then the V accumulation
+ *
+ * Two kernels rather than one fused online-softmax pass, and that is the
+ * whole design decision. A fused kernel needs one workgroup per head —
+ * 32 workgroups on a part with 160 SIMDs, 20% occupancy — and a full
+ * cross-lane reduction per position inside it, which is `count` barriers
+ * deep. Splitting the scores out gives `nHeads x count` independent
+ * waves (16384 at 512 context), which fills the machine, and leaves the
+ * combine pass with no per-position reduction at all.
+ *
+ * WHY IT MATTERS, measured before any of it was written: the host
+ * attention tail is 3 ms of a 32 ms token at 12 positions of context, 20
+ * ms at 128, and 97 ms of a 125 ms token at 512. The projections are
+ * flat at ~29 ms throughout — they must be, they read the same weights
+ * every token. Attention is the only part of a decode token that grows,
+ * and past ~100 positions it is the whole cost.
+ */
+public final class AttnKernel {
+
+    // ── RoPE, one query or key row (5.2, 5.3) ───────────────────────────
+
+    /**
+     * Rotate `t[nHeads x headDim]` in place at absolute position `pos`.
+     * One work item per `(head, dim-pair)`; consecutive items take
+     * consecutive `d`, so the two loads and two stores are coalesced
+     * within a head.
+     */
+    @Kernel
+    public static void ropeDecodeKernel(KernelBuffer<float32> t,
+            KernelBuffer<float32> invFreq, uint32 nHeads, uint32 headDim,
+            float32 pos) {
+        uint32 id = KernelThread.globalIdX();
+        uint32 half = headDim / 2;
+        uint32 lanes = nHeads * half;
+        if (id < lanes) {
+            uint32 h = id / half;
+            uint32 d = id % half;
+            uint32 base = h * headDim;
+            float32 ang = pos * invFreq[d];
+            float32 c = Math.cos(ang);
+            float32 s = Math.sin(ang);
+            float32 a = t[base + d];
+            float32 b = t[base + d + half];
+            t[base + d] = a * c - b * s;
+            t[base + d + half] = a * s + b * c;
+        }
+    }
+
+    // ── KV append (6.1) ─────────────────────────────────────────────────
+
+    /**
+     * Write the already-rotated K row and the V row into row `row` of the
+     * per-layer device K/V planes. One work item per element of each.
+     */
+    @Kernel
+    public static void kvAppendKernel(KernelBuffer<float32> kPool,
+            KernelBuffer<float32> vPool, KernelBuffer<float32> kSrc,
+            KernelBuffer<float32> vSrc, uint32 kvDim, uint32 row) {
+        uint32 id = KernelThread.globalIdX();
+        if (id < kvDim) {
+            uint32 o = row * kvDim + id;
+            kPool[o] = kSrc[id];
+            vPool[o] = vSrc[id];
+        }
+    }
+
+    // ── attend, phase A: the scores (5.6, 5.8) ──────────────────────────
+
+    /**
+     * `scores[h][t] = scale * (q[h] . K[from + t][kvHeadOf(h)])`, one wave
+     * of 32 per `(h, t)`.
+     *
+     * The lane mapping is the point: lane `i` takes dims `i, i+32, ...`,
+     * so the 32 lanes of a wave read 32 CONSECUTIVE floats of the K row
+     * at each step. Giving each lane its own position instead — the
+     * obvious decomposition — has every lane reading a different row and
+     * measures at two thirds the bandwidth (11.0).
+     */
+    @Kernel
+    public static void attnScoreKernel(KernelBuffer<float32> scores,
+            KernelBuffer<float32> q, KernelBuffer<float32> kPool,
+            uint32 nH, uint32 nKv, uint32 hd, uint32 count, uint32 from,
+            uint32 stride, float32 scale) {
+        Shared<float32> part = shared float32[32];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 32;
+        uint32 total = nH * count;
+        float32 s = 0.0f;
+        uint32 h = 0;
+        uint32 t = 0;
+        if (wg < total) {
+            h = wg / count;
+            t = wg % count;
+            uint32 kvDim = nKv * hd;
+            uint32 kvh = h / (nH / nKv);
+            uint32 qBase = h * hd;
+            uint32 kRow = (from + t) * kvDim + kvh * hd;
+            uint32 d = lane;
+            while (d < hd) {
+                s = s + q[qBase + d] * kPool[kRow + d];
+                d = d + 32;
+            }
+        }
+        // The reduction sits OUTSIDE the bounds guard so every workgroup
+        // reaches the same barriers, whether or not it has work.
+        part[lane] = s;
+        Barrier.workgroup();
+        uint32 r = 16;
+        while (r > 0) {
+            if (lane < r) { part[lane] = part[lane] + part[lane + r]; }
+            Barrier.workgroup();
+            r = r / 2;
+        }
+        if (lane == 0 && wg < total) {
+            scores[h * stride + t] = part[0] * scale;
+        }
+    }
+
+    // ── attend, phase B: softmax and the V combine (5.7) ────────────────
+
+    /**
+     * Softmax `scores[h][0..count)` in place, then
+     * `out[h][d] = sum_t p[t] * V[from + t][kvHeadOf(h)][d]`.
+     *
+     * One workgroup of 128 per head. `d` is the lane, so the V reads are
+     * coalesced across the row exactly as the score reads are, and the
+     * position loop carries NO cross-lane reduction — each lane owns one
+     * output element from start to finish.
+     *
+     * Requires `hd <= 128`; {@link DeviceKv#supports} enforces it.
+     */
+    @Kernel
+    public static void attnCombineKernel(KernelBuffer<float32> out,
+            KernelBuffer<float32> scores, KernelBuffer<float32> vPool,
+            uint32 nH, uint32 nKv, uint32 hd, uint32 count, uint32 from,
+            uint32 stride) {
+        Shared<float32> red = shared float32[128];
+        uint32 lane = KernelThread.x();
+        uint32 h = KernelThread.globalIdX() / 128;
+        uint32 kvDim = nKv * hd;
+        uint32 kvh = 0;
+        uint32 sBase = 0;
+        if (h < nH) {
+            kvh = h / (nH / nKv);
+            sBase = h * stride;
+        }
+        // Pass 1: the running max, strided over the lanes.
+        float32 mx = 0.0f - 3.0e38f;
+        if (h < nH) {
+            uint32 t = lane;
+            while (t < count) {
+                float32 sv = scores[sBase + t];
+                if (sv > mx) { mx = sv; }
+                t = t + 128;
+            }
+        }
+        red[lane] = mx;
+        Barrier.workgroup();
+        uint32 r = 64;
+        while (r > 0) {
+            if (lane < r) {
+                if (red[lane + r] > red[lane]) { red[lane] = red[lane + r]; }
+            }
+            Barrier.workgroup();
+            r = r / 2;
+        }
+        float32 m = red[0];
+        Barrier.workgroup();
+        // Pass 2: exponentiate in place and sum.
+        float32 sum = 0.0f;
+        if (h < nH) {
+            uint32 t = lane;
+            while (t < count) {
+                float32 e = Math.exp(scores[sBase + t] - m);
+                scores[sBase + t] = e;
+                sum = sum + e;
+                t = t + 128;
+            }
+        }
+        red[lane] = sum;
+        Barrier.workgroup();
+        r = 64;
+        while (r > 0) {
+            if (lane < r) { red[lane] = red[lane] + red[lane + r]; }
+            Barrier.workgroup();
+            r = r / 2;
+        }
+        float32 rs = 1.0f / red[0];
+        Barrier.workgroup();
+        // Pass 3: the weighted V sum. Ascending in `t` from 0.0f and
+        // scaled once at the end, the same association the host floor
+        // uses, so the two differ only by the score reduction's rounding.
+        if (h < nH && lane < hd) {
+            float32 acc = 0.0f;
+            uint32 vBase = from * kvDim + kvh * hd + lane;
+            uint32 tt = 0;
+            while (tt < count) {
+                acc = acc + scores[sBase + tt] * vPool[vBase + tt * kvDim];
+                tt = tt + 1;
+            }
+            out[h * hd + lane] = acc * rs;
+        }
+    }
+
+    // ── launch wrappers ─────────────────────────────────────────────────
+
+    public static void ropeDecodeLaunchNoSync(KernelBuffer<float32> t,
+            KernelBuffer<float32> invFreq, int32 nHeads, int32 headDim,
+            int32 pos) {
+        uint32 lanes = (uint32) (nHeads * (headDim / 2));
+        KernelStream s #= KernelStream.current();
+        ropeDecodeKernel.launch(s, grid: [(lanes + 63) / 64], block: [64])
+            (t, invFreq, (uint32) nHeads, (uint32) headDim, (float32) pos);
+        return;
+    }
+
+    public static void kvAppendLaunchNoSync(KernelBuffer<float32> kPool,
+            KernelBuffer<float32> vPool, KernelBuffer<float32> kSrc,
+            KernelBuffer<float32> vSrc, int32 kvDim, int32 row) {
+        uint32 lanes = (uint32) kvDim;
+        KernelStream s #= KernelStream.current();
+        kvAppendKernel.launch(s, grid: [(lanes + 63) / 64], block: [64])
+            (kPool, vPool, kSrc, vSrc, (uint32) kvDim, (uint32) row);
+        return;
+    }
+
+    /**
+     * The whole attend for one query row: scores then combine, two
+     * launches, no sync between them and none at the end. The caller
+     * syncs when it needs the result on the host — the resident path
+     * never does.
+     */
+    public static void attendDecodeLaunchNoSync(KernelBuffer<float32> out,
+            KernelBuffer<float32> scores, KernelBuffer<float32> q,
+            KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
+            int32 nH, int32 nKv, int32 hd, int32 count, int32 from,
+            int32 stride, float32 scale) {
+        KernelStream s #= KernelStream.current();
+        uint32 waves = (uint32) (nH * count);
+        // One wave per (head, position): `block` is 32 and `grid` counts
+        // WORK ITEMS, so the item count is waves x 32.
+        attnScoreKernel.launch(s, grid: [waves], block: [32])
+            (scores, q, kPool, (uint32) nH, (uint32) nKv, (uint32) hd,
+             (uint32) count, (uint32) from, (uint32) stride, scale);
+        attnCombineKernel.launch(s, grid: [(uint32) nH], block: [128])
+            (out, scores, vPool, (uint32) nH, (uint32) nKv, (uint32) hd,
+             (uint32) count, (uint32) from, (uint32) stride);
+        return;
+    }
+
+    public static void attendDecodeLaunch(KernelBuffer<float32> out,
+            KernelBuffer<float32> scores, KernelBuffer<float32> q,
+            KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
+            int32 nH, int32 nKv, int32 hd, int32 count, int32 from,
+            int32 stride, float32 scale) {
+        AttnKernel.attendDecodeLaunchNoSync(out, scores, q, kPool, vPool,
+            nH, nKv, hd, count, from, stride, scale);
+        KernelStream s #= KernelStream.current();
+        s.sync();
+        return;
+    }
+
+    // ── host-array shims, so a test can compare against the host floor ──
+
+    /** {@link #ropeDecodeKernel} over host arrays. */
+    public static void ropeDecodeInto(float32[] t, float32[] inv,
+            int32 nHeads, int32 headDim, int32 pos) {
+        int64 n = (int64) (nHeads * headDim);
+        KernelBuffer<float32> tb #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> ib #= heap KernelBuffer<float32>(
+            (uint64) (headDim / 2));
+        tb.upload(t);
+        ib.upload(inv);
+        AttnKernel.ropeDecodeLaunchNoSync(tb, ib, nHeads, headDim, pos);
+        KernelStream s #= KernelStream.current();
+        s.sync();
+        tb.download(t);
+        return;
+    }
+
+    /** The whole decode attend over host arrays: `k`/`v` are `[count x
+     *  kvDim]` contiguous planes, `q` is `[nH x hd]`, `out` is `[nH x
+     *  hd]`. */
+    public static void attendDecodeInto(float32[] out, float32[] q,
+            float32[] k, float32[] v, int32 nH, int32 nKv, int32 hd,
+            int32 count, float32 scale) {
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) (nH * hd);
+        KernelBuffer<float32> qb #= heap KernelBuffer<float32>((uint64) qn);
+        KernelBuffer<float32> ob #= heap KernelBuffer<float32>((uint64) qn);
+        KernelBuffer<float32> kb #= heap KernelBuffer<float32>(
+            (uint64) ((int64) count * kvDim));
+        KernelBuffer<float32> vb #= heap KernelBuffer<float32>(
+            (uint64) ((int64) count * kvDim));
+        KernelBuffer<float32> sb #= heap KernelBuffer<float32>(
+            (uint64) ((int64) nH * (int64) count));
+        qb.upload(q);
+        kb.upload(k);
+        vb.upload(v);
+        AttnKernel.attendDecodeLaunch(ob, sb, qb, kb, vb, nH, nKv, hd,
+            count, 0, count, scale);
+        ob.download(out);
+        return;
+    }
+
+    /**
+     * The HOST floor for {@link #attendDecodeInto} — the same arithmetic
+     * in the same association, so a test has something to compare against
+     * that is not the paged cache.
+     */
+    public static void attendDecodeHost(float32[] out, float32[] q,
+            float32[] k, float32[] v, int32 nH, int32 nKv, int32 hd,
+            int32 count, float32 scale) {
+        int32 group = nH / nKv;
+        int64 kvDim = (int64) (nKv * hd);
+        float32[] sc #= heap float32[(int64) count];
+        int32 h = 0;
+        while (h < nH) {
+            int64 kvHead = (int64) ((h / group) * hd);
+            int64 qBase = (int64) (h * hd);
+            int32 t = 0;
+            while (t < count) {
+                float32 s = 0.0f;
+                int64 kRow = (int64) t * kvDim + kvHead;
+                int32 d = 0;
+                while (d < hd) {
+                    s = s + q[qBase + (int64) d] * k[kRow + (int64) d];
+                    d = d + 1;
+                }
+                sc[(int64) t] = s * scale;
+                t = t + 1;
+            }
+            float32 mx = sc[0];
+            t = 1;
+            while (t < count) {
+                if (sc[(int64) t] > mx) { mx = sc[(int64) t]; }
+                t = t + 1;
+            }
+            float32 sum = 0.0f;
+            t = 0;
+            while (t < count) {
+                float32 e = Math.exp(sc[(int64) t] - mx);
+                sc[(int64) t] = e;
+                sum = sum + e;
+                t = t + 1;
+            }
+            float32 rs = 1.0f / sum;
+            int32 d2 = 0;
+            while (d2 < hd) {
+                float32 acc = 0.0f;
+                int32 t2 = 0;
+                while (t2 < count) {
+                    acc = acc + sc[(int64) t2]
+                        * v[(int64) t2 * kvDim + kvHead + (int64) d2];
+                    t2 = t2 + 1;
+                }
+                out[qBase + (int64) d2] = acc * rs;
+                d2 = d2 + 1;
+            }
+            h = h + 1;
+        }
+        return;
+    }
+}

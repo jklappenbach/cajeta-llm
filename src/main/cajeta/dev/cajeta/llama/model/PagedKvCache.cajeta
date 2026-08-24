@@ -257,6 +257,129 @@ public final class PagedKvCache {
         return true;
     }
 
+    /**
+     * Copy positions `[from, to)` of `(seq, layer)` into CONTIGUOUS host
+     * planes — `kOut[i·kvDim..]` for position `from + i`, and the same for
+     * V (plan 10.11.2).
+     *
+     * The device K/V planes are flat `[cap x kvDim]`, with no block table
+     * and no ring, so seeding them from the paged cache means walking the
+     * indirection once here rather than teaching a kernel about it. Reads
+     * go through raw buffers and one `rowBase` per position, not `kAt`
+     * per element: at 512 positions of an 8B model that is 1M accessor
+     * calls a layer, and the accessor is what `attendRow` measured as the
+     * cost, not the arithmetic.
+     */
+    public void copyRowsTo(int32 seq, int32 layer, int32 from, int32 to,
+            float32[] kOut, float32[] vOut) {
+        int32 sl = seq * this.layers + layer;
+        Tensor<float32> srcK = this.srcOf(sl, false);
+        Tensor<float32> srcV = this.srcOf(sl, true);
+        float32[] kb = srcK.hostBuffer();
+        int64 kbase = srcK.hostBase();
+        float32[] vb = srcV.hostBuffer();
+        int64 vbase = srcV.hostBase();
+        int32 t = from;
+        while (t < to) {
+            int64 dst = (int64) (t - from) * (int64) this.kvDim;
+            int64 kr = kbase + this.rowBase(sl, t, false);
+            int64 vr = vbase + this.rowBase(sl, t, true);
+            int64 j = 0;
+            while (j < (int64) this.kvDim) {
+                kOut[dst + j] = kb[kr + j];
+                vOut[dst + j] = vb[vr + j];
+                j = j + 1;
+            }
+            t = t + 1;
+        }
+        return;
+    }
+
+    /**
+     * {@link #appendRow} from RAW host arrays — the shape a writeback from
+     * device-resident K/V can call. Same bookkeeping, same failure mode.
+     */
+    public boolean appendRowRaw(int32 seq, int32 layer, float32[] kb,
+            int64 kOff, float32[] vb, int64 vOff, int32 p) {
+        int32 sl = seq * this.layers + layer;
+        if (p != this.lenSL[sl]) {
+            throw heap LlamaException("kv append: position " + p
+                + " is not the next position (" + this.lenSL[sl] + ")");
+        }
+        int32 w = this.layerWindow[layer];
+        if (w > 0) {
+            int32 rows = Math.min<int32>(this.maxSeqCap, w);
+            Tensor<float32> rk = this.ringK[sl];
+            Tensor<float32> rv = this.ringV[sl];
+            int64 base = (int64) (p % rows) * (int64) this.kvDim;
+            float32[] rkb = rk.hostBuffer();
+            int64 rkbase = rk.hostBase() + base;
+            float32[] rvb = rv.hostBuffer();
+            int64 rvbase = rv.hostBase() + base;
+            int64 j = 0;
+            while (j < (int64) this.kvDim) {
+                rkb[rkbase + j] = kb[kOff + j];
+                rvb[rvbase + j] = vb[vOff + j];
+                j = j + 1;
+            }
+            this.lenSL[sl] = p + 1;
+            return true;
+        }
+        if (p >= this.maxSeqCap) {
+            throw heap LlamaException("kv append: position " + p
+                + " exceeds the configured maximum context "
+                + this.maxSeqCap);
+        }
+        int32 ti = p / this.blockTokens;
+        int32 tBase = sl * this.blocksPerSeq;
+        int32 blk = 0;
+        if (p % this.blockTokens == 0) {
+            if (this.freeCount == 0) { return false; }
+            this.freeCount = this.freeCount - 1;
+            blk = this.freeList[this.freeCount];
+            this.refCount[blk] = 1;
+            this.tables[tBase + ti] = blk;
+        } else {
+            blk = this.tables[tBase + ti];
+            if (this.refCount[blk] > 1) {
+                if (this.freeCount == 0) { return false; }
+                this.freeCount = this.freeCount - 1;
+                int32 fresh = this.freeList[this.freeCount];
+                this.refCount[fresh] = 1;
+                int64 srcB = (int64) blk * 2 * (int64) this.blockTokens
+                    * (int64) this.kvDim;
+                int64 dstB = (int64) fresh * 2 * (int64) this.blockTokens
+                    * (int64) this.kvDim;
+                int64 n = 2 * (int64) this.blockTokens * (int64) this.kvDim;
+                float32[] pb0 = this.pool.hostBuffer();
+                int64 pbase0 = this.pool.hostBase();
+                int64 j = 0;
+                while (j < n) {
+                    pb0[pbase0 + dstB + j] = pb0[pbase0 + srcB + j];
+                    j = j + 1;
+                }
+                this.refCount[blk] = this.refCount[blk] - 1;
+                this.tables[tBase + ti] = fresh;
+                blk = fresh;
+            }
+        }
+        int32 slot = p % this.blockTokens;
+        int64 kBase = ((int64) blk * 2 * (int64) this.blockTokens
+            + (int64) slot) * (int64) this.kvDim;
+        int64 vBase = ((int64) blk * 2 * (int64) this.blockTokens
+            + (int64) this.blockTokens + (int64) slot) * (int64) this.kvDim;
+        float32[] pb = this.pool.hostBuffer();
+        int64 pbase = this.pool.hostBase();
+        int64 j2 = 0;
+        while (j2 < (int64) this.kvDim) {
+            pb[pbase + kBase + j2] = kb[kOff + j2];
+            pb[pbase + vBase + j2] = vb[vOff + j2];
+            j2 = j2 + 1;
+        }
+        this.lenSL[sl] = p + 1;
+        return true;
+    }
+
     // ── element reads (test surface; in-place attention reads below) ────
 
     /** K element at absolute position `t`; windowed layers serve only the
