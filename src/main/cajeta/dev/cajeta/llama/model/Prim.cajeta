@@ -270,14 +270,55 @@ public final class Prim {
      * `rmsnormRowF32` behind {@link #rmsnormDevice} is the single-row
      * (decode) shape. NoSync: stream-ordered like every resident op.
      */
+    /** One ROW per WORKGROUP, 256-lane cooperative reduction per row —
+     *  the batched shape rocprofv3 demanded: the one-row-per-work-ITEM
+     *  `rmsnormF32` put 512 serial 4096-element reductions on 8
+     *  workgroups and measured 681 us per call, ~8.5x its memory
+     *  floor. */
+    @Kernel
+    public static void rmsnormRowsF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> x, KernelBuffer<float32> w,
+            uint32 dim, float32 eps, int32 form) {
+        Shared<float32> part = shared float32[256];
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 256;
+        uint32 base = row * dim;
+        float32 ss = 0.0f;
+        uint32 i = lane;
+        while (i < dim) {
+            float32 v = x[base + i];
+            ss = ss + v * v;
+            i = i + 256;
+        }
+        part[lane] = ss;
+        Barrier.workgroup();
+        uint32 sred = 128;
+        while (sred > 0) {
+            if (lane < sred) {
+                part[lane] = part[lane] + part[lane + sred];
+            }
+            Barrier.workgroup();
+            sred = sred / 2;
+        }
+        float32 scale = 1.0f
+            / Math.sqrt(part[0] / (float32) dim + eps);
+        uint32 j = lane;
+        while (j < dim) {
+            float32 wi = w[j];
+            if (form == 1) { wi = 1.0f + wi; }
+            out[base + j] = x[base + j] * scale * wi;
+            j = j + 256;
+        }
+    }
+
     public static void rmsnormBatchDevice(KernelBuffer<float32> out,
             KernelBuffer<float32> x, KernelBuffer<float32> w,
             int64 rows, int64 dim, float32 eps, int32 form) {
         uint32 ur = (uint32) rows;
         KernelStream s = KernelStream.current();
         int64 t0 = Clock.nanoTime();
-        rmsnormF32.launch(s, grid: [(ur + 63) / 64], block: [64])
-            (out, x, w, ur, (uint32) dim, eps, form);
+        rmsnormRowsF32.launch(s, grid: [ur], block: [256])
+            (out, x, w, (uint32) dim, eps, form);
         Prim.tNorm = Prim.tNorm + (Clock.nanoTime() - t0);
         Prim.nNorm = Prim.nNorm + 1L;
         return;
