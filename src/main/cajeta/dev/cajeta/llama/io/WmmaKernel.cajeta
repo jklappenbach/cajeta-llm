@@ -257,6 +257,234 @@ public final class WmmaKernel {
     }
 
     /**
+     * 10.12.16 — the ONE-TIME widen: packed Q4_K nibbles out to a
+     * TILE-MAJOR int8 copy holding the RAW nibble 0..15. Scales, mins,
+     * d and dmin are NOT folded in — they stay in the packed buffer and
+     * the deq GEMM applies them at the seam exactly as the staged
+     * kernel does, so the two kernels are bit-identical.
+     *
+     * WHY TILED AND NOT `[outDim x cols]`: the flat layout was BUILT
+     * AND MEASURED FIRST — `mb.load(deq, ., 1, cols)` is functionally
+     * correct (bit-identical output) and 52% SLOWER (launch 4.6 s vs
+     * 3.03 s at 512 ctx), because a column-major fragment load gathers
+     * sixteen 16-byte runs a weight-row apart: one cache line per run
+     * at quarter utilization, with no LDS to absorb the stride.
+     * llama.cpp's MMQ corroborates: their WMMA path never feeds B from
+     * strided global either — `load_tiles` always stages through shared.
+     *
+     * So the copy is stored the way the FRAGMENT wants it: tile
+     * `(I, K) = (i/16, k/16)` is a contiguous 256-byte `[k%16][i%16]`
+     * run at `(I*(cols/16) + K) * 256` — the exact layout the staged
+     * kernel builds in LDS — and the GEMM reads it with
+     * `mb.load(deq, tileBase, 0, 16)`: four fully-utilized cache lines,
+     * no staging, no barriers.
+     *
+     * One thread per packed nibble byte: reads are coalesced along the
+     * 128-byte nibble area; the widen's scattered writes run ONCE per
+     * weight, so their pattern is irrelevant.
+     */
+    @Kernel
+    public static void q4kWidenKernel(KernelBuffer<int8> deq,
+            KernelBuffer<int8> packed, uint32 total, int64 blocksPerRow) {
+        uint32 tid = KernelThread.globalIdX();
+        if (tid < total) {
+            uint32 perRow = (uint32) blocksPerRow * 128;
+            uint32 ii = tid / perRow;
+            uint32 rem = tid % perRow;
+            uint32 b = rem / 128;
+            uint32 byteIdx = rem % 128;
+            int64 ro = (int64) ii * (blocksPerRow * 144L)
+                + (int64) b * 144L + 16L + (int64) byteIdx;
+            int32 rb = (int32) packed[ro] & 255;
+            uint32 g = byteIdx / 32;
+            uint32 t = byteIdx % 32;
+            int64 tilesK = blocksPerRow * 16L;
+            int64 kLo = (int64) b * 256L + (int64) (64 * g + t);
+            int64 kHi = kLo + 32L;
+            int64 tI = (int64) (ii / 16);
+            int64 iIn = (int64) (ii % 16);
+            deq[(tI * tilesK + kLo / 16L) * 256L
+                + (kLo % 16L) * 16L + iIn] = (int8) (rb & 15);
+            deq[(tI * tilesK + kHi / 16L) * 256L
+                + (kHi % 16L) * 16L + iIn] = (int8) ((rb >> 4) & 15);
+        }
+    }
+
+    public static void q4kWidenLaunch(KernelBuffer<int8> deq,
+            KernelBuffer<int8> packed, int64 outDim, int64 cols) {
+        int64 bpr = cols / 256L;
+        int64 total = outDim * bpr * 128L;
+        KernelStream s #= KernelStream.current();
+        q4kWidenKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
+            block: [256])
+            (deq, packed, (uint32) total, bpr);
+        s.sync();
+        return;
+    }
+
+    /**
+     * The deq GEMM (10.12.16): the staged kernel with the B feed moved
+     * to the widened TILE-MAJOR global copy. Each `mb.load(deq,
+     * tileBase, 0, 16)` reads one contiguous 256-byte fragment — the
+     * `bt` tile, its 2048-nibble widen loop and its barrier are GONE;
+     * LDS keeps only the seam spill and the header state. The header
+     * decode, the scale seam and the dmin correction are UNCHANGED, so
+     * the output is bit-identical to the staged kernel's. (The flat
+     * `[outDim x cols]` + layout=1 form was measured 52% slower — see
+     * the widen kernel's comment.)
+     */
+    @Kernel
+    public static void q4kWmmaDeqKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, uint32 rows, uint32 outDim,
+            uint32 tilesN, int64 blocksPerRow) {
+        Shared<int32> ct = shared int32[256];
+        Shared<float32> acc = shared float32[256];
+        Shared<int32> scLds = shared int32[128];
+        Shared<int32> mnLds = shared int32[128];
+        Shared<float32> dLds = shared float32[16];
+        Shared<float32> dmLds = shared float32[16];
+        Shared<float32> xsLds = shared float32[16];
+        Shared<int32> psLds = shared int32[128];
+
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 32;
+        uint32 tileT = wg / tilesN;
+        uint32 tileI = wg % tilesN;
+        uint32 t0 = tileT * 16;
+        uint32 i0 = tileI * 16;
+        if (t0 < rows && i0 < outDim) {
+            int64 rowBytes = blocksPerRow * 144L;
+            int64 xRowBytes = blocksPerRow * 320L;
+
+            uint32 z = lane;
+            while (z < 256) { acc[z] = 0.0f; z = z + 32; }
+            Barrier.workgroup();
+
+            CooperativeMatrix<int8,16,16,0> ma;
+            CooperativeMatrix<int8,16,16,1> mb;
+            CooperativeMatrix<int32,16,16,2> mc;
+
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                if (lane < 16) {
+                    int64 ro = (int64) (i0 + lane) * rowBytes + b * 144L;
+                    dLds[lane] = GgufFile.halfBitsToF32(
+                        ((int32) packed[ro] & 255)
+                        | (((int32) packed[ro + 1L] & 255) << 8));
+                    dmLds[lane] = GgufFile.halfBitsToF32(
+                        ((int32) packed[ro + 2L] & 255)
+                        | (((int32) packed[ro + 3L] & 255) << 8));
+                    int32 q = 0;
+                    while (q < 4) {
+                        int32 dq = (int32) packed[ro + 4L + (int64) q] & 255;
+                        int32 mq = (int32) packed[ro + 8L + (int64) q] & 255;
+                        int32 kq = (int32) packed[ro + 12L + (int64) q] & 255;
+                        scLds[lane * 8 + q] = dq & 63;
+                        scLds[lane * 8 + 4 + q] =
+                            (kq & 15) | ((dq >> 2) & 48);
+                        mnLds[lane * 8 + q] = mq & 63;
+                        mnLds[lane * 8 + 4 + q] =
+                            (kq >> 4) | ((mq >> 2) & 48);
+                        q = q + 1;
+                    }
+                } else {
+                    uint32 tk = lane - 16;
+                    int64 xb = (int64) (t0 + tk) * xRowBytes + b * 320L;
+                    xsLds[tk] = Cajeta.bitsToF32(
+                        ((int32) xp[xb + 288L] & 255)
+                        | (((int32) xp[xb + 289L] & 255) << 8)
+                        | (((int32) xp[xb + 290L] & 255) << 16)
+                        | (((int32) xp[xb + 291L] & 255) << 24));
+                    int32 sbi = 0;
+                    while (sbi < 8) {
+                        int64 at = xb + 256L + (int64) (sbi * 4);
+                        psLds[tk * 8 + sbi] = ((int32) xp[at] & 255)
+                            | (((int32) xp[at + 1L] & 255) << 8)
+                            | (((int32) xp[at + 2L] & 255) << 16)
+                            | (((int32) xp[at + 3L]) << 24);
+                        sbi = sbi + 1;
+                    }
+                }
+                Barrier.workgroup();
+
+                uint32 j = 0;
+                while (j < 8) {
+                    mc.splat(0);
+                    uint32 half = 0;
+                    while (half < 2) {
+                        uint32 kBase = 32 * j + 16 * half;
+                        int64 aOff = (int64) t0 * xRowBytes + b * 320L
+                            + (int64) kBase;
+                        ma.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
+                        // Tile (i0/16, kAbs/16) is one contiguous
+                        // 256-byte [k][outRow] run — the bt layout,
+                        // pre-materialized.
+                        int64 kAbs = b * 256L + (int64) kBase;
+                        int64 bOff = ((int64) (i0 / 16)
+                            * (blocksPerRow * 16L) + kAbs / 16L) * 256L;
+                        mb.load(deq, (uint32) bOff, 0, 16);
+                        mc.mma(ma, mb);
+                        half = half + 1;
+                    }
+                    mc.store(ct, 0, 0, 16);
+                    Barrier.workgroup();
+                    uint32 p = lane;
+                    while (p < 256) {
+                        uint32 tt = p / 16;
+                        uint32 ii = p % 16;
+                        acc[p] = acc[p] + dLds[ii] * xsLds[tt]
+                            * (float32) (scLds[ii * 8 + j] * ct[p]);
+                        p = p + 32;
+                    }
+                    Barrier.workgroup();
+                    j = j + 1;
+                }
+
+                uint32 p2 = lane;
+                while (p2 < 256) {
+                    uint32 tt = p2 / 16;
+                    uint32 ii = p2 % 16;
+                    int32 dm = 0;
+                    uint32 sj = 0;
+                    while (sj < 8) {
+                        dm = dm + mnLds[ii * 8 + sj] * psLds[tt * 8 + sj];
+                        sj = sj + 1;
+                    }
+                    acc[p2] = acc[p2]
+                        - dmLds[ii] * xsLds[tt] * (float32) dm;
+                    p2 = p2 + 32;
+                }
+                Barrier.workgroup();
+                b = b + 1;
+            }
+
+            uint32 w = lane;
+            while (w < 256) {
+                uint32 tt = w / 16;
+                uint32 ii = w % 16;
+                y[(int64) (t0 + tt) * (int64) outDim + (int64) (i0 + ii)] =
+                    acc[w];
+                w = w + 32;
+            }
+        }
+    }
+
+    public static void q4kWmmaDeqLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
+        int64 tilesM = rows / 16L;
+        int64 tilesN = outDim / 16L;
+        KernelStream s #= KernelStream.current();
+        q4kWmmaDeqKernel.launch(s, grid: [(uint32) (tilesM * tilesN)],
+            block: [32])
+            (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
+             (uint32) tilesN, cols / 256L);
+        s.sync();
+        return;
+    }
+
+    /**
      * Both kernels over HOST arrays on the same bytes — the shape a test
      * can call. `want` comes from the shipped one-token-per-lane batch
      * kernel, `got` from the matrix cores.
@@ -284,6 +512,53 @@ public final class WmmaKernel {
         s.sync();
         yDev.download(want, rows * outDim);
         WmmaKernel.q4kWmmaLaunch(yDev, wDev, xDev, rows, outDim, cols);
+        yDev.download(got, rows * outDim);
+        return;
+    }
+
+    /** The widen kernel over a host array — the shape a test can call. */
+    public static void widenInto(int8[] rawW, int64 outDim, int64 cols,
+            int8[] out) {
+        KernelBuffer<int8> wDev #= heap KernelBuffer<int8>(
+            (uint64) rawW.count());
+        wDev.upload(rawW);
+        KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+            (uint64) (outDim * cols));
+        WmmaKernel.q4kWidenLaunch(deqDev, wDev, outDim, cols);
+        deqDev.download(out, outDim * cols);
+        return;
+    }
+
+    /**
+     * Staged vs deq WMMA on the same bytes (10.12.16): `want` from the
+     * staged kernel, `got` from the widen + global-B kernel. The pair is
+     * expected EXACTLY equal — identical accumulation order.
+     */
+    public static void compareDeqInto(int8[] rawW, float32[] x,
+            int64 rows, int64 outDim, int64 cols, float32[] want,
+            float32[] got) {
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int8[] xph #= heap int8[rows * pb];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q8kPack(x, r * cols, cols, xph, r * pb);
+            r = r + 1;
+        }
+        KernelBuffer<int8> wDev #= heap KernelBuffer<int8>(
+            (uint64) rawW.count());
+        KernelBuffer<int8> xDev #= heap KernelBuffer<int8>(
+            (uint64) (rows * pb));
+        KernelBuffer<float32> yDev #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        wDev.upload(rawW);
+        xDev.upload(xph);
+        WmmaKernel.q4kWmmaLaunch(yDev, wDev, xDev, rows, outDim, cols);
+        yDev.download(want, rows * outDim);
+        KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+            (uint64) (outDim * cols));
+        WmmaKernel.q4kWidenLaunch(deqDev, wDev, outDim, cols);
+        WmmaKernel.q4kWmmaDeqLaunch(yDev, wDev, deqDev, xDev, rows,
+            outDim, cols);
         yDev.download(got, rows * outDim);
         return;
     }

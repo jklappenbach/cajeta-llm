@@ -42,6 +42,11 @@ public final class Linear extends InfModule {
     // of inDim·outDim/2 bytes; they go away when the activations themselves
     // become device-resident.
     KernelBuffer<int8> packedDev;
+    // The widened int8 prefill copy (10.12.16), built ONCE on the first
+    // int8-routed matmulInto and only under that policy — a Linear that
+    // never prefills under "int8" never pays the ~2x bytes. Decode never
+    // reads it.
+    KernelBuffer<int8> deqDev;
     KernelBuffer<float32> yDev;
     boolean unified;
     boolean q8;
@@ -576,6 +581,7 @@ public final class Linear extends InfModule {
         this.inDim = inDim;
         this.outDim = outDim;
         this.packedDev = null;
+        this.deqDev = null;
         this.yDev = null;
         this.yScratch = null;
         this.unified = false;
@@ -945,11 +951,20 @@ public final class Linear extends InfModule {
     static int64 btInCap;
     static boolean devPack = true;
     static boolean wmmaOn = true;
+    // Prefill weight residency (10.12.16): false = "packed" (the staged
+    // WMMA kernel, default), true = "int8" (the widened resident copy).
+    // Set from EngineOptions.prefillWeights before any prefill runs.
+    static boolean deqPrefill = false;
     static int64 wmmaCalls;
+    static int64 wmmaDeqCalls;
     static int64 batchFallbackCalls;
 
     public static void setWmma(boolean on) { Linear.wmmaOn = on; }
+    public static void setDeqPrefill(boolean on) {
+        Linear.deqPrefill = on;
+    }
     public static int64 wmmaCallCount() { return Linear.wmmaCalls; }
+    public static int64 wmmaDeqCallCount() { return Linear.wmmaDeqCalls; }
     public static int64 batchFallbackCount() {
         return Linear.batchFallbackCalls;
     }
@@ -1116,7 +1131,13 @@ public final class Linear extends InfModule {
         boolean useWmma = Linear.wmmaOn
             && this.packedTy == Quant.GG_Q4_K
             && WmmaKernel.fits((int64) rows, (int64) this.outDim);
-        if (useWmma) {
+        boolean useDeq = useWmma && Linear.deqPrefill;
+        if (useDeq) {
+            this.ensureDeq();
+            WmmaKernel.q4kWmmaDeqLaunch(this.yBatch, this.packedDev,
+                this.deqDev, Linear.btXp, (int64) rows,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (useWmma) {
             WmmaKernel.q4kWmmaLaunch(this.yBatch, this.packedDev,
                 Linear.btXp, (int64) rows, (int64) this.outDim,
                 (int64) this.inDim);
@@ -1136,7 +1157,9 @@ public final class Linear extends InfModule {
             i = i + 1;
         }
         int64 t3 = Clock.nanoTime();
-        if (useWmma) {
+        if (useDeq) {
+            Linear.wmmaDeqCalls = Linear.wmmaDeqCalls + 1L;
+        } else if (useWmma) {
             Linear.wmmaCalls = Linear.wmmaCalls + 1L;
         } else {
             Linear.batchFallbackCalls = Linear.batchFallbackCalls + 1L;
@@ -1145,6 +1168,17 @@ public final class Linear extends InfModule {
         Linear.btDownNs = Linear.btDownNs + (t2 - t1);
         Linear.btCopyNs = Linear.btCopyNs + (t3 - t2);
         Linear.btCalls = Linear.btCalls + 1L;
+        return;
+    }
+
+    /** Build the widened int8 copy once (10.12.16). Caller holds
+     *  `ensureDevice()` already done — `packedDev` is the source. */
+    void ensureDeq() {
+        if (this.deqDev != null) { return; }
+        int64 n = (int64) this.outDim * (int64) this.inDim;
+        this.deqDev #= heap KernelBuffer<int8>((uint64) n);
+        WmmaKernel.q4kWidenLaunch(this.deqDev, this.packedDev,
+            (int64) this.outDim, (int64) this.inDim);
         return;
     }
 

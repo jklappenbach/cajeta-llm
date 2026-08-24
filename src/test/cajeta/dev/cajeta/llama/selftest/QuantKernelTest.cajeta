@@ -678,7 +678,17 @@ public class QuantKernelTest {
     public void theWmmaKernelAgreesWithTheBatchKernel() {
         String be #= Device.activeBackend();
         if (be.equals("cpu") || be.equals("none")) { return; }
-        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        // The fixture holds 8 blocks and a 16x16 tile needs 16 rows, so
+        // as committed this computed `cols = (8/16)*256 = 0` — a
+        // zero-column GEMM whose all-zero output tripped assertLive the
+        // FIRST time the suite was actually compiled for amdgpu
+        // (2026-08-24; the earlier "green" sweep set CAJETA_XPU_BACKEND,
+        // which run-tests.sh does not read, so every device test
+        // early-returned against a cpu-compiled binary). Tile the
+        // fixture to 32 blocks: 16 rows x 2 blocks, and the b loop
+        // actually iterates.
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
         int64 blocks = (int64) raw.count()
             / (int64) Quant.blockBytes(Quant.GG_Q4_K);
         int64 outDim = 16L;
@@ -719,6 +729,114 @@ public class QuantKernelTest {
                     + ", row " + (k % outDim) + "): wmma " + b2
                     + " vs batch " + a
                     + " - further apart than reassociation explains");
+            }
+            k = k + 1;
+        }
+    }
+
+    /**
+     * 10.12.16 — the one-time widen kernel writes exactly the nibbles
+     * the packed blocks hold, at the TILE-MAJOR addressing the deq GEMM
+     * reads: tile `(i/16, k/16)` is a contiguous 256-byte `[k%16][i%16]`
+     * run (the flat `[outDim x cols]` layout was measured 52% slower —
+     * see the widen kernel's comment).
+     *
+     * The oracle is HOST code written straight from the Q4_K layout
+     * (byte `t` of the 32 at 16+32g holds element 64g+t in its low
+     * nibble and 64g+32+t in its high one) — independent of the kernel's
+     * index math, so an addressing slip in either shows as disagreement.
+     */
+    @Test
+    public void theWidenKernelMatchesHostNibbleExtraction() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 outDim = 16L;
+        int64 bpr = ((int64) raw.count() / 144L) / outDim;
+        int64 cols = bpr * 256L;
+        int8[] got #= heap int8[outDim * cols];
+        WmmaKernel.widenInto(raw, outDim, cols, got);
+
+        boolean live = false;
+        int64 ii = 0;
+        while (ii < outDim) {
+            int64 b = 0;
+            while (b < bpr) {
+                int64 byteIdx = 0;
+                while (byteIdx < 128L) {
+                    int32 rb = (int32) raw[ii * bpr * 144L + b * 144L
+                        + 16L + byteIdx] & 255;
+                    int64 g = byteIdx / 32L;
+                    int64 t = byteIdx % 32L;
+                    int64 kLo = b * 256L + 64L * g + t;
+                    int64 kHi = kLo + 32L;
+                    int32 lo = rb & 15;
+                    int32 hi = (rb >> 4) & 15;
+                    int64 tilesK = bpr * 16L;
+                    int64 tI = ii / 16L;
+                    int64 iIn = ii % 16L;
+                    int32 gotLo = (int32) got[
+                        (tI * tilesK + kLo / 16L) * 256L
+                        + (kLo % 16L) * 16L + iIn];
+                    int32 gotHi = (int32) got[
+                        (tI * tilesK + kHi / 16L) * 256L
+                        + (kHi % 16L) * 16L + iIn];
+                    if (gotLo != lo || gotHi != hi) {
+                        Assert.fail("row " + ii + " block " + b + " byte "
+                            + byteIdx + ": device widen " + gotLo + "/"
+                            + gotHi + " vs host " + lo + "/" + hi);
+                    }
+                    if (lo != 0 || hi != 0) { live = true; }
+                    byteIdx = byteIdx + 1;
+                }
+                b = b + 1;
+            }
+            ii = ii + 1;
+        }
+        if (!live) {
+            Assert.fail("every nibble in the fixture is zero - "
+                + "agreement proved nothing");
+        }
+    }
+
+    /**
+     * 10.12.16 — the deq WMMA kernel (B fed straight from the widened
+     * global int8 copy, layout=1) agrees with the staged WMMA kernel
+     * EXACTLY, not to tolerance: the accumulation order is identical and
+     * the only change is where the B bytes come from. A tolerance here
+     * would let a subtly wrong column-major stride hide behind
+     * reassociation slack.
+     *
+     * This test is also the SPIKE for int8 + layout=1 + global
+     * `mb.load` — a combination no compiler test pins (the layout=1
+     * coverage is all f16 from LDS).
+     */
+    @Test
+    public void theDeqWmmaKernelMatchesTheStagedWmmaKernelExactly() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 outDim = 16L;
+        int64 cols = (((int64) raw.count() / 144L) / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareDeqInto(raw, x, rows, outDim, cols, want, got);
+
+        QuantKernelTest.assertLive(want, "staged WMMA kernel");
+        QuantKernelTest.assertLive(got, "deq WMMA kernel");
+        int64 n = rows * outDim;
+        int64 k = 0;
+        while (k < n) {
+            if (want[k] != got[k]) {
+                Assert.fail("element " + k + " (token " + (k / outDim)
+                    + ", row " + (k % outDim) + "): deq " + got[k]
+                    + " vs staged " + want[k]
+                    + " - the B feed changed the VALUE, not just the path");
             }
             k = k + 1;
         }
