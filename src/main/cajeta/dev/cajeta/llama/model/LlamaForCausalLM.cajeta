@@ -482,6 +482,15 @@ public final class LlamaForCausalLM extends InfModule {
     KernelBuffer<float32> pfXnDev;
     float32[] pfHsHost;
     int64 pfHsCap;
+    // 10.12.7.c: per-row positions for the batched device rope, and the
+    // scratch the roped k/v come down through for the paged cache's
+    // host append (the cache stays authoritative).
+    KernelBuffer<int32> pfPosDev;
+    int32[] pfPosHost;
+    int32 pfPosCap;
+    float32[] pfKScr;
+    float32[] pfVScr;
+    int64 pfKvCap;
 
     void ensurePrefillRes(int64 n) {
         if (this.pfHsCap >= n) { return; }
@@ -489,6 +498,29 @@ public final class LlamaForCausalLM extends InfModule {
         this.pfXnDev #= heap KernelBuffer<float32>((uint64) n);
         this.pfHsHost #= heap float32[n];
         this.pfHsCap = n;
+        return;
+    }
+
+    void ensurePrefillPos(int32 rows, int32 startPos) {
+        if (this.pfPosCap < rows) {
+            this.pfPosDev #= heap KernelBuffer<int32>((uint64) rows);
+            this.pfPosHost #= heap int32[(int64) rows];
+            this.pfPosCap = rows;
+        }
+        int32 i = 0;
+        while (i < rows) {
+            this.pfPosHost[(int64) i] = startPos + i;
+            i = i + 1;
+        }
+        this.pfPosDev.upload(this.pfPosHost, (int64) rows);
+        return;
+    }
+
+    void ensurePrefillKv(int64 n) {
+        if (this.pfKvCap >= n) { return; }
+        this.pfKScr #= heap float32[n];
+        this.pfVScr #= heap float32[n];
+        this.pfKvCap = n;
         return;
     }
 
@@ -668,6 +700,51 @@ public final class LlamaForCausalLM extends InfModule {
                 Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
             }
             int32 r = 0;
+            // 10.12.7.c: with the device attend available, q/k/v never
+            // exist on the host at all — roped on the device, appended
+            // to the planes there, attended there, and the o input
+            // packed straight from the attend's output. The paged cache
+            // stays authoritative through ONE k/v download per layer
+            // into appendRowRaw, replacing per-row host rope + append.
+            boolean resAttn = res && this.dkv != null;
+            if (resAttn) {
+                a.qProj.matmulBatchKeep(rows);
+                a.kProj.matmulBatchKeep(rows);
+                a.vProj.matmulBatchKeep(rows);
+                int64 tr0 = Clock.nanoTime();
+                this.ensurePrefillPos(rows, startPos);
+                Prim.ropeBatchDevice(a.qProj.yBatch, a.deviceRopeInv(),
+                    this.pfPosDev, (int64) rows, nH, hd);
+                Prim.ropeBatchDevice(a.kProj.yBatch, a.deviceRopeInv(),
+                    this.pfPosDev, (int64) rows, nKv, hd);
+                int64 ta0 = Clock.nanoTime();
+                LlamaForCausalLM.pfRopeNs = LlamaForCausalLM.pfRopeNs
+                    + (ta0 - tr0);
+                KernelBuffer<float32> aoDev = this.dkv
+                    .prefillAttendResident(l, a.qProj.yBatch,
+                        a.kProj.yBatch, a.vProj.yBatch, rows, startPos,
+                        a.scale);
+                int64 kvn = (int64) rows * (int64) kvd;
+                this.ensurePrefillKv(kvn);
+                a.kProj.yBatch.download(this.pfKScr, kvn);
+                a.vProj.yBatch.download(this.pfVScr, kvn);
+                r = 0;
+                while (r < rows) {
+                    if (!this.cache.appendRowRaw(seq, l, this.pfKScr,
+                            (int64) r * (int64) kvd, this.pfVScr,
+                            (int64) r * (int64) kvd, startPos + r)) {
+                        throw heap LlamaException("kv pool exhausted at "
+                            + "layer " + l + " position "
+                            + (startPos + r));
+                    }
+                    r = r + 1;
+                }
+                LlamaForCausalLM.pfAttendNs = LlamaForCausalLM.pfAttendNs
+                    + (Clock.nanoTime() - ta0);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatchFromDevice(aoDev, rows, qd,
+                    this.stageTag);
+            } else {
             a.qProj.matmulInto(rows, q, 0L);
             a.kProj.matmulInto(rows, k, 0L);
             a.vProj.matmulInto(rows, v, 0L);
@@ -728,6 +805,7 @@ public final class LlamaForCausalLM extends InfModule {
 
             this.stageTag = this.stageTag + 1L;
             Linear.stageBatch(ao, 0L, rows, qd, this.stageTag);
+            }
             if (res) {
                 // o_proj's output joins the resident hs; the second
                 // norm reads it there.
