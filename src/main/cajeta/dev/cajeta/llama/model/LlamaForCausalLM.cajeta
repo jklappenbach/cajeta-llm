@@ -608,6 +608,19 @@ public final class LlamaForCausalLM extends InfModule {
     static boolean devAttnOn = true;
     static boolean forceReseed = false;
 
+    // 10.12.38: the prefill cache-authority pass is LAZY by default —
+    // the planes adopt with the host cache behind and `writeback` pays
+    // the catch-up only when a host path actually reads K/V. The
+    // profiler measured the eager pass at ~36 ms (4 ms downloads +
+    // ~32 ms per-row host appends) that resident decode never reads.
+    // `eagerauth` reverts; `reseed` forces eager regardless, since its
+    // whole point is to seed decode FROM the host cache.
+    static boolean eagerAuthOn = false;
+
+    public static void setEagerAuth(boolean on) {
+        LlamaForCausalLM.eagerAuthOn = on;
+    }
+
     // Prefill phase timers (10.12.22): the batch phases in Linear cover
     // the projections; these cover the rest of `forwardRowsBatched`, so
     // the whole prefill is accounted rather than "launch plus a
@@ -765,6 +778,11 @@ public final class LlamaForCausalLM extends InfModule {
         boolean resAttn = res && this.dkv != null;
         if (resAttn) {
             this.ensurePrefillPos(rows, startPos);
+            // 10.12.38 lazy authority: a mid-sequence chunk appends host
+            // cache rows at exactly `startPos`, so any debt a lazy first
+            // chunk left must be paid before the layer loop's inline
+            // appends. A no-op when nothing is owed.
+            if (startPos != 0) { this.syncKvToHost(seq); }
         }
         int32 l = 0;
         while (l < this.model.numLayers) {
@@ -1041,11 +1059,17 @@ public final class LlamaForCausalLM extends InfModule {
                 + (Clock.nanoTime() - tt0);
         }
 
-        if (resAttn && startPos == 0) {
+        if (resAttn && startPos == 0
+                && (LlamaForCausalLM.eagerAuthOn
+                    || LlamaForCausalLM.forceReseed)) {
             // The deferred cache-authority pass (10.12.30): ONE sync,
             // then every layer's roped k/v out of the persistent
             // planes into the paged cache. Position dr IS the row
             // index here — that is what the startPos == 0 guard buys.
+            // 10.12.38 made it LAZY by default (adoptLazy below +
+            // on-demand writeback); this eager form remains for the
+            // `eagerauth` arm and for `reseed`, which seeds decode
+            // from the host cache and therefore needs it filled.
             int64 tda = Clock.nanoTime();
             KernelStream ks = QuantKernel.stream();
             ks.sync();
@@ -1082,7 +1106,14 @@ public final class LlamaForCausalLM extends InfModule {
             // prefill wrote are wrong; if it disagrees either way, they
             // are fine and the difference is the softmax reassociation
             // moving a near-tied argmax.
-            this.dkv.adopt(seq, startPos + rows);
+            if (startPos == 0 && !LlamaForCausalLM.eagerAuthOn) {
+                // Lazy authority (10.12.38): the planes hold the rows;
+                // the host cache stays behind until a host path asks.
+                this.dkv.adoptLazy(seq, startPos + rows,
+                    this.cache.lengthOf(seq, 0));
+            } else {
+                this.dkv.adopt(seq, startPos + rows);
+            }
         }
 
         int64 tl0 = Clock.nanoTime();
