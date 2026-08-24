@@ -735,6 +735,71 @@ public class QuantKernelTest {
     }
 
     /**
+     * 10.12.23 — the Q6_K MATRIX-CORE GEMM agrees with the shipped
+     * Q6_K batch kernel on the same bytes. Not bit-identical and it
+     * must not be (the two accumulate in different orders — the same
+     * reassociation slack as the Q4_K pair), but every 16-wide output
+     * stripe must be live, so a tiling slip cannot hide.
+     *
+     * The kernels also differ in SIGN HANDLING, deliberately: the
+     * batch kernel keeps q unsigned (0..63) and corrects with
+     * -32*asum because its dotAccum is uint8 x int8; the WMMA twin
+     * widens the signed value q-32 directly (matrix cores multiply
+     * signed int8), so no correction pass exists to get wrong. This
+     * test is what holds the two reconstructions together.
+     */
+    @Test
+    public void theQ6kWmmaKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q6_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q6_K);
+        int64 outDim = 16L;
+        int64 cols = (blocks / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareQ6Into(raw, x, rows, outDim, cols, want, got);
+
+        QuantKernelTest.assertLive(want, "q6 batch kernel");
+        QuantKernelTest.assertLive(got, "q6 WMMA kernel");
+        int64 t = 0;
+        while (t < rows) {
+            boolean live = false;
+            int64 i = 0;
+            while (i < outDim) {
+                if (got[t * outDim + i] != 0.0f) { live = true; }
+                i = i + 1;
+            }
+            if (!live) {
+                Assert.fail("token row " + t + " of " + rows
+                    + " is entirely zero - the tiling is short");
+            }
+            t = t + 1;
+        }
+        int64 n = rows * outDim;
+        int64 k = 0;
+        while (k < n) {
+            float32 a = want[k];
+            float32 b2 = got[k];
+            float32 diff = a - b2;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.002f + 0.002f) {
+                Assert.fail("element " + k + " (token " + (k / outDim)
+                    + ", row " + (k % outDim) + "): q6 wmma " + b2
+                    + " vs batch " + a
+                    + " - further apart than reassociation explains");
+            }
+            k = k + 1;
+        }
+    }
+
+    /**
      * 10.12.16 — the one-time widen kernel writes exactly the nibbles
      * the packed blocks hold, at the TILE-MAJOR addressing the deq GEMM
      * reads: tile `(i/16, k/16)` is a contiguous 256-byte `[k%16][i%16]`
