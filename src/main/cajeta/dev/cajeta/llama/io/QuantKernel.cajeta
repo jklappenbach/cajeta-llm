@@ -788,7 +788,7 @@ public final class QuantKernel {
     public static void q4kQ8BatchMatMulKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, uint32 outDim, uint32 nTiles,
-            int64 blocksPerRow) {
+            int64 blocksPerRow, uint32 mode) {
         uint32 lane = KernelThread.x();
         uint32 wg = KernelThread.globalIdX() / 32;
         // Consecutive workgroups take consecutive OUTPUT rows within one
@@ -828,34 +828,56 @@ public final class QuantKernel {
                                                           0, 0, 0, 0);
                 Vector<int32,8> scv = zv;
                 Vector<int32,8> mnv = zv;
-                scv[0] = d0 & 63;
-                scv[1] = d1 & 63;
-                scv[2] = d2 & 63;
-                scv[3] = d3 & 63;
-                scv[4] = (k0 & 15) | ((d0 >> 2) & 48);
-                scv[5] = (k1 & 15) | ((d1 >> 2) & 48);
-                scv[6] = (k2 & 15) | ((d2 >> 2) & 48);
-                scv[7] = (k3 & 15) | ((d3 >> 2) & 48);
-                mnv[0] = m0 & 63;
-                mnv[1] = m1 & 63;
-                mnv[2] = m2 & 63;
-                mnv[3] = m3 & 63;
-                mnv[4] = (k0 >> 4) | ((m0 >> 2) & 48);
-                mnv[5] = (k1 >> 4) | ((m1 >> 2) & 48);
-                mnv[6] = (k2 >> 4) | ((m2 >> 2) & 48);
-                mnv[7] = (k3 >> 4) | ((m3 >> 2) & 48);
+                // 10.12.4 PROBE (`mode` 1): keep every load and every dot,
+                // drop only the per-block scale unpack — ~24 integer ops
+                // that EVERY lane of the wave performs identically on the
+                // same 16 bytes. If the GEMM is decode-bound this moves;
+                // if it is bandwidth-bound it cannot. Garbage output when
+                // set, by construction.
+                if (mode == 1) {
+                    scv[0] = d0 & 63;
+                    mnv[0] = m0 & 63;
+                } else {
+                    scv[0] = d0 & 63;
+                    scv[1] = d1 & 63;
+                    scv[2] = d2 & 63;
+                    scv[3] = d3 & 63;
+                    scv[4] = (k0 & 15) | ((d0 >> 2) & 48);
+                    scv[5] = (k1 & 15) | ((d1 >> 2) & 48);
+                    scv[6] = (k2 & 15) | ((d2 >> 2) & 48);
+                    scv[7] = (k3 & 15) | ((d3 >> 2) & 48);
+                    mnv[0] = m0 & 63;
+                    mnv[1] = m1 & 63;
+                    mnv[2] = m2 & 63;
+                    mnv[3] = m3 & 63;
+                    mnv[4] = (k0 >> 4) | ((m0 >> 2) & 48);
+                    mnv[5] = (k1 >> 4) | ((m1 >> 2) & 48);
+                    mnv[6] = (k2 >> 4) | ((m2 >> 2) & 48);
+                    mnv[7] = (k3 >> 4) | ((m3 >> 2) & 48);
+                }
 
                 int64 xb = xBase + b * 320L;
                 Vector<int32,8> tot = zv;
+                // 10.12.4 PROBE (`mode` 2): hoist the ACTIVATION loads
+                // out of the g loop — two per block instead of eight,
+                // every dot and every weight load unchanged. The weight
+                // is reused across 32 tokens here, but the activation is
+                // re-read once per OUTPUT ROW, and there are 4096 of
+                // them; if that is the cost, this moves. Garbage output.
+                Vector<int8,32> h0 = xp.vload<32>(xb);
+                Vector<int8,32> h1 = xp.vload<32>(xb + 32L);
                 int32 g = 0;
                 while (g < 4) {
                     Vector<uint8,32> raw = packed.vload<32>(
                         ro + 16L + (int64) (32 * g)).asUnsigned();
                     Vector<uint8,32> lo = raw & 15;
                     Vector<uint8,32> hi = (raw >> 4) & 15;
-                    Vector<int8,32> a0 = xp.vload<32>(xb + (int64) (64 * g));
-                    Vector<int8,32> a1 = xp.vload<32>(
-                        xb + (int64) (64 * g + 32));
+                    Vector<int8,32> a0 = h0;
+                    Vector<int8,32> a1 = h1;
+                    if (mode != 2) {
+                        a0 = xp.vload<32>(xb + (int64) (64 * g));
+                        a1 = xp.vload<32>(xb + (int64) (64 * g + 32));
+                    }
                     tot = tot + lo.dotAccum(a0, zv) * scv[2 * g];
                     tot = tot + hi.dotAccum(a1, zv) * scv[2 * g + 1];
                     g = g + 1;
@@ -890,6 +912,259 @@ public final class QuantKernel {
         }
     }
 
+    /**
+     * BATCHED Q4_K, FOUR TOKENS PER LANE (plan 10.12.4).
+     *
+     * The one-token-per-lane form measured 3.51 s of a 7.89 s prefill,
+     * 9.5x off the 0.37 s its weight traffic implies and 4% of the
+     * chip's int8 peak. Bandwidth was not the problem — the tiling
+     * already gave 16x reuse. The problem is that all 32 lanes decoded
+     * the SAME weight block: the nibble unpack and the scale decode ran
+     * 32 times over for one block, and that decode is comparable in cost
+     * to the multiply it feeds.
+     *
+     * So each lane now carries FOUR tokens. The header decode, the
+     * weight load and the nibble split happen once and are reused four
+     * times, and a workgroup covers 128 tokens instead of 32 — which
+     * also cuts the passes over the weight matrix from `ceil(rows/32)`
+     * to `ceil(rows/128)`, 4 instead of 16 for a 512-token prompt.
+     *
+     * Lane `t` owns tokens `tile*128 + j*32 + t` for j in 0..3, so for
+     * each j the 32 lanes take consecutive token rows.
+     */
+    @Kernel
+    public static void q4kQ8Batch4MatMulKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, uint32 outDim, uint32 nTiles,
+            int64 blocksPerRow) {
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 32;
+        uint32 tile = wg / outDim;
+        uint32 i32 = wg % outDim;
+        if (tile < nTiles) {
+            int64 i = (int64) i32;
+            int64 rowBytes = blocksPerRow * 144L;
+            int64 xRowBytes = blocksPerRow * 320L;
+            uint32 r0 = tile * 128 + lane;
+            uint32 r1 = r0 + 32;
+            uint32 r2 = r0 + 64;
+            uint32 r3 = r0 + 96;
+            boolean l0 = r0 < rows;
+            boolean l1 = r1 < rows;
+            boolean l2 = r2 < rows;
+            boolean l3 = r3 < rows;
+            // A lane with no live token still walks the loop; clamping
+            // its base to row 0 keeps every load in bounds and the
+            // result is simply not stored.
+            int64 x0 = 0L;
+            int64 x1 = 0L;
+            int64 x2 = 0L;
+            int64 x3 = 0L;
+            if (l0) { x0 = (int64) r0 * xRowBytes; }
+            if (l1) { x1 = (int64) r1 * xRowBytes; }
+            if (l2) { x2 = (int64) r2 * xRowBytes; }
+            if (l3) { x3 = (int64) r3 * xRowBytes; }
+            float32 acc0 = 0.0f;
+            float32 acc1 = 0.0f;
+            float32 acc2 = 0.0f;
+            float32 acc3 = 0.0f;
+            Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0,
+                                                      0, 0, 0, 0);
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 144L;
+
+                // ── decoded ONCE, used four times ───────────────────────
+                Vector<int8,16> hv = packed.vload<16>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                int32 d0 = (int32) hv[4] & 255;
+                int32 d1 = (int32) hv[5] & 255;
+                int32 d2 = (int32) hv[6] & 255;
+                int32 d3 = (int32) hv[7] & 255;
+                int32 m0 = (int32) hv[8] & 255;
+                int32 m1 = (int32) hv[9] & 255;
+                int32 m2 = (int32) hv[10] & 255;
+                int32 m3 = (int32) hv[11] & 255;
+                int32 k0 = (int32) hv[12] & 255;
+                int32 k1 = (int32) hv[13] & 255;
+                int32 k2 = (int32) hv[14] & 255;
+                int32 k3 = (int32) hv[15] & 255;
+                Vector<int32,8> scv = zv;
+                Vector<int32,8> mnv = zv;
+                scv[0] = d0 & 63;
+                scv[1] = d1 & 63;
+                scv[2] = d2 & 63;
+                scv[3] = d3 & 63;
+                scv[4] = (k0 & 15) | ((d0 >> 2) & 48);
+                scv[5] = (k1 & 15) | ((d1 >> 2) & 48);
+                scv[6] = (k2 & 15) | ((d2 >> 2) & 48);
+                scv[7] = (k3 & 15) | ((d3 >> 2) & 48);
+                mnv[0] = m0 & 63;
+                mnv[1] = m1 & 63;
+                mnv[2] = m2 & 63;
+                mnv[3] = m3 & 63;
+                mnv[4] = (k0 >> 4) | ((m0 >> 2) & 48);
+                mnv[5] = (k1 >> 4) | ((m1 >> 2) & 48);
+                mnv[6] = (k2 >> 4) | ((m2 >> 2) & 48);
+                mnv[7] = (k3 >> 4) | ((m3 >> 2) & 48);
+
+                Vector<int32,8> t0 = zv;
+                Vector<int32,8> t1 = zv;
+                Vector<int32,8> t2 = zv;
+                Vector<int32,8> t3 = zv;
+                int32 g = 0;
+                while (g < 4) {
+                    Vector<uint8,32> raw = packed.vload<32>(
+                        ro + 16L + (int64) (32 * g)).asUnsigned();
+                    Vector<uint8,32> lo = raw & 15;
+                    Vector<uint8,32> hi = (raw >> 4) & 15;
+                    int32 sA = scv[2 * g];
+                    int32 sB = scv[2 * g + 1];
+                    int64 o0 = (int64) (64 * g);
+                    int64 o1 = (int64) (64 * g + 32);
+                    Vector<int8,32> a0 = xp.vload<32>(x0 + b * 320L + o0);
+                    Vector<int8,32> a1 = xp.vload<32>(x0 + b * 320L + o1);
+                    t0 = t0 + lo.dotAccum(a0, zv) * sA
+                            + hi.dotAccum(a1, zv) * sB;
+                    Vector<int8,32> c0 = xp.vload<32>(x1 + b * 320L + o0);
+                    Vector<int8,32> c1 = xp.vload<32>(x1 + b * 320L + o1);
+                    t1 = t1 + lo.dotAccum(c0, zv) * sA
+                            + hi.dotAccum(c1, zv) * sB;
+                    Vector<int8,32> e0 = xp.vload<32>(x2 + b * 320L + o0);
+                    Vector<int8,32> e1 = xp.vload<32>(x2 + b * 320L + o1);
+                    t2 = t2 + lo.dotAccum(e0, zv) * sA
+                            + hi.dotAccum(e1, zv) * sB;
+                    Vector<int8,32> f0 = xp.vload<32>(x3 + b * 320L + o0);
+                    Vector<int8,32> f1 = xp.vload<32>(x3 + b * 320L + o1);
+                    t3 = t3 + lo.dotAccum(f0, zv) * sA
+                            + hi.dotAccum(f1, zv) * sB;
+                    g = g + 1;
+                }
+
+                // Token 0's block term. INLINED rather than a helper:
+                // a static taking a KernelBuffer and calling `vload`
+                // lowers as HOST code (CAJETA_ERROR_KERNEL_ONLY_OP), the
+                // defect filed as 10.10.
+                int32 sumi0 = t0[0] + t0[1] + t0[2] + t0[3]
+                    + t0[4] + t0[5] + t0[6] + t0[7];
+                Vector<int8,32> sv0 = xp.vload<32>(x0 + b * 320L + 256L);
+                int32 dmins0 = 0;
+                int32 sb0 = 0;
+                while (sb0 < 8) {
+                    int32 sbb0 = sb0 * 4;
+                    int32 ps0 = ((int32) sv0[sbb0] & 255)
+                        | (((int32) sv0[sbb0 + 1] & 255) << 8)
+                        | (((int32) sv0[sbb0 + 2] & 255) << 16)
+                        | (((int32) sv0[sbb0 + 3]) << 24);
+                    dmins0 = dmins0 + mnv[sb0] * ps0;
+                    sb0 = sb0 + 1;
+                }
+                Vector<int8,16> dv0 = xp.vload<16>(x0 + b * 320L + 288L);
+                float32 xs0 = Cajeta.bitsToF32(((int32) dv0[0] & 255)
+                    | (((int32) dv0[1] & 255) << 8)
+                    | (((int32) dv0[2] & 255) << 16)
+                    | (((int32) dv0[3] & 255) << 24));
+                acc0 = acc0 + d * xs0 * (float32) sumi0
+                    - dmin * xs0 * (float32) dmins0;
+                // Token 1's block term. INLINED rather than a helper:
+                // a static taking a KernelBuffer and calling `vload`
+                // lowers as HOST code (CAJETA_ERROR_KERNEL_ONLY_OP), the
+                // defect filed as 10.10.
+                int32 sumi1 = t1[0] + t1[1] + t1[2] + t1[3]
+                    + t1[4] + t1[5] + t1[6] + t1[7];
+                Vector<int8,32> sv1 = xp.vload<32>(x1 + b * 320L + 256L);
+                int32 dmins1 = 0;
+                int32 sb1 = 0;
+                while (sb1 < 8) {
+                    int32 sbb1 = sb1 * 4;
+                    int32 ps1 = ((int32) sv1[sbb1] & 255)
+                        | (((int32) sv1[sbb1 + 1] & 255) << 8)
+                        | (((int32) sv1[sbb1 + 2] & 255) << 16)
+                        | (((int32) sv1[sbb1 + 3]) << 24);
+                    dmins1 = dmins1 + mnv[sb1] * ps1;
+                    sb1 = sb1 + 1;
+                }
+                Vector<int8,16> dv1 = xp.vload<16>(x1 + b * 320L + 288L);
+                float32 xs1 = Cajeta.bitsToF32(((int32) dv1[0] & 255)
+                    | (((int32) dv1[1] & 255) << 8)
+                    | (((int32) dv1[2] & 255) << 16)
+                    | (((int32) dv1[3] & 255) << 24));
+                acc1 = acc1 + d * xs1 * (float32) sumi1
+                    - dmin * xs1 * (float32) dmins1;
+                // Token 2's block term. INLINED rather than a helper:
+                // a static taking a KernelBuffer and calling `vload`
+                // lowers as HOST code (CAJETA_ERROR_KERNEL_ONLY_OP), the
+                // defect filed as 10.10.
+                int32 sumi2 = t2[0] + t2[1] + t2[2] + t2[3]
+                    + t2[4] + t2[5] + t2[6] + t2[7];
+                Vector<int8,32> sv2 = xp.vload<32>(x2 + b * 320L + 256L);
+                int32 dmins2 = 0;
+                int32 sb2 = 0;
+                while (sb2 < 8) {
+                    int32 sbb2 = sb2 * 4;
+                    int32 ps2 = ((int32) sv2[sbb2] & 255)
+                        | (((int32) sv2[sbb2 + 1] & 255) << 8)
+                        | (((int32) sv2[sbb2 + 2] & 255) << 16)
+                        | (((int32) sv2[sbb2 + 3]) << 24);
+                    dmins2 = dmins2 + mnv[sb2] * ps2;
+                    sb2 = sb2 + 1;
+                }
+                Vector<int8,16> dv2 = xp.vload<16>(x2 + b * 320L + 288L);
+                float32 xs2 = Cajeta.bitsToF32(((int32) dv2[0] & 255)
+                    | (((int32) dv2[1] & 255) << 8)
+                    | (((int32) dv2[2] & 255) << 16)
+                    | (((int32) dv2[3] & 255) << 24));
+                acc2 = acc2 + d * xs2 * (float32) sumi2
+                    - dmin * xs2 * (float32) dmins2;
+                // Token 3's block term. INLINED rather than a helper:
+                // a static taking a KernelBuffer and calling `vload`
+                // lowers as HOST code (CAJETA_ERROR_KERNEL_ONLY_OP), the
+                // defect filed as 10.10.
+                int32 sumi3 = t3[0] + t3[1] + t3[2] + t3[3]
+                    + t3[4] + t3[5] + t3[6] + t3[7];
+                Vector<int8,32> sv3 = xp.vload<32>(x3 + b * 320L + 256L);
+                int32 dmins3 = 0;
+                int32 sb3 = 0;
+                while (sb3 < 8) {
+                    int32 sbb3 = sb3 * 4;
+                    int32 ps3 = ((int32) sv3[sbb3] & 255)
+                        | (((int32) sv3[sbb3 + 1] & 255) << 8)
+                        | (((int32) sv3[sbb3 + 2] & 255) << 16)
+                        | (((int32) sv3[sbb3 + 3]) << 24);
+                    dmins3 = dmins3 + mnv[sb3] * ps3;
+                    sb3 = sb3 + 1;
+                }
+                Vector<int8,16> dv3 = xp.vload<16>(x3 + b * 320L + 288L);
+                float32 xs3 = Cajeta.bitsToF32(((int32) dv3[0] & 255)
+                    | (((int32) dv3[1] & 255) << 8)
+                    | (((int32) dv3[2] & 255) << 16)
+                    | (((int32) dv3[3] & 255) << 24));
+                acc3 = acc3 + d * xs3 * (float32) sumi3
+                    - dmin * xs3 * (float32) dmins3;
+                b = b + 1;
+            }
+            if (l0) { y[(int64) r0 * (int64) outDim + i] = acc0; }
+            if (l1) { y[(int64) r1 * (int64) outDim + i] = acc1; }
+            if (l2) { y[(int64) r2 * (int64) outDim + i] = acc2; }
+            if (l3) { y[(int64) r3 * (int64) outDim + i] = acc3; }
+        }
+    }
+
+    public static void q4kQ8Batch4MatMulLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 outDim, int64 cols) {
+        int64 nTiles = (rows + 127L) / 128L;
+        KernelStream s #= KernelStream.current();
+        q4kQ8Batch4MatMulKernel.launch(s,
+            grid: [(uint32) (nTiles * outDim)], block: [32])
+            (y, packed, xp, (uint32) rows, (uint32) outDim,
+             (uint32) nTiles, cols / 256L);
+        return;
+    }
+
     /** One workgroup of 32 per (output row, 32-token tile). */
     public static void q4kQ8BatchMatMulLaunchNoSync(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
@@ -899,7 +1174,8 @@ public final class QuantKernel {
         q4kQ8BatchMatMulKernel.launch(s,
             grid: [(uint32) (nTiles * outDim)], block: [32])
             (y, packed, xp, (uint32) rows, (uint32) outDim,
-             (uint32) nTiles, cols / 256L);
+             (uint32) nTiles, cols / 256L,
+             (uint32) QuantKernel.batchMode);
         return;
     }
 
@@ -1008,8 +1284,13 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             int64 rows, int64 outDim, int64 cols) {
         if (ty == Quant.GG_Q4_K) {
-            QuantKernel.q4kQ8BatchMatMulLaunchNoSync(y, packed, xp, rows,
-                outDim, cols);
+            if (QuantKernel.batch4) {
+                QuantKernel.q4kQ8Batch4MatMulLaunchNoSync(y, packed, xp,
+                    rows, outDim, cols);
+            } else {
+                QuantKernel.q4kQ8BatchMatMulLaunchNoSync(y, packed, xp,
+                    rows, outDim, cols);
+            }
         } else if (ty == Quant.GG_Q6_K) {
             QuantKernel.q6kQ8BatchMatMulLaunchNoSync(y, packed, xp, rows,
                 outDim, cols);
@@ -1021,6 +1302,23 @@ public final class QuantKernel {
         s.sync();
         return;
     }
+
+    /**
+     * Arm for 10.12.4: four tokens per lane, or one. DEFAULT OFF — four
+     * measured 3989 ms against one at 3514 on the same prefill, which
+     * refutes the reason it was written. Four tokens a lane cuts the
+     * passes over the weights from 16 to 4, so a bandwidth-bound GEMM
+     * would have been ~4x faster; it was 13% SLOWER. The GEMM is issue-
+     * and occupancy-bound, and four Vector<int32,8> accumulators plus
+     * eight live activation vectors per lane cost more in registers than
+     * the traffic was worth.
+     */
+    static boolean batch4 = false;
+    static int32 batchMode = 0;
+
+    public static void setBatchMode(int32 m) { QuantKernel.batchMode = m; }
+
+    public static void setBatch4(boolean on) { QuantKernel.batch4 = on; }
 
     /** True when the batched GEMM has a kernel for `ty`. */
     public static boolean hasBatchKernel(int32 ty) {

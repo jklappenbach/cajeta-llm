@@ -939,6 +939,50 @@ public final class Linear extends InfModule {
     static int64 btTag = 0L - 1L;
     static int32 btRows;
     static int32 btN;
+    static KernelBuffer<float32> btXf;
+    static float32[] btXfh;
+    static int64 btInCap;
+    static boolean devPack = true;
+
+    public static void setDeviceBatchPack(boolean on) {
+        Linear.devPack = on;
+    }
+
+    static void ensureBatchIn(int64 span) {
+        if (Linear.btInCap >= span) { return; }
+        Linear.btXf #= heap KernelBuffer<float32>((uint64) span);
+        Linear.btXfh #= heap float32[span];
+        Linear.btInCap = span;
+        return;
+    }
+
+    // Phase timers for the batched path (plan 10.12.4). The existing
+    // devCopyIn/devUpload/... timers only see `matvecIntoDevice`, so the
+    // batched entry points are invisible to them — and "prefill is 7 s"
+    // is not a diagnosis.
+    static int64 btPackNs;
+    static int64 btUploadNs;
+    static int64 btLaunchNs;
+    static int64 btDownNs;
+    static int64 btCopyNs;
+    static int64 btCalls;
+
+    public static int64 batchPackNs()   { return Linear.btPackNs; }
+    public static int64 batchUploadNs() { return Linear.btUploadNs; }
+    public static int64 batchLaunchNs() { return Linear.btLaunchNs; }
+    public static int64 batchDownNs()   { return Linear.btDownNs; }
+    public static int64 batchCopyNs()   { return Linear.btCopyNs; }
+    public static int64 batchCalls()    { return Linear.btCalls; }
+
+    public static void resetBatchTimers() {
+        Linear.btPackNs = 0L;
+        Linear.btUploadNs = 0L;
+        Linear.btLaunchNs = 0L;
+        Linear.btDownNs = 0L;
+        Linear.btCopyNs = 0L;
+        Linear.btCalls = 0L;
+        return;
+    }
 
     static void ensureBatchStage(int32 rows, int32 n) {
         if (Linear.btCap >= rows && Linear.btDim >= n) { return; }
@@ -987,13 +1031,43 @@ public final class Linear extends InfModule {
         // and wrong: the first prefill token came back as 55110 instead
         // of 198.
         int64 pb = Quant.q8kPackedBytes((int64) n);
-        int64 r = 0;
-        while (r < (int64) rows) {
-            Quant.q8kPack(sb, base + r * (int64) n, (int64) n,
-                Linear.btXph, r * pb);
-            r = r + 1;
+        int64 span = (int64) rows * (int64) n;
+        if (Linear.devPack) {
+            // PACK ON THE DEVICE. The host packer was 877 ms of a 7.9 s
+            // prefill — 11% — quantizing `rows x inDim` floats one at a
+            // time. The existing q8_K pack kernel needs no batched
+            // variant: block `b` of a flat vector lands at `out[b*320]`,
+            // and row `r`'s blocks are `r*nb .. r*nb+nb-1`, so a
+            // contiguous `[rows x n]` activation packs to exactly the
+            // `[rows x pb]` layout the GEMM reads. One long vector.
+            int64 t0 = Clock.nanoTime();
+            Linear.ensureBatchIn(span);
+            float32[] fh = Linear.btXfh;
+            int64 c = 0;
+            while (c < span) {
+                fh[c] = sb[base + c];
+                c = c + 1;
+            }
+            int64 t1 = Clock.nanoTime();
+            Linear.btXf.upload(fh, span);
+            QuantKernel.q8kPackLaunch(Linear.btXp, Linear.btXf, span);
+            int64 t2 = Clock.nanoTime();
+            Linear.btPackNs = Linear.btPackNs + (t1 - t0);
+            Linear.btUploadNs = Linear.btUploadNs + (t2 - t1);
+        } else {
+            int64 t0 = Clock.nanoTime();
+            int64 r = 0;
+            while (r < (int64) rows) {
+                Quant.q8kPack(sb, base + r * (int64) n, (int64) n,
+                    Linear.btXph, r * pb);
+                r = r + 1;
+            }
+            int64 t1 = Clock.nanoTime();
+            Linear.btXp.upload(Linear.btXph, (int64) rows * pb);
+            int64 t2 = Clock.nanoTime();
+            Linear.btPackNs = Linear.btPackNs + (t1 - t0);
+            Linear.btUploadNs = Linear.btUploadNs + (t2 - t1);
         }
-        Linear.btXp.upload(Linear.btXph, (int64) rows * pb);
         Linear.btTag = tag;
         Linear.btRows = rows;
         Linear.btN = n;
@@ -1020,19 +1094,26 @@ public final class Linear extends InfModule {
     void matmulInto(int32 rows, Tensor<float32> dst, int64 dstOff) {
         this.ensureDevice();
         this.ensureBatchOut(rows);
+        int64 n = (int64) rows * (int64) this.outDim;
+        int64 t0 = Clock.nanoTime();
         QuantKernel.batchMatMulLaunch(this.packedTy, this.yBatch,
             this.packedDev, Linear.btXp, (int64) rows,
             (int64) this.outDim, (int64) this.inDim);
-        this.yBatch.download(this.yBatchH,
-            (int64) rows * (int64) this.outDim);
+        int64 t1 = Clock.nanoTime();
+        this.yBatch.download(this.yBatchH, n);
+        int64 t2 = Clock.nanoTime();
         float32[] db = dst.hostBuffer();
         int64 doff = dst.hostBase() + dstOff;
-        int64 n = (int64) rows * (int64) this.outDim;
         int64 i = 0;
         while (i < n) {
             db[doff + i] = this.yBatchH[i];
             i = i + 1;
         }
+        int64 t3 = Clock.nanoTime();
+        Linear.btLaunchNs = Linear.btLaunchNs + (t1 - t0);
+        Linear.btDownNs = Linear.btDownNs + (t2 - t1);
+        Linear.btCopyNs = Linear.btCopyNs + (t3 - t2);
+        Linear.btCalls = Linear.btCalls + 1L;
         return;
     }
 
