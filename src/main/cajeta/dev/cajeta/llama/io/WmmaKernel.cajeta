@@ -1309,6 +1309,522 @@ public final class WmmaKernel {
         }
     }
 
+    /**
+     * N=4 OUTPUT-TILED deq GEMM (10.12.21 second iteration) — the
+     * counter pass's answer. The memory unit sits at 92% busy on
+     * REDUNDANT traffic: with one output tile per wave, every A
+     * fragment is re-read once per output-tile column (up to 896x per
+     * projection) and L2 holds only 27% of it. Here one wave computes
+     * FOUR adjacent output tiles of the same token tile: the A
+     * fragments are loaded ONCE per K-slice (two wide loads) and mma'd
+     * against four B tiles — A traffic and A load ops divide by four,
+     * the dominant term T2 never touched. Seam and B stay per-tile
+     * (the spill seam is the measured Q4_K champion). Requires
+     * `outDim % 64 == 0` — true for every Q4_K projection of the 8B.
+     */
+    @Kernel
+    public static void q4kWmmaDeqN4Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, uint32 rows, uint32 outDim,
+            uint32 tilesN4, int64 blocksPerRow) {
+        Shared<int32> ct = shared int32[256];
+        Shared<float32> acc = shared float32[1024];
+        Shared<int32> scLds = shared int32[512];   // [64 rows][8 subs]
+        Shared<int32> mnLds = shared int32[512];
+        Shared<float32> dLds = shared float32[64];
+        Shared<float32> dmLds = shared float32[64];
+        Shared<float32> xsLds = shared float32[16];
+        Shared<int32> psLds = shared int32[128];
+
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 32;
+        uint32 tileT = wg / tilesN4;
+        uint32 tileI = wg % tilesN4;
+        uint32 t0 = tileT * 16;
+        uint32 i0 = tileI * 64;
+        if (t0 < rows && i0 < outDim) {
+            int64 rowBytes = blocksPerRow * 144L;
+            int64 xRowBytes = blocksPerRow * 320L;
+
+            uint32 z = lane;
+            while (z < 1024) { acc[z] = 0.0f; z = z + 32; }
+            Barrier.workgroup();
+
+            CooperativeMatrix<int8,16,16,0> ma0;
+            CooperativeMatrix<int8,16,16,0> ma1;
+            CooperativeMatrix<int8,16,16,1> mb;
+            CooperativeMatrix<int32,16,16,2> mc;
+
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                // Header decode for all 64 output rows: 16 lanes x 4.
+                if (lane < 16) {
+                    uint32 r4 = 0;
+                    while (r4 < 4) {
+                        uint32 rr = r4 * 16 + lane;
+                        int64 ro = (int64) (i0 + rr) * rowBytes
+                            + b * 144L;
+                        dLds[rr] = GgufFile.halfBitsToF32(
+                            ((int32) packed[ro] & 255)
+                            | (((int32) packed[ro + 1L] & 255) << 8));
+                        dmLds[rr] = GgufFile.halfBitsToF32(
+                            ((int32) packed[ro + 2L] & 255)
+                            | (((int32) packed[ro + 3L] & 255) << 8));
+                        int32 q = 0;
+                        while (q < 4) {
+                            int32 dq = (int32) packed[ro + 4L
+                                + (int64) q] & 255;
+                            int32 mq = (int32) packed[ro + 8L
+                                + (int64) q] & 255;
+                            int32 kq = (int32) packed[ro + 12L
+                                + (int64) q] & 255;
+                            scLds[rr * 8 + q] = dq & 63;
+                            scLds[rr * 8 + 4 + q] =
+                                (kq & 15) | ((dq >> 2) & 48);
+                            mnLds[rr * 8 + q] = mq & 63;
+                            mnLds[rr * 8 + 4 + q] =
+                                (kq >> 4) | ((mq >> 2) & 48);
+                            q = q + 1;
+                        }
+                        r4 = r4 + 1;
+                    }
+                } else {
+                    uint32 tk = lane - 16;
+                    int64 xb = (int64) (t0 + tk) * xRowBytes + b * 320L;
+                    xsLds[tk] = Cajeta.bitsToF32(
+                        ((int32) xp[xb + 288L] & 255)
+                        | (((int32) xp[xb + 289L] & 255) << 8)
+                        | (((int32) xp[xb + 290L] & 255) << 16)
+                        | (((int32) xp[xb + 291L] & 255) << 24));
+                    int32 sbi = 0;
+                    while (sbi < 8) {
+                        int64 at = xb + 256L + (int64) (sbi * 4);
+                        psLds[tk * 8 + sbi] = ((int32) xp[at] & 255)
+                            | (((int32) xp[at + 1L] & 255) << 8)
+                            | (((int32) xp[at + 2L] & 255) << 16)
+                            | (((int32) xp[at + 3L]) << 24);
+                        sbi = sbi + 1;
+                    }
+                }
+                Barrier.workgroup();
+
+                uint32 j = 0;
+                while (j < 8) {
+                    // A ONCE per K-slice, both halves, held in
+                    // registers across the four output tiles.
+                    int64 aOff0 = (int64) t0 * xRowBytes + b * 320L
+                        + (int64) (32 * j);
+                    ma0.load(xp, (uint32) aOff0, 0, (uint32) xRowBytes);
+                    ma1.load(xp, (uint32) (aOff0 + 16L), 0,
+                        (uint32) xRowBytes);
+                    uint32 t = 0;
+                    while (t < 4) {
+                        mc.splat(0);
+                        int64 kAbs0 = b * 256L + (int64) (32 * j);
+                        int64 bOff0 = ((int64) ((i0 + 16 * t) / 16)
+                            * (blocksPerRow * 16L) + kAbs0 / 16L)
+                            * 256L;
+                        mb.load(deq, (uint32) bOff0, 1, 16);
+                        mc.mma(ma0, mb);
+                        mb.load(deq, (uint32) (bOff0 + 256L), 1, 16);
+                        mc.mma(ma1, mb);
+                        mc.store(ct, 0, 0, 16);
+                        Barrier.workgroup();
+                        uint32 p = lane;
+                        while (p < 256) {
+                            uint32 tt = p / 16;
+                            uint32 ii = p % 16;
+                            acc[t * 256 + p] = acc[t * 256 + p]
+                                + dLds[t * 16 + ii] * xsLds[tt]
+                                * (float32) (scLds[(t * 16 + ii) * 8
+                                    + j] * ct[p]);
+                            p = p + 32;
+                        }
+                        Barrier.workgroup();
+                        t = t + 1;
+                    }
+                    j = j + 1;
+                }
+
+                // dmin correction, per tile.
+                uint32 p2 = lane;
+                while (p2 < 1024) {
+                    uint32 t2 = p2 / 256;
+                    uint32 pp = p2 % 256;
+                    uint32 tt = pp / 16;
+                    uint32 ii = t2 * 16 + pp % 16;
+                    int32 dm = 0;
+                    uint32 sj = 0;
+                    while (sj < 8) {
+                        dm = dm + mnLds[ii * 8 + sj]
+                            * psLds[tt * 8 + sj];
+                        sj = sj + 1;
+                    }
+                    acc[p2] = acc[p2]
+                        - dmLds[ii] * xsLds[tt] * (float32) dm;
+                    p2 = p2 + 32;
+                }
+                Barrier.workgroup();
+                b = b + 1;
+            }
+
+            uint32 w = lane;
+            while (w < 1024) {
+                uint32 t3 = w / 256;
+                uint32 pp = w % 256;
+                uint32 tt = pp / 16;
+                uint32 ii = pp % 16;
+                y[(int64) (t0 + tt) * (int64) outDim
+                    + (int64) (i0 + t3 * 16 + ii)] = acc[w];
+                w = w + 32;
+            }
+        }
+    }
+
+    /**
+     * THE MULTI-WAVE deq GEMM (10.12.21 FINAL) — all three levers the
+     * six single-lever probes showed only pay TOGETHER:
+     *
+     * 1. EIGHT WAVES PER WORKGROUP, each its own 16-col output tile
+     *    (same total wave count as the champion — concurrency
+     *    preserved, unlike N4), sharing only the token-side xs/ps
+     *    staging. LDS ~1.8 KB per WG (was 3.8 KB per WAVE): the
+     *    occupancy cap lifts entirely.
+     * 2. REGISTER EPILOGUE via the DUAL verb: the weight-side header
+     *    (d, dmin, 8 scales, 8 mins) is decoded into PER-LANE
+     *    REGISTERS straight from global — no scale LDS, no header
+     *    barriers — and the dmin term rides the same accumulator
+     *    visit (`scaledAccumInto2`), so the separate ranked pass is
+     *    gone. ~55 issue slots per mma pair where the spill seam paid
+     *    ~150.
+     * 3. BARRIER-FREE K-LOOP: the only barriers are the two around
+     *    the once-per-block token staging, so the scheduler is free
+     *    to pipeline the wide A/B loads across j iterations.
+     */
+    @Kernel
+    public static void q4kWmmaDeqMwKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, uint32 rows, uint32 outDim,
+            uint32 tilesN8, int64 blocksPerRow) {
+        Shared<float32> xsLds = shared float32[16];
+        Shared<int32> psLds = shared int32[128];
+        // Per-wave scale vectors: the verb resolves its Shared args at
+        // the array BASE, so each wave gets its own set, selected by a
+        // wave-uniform branch. rg (xs*ps_j) is VALUE-identical across
+        // waves but must still be PER-WAVE: the j-loop is barrier-free,
+        // waves drift, and a shared rg let wave 0's j=5 overwrite what
+        // wave 1's j=3 was reading — caught by the outDim=128 test at
+        // exactly the first element of wave 1's tile.
+        Shared<float32> rg0 = shared float32[16];
+        Shared<float32> rg1 = shared float32[16];
+        Shared<float32> rg2 = shared float32[16];
+        Shared<float32> rg3 = shared float32[16];
+        Shared<float32> rg4 = shared float32[16];
+        Shared<float32> rg5 = shared float32[16];
+        Shared<float32> rg6 = shared float32[16];
+        Shared<float32> rg7 = shared float32[16];
+        Shared<float32> cf0 = shared float32[16];
+        Shared<float32> cf1 = shared float32[16];
+        Shared<float32> cf2 = shared float32[16];
+        Shared<float32> cf3 = shared float32[16];
+        Shared<float32> cf4 = shared float32[16];
+        Shared<float32> cf5 = shared float32[16];
+        Shared<float32> cf6 = shared float32[16];
+        Shared<float32> cf7 = shared float32[16];
+        Shared<float32> cg0 = shared float32[16];
+        Shared<float32> cg1 = shared float32[16];
+        Shared<float32> cg2 = shared float32[16];
+        Shared<float32> cg3 = shared float32[16];
+        Shared<float32> cg4 = shared float32[16];
+        Shared<float32> cg5 = shared float32[16];
+        Shared<float32> cg6 = shared float32[16];
+        Shared<float32> cg7 = shared float32[16];
+
+        uint32 tid = KernelThread.x();
+        uint32 lane = tid % 32;
+        uint32 wid = tid / 32;
+        uint32 lane16 = lane % 16;
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 tileT = wg / tilesN8;
+        uint32 tileI8 = wg % tilesN8;
+        uint32 t0 = tileT * 16;
+        uint32 i0 = tileI8 * 128 + wid * 16;
+        if (t0 < rows && i0 < outDim) {
+            int64 rowBytes = blocksPerRow * 144L;
+            int64 xRowBytes = blocksPerRow * 320L;
+            int64 myRo = (int64) (i0 + lane16) * rowBytes;
+
+            CooperativeMatrix<int8,16,16,0> ma0;
+            CooperativeMatrix<int8,16,16,0> ma1;
+            CooperativeMatrix<int8,16,16,1> mb;
+            CooperativeMatrix<int32,16,16,2> mc;
+            CooperativeMatrix<float32,16,16,2> facc;
+            facc.splat(0.0f);
+
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                // Token staging: wave 0 only, the block's two barriers.
+                if (wid == 0) {
+                    if (lane < 16) {
+                        int64 xb = (int64) (t0 + lane) * xRowBytes
+                            + b * 320L;
+                        xsLds[lane] = Cajeta.bitsToF32(
+                            ((int32) xp[xb + 288L] & 255)
+                            | (((int32) xp[xb + 289L] & 255) << 8)
+                            | (((int32) xp[xb + 290L] & 255) << 16)
+                            | (((int32) xp[xb + 291L] & 255) << 24));
+                    } else {
+                        uint32 tk = lane - 16;
+                        int64 xb = (int64) (t0 + tk) * xRowBytes
+                            + b * 320L;
+                        int32 sbi = 0;
+                        while (sbi < 8) {
+                            int64 at = xb + 256L + (int64) (sbi * 4);
+                            psLds[tk * 8 + sbi] = ((int32) xp[at] & 255)
+                                | (((int32) xp[at + 1L] & 255) << 8)
+                                | (((int32) xp[at + 2L] & 255) << 16)
+                                | (((int32) xp[at + 3L]) << 24);
+                            sbi = sbi + 1;
+                        }
+                    }
+                }
+                Barrier.workgroup();
+
+                // Weight-side header: PER-LANE REGISTERS from global.
+                // Both half-lanes of a column decode the same row.
+                int64 ro = myRo + b * 144L;
+                float32 dv = GgufFile.halfBitsToF32(
+                    ((int32) packed[ro] & 255)
+                    | (((int32) packed[ro + 1L] & 255) << 8));
+                float32 dmv = GgufFile.halfBitsToF32(
+                    ((int32) packed[ro + 2L] & 255)
+                    | (((int32) packed[ro + 3L] & 255) << 8));
+                int32 d0 = (int32) packed[ro + 4L] & 255;
+                int32 d1 = (int32) packed[ro + 5L] & 255;
+                int32 d2 = (int32) packed[ro + 6L] & 255;
+                int32 d3 = (int32) packed[ro + 7L] & 255;
+                int32 m0 = (int32) packed[ro + 8L] & 255;
+                int32 m1 = (int32) packed[ro + 9L] & 255;
+                int32 m2 = (int32) packed[ro + 10L] & 255;
+                int32 m3 = (int32) packed[ro + 11L] & 255;
+                int32 k0 = (int32) packed[ro + 12L] & 255;
+                int32 k1 = (int32) packed[ro + 13L] & 255;
+                int32 k2 = (int32) packed[ro + 14L] & 255;
+                int32 k3 = (int32) packed[ro + 15L] & 255;
+                int32 s0 = d0 & 63;
+                int32 s1 = d1 & 63;
+                int32 s2 = d2 & 63;
+                int32 s3 = d3 & 63;
+                int32 s4 = (k0 & 15) | ((d0 >> 2) & 48);
+                int32 s5 = (k1 & 15) | ((d1 >> 2) & 48);
+                int32 s6 = (k2 & 15) | ((d2 >> 2) & 48);
+                int32 s7 = (k3 & 15) | ((d3 >> 2) & 48);
+                int32 n0 = m0 & 63;
+                int32 n1 = m1 & 63;
+                int32 n2 = m2 & 63;
+                int32 n3 = m3 & 63;
+                int32 n4 = (k0 >> 4) | ((m0 >> 2) & 48);
+                int32 n5 = (k1 >> 4) | ((m1 >> 2) & 48);
+                int32 n6 = (k2 >> 4) | ((m2 >> 2) & 48);
+                int32 n7 = (k3 >> 4) | ((m3 >> 2) & 48);
+
+                uint32 j = 0;
+                while (j < 8) {
+                    int32 scj = s0;
+                    int32 mnj = n0;
+                    if (j == 1) { scj = s1; mnj = n1; }
+                    else if (j == 2) { scj = s2; mnj = n2; }
+                    else if (j == 3) { scj = s3; mnj = n3; }
+                    else if (j == 4) { scj = s4; mnj = n4; }
+                    else if (j == 5) { scj = s5; mnj = n5; }
+                    else if (j == 6) { scj = s6; mnj = n6; }
+                    else if (j == 7) { scj = s7; mnj = n7; }
+                    float32 cfv = dv * (float32) scj;
+                    float32 cgv = 0.0f - dmv * (float32) mnj;
+                    float32 rgv = 0.0f;
+                    if (lane < 16) {
+                        rgv = xsLds[lane]
+                            * (float32) psLds[lane * 8 + j];
+                    }
+                    mc.splat(0);
+                    uint32 kBase = 32 * j;
+                    int64 aOff = (int64) t0 * xRowBytes + b * 320L
+                        + (int64) kBase;
+                    ma0.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
+                    ma1.load(xp, (uint32) (aOff + 16L), 0,
+                        (uint32) xRowBytes);
+                    int64 kAbs = b * 256L + (int64) kBase;
+                    int64 bOff = ((int64) (i0 / 16)
+                        * (blocksPerRow * 16L) + kAbs / 16L) * 256L;
+                    mb.load(deq, (uint32) bOff, 1, 16);
+                    mc.mma(ma0, mb);
+                    mb.load(deq, (uint32) (bOff + 256L), 1, 16);
+                    mc.mma(ma1, mb);
+                    // Wave-uniform 8-way select of this wave's pair.
+                    if (wid == 0) {
+                        if (lane < 16) {
+                            cf0[lane] = cfv; cg0[lane] = cgv;
+                            rg0[lane] = rgv;
+                        }
+                        mc.scaledAccumInto2(facc, xsLds, cf0, rg0, cg0);
+                    } else if (wid == 1) {
+                        if (lane < 16) {
+                            cf1[lane] = cfv; cg1[lane] = cgv;
+                            rg1[lane] = rgv;
+                        }
+                        mc.scaledAccumInto2(facc, xsLds, cf1, rg1, cg1);
+                    } else if (wid == 2) {
+                        if (lane < 16) {
+                            cf2[lane] = cfv; cg2[lane] = cgv;
+                            rg2[lane] = rgv;
+                        }
+                        mc.scaledAccumInto2(facc, xsLds, cf2, rg2, cg2);
+                    } else if (wid == 3) {
+                        if (lane < 16) {
+                            cf3[lane] = cfv; cg3[lane] = cgv;
+                            rg3[lane] = rgv;
+                        }
+                        mc.scaledAccumInto2(facc, xsLds, cf3, rg3, cg3);
+                    } else if (wid == 4) {
+                        if (lane < 16) {
+                            cf4[lane] = cfv; cg4[lane] = cgv;
+                            rg4[lane] = rgv;
+                        }
+                        mc.scaledAccumInto2(facc, xsLds, cf4, rg4, cg4);
+                    } else if (wid == 5) {
+                        if (lane < 16) {
+                            cf5[lane] = cfv; cg5[lane] = cgv;
+                            rg5[lane] = rgv;
+                        }
+                        mc.scaledAccumInto2(facc, xsLds, cf5, rg5, cg5);
+                    } else if (wid == 6) {
+                        if (lane < 16) {
+                            cf6[lane] = cfv; cg6[lane] = cgv;
+                            rg6[lane] = rgv;
+                        }
+                        mc.scaledAccumInto2(facc, xsLds, cf6, rg6, cg6);
+                    } else {
+                        if (lane < 16) {
+                            cf7[lane] = cfv; cg7[lane] = cgv;
+                            rg7[lane] = rgv;
+                        }
+                        mc.scaledAccumInto2(facc, xsLds, cf7, rg7, cg7);
+                    }
+                    j = j + 1;
+                }
+                Barrier.workgroup();
+                b = b + 1;
+            }
+
+            facc.store(y, (uint32) ((int64) t0 * (int64) outDim
+                + (int64) i0), 0, outDim);
+        }
+    }
+
+    /** True when the multi-wave tiling applies. */
+    public static boolean fitsMw(int64 rows, int64 outDim) {
+        return rows % 16L == 0L && outDim % 128L == 0L;
+    }
+
+    public static void q4kWmmaDeqMwLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
+        int64 tilesM = rows / 16L;
+        int64 tilesN8 = outDim / 128L;
+        KernelStream s #= KernelStream.current();
+        q4kWmmaDeqMwKernel.launch(s, grid: [(uint32) (tilesM * tilesN8)],
+            block: [256])
+            (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
+             (uint32) tilesN8, cols / 256L);
+        return;
+    }
+
+    /** Batch kernel vs the multi-wave deq kernel — the test harness. */
+    public static void compareMwInto(int8[] rawW, float32[] x,
+            int64 rows, int64 outDim, int64 cols, float32[] want,
+            float32[] got) {
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int8[] xph #= heap int8[rows * pb];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q8kPack(x, r * cols, cols, xph, r * pb);
+            r = r + 1;
+        }
+        KernelBuffer<int8> wDev #= heap KernelBuffer<int8>(
+            (uint64) rawW.count());
+        KernelBuffer<int8> xDev #= heap KernelBuffer<int8>(
+            (uint64) (rows * pb));
+        KernelBuffer<float32> yDev #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        wDev.upload(rawW);
+        xDev.upload(xph);
+        KernelStream s #= KernelStream.current();
+        QuantKernel.q4kQ8BatchMatMulLaunchNoSync(yDev, wDev, xDev, rows,
+            outDim, cols);
+        s.sync();
+        yDev.download(want, rows * outDim);
+        KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+            (uint64) (outDim * cols));
+        WmmaKernel.q4kWidenLaunch(deqDev, wDev, outDim, cols);
+        WmmaKernel.q4kWmmaDeqMwLaunch(yDev, wDev, deqDev, xDev, rows,
+            outDim, cols);
+        s.sync();
+        yDev.download(got, rows * outDim);
+        return;
+    }
+
+    /** True when the N4 tiling applies. */
+    public static boolean fitsN4(int64 rows, int64 outDim) {
+        return rows % 16L == 0L && outDim % 64L == 0L;
+    }
+
+    public static void q4kWmmaDeqN4Launch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
+        int64 tilesM = rows / 16L;
+        int64 tilesN4 = outDim / 64L;
+        KernelStream s #= KernelStream.current();
+        q4kWmmaDeqN4Kernel.launch(s, grid: [(uint32) (tilesM * tilesN4)],
+            block: [32])
+            (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
+             (uint32) tilesN4, cols / 256L);
+        return;
+    }
+
+    /** Batch kernel vs the N4 deq kernel — the test harness. */
+    public static void compareN4Into(int8[] rawW, float32[] x,
+            int64 rows, int64 outDim, int64 cols, float32[] want,
+            float32[] got) {
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int8[] xph #= heap int8[rows * pb];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q8kPack(x, r * cols, cols, xph, r * pb);
+            r = r + 1;
+        }
+        KernelBuffer<int8> wDev #= heap KernelBuffer<int8>(
+            (uint64) rawW.count());
+        KernelBuffer<int8> xDev #= heap KernelBuffer<int8>(
+            (uint64) (rows * pb));
+        KernelBuffer<float32> yDev #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        wDev.upload(rawW);
+        xDev.upload(xph);
+        KernelStream s #= KernelStream.current();
+        QuantKernel.q4kQ8BatchMatMulLaunchNoSync(yDev, wDev, xDev, rows,
+            outDim, cols);
+        s.sync();
+        yDev.download(want, rows * outDim);
+        KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+            (uint64) (outDim * cols));
+        WmmaKernel.q4kWidenLaunch(deqDev, wDev, outDim, cols);
+        WmmaKernel.q4kWmmaDeqN4Launch(yDev, wDev, deqDev, xDev, rows,
+            outDim, cols);
+        s.sync();
+        yDev.download(got, rows * outDim);
+        return;
+    }
+
     /** True when the T2 tiling applies. */
     public static boolean fitsT2(int64 rows, int64 outDim) {
         return rows % 32L == 0L && outDim % 16L == 0L;
