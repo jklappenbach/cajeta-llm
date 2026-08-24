@@ -3,6 +3,7 @@ package dev.cajeta.llama.model;
 import cajeta.collection.ArrayList;
 import cajeta.lang.String;
 import cajeta.lang.System;
+import cajeta.time.Clock;
 import cajeta.xpu.KernelBuffer;
 import cajeta.math.Tensor;
 import dev.cajeta.llama.LlamaException;
@@ -477,6 +478,24 @@ public final class LlamaForCausalLM extends InfModule {
     static boolean devAttnOn = true;
     static boolean forceReseed = false;
 
+    // Prefill phase timers (10.12.22): the batch phases in Linear cover
+    // the projections; these cover the rest of `forwardRowsBatched`, so
+    // the whole prefill is accounted rather than "launch plus a
+    // mystery". Host prims = the rmsnorm/GLU/add row loops.
+    static int64 pfPrimNs;
+    static int64 pfRopeNs;
+    static int64 pfAttendNs;
+
+    public static int64 prefillPrimNs()   { return LlamaForCausalLM.pfPrimNs; }
+    public static int64 prefillRopeNs()   { return LlamaForCausalLM.pfRopeNs; }
+    public static int64 prefillAttendNs() { return LlamaForCausalLM.pfAttendNs; }
+    public static void resetPrefillTimers() {
+        LlamaForCausalLM.pfPrimNs = 0L;
+        LlamaForCausalLM.pfRopeNs = 0L;
+        LlamaForCausalLM.pfAttendNs = 0L;
+        return;
+    }
+
     public static void setForceReseed(boolean on) {
         LlamaForCausalLM.forceReseed = on;
     }
@@ -589,6 +608,7 @@ public final class LlamaForCausalLM extends InfModule {
             Attention a = d.selfAttn;
 
             // ── attention sublayer ──────────────────────────────────────
+            int64 tp0 = Clock.nanoTime();
             int32 r = 0;
             while (r < rows) {
                 Prim.rmsnormRowHost(hs, (int64) r * (int64) h,
@@ -596,6 +616,8 @@ public final class LlamaForCausalLM extends InfModule {
                     xn, (int64) r * (int64) h, h, d.normForm);
                 r = r + 1;
             }
+            LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                + (Clock.nanoTime() - tp0);
             this.stageTag = this.stageTag + 1L;
             Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
             a.qProj.matmulInto(rows, q, 0L);
@@ -612,6 +634,7 @@ public final class LlamaForCausalLM extends InfModule {
                 // then ONE attend for all of them. Safe here only because
                 // the kernel takes `startPos` and derives each row's
                 // causal range from it.
+                int64 tr0 = Clock.nanoTime();
                 r = 0;
                 while (r < rows) {
                     int64 rkv = (int64) r * (int64) kvd;
@@ -625,8 +648,13 @@ public final class LlamaForCausalLM extends InfModule {
                     }
                     r = r + 1;
                 }
+                int64 ta0 = Clock.nanoTime();
+                LlamaForCausalLM.pfRopeNs = LlamaForCausalLM.pfRopeNs
+                    + (ta0 - tr0);
                 this.dkv.prefillAttend(l, q, k, v, ao, rows, startPos,
                     a.scale);
+                LlamaForCausalLM.pfAttendNs = LlamaForCausalLM.pfAttendNs
+                    + (Clock.nanoTime() - ta0);
             } else {
                 // INTERLEAVED, and it must be. `attendRow` takes the query
                 // position from `lenSL - 1`, so appending every row before
@@ -653,6 +681,7 @@ public final class LlamaForCausalLM extends InfModule {
             this.stageTag = this.stageTag + 1L;
             Linear.stageBatch(ao, 0L, rows, qd, this.stageTag);
             a.oProj.matmulInto(rows, proj, 0L);
+            int64 tp1 = Clock.nanoTime();
             r = 0;
             while (r < rows) {
                 HostOps.addRow(hs, (int64) r * (int64) h, proj,
@@ -669,10 +698,13 @@ public final class LlamaForCausalLM extends InfModule {
                     (int64) r * (int64) h, h, d.normForm);
                 r = r + 1;
             }
+            LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                + (Clock.nanoTime() - tp1);
             this.stageTag = this.stageTag + 1L;
             Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
             d.mlp.gateProj.matmulInto(rows, gate, 0L);
             d.mlp.upProj.matmulInto(rows, up, 0L);
+            int64 tp2 = Clock.nanoTime();
             r = 0;
             while (r < rows) {
                 int64 ri = (int64) r * (int64) inter;
@@ -680,15 +712,20 @@ public final class LlamaForCausalLM extends InfModule {
                     d.activation);
                 r = r + 1;
             }
+            LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                + (Clock.nanoTime() - tp2);
             this.stageTag = this.stageTag + 1L;
             Linear.stageBatch(gate, 0L, rows, inter, this.stageTag);
             d.mlp.downProj.matmulInto(rows, mlpOut, 0L);
+            int64 tp3 = Clock.nanoTime();
             r = 0;
             while (r < rows) {
                 HostOps.addRow(hs, (int64) r * (int64) h, mlpOut,
                     (int64) r * (int64) h, h);
                 r = r + 1;
             }
+            LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                + (Clock.nanoTime() - tp3);
             l = l + 1;
         }
 
