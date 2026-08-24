@@ -2,6 +2,7 @@ package dev.cajeta.llama.model;
 
 import cajeta.collection.ArrayList;
 import cajeta.lang.String;
+import cajeta.lang.System;
 import cajeta.xpu.KernelBuffer;
 import cajeta.math.Tensor;
 import dev.cajeta.llama.LlamaException;
@@ -91,6 +92,15 @@ public final class LlamaForCausalLM extends InfModule {
     }
 
     /** The cache — observable occupancy for tests and the scheduler. */
+    /** The vocabulary width, for a caller inspecting logits. */
+    public int32 vocabSize() { return this.cfg.vocabSize; }
+
+    /** Logit `i` of the last step — the measurement surface for the
+     *  top-2 gap at a divergence. */
+    public float32 logitAt(int32 i) {
+        return this.pool.logits.flatGet((int64) i);
+    }
+
     public PagedKvCache kvCache() {
         return this.cache;
     }
@@ -269,6 +279,42 @@ public final class LlamaForCausalLM extends InfModule {
             this.hsDev.upload(this.hsHost);
         }
 
+        // BATCHED PREFILL (plan 10.12.1). The projections run over ALL
+        // rows at once so a 32-token tile shares one pass over the
+        // weights; the per-row path below reads all 4.58 GB of an 8B
+        // checkpoint once PER PROMPT TOKEN, which is 2.4 TB for a
+        // 512-token prompt and is why prefill(512) took 34 s.
+        boolean batched = rows > 1 && this.batchReady();
+        if (batched && LlamaForCausalLM.devAttnOn
+                && DeviceKv.supports(this.cfg)) {
+            // The prefill attend needs the device planes; the same ones
+            // decode then inherits, already holding the prompt, so the
+            // 10.11 seed becomes free.
+            if (this.dkv == null) {
+                this.dkv #= heap DeviceKv(this.cfg, this.maxSeq);
+                this.dkv.bindRope(this.model);
+            }
+        }
+        if (rows > 1 && !this.batchSaid) {
+            // SAY whether it engaged. The first version of this only knew
+            // Q4_K, and Q4_K_M is a MIXTURE — attn_v and some ffn_down are
+            // Q6_K — so `batchReady` was false and the whole prefill ran
+            // per row. It read as "batching bought 4%" when it never ran.
+            this.batchSaid = true;
+            if (batched) {
+                System.stdout.println("prefill: BATCHED projections");
+            } else {
+                System.stdout.println("prefill: per-row projections "
+                    + "(no batched GEMM for some weight type)");
+            }
+        }
+        if (batched) {
+            this.forwardRowsBatched(seq, hs, xn, q, k, v, ao, proj, gate,
+                up, mlpOut, rows, startPos, h, qd, kvd, inter, nH, nKv, hd,
+                scores);
+            return;
+        }
+
         int32 l = 0;
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
@@ -429,6 +475,11 @@ public final class LlamaForCausalLM extends InfModule {
     DeviceKv dkv;
 
     static boolean devAttnOn = true;
+    static boolean forceReseed = false;
+
+    public static void setForceReseed(boolean on) {
+        LlamaForCausalLM.forceReseed = on;
+    }
 
     /** Arm for 10.11 — the attention tail on the device. On by default:
      *  the host tail is 3 ms of a 32 ms token at 12 positions of context
@@ -487,6 +538,184 @@ public final class LlamaForCausalLM extends InfModule {
             l = l + 1;
         }
         return true;
+    }
+
+    /** Every projection in the stack has a batched GEMM kernel. */
+    boolean batchReady() {
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.selfAttn;
+            if (d.fourNorm || a.qNorm != null) { return false; }
+            if (!a.qProj.isBatchRouted() || !a.kProj.isBatchRouted()
+                    || !a.vProj.isBatchRouted()
+                    || !a.oProj.isBatchRouted()
+                    || !d.mlp.gateProj.isBatchRouted()
+                    || !d.mlp.upProj.isBatchRouted()
+                    || !d.mlp.downProj.isBatchRouted()) {
+                return false;
+            }
+            l = l + 1;
+        }
+        return true;
+    }
+
+    /** Monotonic, so the batch stage can never hit on a stale window:
+     *  `xn` is rewritten at the SAME address every layer, and identity
+     *  plus offset cannot tell layer N's activation from layer N+1's. */
+    int64 stageTag;
+    boolean batchSaid;
+
+    /**
+     * The layer stack with the PROJECTIONS BATCHED over all rows.
+     *
+     * Same arithmetic as the per-row path and the same order within a
+     * row; what changes is that the row loop moved INSIDE each
+     * projection, so the weights are streamed once per 32-row tile
+     * instead of once per row. Attention stays per row for now — it is
+     * O(n^2) and the next unit — but it is no longer competing with 2.4
+     * TB of redundant weight traffic.
+     */
+    void forwardRowsBatched(int32 seq, Tensor<float32> hs,
+            Tensor<float32> xn, Tensor<float32> q, Tensor<float32> k,
+            Tensor<float32> v, Tensor<float32> ao, Tensor<float32> proj,
+            Tensor<float32> gate, Tensor<float32> up,
+            Tensor<float32> mlpOut, int32 rows, int32 startPos,
+            int32 h, int32 qd, int32 kvd, int32 inter,
+            int32 nH, int32 nKv, int32 hd, Tensor<float32> scores) {
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.selfAttn;
+
+            // ── attention sublayer ──────────────────────────────────────
+            int32 r = 0;
+            while (r < rows) {
+                Prim.rmsnormRowHost(hs, (int64) r * (int64) h,
+                    d.inputLayernorm.weight, d.inputLayernorm.eps,
+                    xn, (int64) r * (int64) h, h, d.normForm);
+                r = r + 1;
+            }
+            this.stageTag = this.stageTag + 1L;
+            Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
+            a.qProj.matmulInto(rows, q, 0L);
+            a.kProj.matmulInto(rows, k, 0L);
+            a.vProj.matmulInto(rows, v, 0L);
+
+            // RoPE and the cache append stay on the host: they are O(n)
+            // and they are what keeps the paged cache authoritative for
+            // everything outside this pass. The ATTEND is O(n^2) and is
+            // 16.5 s of a 23.6 s prefill at 512 tokens, so it goes to the
+            // device for every row at once (10.12.2).
+            if (this.dkv != null) {
+                // Device attend: RoPE and the append for every row first,
+                // then ONE attend for all of them. Safe here only because
+                // the kernel takes `startPos` and derives each row's
+                // causal range from it.
+                r = 0;
+                while (r < rows) {
+                    int64 rkv = (int64) r * (int64) kvd;
+                    int32 p = startPos + r;
+                    Prim.ropeRowHost(q, (int64) r * (int64) qd, nH, hd, p,
+                        a.ropeInv);
+                    Prim.ropeRowHost(k, rkv, nKv, hd, p, a.ropeInv);
+                    if (!this.cache.appendRow(seq, l, k, rkv, v, rkv, p)) {
+                        throw heap LlamaException("kv pool exhausted at "
+                            + "layer " + l + " position " + p);
+                    }
+                    r = r + 1;
+                }
+                this.dkv.prefillAttend(l, q, k, v, ao, rows, startPos,
+                    a.scale);
+            } else {
+                // INTERLEAVED, and it must be. `attendRow` takes the query
+                // position from `lenSL - 1`, so appending every row before
+                // attending makes every row attend as the LAST one — a
+                // causality break that still decodes, just wrongly. It
+                // decoded 1882 1889 1882 1889 rather than 198 14196.
+                r = 0;
+                while (r < rows) {
+                    int64 rq = (int64) r * (int64) qd;
+                    int64 rkv = (int64) r * (int64) kvd;
+                    int32 p = startPos + r;
+                    Prim.ropeRowHost(q, rq, nH, hd, p, a.ropeInv);
+                    Prim.ropeRowHost(k, rkv, nKv, hd, p, a.ropeInv);
+                    if (!this.cache.appendRow(seq, l, k, rkv, v, rkv, p)) {
+                        throw heap LlamaException("kv pool exhausted at "
+                            + "layer " + l + " position " + p);
+                    }
+                    this.cache.attendRow(seq, l, q, rq, a.scale, scores,
+                        ao, rq, nH, nKv, hd);
+                    r = r + 1;
+                }
+            }
+
+            this.stageTag = this.stageTag + 1L;
+            Linear.stageBatch(ao, 0L, rows, qd, this.stageTag);
+            a.oProj.matmulInto(rows, proj, 0L);
+            r = 0;
+            while (r < rows) {
+                HostOps.addRow(hs, (int64) r * (int64) h, proj,
+                    (int64) r * (int64) h, h);
+                r = r + 1;
+            }
+
+            // ── MLP sublayer ────────────────────────────────────────────
+            r = 0;
+            while (r < rows) {
+                Prim.rmsnormRowHost(hs, (int64) r * (int64) h,
+                    d.postAttentionLayernorm.weight,
+                    d.postAttentionLayernorm.eps, xn,
+                    (int64) r * (int64) h, h, d.normForm);
+                r = r + 1;
+            }
+            this.stageTag = this.stageTag + 1L;
+            Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
+            d.mlp.gateProj.matmulInto(rows, gate, 0L);
+            d.mlp.upProj.matmulInto(rows, up, 0L);
+            r = 0;
+            while (r < rows) {
+                int64 ri = (int64) r * (int64) inter;
+                Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
+                    d.activation);
+                r = r + 1;
+            }
+            this.stageTag = this.stageTag + 1L;
+            Linear.stageBatch(gate, 0L, rows, inter, this.stageTag);
+            d.mlp.downProj.matmulInto(rows, mlpOut, 0L);
+            r = 0;
+            while (r < rows) {
+                HostOps.addRow(hs, (int64) r * (int64) h, mlpOut,
+                    (int64) r * (int64) h, h);
+                r = r + 1;
+            }
+            l = l + 1;
+        }
+
+        if (this.dkv != null && !LlamaForCausalLM.forceReseed) {
+            // The planes now hold every prompt position, written by
+            // `prefillAttend`, and the paged cache holds them too. Say so,
+            // or the first decode token re-seeds 134 MB it already has.
+            //
+            // `forceReseed` is the CONTROL for that claim: it skips the
+            // adopt so decode seeds from the paged cache instead. If a
+            // run agrees with the host only under `reseed`, the planes
+            // prefill wrote are wrong; if it disagrees either way, they
+            // are fine and the difference is the softmax reassociation
+            // moving a near-tied argmax.
+            this.dkv.adopt(seq, startPos + rows);
+        }
+
+        int64 lastH = (int64) (rows - 1) * (int64) h;
+        Prim.rmsnormRowHost(hs, lastH, this.model.norm.weight,
+            this.model.norm.eps, xn, lastH, h, this.cfg.normForm);
+        if (this.lmHead != null) {
+            this.lmHead.matvecInto(xn, lastH, this.pool.logits, 0);
+        } else {
+            HostOps.rowsDotRow(this.model.embedTokens.weight, xn, lastH,
+                this.pool.logits, this.cfg.vocabSize, h);
+        }
+        return;
     }
 
     /**

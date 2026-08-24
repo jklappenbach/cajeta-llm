@@ -249,6 +249,194 @@ public final class AttnKernel {
         }
     }
 
+    // ── PREFILL: many query rows at once (plan 10.12.2) ─────────────────
+
+    /**
+     * Copy `count` contiguous K/V rows into the device planes starting at
+     * `fromRow`. Prefill produces `rows` positions in one pass, and `k`
+     * and `v` are already contiguous `[rows x kvDim]`, so they upload
+     * whole and this kernel places them.
+     */
+    @Kernel
+    public static void kvAppendRangeKernel(KernelBuffer<float32> kPool,
+            KernelBuffer<float32> vPool, KernelBuffer<float32> kSrc,
+            KernelBuffer<float32> vSrc, uint32 kvDim, uint32 fromRow,
+            uint32 count) {
+        uint32 id = KernelThread.globalIdX();
+        uint32 total = kvDim * count;
+        if (id < total) {
+            uint32 r = id / kvDim;
+            uint32 d = id % kvDim;
+            uint32 o = (fromRow + r) * kvDim + d;
+            kPool[o] = kSrc[id];
+            vPool[o] = vSrc[id];
+        }
+    }
+
+    /**
+     * Prefill scores: one wave per `(query row, head, key position)`.
+     *
+     * Causal by construction — row `r` sits at absolute position
+     * `startPos + r` and reads `[0, startPos + r]`, so the guard is a
+     * comparison and never a mask (5.6). Positions past a row's own are
+     * launched and return immediately; the alternative is a ragged grid,
+     * and half a wave of no-op is cheaper than the indexing that avoids
+     * it.
+     */
+    @Kernel
+    public static void attnScorePrefillKernel(KernelBuffer<float32> scores,
+            KernelBuffer<float32> q, KernelBuffer<float32> kPool,
+            uint32 rows, uint32 nH, uint32 nKv, uint32 hd, uint32 tMax,
+            uint32 startPos, uint32 stride, float32 scale) {
+        Shared<float32> part = shared float32[32];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 32;
+        uint32 perRow = nH * tMax;
+        uint32 total = rows * perRow;
+        float32 s = 0.0f;
+        uint32 r = 0;
+        uint32 h = 0;
+        uint32 t = 0;
+        boolean live = false;
+        if (wg < total) {
+            r = wg / perRow;
+            uint32 rem = wg % perRow;
+            h = rem / tMax;
+            t = rem % tMax;
+            if (t <= startPos + r) {
+                live = true;
+                uint32 kvDim = nKv * hd;
+                uint32 kvh = h / (nH / nKv);
+                uint32 qBase = r * (nH * hd) + h * hd;
+                uint32 kRow = t * kvDim + kvh * hd;
+                uint32 d = lane;
+                while (d < hd) {
+                    s = s + q[qBase + d] * kPool[kRow + d];
+                    d = d + 32;
+                }
+            }
+        }
+        part[lane] = s;
+        Barrier.workgroup();
+        uint32 rr = 16;
+        while (rr > 0) {
+            if (lane < rr) { part[lane] = part[lane] + part[lane + rr]; }
+            Barrier.workgroup();
+            rr = rr / 2;
+        }
+        if (lane == 0 && live) {
+            scores[(r * nH + h) * stride + t] = part[0] * scale;
+        }
+    }
+
+    /** Prefill softmax and V combine: one workgroup of 128 per
+     *  `(query row, head)`, over that row's causal range. */
+    @Kernel
+    public static void attnCombinePrefillKernel(KernelBuffer<float32> out,
+            KernelBuffer<float32> scores, KernelBuffer<float32> vPool,
+            uint32 rows, uint32 nH, uint32 nKv, uint32 hd,
+            uint32 startPos, uint32 stride) {
+        Shared<float32> red = shared float32[128];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 128;
+        uint32 kvDim = nKv * hd;
+        uint32 r = 0;
+        uint32 h = 0;
+        uint32 kvh = 0;
+        uint32 sBase = 0;
+        uint32 count = 1;
+        if (wg < rows * nH) {
+            r = wg / nH;
+            h = wg % nH;
+            kvh = h / (nH / nKv);
+            sBase = (r * nH + h) * stride;
+            count = startPos + r + 1;
+        }
+        float32 mx = 0.0f - 3.0e38f;
+        if (wg < rows * nH) {
+            uint32 t = lane;
+            while (t < count) {
+                float32 sv = scores[sBase + t];
+                if (sv > mx) { mx = sv; }
+                t = t + 128;
+            }
+        }
+        red[lane] = mx;
+        Barrier.workgroup();
+        uint32 rr = 64;
+        while (rr > 0) {
+            if (lane < rr) {
+                if (red[lane + rr] > red[lane]) { red[lane] = red[lane + rr]; }
+            }
+            Barrier.workgroup();
+            rr = rr / 2;
+        }
+        float32 m = red[0];
+        Barrier.workgroup();
+        float32 sum = 0.0f;
+        if (wg < rows * nH) {
+            uint32 t = lane;
+            while (t < count) {
+                float32 e = Math.exp(scores[sBase + t] - m);
+                scores[sBase + t] = e;
+                sum = sum + e;
+                t = t + 128;
+            }
+        }
+        red[lane] = sum;
+        Barrier.workgroup();
+        rr = 64;
+        while (rr > 0) {
+            if (lane < rr) { red[lane] = red[lane] + red[lane + rr]; }
+            Barrier.workgroup();
+            rr = rr / 2;
+        }
+        float32 rs = 1.0f / red[0];
+        Barrier.workgroup();
+        if (wg < rows * nH && lane < hd) {
+            float32 acc = 0.0f;
+            uint32 vBase = kvh * hd + lane;
+            uint32 tt = 0;
+            while (tt < count) {
+                acc = acc + scores[sBase + tt] * vPool[vBase + tt * kvDim];
+                tt = tt + 1;
+            }
+            out[r * (nH * hd) + h * hd + lane] = acc * rs;
+        }
+    }
+
+    public static void kvAppendRangeLaunchNoSync(KernelBuffer<float32> kPool,
+            KernelBuffer<float32> vPool, KernelBuffer<float32> kSrc,
+            KernelBuffer<float32> vSrc, int32 kvDim, int32 fromRow,
+            int32 count) {
+        uint32 lanes = (uint32) (kvDim * count);
+        KernelStream s #= KernelStream.current();
+        kvAppendRangeKernel.launch(s, grid: [(lanes + 63) / 64], block: [64])
+            (kPool, vPool, kSrc, vSrc, (uint32) kvDim, (uint32) fromRow,
+             (uint32) count);
+        return;
+    }
+
+    public static void attendPrefillLaunch(KernelBuffer<float32> out,
+            KernelBuffer<float32> scores, KernelBuffer<float32> q,
+            KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
+            int32 rows, int32 nH, int32 nKv, int32 hd, int32 startPos,
+            int32 stride, float32 scale) {
+        KernelStream s #= KernelStream.current();
+        int32 tMax = startPos + rows;
+        int64 waves = (int64) rows * (int64) nH * (int64) tMax;
+        attnScorePrefillKernel.launch(s, grid: [(uint32) waves], block: [32])
+            (scores, q, kPool, (uint32) rows, (uint32) nH, (uint32) nKv,
+             (uint32) hd, (uint32) tMax, (uint32) startPos,
+             (uint32) stride, scale);
+        attnCombinePrefillKernel.launch(s,
+            grid: [(uint32) (rows * nH)], block: [128])
+            (out, scores, vPool, (uint32) rows, (uint32) nH, (uint32) nKv,
+             (uint32) hd, (uint32) startPos, (uint32) stride);
+        s.sync();
+        return;
+    }
+
     // ── launch wrappers ─────────────────────────────────────────────────
 
     public static void ropeDecodeLaunchNoSync(KernelBuffer<float32> t,
@@ -351,6 +539,59 @@ public final class AttnKernel {
         AttnKernel.attendDecodeLaunch(ob, sb, qb, kb, vb, nH, nKv, hd,
             count, 0, count, scale);
         ob.download(out);
+        return;
+    }
+
+    /** The prefill attend over host arrays: `q` is `[rows x nH x hd]`,
+     *  `k`/`v` are `[tMax x kvDim]`, `out` is `[rows x nH x hd]`, and row
+     *  `r` attends over `[0, startPos + r]`. */
+    public static void attendPrefillInto(float32[] out, float32[] q,
+            float32[] k, float32[] v, int32 rows, int32 nH, int32 nKv,
+            int32 hd, int32 startPos, float32 scale) {
+        int64 kvDim = (int64) (nKv * hd);
+        int32 tMax = startPos + rows;
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        KernelBuffer<float32> qb #= heap KernelBuffer<float32>((uint64) qn);
+        KernelBuffer<float32> ob #= heap KernelBuffer<float32>((uint64) qn);
+        KernelBuffer<float32> kb #= heap KernelBuffer<float32>(
+            (uint64) ((int64) tMax * kvDim));
+        KernelBuffer<float32> vb #= heap KernelBuffer<float32>(
+            (uint64) ((int64) tMax * kvDim));
+        KernelBuffer<float32> sb #= heap KernelBuffer<float32>(
+            (uint64) ((int64) rows * (int64) nH * (int64) tMax));
+        qb.upload(q);
+        kb.upload(k);
+        vb.upload(v);
+        AttnKernel.attendPrefillLaunch(ob, sb, qb, kb, vb, rows, nH, nKv,
+            hd, startPos, tMax, scale);
+        ob.download(out);
+        return;
+    }
+
+    /** The HOST floor for {@link #attendPrefillInto}. */
+    public static void attendPrefillHost(float32[] out, float32[] q,
+            float32[] k, float32[] v, int32 rows, int32 nH, int32 nKv,
+            int32 hd, int32 startPos, float32 scale) {
+        int32 r = 0;
+        while (r < rows) {
+            int32 count = startPos + r + 1;
+            int64 qOff = (int64) r * (int64) (nH * hd);
+            float32[] qr #= heap float32[(int64) (nH * hd)];
+            int64 c = 0;
+            while (c < (int64) (nH * hd)) {
+                qr[c] = q[qOff + c];
+                c = c + 1;
+            }
+            float32[] orow #= heap float32[(int64) (nH * hd)];
+            AttnKernel.attendDecodeHost(orow, qr, k, v, nH, nKv, hd, count,
+                scale);
+            c = 0;
+            while (c < (int64) (nH * hd)) {
+                out[qOff + c] = orow[c];
+                c = c + 1;
+            }
+            r = r + 1;
+        }
         return;
     }
 
