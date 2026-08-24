@@ -5,6 +5,7 @@ import cajeta.lang.String;
 import cajeta.lang.System;
 import cajeta.time.Clock;
 import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
 import cajeta.math.Tensor;
 import dev.cajeta.llama.LlamaException;
 import dev.cajeta.llama.io.Checkpoint;
@@ -472,6 +473,25 @@ public final class LlamaForCausalLM extends InfModule {
     KernelBuffer<float32> xnDev;
     float32[] hsHost;
 
+    // Prefill-resident hidden state (10.12.7.b): `[rows x h]` device
+    // twins of hs/xn for the batched path, plus the scratch host array
+    // the one-per-prefill upload/download bounces through — an arena
+    // slice's `hostBase` is nonzero and `KernelBuffer.upload` starts at
+    // index 0, the exact trap that broke `prefillAttend` (spec 9).
+    KernelBuffer<float32> pfHsDev;
+    KernelBuffer<float32> pfXnDev;
+    float32[] pfHsHost;
+    int64 pfHsCap;
+
+    void ensurePrefillRes(int64 n) {
+        if (this.pfHsCap >= n) { return; }
+        this.pfHsDev #= heap KernelBuffer<float32>((uint64) n);
+        this.pfXnDev #= heap KernelBuffer<float32>((uint64) n);
+        this.pfHsHost #= heap float32[n];
+        this.pfHsCap = n;
+        return;
+    }
+
     // Device attention (plan 10.11): RoPE, the KV planes and the attend.
     DeviceKv dkv;
 
@@ -602,24 +622,52 @@ public final class LlamaForCausalLM extends InfModule {
             Tensor<float32> mlpOut, int32 rows, int32 startPos,
             int32 h, int32 qd, int32 kvd, int32 inter,
             int32 nH, int32 nKv, int32 hd, Tensor<float32> scores) {
+        // RESIDENT HIDDEN STATE (10.12.7.b): hs lives on the device for
+        // the whole layer stack — norms, residual adds and the MLP chain
+        // never read it on the host. It crosses the bus exactly twice: up
+        // here, down after the last layer. q/k/v still come down each
+        // layer because rope/append/attend keep their host seam (.c).
+        boolean res = Linear.devicePackOn();
+        int64 nHs = (int64) rows * (int64) h;
+        if (res) {
+            this.ensurePrefillRes(nHs);
+            float32[] hb = hs.hostBuffer();
+            int64 hb0 = hs.hostBase();
+            int64 c = 0;
+            while (c < nHs) {
+                this.pfHsHost[c] = hb[hb0 + c];
+                c = c + 1;
+            }
+            this.pfHsDev.upload(this.pfHsHost, nHs);
+        }
         int32 l = 0;
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
 
             // ── attention sublayer ──────────────────────────────────────
-            int64 tp0 = Clock.nanoTime();
-            int32 r = 0;
-            while (r < rows) {
-                Prim.rmsnormRowHost(hs, (int64) r * (int64) h,
-                    d.inputLayernorm.weight, d.inputLayernorm.eps,
-                    xn, (int64) r * (int64) h, h, d.normForm);
-                r = r + 1;
+            if (res) {
+                Prim.rmsnormBatchDevice(this.pfXnDev, this.pfHsDev,
+                    d.inputLayernorm.deviceWeight(), (int64) rows,
+                    (int64) h, d.inputLayernorm.eps, d.normForm);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatchFromDevice(this.pfXnDev, rows, h,
+                    this.stageTag);
+            } else {
+                int64 tp0 = Clock.nanoTime();
+                int32 r0 = 0;
+                while (r0 < rows) {
+                    Prim.rmsnormRowHost(hs, (int64) r0 * (int64) h,
+                        d.inputLayernorm.weight, d.inputLayernorm.eps,
+                        xn, (int64) r0 * (int64) h, h, d.normForm);
+                    r0 = r0 + 1;
+                }
+                LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                    + (Clock.nanoTime() - tp0);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
             }
-            LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
-                + (Clock.nanoTime() - tp0);
-            this.stageTag = this.stageTag + 1L;
-            Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
+            int32 r = 0;
             a.qProj.matmulInto(rows, q, 0L);
             a.kProj.matmulInto(rows, k, 0L);
             a.vProj.matmulInto(rows, v, 0L);
@@ -680,28 +728,42 @@ public final class LlamaForCausalLM extends InfModule {
 
             this.stageTag = this.stageTag + 1L;
             Linear.stageBatch(ao, 0L, rows, qd, this.stageTag);
-            a.oProj.matmulInto(rows, proj, 0L);
-            int64 tp1 = Clock.nanoTime();
-            r = 0;
-            while (r < rows) {
-                HostOps.addRow(hs, (int64) r * (int64) h, proj,
-                    (int64) r * (int64) h, h);
-                r = r + 1;
-            }
+            if (res) {
+                // o_proj's output joins the resident hs; the second
+                // norm reads it there.
+                a.oProj.matmulBatchKeep(rows);
+                Prim.addDevice(this.pfHsDev, a.oProj.yBatch, nHs);
+                Prim.rmsnormBatchDevice(this.pfXnDev, this.pfHsDev,
+                    d.postAttentionLayernorm.deviceWeight(),
+                    (int64) rows, (int64) h,
+                    d.postAttentionLayernorm.eps, d.normForm);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatchFromDevice(this.pfXnDev, rows, h,
+                    this.stageTag);
+            } else {
+                a.oProj.matmulInto(rows, proj, 0L);
+                int64 tp1 = Clock.nanoTime();
+                r = 0;
+                while (r < rows) {
+                    HostOps.addRow(hs, (int64) r * (int64) h, proj,
+                        (int64) r * (int64) h, h);
+                    r = r + 1;
+                }
 
-            // ── MLP sublayer ────────────────────────────────────────────
-            r = 0;
-            while (r < rows) {
-                Prim.rmsnormRowHost(hs, (int64) r * (int64) h,
-                    d.postAttentionLayernorm.weight,
-                    d.postAttentionLayernorm.eps, xn,
-                    (int64) r * (int64) h, h, d.normForm);
-                r = r + 1;
+                // ── MLP sublayer ────────────────────────────────────────
+                r = 0;
+                while (r < rows) {
+                    Prim.rmsnormRowHost(hs, (int64) r * (int64) h,
+                        d.postAttentionLayernorm.weight,
+                        d.postAttentionLayernorm.eps, xn,
+                        (int64) r * (int64) h, h, d.normForm);
+                    r = r + 1;
+                }
+                LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                    + (Clock.nanoTime() - tp1);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
             }
-            LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
-                + (Clock.nanoTime() - tp1);
-            this.stageTag = this.stageTag + 1L;
-            Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
             if (Linear.devicePackOn()) {
                 // RESIDENT MLP CHAIN (10.12.7.a): gate and up never
                 // leave the device — the GLU runs in place on gate's
@@ -720,7 +782,12 @@ public final class LlamaForCausalLM extends InfModule {
                 this.stageTag = this.stageTag + 1L;
                 Linear.stageBatchFromDevice(d.mlp.gateProj.yBatch,
                     rows, inter, this.stageTag);
-                d.mlp.downProj.matmulInto(rows, mlpOut, 0L);
+                // With hs resident (.b) the down projection joins it on
+                // the device; devicePackOn == res here, so both arms of
+                // the residual agree on where hs lives.
+                d.mlp.downProj.matmulBatchKeep(rows);
+                Prim.addDevice(this.pfHsDev, d.mlp.downProj.yBatch,
+                    nHs);
             } else {
                 d.mlp.gateProj.matmulInto(rows, gate, 0L);
                 d.mlp.upProj.matmulInto(rows, up, 0L);
@@ -738,16 +805,32 @@ public final class LlamaForCausalLM extends InfModule {
                 Linear.stageBatch(gate, 0L, rows, inter, this.stageTag);
                 d.mlp.downProj.matmulInto(rows, mlpOut, 0L);
             }
-            int64 tp3 = Clock.nanoTime();
-            r = 0;
-            while (r < rows) {
-                HostOps.addRow(hs, (int64) r * (int64) h, mlpOut,
-                    (int64) r * (int64) h, h);
-                r = r + 1;
+            if (!res) {
+                int64 tp3 = Clock.nanoTime();
+                r = 0;
+                while (r < rows) {
+                    HostOps.addRow(hs, (int64) r * (int64) h, mlpOut,
+                        (int64) r * (int64) h, h);
+                    r = r + 1;
+                }
+                LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                    + (Clock.nanoTime() - tp3);
             }
-            LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
-                + (Clock.nanoTime() - tp3);
             l = l + 1;
+        }
+        if (res) {
+            // hs comes home ONCE — the logits path below and every
+            // later host read see exactly what the device accumulated.
+            KernelStream ps #= KernelStream.current();
+            ps.sync();
+            this.pfHsDev.download(this.pfHsHost, nHs);
+            float32[] hb2 = hs.hostBuffer();
+            int64 hb02 = hs.hostBase();
+            int64 c2 = 0;
+            while (c2 < nHs) {
+                hb2[hb02 + c2] = this.pfHsHost[c2];
+                c2 = c2 + 1;
+            }
         }
 
         if (this.dkv != null && !LlamaForCausalLM.forceReseed) {
