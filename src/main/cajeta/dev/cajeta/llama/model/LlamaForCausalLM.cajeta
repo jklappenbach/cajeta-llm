@@ -9,6 +9,7 @@ import cajeta.xpu.KernelStream;
 import cajeta.math.Tensor;
 import dev.cajeta.llama.LlamaException;
 import dev.cajeta.llama.io.Checkpoint;
+import dev.cajeta.llama.io.Quant;
 
 /**
  * The tape-free inference model (plan Unit 6; spec §4). Construction
@@ -101,12 +102,30 @@ public final class LlamaForCausalLM extends InfModule {
         int32 l = 0;
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
-            d.selfAttn.qProj.prewarmDeq();
-            d.selfAttn.kProj.prewarmDeq();
-            d.selfAttn.vProj.prewarmDeq();
+            if (Linear.fuseEnabled()) {
+                // 10.12.32: the fused buffers replace the per-tensor
+                // deq for the fused tensors — building both would
+                // double their footprint for nothing. Layers whose
+                // attn_v is Q6_K cannot fuse q|k|v (half of Q4_K_M):
+                // their trio prewarms per-tensor, or the widens land
+                // inside the first timed prefill.
+                if (d.selfAttn.vProj.packedTy == Quant.GG_Q4_K) {
+                    d.selfAttn.qProj.ensureFused3(d.selfAttn.kProj,
+                        d.selfAttn.vProj);
+                } else {
+                    d.selfAttn.qProj.prewarmDeq();
+                    d.selfAttn.kProj.prewarmDeq();
+                    d.selfAttn.vProj.prewarmDeq();
+                }
+                d.mlp.gateProj.ensureFused2(d.mlp.upProj);
+            } else {
+                d.selfAttn.qProj.prewarmDeq();
+                d.selfAttn.kProj.prewarmDeq();
+                d.selfAttn.vProj.prewarmDeq();
+                d.mlp.gateProj.prewarmDeq();
+                d.mlp.upProj.prewarmDeq();
+            }
             d.selfAttn.oProj.prewarmDeq();
-            d.mlp.gateProj.prewarmDeq();
-            d.mlp.upProj.prewarmDeq();
             d.mlp.downProj.prewarmDeq();
             l = l + 1;
         }
@@ -740,9 +759,14 @@ public final class LlamaForCausalLM extends InfModule {
             // stays authoritative through ONE k/v download per layer
             // into appendRowRaw, replacing per-row host rope + append.
             if (resAttn) {
-                a.qProj.matmulBatchKeep(rows);
-                a.kProj.matmulBatchKeep(rows);
-                a.vProj.matmulBatchKeep(rows);
+                // 10.12.32: one fused q|k|v launch when the route
+                // applies; the scatter leaves rope/append untouched.
+                if (!a.qProj.fusedQkvBatchKeep(a.kProj, a.vProj,
+                        rows)) {
+                    a.qProj.matmulBatchKeep(rows);
+                    a.kProj.matmulBatchKeep(rows);
+                    a.vProj.matmulBatchKeep(rows);
+                }
                 int64 tr0 = Clock.nanoTime();
                 Prim.ropeBatchDevice(a.qProj.yBatch, a.deviceRopeInv(),
                     this.pfPosDev, (int64) rows, nH, hd);
@@ -894,11 +918,23 @@ public final class LlamaForCausalLM extends InfModule {
                 // throughout: keep -> keep -> glu -> pack -> down all
                 // launch on the current stream, and down's launch
                 // syncs.
-                d.mlp.gateProj.matmulBatchKeep(rows);
-                d.mlp.upProj.matmulBatchKeep(rows);
-                Prim.gluDevice(d.mlp.gateProj.yBatch,
-                    d.mlp.upProj.yBatch,
-                    (int64) rows * (int64) inter, d.activation);
+                // 10.12.32: one fused gate|up launch; the fused GLU
+                // reads the concatenated rows in place and writes the
+                // compact [rows x inter] result, so the split copy a
+                // separate gate/up would need never exists.
+                if (d.mlp.gateProj.fusedPairBatchKeep(d.mlp.upProj,
+                        rows)) {
+                    d.mlp.gateProj.ensureBatchOut(rows);
+                    Prim.gluFusedDevice(d.mlp.gateProj.yBatch,
+                        d.mlp.gateProj.fusedYBatch, (int64) rows,
+                        (int64) inter, d.activation);
+                } else {
+                    d.mlp.gateProj.matmulBatchKeep(rows);
+                    d.mlp.upProj.matmulBatchKeep(rows);
+                    Prim.gluDevice(d.mlp.gateProj.yBatch,
+                        d.mlp.upProj.yBatch,
+                        (int64) rows * (int64) inter, d.activation);
+                }
                 this.stageTag = this.stageTag + 1L;
                 Linear.stageBatchFromDevice(d.mlp.gateProj.yBatch,
                     rows, inter, this.stageTag);

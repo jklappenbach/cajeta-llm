@@ -1006,6 +1006,21 @@ public final class Linear extends InfModule {
     // alternated rounds — DEFAULT ON; `noq6mw4` reverts to the epi
     // kernel. Only fires in deq (int8) mode; packed mode keeps epi.
     static boolean q6Mw4On = true;
+    // 10.12.32: fused q|k|v and gate|up projections — one launch over
+    // the concatenated outDim, so the thin k/v grids ride the q
+    // projection's occupancy and two thirds of the projection
+    // launches disappear. Deq mode only; costs a fused packed copy
+    // (~2.6 GB — the fused deq REPLACES the per-tensor deq for the
+    // fused tensors, so that side is neutral). Off until measured
+    // (the `fuse` arm).
+    static boolean fuseOn = false;
+    // 10.12.34: partition the big GEMMs into ~32-WG launches — the
+    // grid-sweep sweet spot (6.85 vs 5.3-5.5 TMAC/s at constant work:
+    // 32 WGs fills the ~40-concurrent-WG capacity with no scheduling
+    // tail and keeps the activation slab MALL-resident). Measured 846
+    // vs 959 ms prefill(512) over 3 alternated rounds — DEFAULT ON;
+    // `nopart32` reverts to monolithic launches.
+    static boolean part32On = true;
     public static void setWmma(boolean on) { Linear.wmmaOn = on; }
     public static void setWmma6(boolean on) { Linear.wmma6On = on; }
     public static void setEpi(boolean on) { Linear.epiOn = on; }
@@ -1016,6 +1031,9 @@ public final class Linear extends InfModule {
     public static void setQ4Mw4(boolean on) { Linear.q4Mw4On = on; }
     public static void setQ6Mw4(boolean on) { Linear.q6Mw4On = on; }
     public static void setQ4Mw8(boolean on) { Linear.q4Mw8On = on; }
+    public static void setFuse(boolean on) { Linear.fuseOn = on; }
+    public static void setPart32(boolean on) { Linear.part32On = on; }
+    public static boolean fuseEnabled() { return Linear.fuseOn; }
     public static boolean epiEnabled() { return Linear.epiOn; }
     public static boolean q6Mw4Enabled() { return Linear.q6Mw4On; }
     public static boolean q4EpiEnabled() { return Linear.q4EpiOn; }
@@ -1244,10 +1262,17 @@ public final class Linear extends InfModule {
             if (Linear.q4Mw8On
                     && WmmaKernel.fitsMw8((int64) rows,
                         (int64) this.outDim)) {
-                WmmaKernel.q4kWmmaDeqMw8Launch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
-                    (int64) this.inDim);
+                if (Linear.part32On) {
+                    WmmaKernel.q4kWmmaDeqMw8PartLaunch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                } else {
+                    WmmaKernel.q4kWmmaDeqMw8Launch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                }
             } else if (Linear.q4Mw4On
                     && WmmaKernel.fitsMw4((int64) rows,
                         (int64) this.outDim)) {
@@ -1301,10 +1326,17 @@ public final class Linear extends InfModule {
                     && WmmaKernel.fitsMw4((int64) rows,
                         (int64) this.outDim)) {
                 this.ensureDeq();
-                WmmaKernel.q6kWmmaDeqMw4Launch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
-                    (int64) this.inDim);
+                if (Linear.part32On) {
+                    WmmaKernel.q6kWmmaDeqMw4PartLaunch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                } else {
+                    WmmaKernel.q6kWmmaDeqMw4Launch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                }
             } else if (Linear.epiOn) {
                 WmmaKernel.q6kWmmaEpiLaunch(this.yBatch, this.packedDev,
                     Linear.btXp, (int64) rows, (int64) this.outDim,
@@ -1376,6 +1408,147 @@ public final class Linear extends InfModule {
         this.ensureDevice();
         this.ensureDeq();
         return;
+    }
+
+    // 10.12.32: fused-projection state, held by the FIRST Linear of
+    // the group (qProj for q|k|v, gateProj for gate|up). The fused
+    // deq replaces the per-tensor deq for these tensors (which stays
+    // lazily unallocated as long as the fused route runs); the fused
+    // packed copy is additional — the GEMM reads per-row headers.
+    KernelBuffer<int8> fusedPackedDev;
+    KernelBuffer<int8> fusedDeqDev;
+    KernelBuffer<float32> fusedYBatch;
+    int64 fusedOut;
+    int32 fusedYRows;
+
+    /** Build the fused packed + deq buffers once (device-side concat
+     *  of the resident per-tensor packed copies, then one widen over
+     *  the concatenated rows). Two-way group.
+     *
+     *  (An earlier probe suggested a null-param compiler defect here;
+     *  it was WRONG — the probe printed only two of three types, and
+     *  the third really was Q6_K. attn_v is Q6 in half the layers of
+     *  Q4_K_M.) */
+    void ensureFused2(Linear b) {
+        if (this.fusedDeqDev != null) { return; }
+        this.ensureDevice();
+        b.ensureDevice();
+        int64 an = (int64) this.packed.count();
+        int64 bn = (int64) b.packed.count();
+        this.fusedOut = (int64) this.outDim + (int64) b.outDim;
+        this.fusedPackedDev #= heap KernelBuffer<int8>(
+            (uint64) (an + bn));
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, this.packedDev,
+            an, 0L);
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, b.packedDev,
+            bn, an);
+        int64 n = this.fusedOut * (int64) this.inDim;
+        this.fusedDeqDev #= heap KernelBuffer<int8>((uint64) n);
+        WmmaKernel.q4kWidenLaunch(this.fusedDeqDev, this.fusedPackedDev,
+            this.fusedOut, (int64) this.inDim);
+        return;
+    }
+
+    /** Three-way group (q|k|v). */
+    void ensureFused3(Linear b, Linear c) {
+        if (this.fusedDeqDev != null) { return; }
+        this.ensureDevice();
+        b.ensureDevice();
+        c.ensureDevice();
+        int64 an = (int64) this.packed.count();
+        int64 bn = (int64) b.packed.count();
+        int64 cn = (int64) c.packed.count();
+        this.fusedOut = (int64) this.outDim + (int64) b.outDim
+            + (int64) c.outDim;
+        this.fusedPackedDev #= heap KernelBuffer<int8>(
+            (uint64) (an + bn + cn));
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, this.packedDev,
+            an, 0L);
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, b.packedDev,
+            bn, an);
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, c.packedDev,
+            cn, an + bn);
+        int64 n = this.fusedOut * (int64) this.inDim;
+        this.fusedDeqDev #= heap KernelBuffer<int8>((uint64) n);
+        WmmaKernel.q4kWidenLaunch(this.fusedDeqDev, this.fusedPackedDev,
+            this.fusedOut, (int64) this.inDim);
+        return;
+    }
+
+    void ensureFusedY(int32 rows) {
+        if (this.fusedYBatch != null && this.fusedYRows >= rows) {
+            return;
+        }
+        this.fusedYBatch #= heap KernelBuffer<float32>(
+            (uint64) ((int64) rows * this.fusedOut));
+        this.fusedYRows = rows;
+        return;
+    }
+
+    /** The shared launch tail: the group's fused buffers exist and
+     *  the shape fits — launch ONE Mw8 GEMM over the concatenated
+     *  outDim and account it as one deq call. */
+    void fusedLaunch(int32 rows) {
+        this.ensureFusedY(rows);
+        int64 t0 = Clock.nanoTime();
+        WmmaKernel.q4kWmmaDeqMw8Launch(this.fusedYBatch,
+            this.fusedPackedDev, this.fusedDeqDev, Linear.btXp,
+            (int64) rows, this.fusedOut, (int64) this.inDim);
+        int64 t1 = Clock.nanoTime();
+        Linear.wmmaDeqCalls = Linear.wmmaDeqCalls + 1L;
+        Linear.btDeqNs = Linear.btDeqNs + (t1 - t0);
+        Linear.btLaunchNs = Linear.btLaunchNs + (t1 - t0);
+        Linear.btCalls = Linear.btCalls + 1L;
+        return;
+    }
+
+    static boolean fuseRouteOn() {
+        return Linear.fuseOn && Linear.deqPrefill && Linear.wmmaOn
+            && Linear.q4Mw8On;
+    }
+
+    /** Fused gate|up: one launch; the caller runs the fused GLU over
+     *  `fusedYBatch`. Returns false (nothing launched) when the route
+     *  does not apply. */
+    boolean fusedPairBatchKeep(Linear b, int32 rows) {
+        if (!Linear.fuseRouteOn()) { return false; }
+        if (this.packedTy != Quant.GG_Q4_K
+                || b.packedTy != Quant.GG_Q4_K) {
+            return false;
+        }
+        this.ensureFused2(b);
+        if (!WmmaKernel.fitsMw8((int64) rows, this.fusedOut)) {
+            return false;
+        }
+        this.fusedLaunch(rows);
+        return true;
+    }
+
+    /** Fused q|k|v: one launch, then a scatter into the three
+     *  per-projection yBatch buffers so rope/append/attend see
+     *  exactly what the separate launches produced. */
+    boolean fusedQkvBatchKeep(Linear kL, Linear vL, int32 rows) {
+        if (!Linear.fuseRouteOn()) { return false; }
+        if (this.packedTy != Quant.GG_Q4_K
+                || kL.packedTy != Quant.GG_Q4_K
+                || vL.packedTy != Quant.GG_Q4_K) {
+            // Real in Q4_K_M: attn_v is Q6_K in 16 of 32 layers (and
+            // ffn_down Q6 in the other 16), so this fallback fires on
+            // half the layers by MODEL layout, not by accident.
+            return false;
+        }
+        this.ensureFused3(kL, vL);
+        if (!WmmaKernel.fitsMw8((int64) rows, this.fusedOut)) {
+            return false;
+        }
+        this.fusedLaunch(rows);
+        this.ensureBatchOut(rows);
+        kL.ensureBatchOut(rows);
+        vL.ensureBatchOut(rows);
+        Prim.splitRows3Device(this.yBatch, kL.yBatch, vL.yBatch,
+            this.fusedYBatch, (int64) rows, (int64) this.outDim,
+            (int64) kL.outDim, (int64) vL.outDim);
+        return true;
     }
 
     /** Build the widened int8 copy once (10.12.16; Q6 10.12.27).

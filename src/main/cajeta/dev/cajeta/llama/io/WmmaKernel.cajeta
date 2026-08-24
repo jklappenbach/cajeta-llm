@@ -327,6 +327,43 @@ public final class WmmaKernel {
         return;
     }
 
+    /** 10.12.32: device-side byte copy at an offset — builds the
+     *  fused packed weight buffers (q|k|v, gate|up) from the resident
+     *  per-tensor copies at device bandwidth, once, at prewarm. */
+    @Kernel
+    public static void concatI8Kernel(KernelBuffer<int8> dst,
+            KernelBuffer<int8> src, uint32 n, uint32 dstOff) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < n) { dst[dstOff + i] = src[i]; }
+    }
+
+    public static void concatI8Launch(KernelBuffer<int8> dst,
+            KernelBuffer<int8> src, int64 n, int64 dstOff) {
+        KernelStream s #= KernelStream.current();
+        concatI8Kernel.launch(s, grid: [(uint32) ((n + 255L) / 256L)],
+            block: [256])
+            (dst, src, (uint32) n, (uint32) dstOff);
+        return;
+    }
+
+    /** The read-side twin: copy `n` bytes starting at `srcOff` — the
+     *  grid-sweep probe carves row-range slices with it. */
+    @Kernel
+    public static void sliceI8Kernel(KernelBuffer<int8> dst,
+            KernelBuffer<int8> src, uint32 n, uint32 srcOff) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < n) { dst[i] = src[srcOff + i]; }
+    }
+
+    public static void sliceI8Launch(KernelBuffer<int8> dst,
+            KernelBuffer<int8> src, int64 n, int64 srcOff) {
+        KernelStream s #= KernelStream.current();
+        sliceI8Kernel.launch(s, grid: [(uint32) ((n + 255L) / 256L)],
+            block: [256])
+            (dst, src, (uint32) n, (uint32) srcOff);
+        return;
+    }
+
     /**
      * The deq GEMM (10.12.16): the staged kernel with the B feed moved
      * to the widened TILE-MAJOR global copy. Each `mb.load(deq,
@@ -2148,7 +2185,7 @@ public final class WmmaKernel {
     public static void q4kWmmaDeqMw8Kernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> deq,
             KernelBuffer<int8> xp, uint32 rows, uint32 outDim,
-            uint32 tilesN8, int64 blocksPerRow) {
+            uint32 tilesN8, int64 blocksPerRow, uint32 rowBase) {
         Shared<float32> xsA = shared float32[16];
         Shared<float32> xsB = shared float32[16];
         Shared<float32> xsC = shared float32[16];
@@ -2173,7 +2210,10 @@ public final class WmmaKernel {
         uint32 tileT = wg / tilesN8;
         uint32 tileI8 = wg % tilesN8;
         uint32 t0 = tileT * 128;
-        uint32 i0 = tileI8 * 128 + wid * 16;
+        // 10.12.34: rowBase slides the workgroup's output window — the
+        // partitioned launch covers a big matrix in ~32-WG slices
+        // (the grid-sweep's occupancy sweet spot) sharing ALL buffers.
+        uint32 i0 = rowBase + tileI8 * 128 + wid * 16;
         if (t0 < rows && i0 < outDim) {
             int64 rowBytes = blocksPerRow * 144L;
             int64 xRowBytes = blocksPerRow * 320L;
@@ -2424,7 +2464,39 @@ public final class WmmaKernel {
         q4kWmmaDeqMw8Kernel.launch(s,
             grid: [(uint32) (tilesM8 * tilesN8)], block: [256])
             (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
-             (uint32) tilesN8, cols / 256L);
+             (uint32) tilesN8, cols / 256L, 0);
+        return;
+    }
+
+    /**
+     * 10.12.34: the PARTITIONED Mw8 launch — the same GEMM as one
+     * back-to-back run of ~32-WG slices, each a full launch over a
+     * `rowBase` window of the output. The grid sweep measured the
+     * same work at 6.85 TMAC/s in 32-WG launches vs 5.3-5.5 in one
+     * monolithic launch: 32 fills the ~40-concurrent-WG capacity (2
+     * per WGP x 20) with no scheduling tail, and the narrow weight
+     * window keeps the activation slab MALL-resident. All slices
+     * share every buffer; the stream keeps them in order.
+     */
+    public static void q4kWmmaDeqMw8PartLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
+        int64 tilesM8 = rows / 128L;
+        int64 tilesN8 = outDim / 128L;
+        // 32 WGs per launch: tilesM8 * sliceN8 = 32 -> sliceN8.
+        int64 sliceN8 = 32L / tilesM8;
+        if (sliceN8 < 1L) { sliceN8 = 1L; }
+        KernelStream s #= KernelStream.current();
+        int64 base = 0L;
+        while (base < tilesN8) {
+            int64 n8 = sliceN8;
+            if (base + n8 > tilesN8) { n8 = tilesN8 - base; }
+            q4kWmmaDeqMw8Kernel.launch(s,
+                grid: [(uint32) (tilesM8 * n8)], block: [256])
+                (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
+                 (uint32) n8, cols / 256L, (uint32) (base * 128L));
+            base = base + n8;
+        }
         return;
     }
 
@@ -2532,7 +2604,7 @@ public final class WmmaKernel {
     public static void q6kWmmaDeqMw4Kernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> deq,
             KernelBuffer<int8> xp, uint32 rows, uint32 outDim,
-            uint32 tilesN8, int64 blocksPerRow) {
+            uint32 tilesN8, int64 blocksPerRow, uint32 rowBase) {
         Shared<float32> xsA = shared float32[16];
         Shared<float32> xsB = shared float32[16];
         Shared<float32> xsC = shared float32[16];
@@ -2548,7 +2620,7 @@ public final class WmmaKernel {
         uint32 tileT = wg / tilesN8;
         uint32 tileI8 = wg % tilesN8;
         uint32 t0 = tileT * 64;
-        uint32 i0 = tileI8 * 128 + wid * 16;
+        uint32 i0 = rowBase + tileI8 * 128 + wid * 16;
         if (t0 < rows && i0 < outDim) {
             int64 rowBytes = blocksPerRow * 210L;
             int64 xRowBytes = blocksPerRow * 320L;
@@ -2685,7 +2757,30 @@ public final class WmmaKernel {
         q6kWmmaDeqMw4Kernel.launch(s,
             grid: [(uint32) (tilesM4 * tilesN8)], block: [256])
             (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
-             (uint32) tilesN8, cols / 256L);
+             (uint32) tilesN8, cols / 256L, 0);
+        return;
+    }
+
+    /** 10.12.34: the partitioned Q6 launch — ~32-WG slices, same
+     *  rationale as q4kWmmaDeqMw8PartLaunch. */
+    public static void q6kWmmaDeqMw4PartLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
+        int64 tilesM4 = rows / 64L;
+        int64 tilesN8 = outDim / 128L;
+        int64 sliceN8 = 32L / tilesM4;
+        if (sliceN8 < 1L) { sliceN8 = 1L; }
+        KernelStream s #= KernelStream.current();
+        int64 base = 0L;
+        while (base < tilesN8) {
+            int64 n8 = sliceN8;
+            if (base + n8 > tilesN8) { n8 = tilesN8 - base; }
+            q6kWmmaDeqMw4Kernel.launch(s,
+                grid: [(uint32) (tilesM4 * n8)], block: [256])
+                (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
+                 (uint32) n8, cols / 256L, (uint32) (base * 128L));
+            base = base + n8;
+        }
         return;
     }
 

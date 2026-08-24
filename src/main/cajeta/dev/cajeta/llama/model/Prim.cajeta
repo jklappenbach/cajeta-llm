@@ -173,6 +173,81 @@ public final class Prim {
     }
 
     /**
+     * 10.12.32: GLU over the FUSED gate|up projection output — row r
+     * of `src` holds gate at [0, inter) and up at [inter, 2*inter).
+     * The result lands in the compact `[rows x inter]` `out`, so the
+     * down projection's pack is unchanged — and the 117 MB/layer
+     * split copy a separate gate/up would need never exists.
+     */
+    @Kernel
+    public static void gluFusedF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> src, uint32 rows, uint32 inter,
+            int32 act) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < rows * inter) {
+            uint32 r = i / inter;
+            uint32 c = i % inter;
+            float32 x = src[r * (2 * inter) + c];
+            float32 a = 0.0f;
+            if (act == 1) {
+                float32 t = 0.7978845608f
+                    * (x + 0.044715f * x * x * x);
+                float32 th = 1.0f - 2.0f / (Math.exp(2.0f * t) + 1.0f);
+                a = 0.5f * x * (1.0f + th);
+            } else {
+                a = x / (1.0f + Math.exp(0.0f - x));
+            }
+            out[i] = a * src[r * (2 * inter) + inter + c];
+        }
+    }
+
+    public static void gluFusedDevice(KernelBuffer<float32> out,
+            KernelBuffer<float32> src, int64 rows, int64 inter,
+            int32 act) {
+        uint32 un = (uint32) (rows * inter);
+        KernelStream s = KernelStream.current();
+        int64 t0 = Clock.nanoTime();
+        gluFusedF32.launch(s, grid: [(un + 63) / 64], block: [64])
+            (out, src, (uint32) rows, (uint32) inter, act);
+        Prim.tGlu = Prim.tGlu + (Clock.nanoTime() - t0);
+        Prim.nGlu = Prim.nGlu + 1L;
+        return;
+    }
+
+    /** 10.12.32: scatter the fused q|k|v batch output into the three
+     *  per-projection buffers — rope, append and attend stay
+     *  untouched. ~12.6 MB per layer at ctx512; the fusion's launch
+     *  and occupancy win pays for it. */
+    @Kernel
+    public static void splitRows3F32(KernelBuffer<float32> aOut,
+            KernelBuffer<float32> bOut, KernelBuffer<float32> cOut,
+            KernelBuffer<float32> src, uint32 rows, uint32 aW,
+            uint32 bW, uint32 cW) {
+        uint32 i = KernelThread.globalIdX();
+        uint32 tot = aW + bW + cW;
+        if (i < rows * tot) {
+            uint32 r = i / tot;
+            uint32 c = i % tot;
+            float32 v = src[i];
+            if (c < aW) { aOut[r * aW + c] = v; }
+            else if (c < aW + bW) { bOut[r * bW + (c - aW)] = v; }
+            else { cOut[r * cW + (c - aW - bW)] = v; }
+        }
+    }
+
+    public static void splitRows3Device(KernelBuffer<float32> aOut,
+            KernelBuffer<float32> bOut, KernelBuffer<float32> cOut,
+            KernelBuffer<float32> src, int64 rows, int64 aW, int64 bW,
+            int64 cW) {
+        uint32 un = (uint32) (rows * (aW + bW + cW));
+        KernelStream s = KernelStream.current();
+        splitRows3F32.launch(s, grid: [(un + 63) / 64], block: [64])
+            (aOut, bOut, cOut, src, (uint32) rows, (uint32) aW,
+             (uint32) bW, (uint32) cW);
+        return;
+    }
+
+    /**
      * RMSNorm over ONE row already on the device (plan 10.2), as a
      * WORKGROUP-COOPERATIVE reduction.
      *

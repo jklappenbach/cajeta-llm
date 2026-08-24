@@ -5,8 +5,11 @@ import cajeta.io.file.OpenMode;
 import cajeta.lang.String;
 import cajeta.lang.System;
 import cajeta.time.Clock;
+import cajeta.collection.ArrayList;
 import dev.cajeta.llama.io.Checkpoint;
 import dev.cajeta.llama.io.QuantKernel;
+import dev.cajeta.llama.io.Quant;
+import dev.cajeta.llama.io.WmmaKernel;
 import dev.cajeta.llama.model.AttnKernel;
 import dev.cajeta.llama.model.Linear;
 import dev.cajeta.llama.model.LlamaForCausalLM;
@@ -73,8 +76,131 @@ public class PackedResident {
         return (b0 - b1) / mag;
     }
 
+    /**
+     * 10.12.32 follow-up (Julian): GEMM efficiency vs LAUNCH WIDTH at
+     * constant work. The fusion refutation left a non-monotone puzzle
+     * — 32 WGs ~1 TMAC/s, 128 -> 3.4, 192 -> 2.0, 448 -> 5.2, 896 ->
+     * 4.1 — but those widths were confounded with tensor identity and
+     * cache history. Here: ONE synthetic 28672 x 4096 Q4_K matrix
+     * (the fused gate|up shape) at 512 tokens, partitioned into
+     * launches of controlled width; same bytes, same tiles, same Mw8
+     * kernel — only the partitioning varies. Slice buffers are carved
+     * OUTSIDE the timed section; three rounds, order reversed per
+     * round.
+     */
+    static void gridSweep() {
+        int64 rowsW = 28672L;
+        int64 cols = 4096L;
+        int64 toks = 512L;
+        int64 bpr = cols / 256L;
+        int64 rowBytes = bpr * 144L;
+        int64 pn = rowsW * rowBytes;
+        int8[] ph #= heap int8[pn];
+        int64 i = 0;
+        while (i < pn) {
+            ph[i] = (int8) ((i * 31L + 7L) % 251L - 125L);
+            i = i + 1;
+        }
+        KernelBuffer<int8> pDev #= heap KernelBuffer<int8>((uint64) pn);
+        pDev.upload(ph);
+        KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+            (uint64) (rowsW * cols));
+        WmmaKernel.q4kWidenLaunch(deqDev, pDev, rowsW, cols);
+        float32[] x #= heap float32[toks * cols];
+        i = 0;
+        while (i < toks * cols) {
+            x[i] = ((float32) ((i * 37L) % 1000L)) * 0.001f - 0.5f;
+            i = i + 1;
+        }
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int8[] xph #= heap int8[toks * pb];
+        int64 r = 0;
+        while (r < toks) {
+            Quant.q8kPack(x, r * cols, cols, xph, r * pb);
+            r = r + 1;
+        }
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) (toks * pb));
+        xp.upload(xph);
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>(
+            (uint64) (toks * rowsW));
+        KernelStream s #= KernelStream.current();
+        s.sync();
+        // tilesN8 per slice -> WGs per launch = 4x that.
+        int32[] cfg = heap int32[9];
+        cfg[0] = 6;   cfg[1] = 8;   cfg[2] = 12;  cfg[3] = 16;
+        cfg[4] = 24;  cfg[5] = 32;  cfg[6] = 56;  cfg[7] = 112;
+        cfg[8] = 224;
+        int64 totalTiles = rowsW / 128L;   // 224
+        float64 gmac = (float64) (toks * rowsW * cols) / 1.0e9;
+        int32 round = 0;
+        while (round < 3) {
+            int32 ci = 0;
+            while (ci < 9) {
+                int32 pick = ci;
+                if (round % 2 == 1) { pick = 8 - ci; }
+                int64 st = (int64) cfg[pick];
+                // Carve the slices OUTSIDE the timed window.
+                int64 nSlices = (totalTiles + st - 1L) / st;
+                int64 done = 0L;
+                int64 si = 0;
+                // Slice sets live in ArrayLists (the Sink model:
+                // add transfers, get lends to the launch).
+                ArrayList<KernelBuffer<int8>> sp =
+                    heap ArrayList<KernelBuffer<int8>>();
+                ArrayList<KernelBuffer<int8>> sd =
+                    heap ArrayList<KernelBuffer<int8>>();
+                int64[] srows = heap int64[nSlices];
+                while (si < nSlices) {
+                    int64 t0tiles = si * st;
+                    int64 tCount = st;
+                    if (t0tiles + tCount > totalTiles) {
+                        tCount = totalTiles - t0tiles;
+                    }
+                    int64 sr = tCount * 128L;
+                    srows[si] = sr;
+                    KernelBuffer<int8> bp #= heap KernelBuffer<int8>(
+                        (uint64) (sr * rowBytes));
+                    WmmaKernel.sliceI8Launch(bp, pDev,
+                        sr * rowBytes, t0tiles * 128L * rowBytes);
+                    sp.add(#bp);
+                    KernelBuffer<int8> bd #= heap KernelBuffer<int8>(
+                        (uint64) (sr * cols));
+                    WmmaKernel.sliceI8Launch(bd, deqDev,
+                        sr * cols, t0tiles * 128L * cols);
+                    sd.add(#bd);
+                    si = si + 1;
+                }
+                s.sync();
+                int64 t0 = Clock.nanoTime();
+                si = 0;
+                while (si < nSlices) {
+                    WmmaKernel.q4kWmmaDeqMw8Launch(y,
+                        sp.get((int32) si), sd.get((int32) si),
+                        xp, toks, srows[si], cols);
+                    si = si + 1;
+                }
+                s.sync();
+                float64 ms = (float64) (Clock.nanoTime() - t0)
+                    / 1000000.0;
+                System.stdout.println("gridsweep r" + round
+                    + "  wgs " + (cfg[pick] * 4)
+                    + "  launches " + nSlices
+                    + "  ms " + ms
+                    + "  tmacs " + (gmac / ms));
+                ci = ci + 1;
+            }
+            round = round + 1;
+        }
+        return;
+    }
+
     public static void run(String[] args) {
         String path = args[0];
+        if (args.count() > 1 && args[1].equals("gridsweep")) {
+            PackedResident.gridSweep();
+            return;
+        }
         if (args.count() > 1 && args[1].equals("dotceil")) {
             PackedResident.dotCeiling();
             return;
@@ -199,6 +325,12 @@ public class PackedResident {
             // reverts to Mw4.
             if (args[ai].equals("deqmw8")) { Linear.setQ4Mw8(true); }
             if (args[ai].equals("nomw8")) { Linear.setQ4Mw8(false); }
+            // 10.12.32: fused q|k|v and gate|up projections.
+            if (args[ai].equals("fuse")) { Linear.setFuse(true); }
+            // 10.12.34: ~32-WG partitioned launches — the DEFAULT;
+            // `nopart32` reverts to monolithic.
+            if (args[ai].equals("part32")) { Linear.setPart32(true); }
+            if (args[ai].equals("nopart32")) { Linear.setPart32(false); }
             // 10.12.29: wave-per-(row,head) prefill score kernel —
             // now the DEFAULT; `oldscore` reverts.
             if (args[ai].equals("rowscore")) {
