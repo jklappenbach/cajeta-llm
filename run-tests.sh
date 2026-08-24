@@ -16,6 +16,18 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 CAJETA="${CAJETA:-cajeta}"
 
+# The COMPILE backend. CAJETA_XPU_BACKEND (the runtime dispatcher's env
+# var) is accepted as a fallback spelling because a sweep invoked with
+# only that var otherwise compiles for cpu and every device test
+# early-returns — a vacuously green "amdgpu" suite, which is exactly
+# what happened on 2026-08-23: the recorded 192/0/1 amdgpu sweep never
+# ran a line of device code (proven by re-running both spellings on
+# 2026-08-24: CAJETA_XPU_BACKEND alone reproduces 192/0/1 and the
+# mma-tiering note names the cpu backend; XPU_BACKEND=amdgpu found 3
+# failures the cpu compile could never see).
+XPU_BACKEND="${XPU_BACKEND:-${CAJETA_XPU_BACKEND:-cpu}}"
+echo ">> compile backend: ${XPU_BACKEND}"
+
 # Ownership-migration switches (ownership/transfer-of-borrow compiler):
 # the return-side (OWNED_BIND) and captured-borrow checks land warn-first
 # there, and this library has NOT done its migration pass yet — the chat
