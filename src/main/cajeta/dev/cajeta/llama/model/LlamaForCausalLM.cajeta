@@ -8,6 +8,7 @@ import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.math.Tensor;
 import dev.cajeta.llama.LlamaException;
+import dev.cajeta.llama.io.QuantKernel;
 import dev.cajeta.llama.io.Checkpoint;
 import dev.cajeta.llama.io.Quant;
 
@@ -127,9 +128,27 @@ public final class LlamaForCausalLM extends InfModule {
             }
             d.selfAttn.oProj.prewarmDeq();
             d.mlp.downProj.prewarmDeq();
+            // 10.12.35: the yBatch buffers were allocated lazily by the
+            // FIRST prefill — rocprofv3 put ~40 ms of hipMalloc inside
+            // its pack->GEMM gaps. Allocate them off the clock, at the
+            // full-context bound they would reach anyway.
+            d.selfAttn.qProj.ensureBatchOut(this.maxSeq);
+            d.selfAttn.kProj.ensureBatchOut(this.maxSeq);
+            d.selfAttn.vProj.ensureBatchOut(this.maxSeq);
+            d.selfAttn.oProj.ensureBatchOut(this.maxSeq);
+            d.mlp.gateProj.ensureBatchOut(this.maxSeq);
+            d.mlp.upProj.ensureBatchOut(this.maxSeq);
+            d.mlp.downProj.ensureBatchOut(this.maxSeq);
             l = l + 1;
         }
-        KernelStream ps #= KernelStream.current();
+        Linear.ensureBatchStage(this.maxSeq,
+            this.cfg.intermediateSize);
+        if (this.lmHead != null) {
+            // The output projection's ~430 MB device upload happened
+            // lazily INSIDE the first prefill's logits tail.
+            this.lmHead.ensureDevice();
+        }
+        KernelStream ps = QuantKernel.stream();
         ps.sync();
         return;
     }
@@ -561,6 +580,16 @@ public final class LlamaForCausalLM extends InfModule {
         return;
     }
 
+    KernelBuffer<float32> pfLastDev;
+    int64 pfLastCap;
+
+    void ensurePrefillLast(int64 n) {
+        if (this.pfLastDev != null && this.pfLastCap >= n) { return; }
+        this.pfLastDev #= heap KernelBuffer<float32>((uint64) n);
+        this.pfLastCap = n;
+        return;
+    }
+
     void ensurePrefillKv(int64 n) {
         if (this.pfKvCap >= n) { return; }
         this.pfKScr #= heap float32[n];
@@ -582,6 +611,12 @@ public final class LlamaForCausalLM extends InfModule {
     static int64 pfPrimNs;
     static int64 pfRopeNs;
     static int64 pfAttendNs;
+    static int64 pfHeadNs;
+    static int64 pfTailHsNs;
+    static int64 pfLogitsNs;
+    public static int64 prefillHeadNs() { return LlamaForCausalLM.pfHeadNs; }
+    public static int64 prefillTailHsNs() { return LlamaForCausalLM.pfTailHsNs; }
+    public static int64 prefillLogitsNs() { return LlamaForCausalLM.pfLogitsNs; }
 
     public static int64 prefillPrimNs()   { return LlamaForCausalLM.pfPrimNs; }
     public static int64 prefillRopeNs()   { return LlamaForCausalLM.pfRopeNs; }
@@ -707,6 +742,7 @@ public final class LlamaForCausalLM extends InfModule {
         boolean res = Linear.devicePackOn();
         int64 nHs = (int64) rows * (int64) h;
         if (res) {
+            int64 th0 = Clock.nanoTime();
             this.ensurePrefillRes(nHs);
             float32[] hb = hs.hostBuffer();
             int64 hb0 = hs.hostBase();
@@ -716,6 +752,8 @@ public final class LlamaForCausalLM extends InfModule {
                 c = c + 1;
             }
             this.pfHsDev.upload(this.pfHsHost, nHs);
+            LlamaForCausalLM.pfHeadNs = LlamaForCausalLM.pfHeadNs
+                + (Clock.nanoTime() - th0);
         }
         // Layer-invariant (10.12.24's extraneous-call audit): the
         // per-row positions were re-filled and re-uploaded once PER
@@ -787,7 +825,7 @@ public final class LlamaForCausalLM extends InfModule {
                 // keeps the in-loop path (the planes hold absolute
                 // positions; a prefix download cannot reach them).
                 if (startPos != 0) {
-                    KernelStream as #= KernelStream.current();
+                    KernelStream as = QuantKernel.stream();
                     as.sync();
                     int64 kvn = (int64) rows * (int64) kvd;
                     this.ensurePrefillKv(kvn);
@@ -975,18 +1013,28 @@ public final class LlamaForCausalLM extends InfModule {
             l = l + 1;
         }
         if (res) {
-            // hs comes home ONCE — the logits path below and every
-            // later host read see exactly what the device accumulated.
-            KernelStream ps #= KernelStream.current();
+            // Only the LAST row of hs comes home (10.12.35): the sole
+            // consumer after this loop is the final rmsnorm + logits
+            // over row rows-1, and hs is an arena slice that dies with
+            // the call — nothing reads the other rows. 16 KB down
+            // instead of 8 MB + a 2M-element host copy loop.
+            int64 tt0 = Clock.nanoTime();
+            this.ensurePrefillLast((int64) h);
+            Prim.sliceF32Device(this.pfLastDev, this.pfHsDev,
+                (int64) h, (int64) (rows - 1) * (int64) h);
+            KernelStream ps = QuantKernel.stream();
             ps.sync();
-            this.pfHsDev.download(this.pfHsHost, nHs);
+            this.pfLastDev.download(this.pfHsHost, (int64) h);
             float32[] hb2 = hs.hostBuffer();
-            int64 hb02 = hs.hostBase();
+            int64 hb02 = hs.hostBase()
+                + (int64) (rows - 1) * (int64) h;
             int64 c2 = 0;
-            while (c2 < nHs) {
+            while (c2 < (int64) h) {
                 hb2[hb02 + c2] = this.pfHsHost[c2];
                 c2 = c2 + 1;
             }
+            LlamaForCausalLM.pfTailHsNs = LlamaForCausalLM.pfTailHsNs
+                + (Clock.nanoTime() - tt0);
         }
 
         if (resAttn && startPos == 0) {
@@ -995,7 +1043,7 @@ public final class LlamaForCausalLM extends InfModule {
             // planes into the paged cache. Position dr IS the row
             // index here — that is what the startPos == 0 guard buys.
             int64 tda = Clock.nanoTime();
-            KernelStream ks #= KernelStream.current();
+            KernelStream ks = QuantKernel.stream();
             ks.sync();
             int64 kvnD = (int64) rows * (int64) kvd;
             this.ensurePrefillKv(kvnD);
@@ -1033,6 +1081,7 @@ public final class LlamaForCausalLM extends InfModule {
             this.dkv.adopt(seq, startPos + rows);
         }
 
+        int64 tl0 = Clock.nanoTime();
         int64 lastH = (int64) (rows - 1) * (int64) h;
         Prim.rmsnormRowHost(hs, lastH, this.model.norm.weight,
             this.model.norm.eps, xn, lastH, h, this.cfg.normForm);
@@ -1042,6 +1091,8 @@ public final class LlamaForCausalLM extends InfModule {
             HostOps.rowsDotRow(this.model.embedTokens.weight, xn, lastH,
                 this.pool.logits, this.cfg.vocabSize, h);
         }
+        LlamaForCausalLM.pfLogitsNs = LlamaForCausalLM.pfLogitsNs
+            + (Clock.nanoTime() - tl0);
         return;
     }
 
