@@ -385,6 +385,38 @@ public final class Linear extends InfModule {
     static boolean waveSet;
     static boolean waveWant;
 
+    /**
+     * The device-resident decode path (plan 10.2) — the residual stream
+     * stays on the device across the layer stack.
+     *
+     * DEFAULT OFF, because on this hardware it MEASURED SLOWER: 32.40/32.06/
+     * 31.74 against the host-driven path's 31.25/31.26/31.12, every round,
+     * both arm orders, idle box. Correct on every run — the tokens are
+     * unchanged — just not faster.
+     *
+     * The reason is the machine, not the code. Strix Halo's host and device
+     * share one pool of LPDDR5X, so an "upload" is a memcpy in the same
+     * memory rather than PCIe traffic: it costs ~30us for 5-18 KB, and the
+     * four crossings a layer this removes do not pay for the norm, add and
+     * quantize dispatches that replace them.
+     *
+     * Kept, and expected to FLIP in two situations. On a discrete GPU those
+     * crossings are real bus traffic. And once attention runs on the device
+     * (rope, the KV cache, the attend), the resident path removes the LAST
+     * four crossings instead of four of eight — at which point its extra
+     * dispatches are amortized against a layer that never touches the host.
+     * It is a prerequisite for that work, not a competitor to it.
+     */
+    static boolean residentOn = false;
+
+    public static boolean residentEnabled() {
+        return Linear.residentOn && Linear.waveMv();
+    }
+
+    public static void setDeviceResident(boolean on) {
+        Linear.residentOn = on;
+    }
+
     /** Arm for 11.1: force the one-item-per-row kernel back on. */
     public static void setWaveMatVec(boolean on) {
         Linear.waveWant = on;
@@ -681,62 +713,7 @@ public final class Linear extends InfModule {
      * that is never routed should not pay for a second copy of its weight.
      */
     void matvecIntoDevice(float32[] sb, int64 so, float32[] db, int64 doff) {
-        if (this.packedDev == null) {
-            this.packedDev #= heap KernelBuffer<int8>(
-                (uint64) this.packed.count());
-            this.packedDev.upload(this.packed);
-            // Only the OUTPUT is per-Linear now; the activation side is
-            // shared (see ensureStage), because that is the half that is
-            // identical across q/k/v and across gate/up.
-            this.yScratch #= heap float32[(int64) this.outDim];
-            this.yDev #= heap KernelBuffer<float32>((uint64) this.outDim);
-            Linear.ensureStage(this.inDim);
-            // Latched per Linear at build time, not read per call: the
-            // store/load spelling below must match how the buffer was
-            // allocated, and flipping the static mid-run would desynchronize
-            // the two into a silent no-op.
-            this.unified = Linear.wantUnified;
-            this.q8 = Linear.q8Route() && this.packedTy == Quant.GG_Q4_K;
-            this.packed1 = Linear.packedActivations();
-            // `q8` is part of the condition, not an accident of ordering:
-            // the wave kernel is the INTEGER route's kernel, and a Q6_K
-            // weight beside it still dispatches the f32 one — which is
-            // chunked, and collapses to 9.6 GB/s if this flag turns
-            // chunking off on its behalf.
-            this.wave = Linear.waveMv() && this.packed1 && this.q8;
-            // Q6_K gets the wave decomposition too (plan 11.2), on its own
-            // kernel and WITHOUT the q8 integer route's activation switch —
-            // it reads the same packed q8_K block.
-            // Behind `q8Route` like every other route that CHANGES THE
-            // ANSWER (9.4's rule). Q6_K's wave kernel reads q8_K-quantized
-            // activations, so it carries the same approximation the Q4_K
-            // integer route does — measured at 0.028% on a real v_proj —
-            // and a caller that pins the switch off must still get the
-            // exact path.
-            this.wave6 = Linear.waveMv() && this.packed1 && Linear.q8Route()
-                && this.packedTy == Quant.GG_Q6_K;
-            // WHAT THE KERNEL READS, which is not the same question as
-            // whether the integer route is on. A Q6_K wave weight has
-            // `q8 == false` — it makes no activation-quantization switch —
-            // and still reads the PACKED block. Keying the staging off `q8`
-            // fed it the f32 buffer instead.
-            // TWO predicates, because they answer different questions.
-            //
-            // `qAct` — does this weight read a QUANTIZED activation staging
-            // at all? That is what the shared stage keys on, because a
-            // weight reading the integer form and one reading the f32 form
-            // must not share an entry.
-            //
-            // `packedAct` — is that staging the PACKED block rather than the
-            // three typed buffers? A backend question, and folding it into
-            // the key is what broke the CPU arm: `packed1` is false there,
-            // so every Linear keyed alike and a Q6_K f32 weight took a hit
-            // on an integer staging. Tokens went 15 198 334 62 334 ->
-            // 15 13 40 13 40, which is the same signature 9.9 recorded.
-            this.qAct = this.q8 || this.wave6;
-            this.packedAct = this.qAct && this.packed1;
-            if (this.unified) { this.yDev.allocate(MemoryKind.Unified); }
-        }
+        this.ensureDevice();
         if (!Linear.timeDev) {
             int64 i = 0;
             // Hoisted: the bound, not the body. A static read per element in
@@ -910,6 +887,191 @@ public final class Linear extends InfModule {
             return;
         }
         this.yDev.download(this.yScratch);
+        return;
+    }
+
+    /**
+     * The DEVICE-RESIDENT pair (plan 10.2). Together they let a chain of
+     * projections run without the host in the middle:
+     *
+     *   gate.matvecKeepOnDevice(xn, rh)     // result stays in gate.yDev
+     *   up.matvecKeepOnDevice(xn, rh)
+     *   Prim.gluDevice(gate.out(), up.out(), inter, act)
+     *   down.matvecFromDevice(gate.out(), inter, mlpOut, rh)
+     *
+     * where the old shape downloaded gate and up, ran the SwiGLU on the
+     * host, and uploaded the result again — three crossings a layer for a
+     * value that never needed to leave.
+     *
+     * Only valid on a routed device path; a caller must check
+     * {@link #isDeviceRouted}.
+     */
+    boolean isDeviceRouted() {
+        return this.packedTy >= 0 && QuantKernel.hasKernel(this.packedTy)
+            && QuantKernel.routingEnabled() && Linear.waveMv();
+    }
+
+    /** This Linear's output buffer — a BORROW of interior state, valid
+     *  until its next mat-vec overwrites it. The caller must not outlive
+     *  the Linear and must not free it. */
+    KernelBuffer<float32> out() { return this.yDev; }
+
+    /** As `matvecInto`, but the result is LEFT on the device. */
+    void matvecKeepOnDevice(Tensor<float32> src, int64 srcOff) {
+        float32[] sb = src.hostBuffer();
+        int64 so = src.hostBase() + srcOff;
+        this.ensureDevice();
+        int64 i = 0;
+        int64 nIn = this.stageHit(so) ? 0L : (int64) this.inDim;
+        while (i < nIn) {
+            Linear.stXh[i] = sb[so + i];
+            i = i + 1;
+        }
+        this.sendActivations(so);
+        this.launchRows();
+        return;
+    }
+
+    /**
+     * Quantize a DEVICE-RESIDENT activation into the shared stage, once,
+     * for the projections that follow (plan 10.2).
+     *
+     * The device twin of `sendActivations`, and it does the same job the
+     * shared stage does on the host side: q/k/v read one staging, gate/up
+     * read another. What it cannot do is participate in the stage's HIT
+     * bookkeeping — `xDev` is a device pointer, and the (tag, offset,
+     * dimension) key describes a host tensor window. So it invalidates
+     * instead, and the caller decides when to re-stage. A stale hit here
+     * would multiply against the previous activation, which is 9.9 and
+     * 11.3 both.
+     */
+    public static void stageDeviceActivation(KernelBuffer<float32> xDev,
+            int64 n) {
+        Linear.ensureStage((int32) n);
+        QuantKernel.q8kPackLaunchNoSync(Linear.stXp, xDev, n);
+        Linear.stValid = false;
+        return;
+    }
+
+    /** Launch against whatever {@link #stageDeviceActivation} last staged,
+     *  leaving the result on the device. */
+    void matvecStagedKeep() {
+        this.ensureDevice();
+        if (!this.packedAct) {
+            throw heap LlamaException("matvecStagedKeep: no device-resident "
+                + "path for packed type " + this.packedTy);
+        }
+        this.launchRows();
+        return;
+    }
+
+    /** Launch against the staged activation and bring the result back. */
+    void matvecStaged(Tensor<float32> dst, int64 dstOff) {
+        this.matvecStagedKeep();
+        this.fetchResult();
+        float32[] db = dst.hostBuffer();
+        int64 doff = dst.hostBase() + dstOff;
+        int64 i = 0;
+        while (i < (int64) this.outDim) {
+            db[doff + i] = this.yScratch[i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /**
+     * `y = W · x` where x is ALREADY ON THE DEVICE — quantized there by
+     * `q8kPackKernel` rather than shipped to the host and back.
+     *
+     * The shared stage is invalidated rather than consulted: `xDev` is
+     * identified by a device pointer the stage's (tag, offset, dimension)
+     * key cannot describe, and a stale hit here would multiply against the
+     * previous activation. 9.9 and 11.3 are both that mistake.
+     */
+    void matvecFromDevice(KernelBuffer<float32> xDev, int64 n,
+            Tensor<float32> dst, int64 dstOff) {
+        this.ensureDevice();
+        Linear.stValid = false;
+        if (this.packedAct) {
+            QuantKernel.q8kPackLaunchNoSync(Linear.stXp, xDev, n);
+        } else {
+            // Only the packed staging has a DEVICE quantizer. A format that
+            // still takes the f32 route (Q5_K, Q8_0) has no device-resident
+            // path yet, and saying so beats silently multiplying against
+            // whatever `stX` last held.
+            throw heap LlamaException("matvecFromDevice: no device-resident "
+                + "path for packed type " + this.packedTy);
+        }
+        this.launchRows();
+        this.fetchResult();
+        float32[] db = dst.hostBuffer();
+        int64 doff = dst.hostBase() + dstOff;
+        int64 i = 0;
+        while (i < (int64) this.outDim) {
+            db[doff + i] = this.yScratch[i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** Build this Linear's device side — the weight upload, the output
+     *  buffer, the shared stage, and every latched routing flag. */
+    void ensureDevice() {
+        if (this.packedDev != null) { return; }
+            this.packedDev #= heap KernelBuffer<int8>(
+                (uint64) this.packed.count());
+            this.packedDev.upload(this.packed);
+            // Only the OUTPUT is per-Linear now; the activation side is
+            // shared (see ensureStage), because that is the half that is
+            // identical across q/k/v and across gate/up.
+            this.yScratch #= heap float32[(int64) this.outDim];
+            this.yDev #= heap KernelBuffer<float32>((uint64) this.outDim);
+            Linear.ensureStage(this.inDim);
+            // Latched per Linear at build time, not read per call: the
+            // store/load spelling below must match how the buffer was
+            // allocated, and flipping the static mid-run would desynchronize
+            // the two into a silent no-op.
+            this.unified = Linear.wantUnified;
+            this.q8 = Linear.q8Route() && this.packedTy == Quant.GG_Q4_K;
+            this.packed1 = Linear.packedActivations();
+            // `q8` is part of the condition, not an accident of ordering:
+            // the wave kernel is the INTEGER route's kernel, and a Q6_K
+            // weight beside it still dispatches the f32 one — which is
+            // chunked, and collapses to 9.6 GB/s if this flag turns
+            // chunking off on its behalf.
+            this.wave = Linear.waveMv() && this.packed1 && this.q8;
+            // Q6_K gets the wave decomposition too (plan 11.2), on its own
+            // kernel and WITHOUT the q8 integer route's activation switch —
+            // it reads the same packed q8_K block.
+            // Behind `q8Route` like every other route that CHANGES THE
+            // ANSWER (9.4's rule). Q6_K's wave kernel reads q8_K-quantized
+            // activations, so it carries the same approximation the Q4_K
+            // integer route does — measured at 0.028% on a real v_proj —
+            // and a caller that pins the switch off must still get the
+            // exact path.
+            this.wave6 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+                && this.packedTy == Quant.GG_Q6_K;
+            // WHAT THE KERNEL READS, which is not the same question as
+            // whether the integer route is on. A Q6_K wave weight has
+            // `q8 == false` — it makes no activation-quantization switch —
+            // and still reads the PACKED block. Keying the staging off `q8`
+            // fed it the f32 buffer instead.
+            // TWO predicates, because they answer different questions.
+            //
+            // `qAct` — does this weight read a QUANTIZED activation staging
+            // at all? That is what the shared stage keys on, because a
+            // weight reading the integer form and one reading the f32 form
+            // must not share an entry.
+            //
+            // `packedAct` — is that staging the PACKED block rather than the
+            // three typed buffers? A backend question, and folding it into
+            // the key is what broke the CPU arm: `packed1` is false there,
+            // so every Linear keyed alike and a Q6_K f32 weight took a hit
+            // on an integer staging. Tokens went 15 198 334 62 334 ->
+            // 15 13 40 13 40, which is the same signature 9.9 recorded.
+            this.qAct = this.q8 || this.wave6;
+            this.packedAct = this.qAct && this.packed1;
+        if (this.unified) { this.yDev.allocate(MemoryKind.Unified); }
         return;
     }
 

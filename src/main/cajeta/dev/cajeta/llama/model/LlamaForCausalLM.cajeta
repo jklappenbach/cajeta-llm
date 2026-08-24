@@ -2,6 +2,7 @@ package dev.cajeta.llama.model;
 
 import cajeta.collection.ArrayList;
 import cajeta.lang.String;
+import cajeta.xpu.KernelBuffer;
 import cajeta.math.Tensor;
 import dev.cajeta.llama.LlamaException;
 import dev.cajeta.llama.io.Checkpoint;
@@ -242,10 +243,35 @@ public final class LlamaForCausalLM extends InfModule {
         int32 hd = this.cfg.headDim;
         Tensor<float32> scores = this.pool.scores;
 
+        // FULL LAYER RESIDENCY (plan 10.2), when the layout allows it.
+        // Gated on the Llama shape — no QK-norm, no four-norm — because the
+        // extra norms in the other layouts have no device path yet, and a
+        // half-resident layer that silently used a stale `hs` would be the
+        // worst of both. rows==1 because only decode has a residual chain
+        // short enough for one buffer.
+        boolean resident = rows == 1 && this.deviceResidentReady();
+        if (resident) {
+            this.ensureResidentBuffers(h);
+            float32[] hb = hs.hostBuffer();
+            int64 hbase = hs.hostBase();
+            int64 ci = 0;
+            while (ci < (int64) h) {
+                this.hsHost[ci] = hb[hbase + ci];
+                ci = ci + 1;
+            }
+            this.hsDev.upload(this.hsHost);
+        }
+
         int32 l = 0;
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
+            if (resident) {
+                this.residentLayer(seq, l, d, a, q, k, v, ao, scores,
+                    h, qd, kvd, inter, nH, nKv, hd, startPos);
+                l = l + 1;
+                continue;
+            }
             int32 r = 0;
             while (r < rows) {
                 int64 rh = (int64) r * (int64) h;
@@ -319,12 +345,30 @@ public final class LlamaForCausalLM extends InfModule {
                 Prim.rmsnormRowHost(hs, rh, pre.weight, pre.eps,
                     xn, rh, h, d.normForm);
                 Linear.beginSharedActivation();
-                d.mlp.gateProj.matvecInto(xn, rh, gate, ri);
-                d.mlp.upProj.matvecInto(xn, rh, up, ri);
-                Linear.endSharedActivation();
-                Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
-                    d.activation);
-                d.mlp.downProj.matvecInto(gate, ri, mlpOut, rh);
+                if (d.mlp.gateProj.isDeviceRouted()
+                        && d.mlp.upProj.isDeviceRouted()
+                        && d.mlp.downProj.isDeviceRouted()) {
+                    // THE MLP MIDDLE NEVER LEAVES THE DEVICE (plan 10.2).
+                    // gate and up are produced there, the SwiGLU runs there,
+                    // and down quantizes the result there — where the host
+                    // path downloads gate and up, folds them, and uploads
+                    // the fold again, three crossings a layer for a value
+                    // no one on this side ever looks at.
+                    d.mlp.gateProj.matvecKeepOnDevice(xn, rh);
+                    d.mlp.upProj.matvecKeepOnDevice(xn, rh);
+                    Linear.endSharedActivation();
+                    Prim.gluDevice(d.mlp.gateProj.out(), d.mlp.upProj.out(),
+                        (int64) inter, d.activation);
+                    d.mlp.downProj.matvecFromDevice(d.mlp.gateProj.out(),
+                        (int64) inter, mlpOut, rh);
+                } else {
+                    d.mlp.gateProj.matvecInto(xn, rh, gate, ri);
+                    d.mlp.upProj.matvecInto(xn, rh, up, ri);
+                    Linear.endSharedActivation();
+                    Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
+                        d.activation);
+                    d.mlp.downProj.matvecInto(gate, ri, mlpOut, rh);
+                }
                 if (d.fourNorm) {
                     Prim.rmsnormRowHost(mlpOut, rh,
                         d.postFeedforwardLayernorm.weight,
@@ -335,6 +379,18 @@ public final class LlamaForCausalLM extends InfModule {
                 r = r + 1;
             }
             l = l + 1;
+        }
+
+        if (resident) {
+            // Back to the host once, for the final norm and lm_head.
+            this.hsDev.download(this.hsHost);
+            float32[] hb2 = hs.hostBuffer();
+            int64 hb2base = hs.hostBase();
+            int64 co = 0;
+            while (co < (int64) h) {
+                hb2[hb2base + co] = this.hsHost[co];
+                co = co + 1;
+            }
         }
 
         // Final norm of the last row, then the output projection.
@@ -349,4 +405,92 @@ public final class LlamaForCausalLM extends InfModule {
                 this.pool.logits, this.cfg.vocabSize, h);
         }
     }
+
+    // Device-resident decode state (plan 10.2). One hidden-wide buffer for
+    // the residual stream and one for the norm output, allocated once.
+    KernelBuffer<float32> hsDev;
+    KernelBuffer<float32> xnDev;
+    float32[] hsHost;
+
+    /** Is every projection in the stack on a device route, and is the
+     *  layout the plain Llama one the resident path implements? */
+    boolean deviceResidentReady() {
+        if (!Linear.residentEnabled()) { return false; }
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.selfAttn;
+            if (d.fourNorm || a.qNorm != null) { return false; }
+            if (!a.qProj.isDeviceRouted() || !a.kProj.isDeviceRouted()
+                    || !a.vProj.isDeviceRouted()
+                    || !a.oProj.isDeviceRouted()
+                    || !d.mlp.gateProj.isDeviceRouted()
+                    || !d.mlp.upProj.isDeviceRouted()
+                    || !d.mlp.downProj.isDeviceRouted()) {
+                return false;
+            }
+            l = l + 1;
+        }
+        return true;
+    }
+
+    void ensureResidentBuffers(int32 h) {
+        if (this.hsDev != null) { return; }
+        this.hsHost #= heap float32[(int64) h];
+        this.hsDev #= heap KernelBuffer<float32>((uint64) h);
+        this.xnDev #= heap KernelBuffer<float32>((uint64) h);
+        return;
+    }
+
+    /**
+     * One decoder layer with the residual stream LEFT ON THE DEVICE.
+     *
+     * `hs` never crosses the bus inside the stack: the two norms, the
+     * SwiGLU and both residual adds all run on the device, and the
+     * activation is quantized there. What still crosses is attention —
+     * q, k and v come back so RoPE, the KV cache and the attend can run on
+     * the host, and the attention output goes up again. Four crossings a
+     * layer where the host-driven path has eleven.
+     */
+    void residentLayer(int32 seq, int32 li, DecoderLayer d, Attention a,
+            Tensor<float32> q, Tensor<float32> k, Tensor<float32> v,
+            Tensor<float32> ao, Tensor<float32> scores,
+            int32 h, int32 qd, int32 kvd, int32 inter,
+            int32 nH, int32 nKv, int32 hd, int32 p) {
+        // Attention sublayer.
+        Prim.rmsnormDevice(this.xnDev, this.hsDev,
+            d.inputLayernorm.deviceWeight(), (int64) h,
+            d.inputLayernorm.eps, d.normForm);
+        Linear.stageDeviceActivation(this.xnDev, (int64) h);
+        a.qProj.matvecStaged(q, 0L);
+        a.kProj.matvecStaged(k, 0L);
+        a.vProj.matvecStaged(v, 0L);
+
+        Prim.ropeRowHost(q, 0L, nH, hd, p, a.ropeInv);
+        Prim.ropeRowHost(k, 0L, nKv, hd, p, a.ropeInv);
+        if (!this.cache.appendRow(seq, li, k, 0L, v, 0L, p)) {
+            throw heap LlamaException("kv pool exhausted at layer "
+                + li + " position " + p);
+        }
+        this.cache.attendRow(seq, li, q, 0L, a.scale, scores,
+            ao, 0L, nH, nKv, hd);
+
+        a.oProj.matvecKeepOnDevice(ao, 0L);
+        Prim.addDevice(this.hsDev, a.oProj.out(), (int64) h);
+
+        // MLP sublayer.
+        Prim.rmsnormDevice(this.xnDev, this.hsDev,
+            d.postAttentionLayernorm.deviceWeight(), (int64) h,
+            d.postAttentionLayernorm.eps, d.normForm);
+        Linear.stageDeviceActivation(this.xnDev, (int64) h);
+        d.mlp.gateProj.matvecStagedKeep();
+        d.mlp.upProj.matvecStagedKeep();
+        Prim.gluDevice(d.mlp.gateProj.out(), d.mlp.upProj.out(),
+            (int64) inter, d.activation);
+        Linear.stageDeviceActivation(d.mlp.gateProj.out(), (int64) inter);
+        d.mlp.downProj.matvecStagedKeep();
+        Prim.addDevice(this.hsDev, d.mlp.downProj.out(), (int64) h);
+        return;
+    }
+
 }

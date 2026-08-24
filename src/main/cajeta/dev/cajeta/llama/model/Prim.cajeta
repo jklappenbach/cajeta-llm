@@ -3,8 +3,11 @@ package dev.cajeta.llama.model;
 import cajeta.lang.Math;
 import cajeta.math.Placement;
 import cajeta.math.Tensor;
+import cajeta.xpu.Barrier;
+import cajeta.time.Clock;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
+import cajeta.xpu.Shared;
 import cajeta.xpu.KernelThread;
 
 /**
@@ -167,6 +170,137 @@ public final class Prim {
             }
             out[i] = a * u[i];
         }
+    }
+
+    /**
+     * RMSNorm over ONE row already on the device (plan 10.2), as a
+     * WORKGROUP-COOPERATIVE reduction.
+     *
+     * `rmsnormF32` gives one ROW to one work item, which is right when
+     * there are many rows and catastrophic when there is one: decode's
+     * single row put a 4096-element dependent-load reduction on a single
+     * lane, twice a layer, and cost 20 ms/token — more than the residency
+     * it was there to enable saved. Here 64 lanes stride the row, reduce
+     * through LDS, and stride it again to write.
+     *
+     * The sum is therefore REGROUPED against the host's sequential one.
+     * Float addition is not associative, so this is a different rounding —
+     * legitimate, and the reason the decode is checked by its token
+     * sequence rather than by bit-identity against the host path.
+     */
+    @Kernel
+    public static void rmsnormRowF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> x, KernelBuffer<float32> w,
+            uint32 dim, float32 eps, int32 form) {
+        // 256 lanes, not 64. A single row's reduction cannot be split
+        // across workgroups without a global barrier, so the ONLY lever on
+        // its parallelism is the workgroup width — and at 64 lanes each one
+        // walked 64 elements of a 4096-wide row, twice a layer.
+        Shared<float32> part = shared float32[256];
+        uint32 lane = KernelThread.x();
+        float32 ss = 0.0f;
+        uint32 i = lane;
+        while (i < dim) {
+            float32 v = x[i];
+            ss = ss + v * v;
+            i = i + 256;
+        }
+        part[lane] = ss;
+        Barrier.workgroup();
+        uint32 s = 128;
+        while (s > 0) {
+            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
+            Barrier.workgroup();
+            s = s / 2;
+        }
+        float32 scale = 1.0f / Math.sqrt(part[0] / (float32) dim + eps);
+        uint32 j = lane;
+        while (j < dim) {
+            float32 wi = w[j];
+            if (form == 1) { wi = 1.0f + wi; }
+            out[j] = x[j] * scale * wi;
+            j = j + 256;
+        }
+    }
+
+    // Where the resident path's time actually goes (plan 10.2). The phase
+    // timers in Linear only see `matvecIntoDevice`, so the resident entry
+    // points are invisible to them — and "the transfers went to zero and
+    // the token got slower" is not a diagnosis.
+    static int64 tNorm;
+    static int64 tAdd;
+    static int64 tGlu;
+    static int64 nNorm;
+    static int64 nAdd;
+    static int64 nGlu;
+
+    public static int64 devNormNs() { return Prim.tNorm; }
+    public static int64 devAddNs()  { return Prim.tAdd; }
+    public static int64 devGluNs()  { return Prim.tGlu; }
+    public static int64 devNormCalls() { return Prim.nNorm; }
+    public static int64 devAddCalls()  { return Prim.nAdd; }
+    public static int64 devGluCalls()  { return Prim.nGlu; }
+    public static void resetDevOpTimers() {
+        Prim.tNorm = 0L; Prim.tAdd = 0L; Prim.tGlu = 0L;
+        Prim.nNorm = 0L; Prim.nAdd = 0L; Prim.nGlu = 0L;
+    }
+
+    public static void rmsnormDevice(KernelBuffer<float32> out,
+            KernelBuffer<float32> x, KernelBuffer<float32> w,
+            int64 dim, float32 eps, int32 form) {
+        int64 t0 = Clock.nanoTime();
+        KernelStream s = KernelStream.current();
+        rmsnormRowF32.launch(s, grid: [1], block: [256])
+            (out, x, w, (uint32) dim, eps, form);
+        Prim.tNorm = Prim.tNorm + (Clock.nanoTime() - t0);
+        Prim.nNorm = Prim.nNorm + 1L;
+        // NO SYNC. Everything in a resident layer is enqueued on one
+        // stream and ordered by it; the only thing that must wait is the
+        // download at the end. Syncing here cost a driver round trip per
+        // call, seven times a layer, which is what made the first resident
+        // build SLOWER than the path it replaced (10.3's lesson, on the
+        // ops rather than on the mat-vec).
+        return;
+    }
+
+    /** `a += b` elementwise on the device — the residual add. */
+    @Kernel
+    public static void addF32(KernelBuffer<float32> a,
+            KernelBuffer<float32> b, uint32 n) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < n) { a[i] = a[i] + b[i]; }
+    }
+
+    /** {@link #addF32} over a whole row. */
+    public static void addDevice(KernelBuffer<float32> a,
+            KernelBuffer<float32> b, int64 n) {
+        uint32 un = (uint32) n;
+        KernelStream s = KernelStream.current();
+        int64 t0 = Clock.nanoTime();
+        addF32.launch(s, grid: [(un + 63) / 64], block: [64])(a, b, un);
+        Prim.tAdd = Prim.tAdd + (Clock.nanoTime() - t0);
+        Prim.nAdd = Prim.nAdd + 1L;
+        return;
+    }
+
+    /**
+     * SwiGLU over buffers ALREADY ON THE DEVICE, in place into `g`
+     * (plan 10.2).
+     *
+     * The same `gluF32` kernel the placement-routed op uses; what is
+     * different is that nothing is uploaded or downloaded around it. In
+     * place is safe because a work item reads `g[i]` and `u[i]` and writes
+     * only `out[i]`.
+     */
+    public static void gluDevice(KernelBuffer<float32> g,
+            KernelBuffer<float32> u, int64 n, int32 act) {
+        uint32 un = (uint32) n;
+        KernelStream s = KernelStream.current();
+        int64 t0 = Clock.nanoTime();
+        gluF32.launch(s, grid: [(un + 63) / 64], block: [64])(g, g, u, un, act);
+        Prim.tGlu = Prim.tGlu + (Clock.nanoTime() - t0);
+        Prim.nGlu = Prim.nGlu + 1L;
+        return;
     }
 
     /** Placement-routed GLU op over equal-shaped tensors. */
