@@ -870,8 +870,20 @@ public final class QuantKernel {
                 while (g < 4) {
                     Vector<uint8,32> raw = packed.vload<32>(
                         ro + 16L + (int64) (32 * g)).asUnsigned();
-                    Vector<uint8,32> lo = raw & 15;
-                    Vector<uint8,32> hi = (raw >> 4) & 15;
+                    // 10.12.8 PROBE (`mode` 3): skip the NIBBLE SPLIT,
+                    // keeping the weight load and both dots. `mode` 1
+                    // covered only the 24-op header unpack and measured
+                    // 2%, which was then reported as "decode is 2%" —
+                    // wrongly. This is the other half of the decode and
+                    // it is the larger one: eight vector ops per block
+                    // against eight dotAccum, every lane of the wave
+                    // doing it identically. Garbage output.
+                    Vector<uint8,32> lo = raw;
+                    Vector<uint8,32> hi = raw;
+                    if (mode != 3) {
+                        lo = raw & 15;
+                        hi = (raw >> 4) & 15;
+                    }
                     Vector<int8,32> a0 = h0;
                     Vector<int8,32> a1 = h1;
                     if (mode != 2) {
@@ -885,17 +897,35 @@ public final class QuantKernel {
                 int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
                            + tot[4] + tot[5] + tot[6] + tot[7];
 
+                // 10.12.10 PROBE (`mode` 4): skip the DMINS TAIL — an
+                // 8-iteration loop that assembles an int32 out of four
+                // bytes with masks, shifts and ORs, ~96 scalar integer
+                // ops per block against the 8 VECTOR dots that precede
+                // it. Everything else, including both vloads, is kept.
+                // Garbage output.
                 Vector<int8,32> sv = xp.vload<32>(xb + 256L);
                 int32 dmins = 0;
-                int32 sb = 0;
-                while (sb < 8) {
-                    int32 sbb = sb * 4;
-                    int32 ps = ((int32) sv[sbb] & 255)
-                        | (((int32) sv[sbb + 1] & 255) << 8)
-                        | (((int32) sv[sbb + 2] & 255) << 16)
-                        | (((int32) sv[sbb + 3]) << 24);
-                    dmins = dmins + mnv[sb] * ps;
-                    sb = sb + 1;
+                // 10.12.10 PROBE (`mode` 4): skip the DMINS TAIL, an
+                // 8-iteration loop assembling an int32 from four bytes
+                // with masks, shifts and ORs — ~96 scalar ops per block
+                // against the 8 VECTOR dots before it.
+                //
+                // The guard is on the WHOLE loop, not on its start index.
+                // Writing `if (mode == 4) { sb = 8; }` made the trip count
+                // runtime-dependent, the compiler stopped unrolling it,
+                // and the BASELINE arm went 3588 -> 5583 ms. The probe
+                // moved its own control — 2 s of the thing being measured.
+                if (mode != 4) {
+                    int32 sb = 0;
+                    while (sb < 8) {
+                        int32 sbb = sb * 4;
+                        int32 ps = ((int32) sv[sbb] & 255)
+                            | (((int32) sv[sbb + 1] & 255) << 8)
+                            | (((int32) sv[sbb + 2] & 255) << 16)
+                            | (((int32) sv[sbb + 3]) << 24);
+                        dmins = dmins + mnv[sb] * ps;
+                        sb = sb + 1;
+                    }
                 }
 
                 Vector<int8,16> dv = xp.vload<16>(xb + 288L);
@@ -1319,6 +1349,61 @@ public final class QuantKernel {
     public static void setBatchMode(int32 m) { QuantKernel.batchMode = m; }
 
     public static void setBatch4(boolean on) { QuantKernel.batch4 = on; }
+
+    /**
+     * PURE `dotAccum` THROUGHPUT (plan 10.12.9) — no memory in the loop.
+     *
+     * The GEMM sustains 1.17 TMAC/s and none of bandwidth (0%), decode
+     * (5%) or the activation loads (15%) explains it. Before optimizing
+     * the remaining 80% it has to be known whether that is near the
+     * instrument's ceiling or far below it: a null result is worth
+     * nothing until the instrument is validated.
+     *
+     * Four independent accumulator chains so this measures THROUGHPUT
+     * rather than latency, and a per-iteration bump of one operand so the
+     * loop cannot be strength-reduced to a multiply. The caller checks
+     * that doubling `iters` doubles the TIME — a hoisted loop would not.
+     */
+    @Kernel
+    public static void dotCeilingKernel(KernelBuffer<float32> out,
+            KernelBuffer<int8> src, uint32 iters) {
+        uint32 id = KernelThread.globalIdX();
+        Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
+        Vector<int8,32> a0 = src.vload<32>(0L);
+        Vector<int8,32> a1 = src.vload<32>(32L);
+        Vector<int8,32> a2 = src.vload<32>(64L);
+        Vector<int8,32> a3 = src.vload<32>(96L);
+        Vector<uint8,32> w0 = src.vload<32>(128L).asUnsigned();
+        Vector<uint8,32> w1 = src.vload<32>(160L).asUnsigned();
+        Vector<uint8,32> w2 = src.vload<32>(192L).asUnsigned();
+        Vector<uint8,32> w3 = src.vload<32>(224L).asUnsigned();
+        Vector<int32,8> t0 = zv;
+        Vector<int32,8> t1 = zv;
+        Vector<int32,8> t2 = zv;
+        Vector<int32,8> t3 = zv;
+        uint32 k = 0;
+        while (k < iters) {
+            t0 = t0 + w0.dotAccum(a0, zv);
+            t1 = t1 + w1.dotAccum(a1, zv);
+            t2 = t2 + w2.dotAccum(a2, zv);
+            t3 = t3 + w3.dotAccum(a3, zv);
+            a0 = a0 + 1;
+            k = k + 1;
+        }
+        Vector<int32,8> tt = t0 + t1 + t2 + t3;
+        out[id] = (float32) (tt[0] + tt[1] + tt[2] + tt[3]
+                           + tt[4] + tt[5] + tt[6] + tt[7]);
+    }
+
+    /** Launch the ceiling probe over `groups` workgroups of 32. */
+    public static void dotCeilingLaunch(KernelBuffer<float32> out,
+            KernelBuffer<int8> src, int64 groups, int32 iters) {
+        KernelStream s #= KernelStream.current();
+        dotCeilingKernel.launch(s, grid: [(uint32) groups], block: [32])
+            (out, src, (uint32) iters);
+        s.sync();
+        return;
+    }
 
     /** True when the batched GEMM has a kernel for `ty`. */
     public static boolean hasBatchKernel(int32 ty) {
