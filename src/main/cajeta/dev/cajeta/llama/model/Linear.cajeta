@@ -1140,9 +1140,34 @@ public final class Linear extends InfModule {
      * shares one pass.
      */
     void matmulInto(int32 rows, Tensor<float32> dst, int64 dstOff) {
+        this.matmulBatchKeep(rows);
+        int64 n = (int64) rows * (int64) this.outDim;
+        int64 t2s = Clock.nanoTime();
+        this.yBatch.download(this.yBatchH, n);
+        int64 t2 = Clock.nanoTime();
+        float32[] db = dst.hostBuffer();
+        int64 doff = dst.hostBase() + dstOff;
+        int64 i = 0;
+        while (i < n) {
+            db[doff + i] = this.yBatchH[i];
+            i = i + 1;
+        }
+        int64 t3 = Clock.nanoTime();
+        Linear.btDownNs = Linear.btDownNs + (t2 - t2s);
+        Linear.btCopyNs = Linear.btCopyNs + (t3 - t2);
+        return;
+    }
+
+    /**
+     * As {@link #matmulInto} but the result STAYS on the device in
+     * `yBatch` (10.12.7.a): the MLP chain feeds the GLU and the next
+     * projection's pack without the host ever reading gate/up — which
+     * 10.12.22 measured as two thirds of the downloaded bytes and the
+     * largest host prim.
+     */
+    void matmulBatchKeep(int32 rows) {
         this.ensureDevice();
         this.ensureBatchOut(rows);
-        int64 n = (int64) rows * (int64) this.outDim;
         int64 t0 = Clock.nanoTime();
         // MATRIX CORES when the shape tiles and the format has a kernel
         // (plan 10.12.14). Only Q4_K has one, so a Q4_K_M checkpoint runs
@@ -1178,16 +1203,6 @@ public final class Linear extends InfModule {
                 (int64) this.outDim, (int64) this.inDim);
         }
         int64 t1 = Clock.nanoTime();
-        this.yBatch.download(this.yBatchH, n);
-        int64 t2 = Clock.nanoTime();
-        float32[] db = dst.hostBuffer();
-        int64 doff = dst.hostBase() + dstOff;
-        int64 i = 0;
-        while (i < n) {
-            db[doff + i] = this.yBatchH[i];
-            i = i + 1;
-        }
-        int64 t3 = Clock.nanoTime();
         if (useDeq) {
             Linear.wmmaDeqCalls = Linear.wmmaDeqCalls + 1L;
             Linear.btDeqNs = Linear.btDeqNs + (t1 - t0);
@@ -1202,11 +1217,34 @@ public final class Linear extends InfModule {
             Linear.btFbNs = Linear.btFbNs + (t1 - t0);
         }
         Linear.btLaunchNs = Linear.btLaunchNs + (t1 - t0);
-        Linear.btDownNs = Linear.btDownNs + (t2 - t1);
-        Linear.btCopyNs = Linear.btCopyNs + (t3 - t2);
         Linear.btCalls = Linear.btCalls + 1L;
         return;
     }
+
+    /**
+     * As {@link #stageBatch} but the activations are ALREADY a device
+     * buffer (10.12.7.a) — pack straight from it, no host walk, no
+     * upload. Only meaningful on the device-pack path; callers gate on
+     * {@link #devicePackOn}.
+     */
+    public static void stageBatchFromDevice(KernelBuffer<float32> src,
+            int32 rows, int32 n, int64 tag) {
+        Linear.ensureBatchStage(rows, n);
+        if (Linear.btTag == tag && Linear.btRows == rows
+                && Linear.btN == n) {
+            return;
+        }
+        int64 t0 = Clock.nanoTime();
+        QuantKernel.q8kPackLaunchNoSync(Linear.btXp, src,
+            (int64) rows * (int64) n);
+        Linear.btPackNs = Linear.btPackNs + (Clock.nanoTime() - t0);
+        Linear.btTag = tag;
+        Linear.btRows = rows;
+        Linear.btN = n;
+        return;
+    }
+
+    public static boolean devicePackOn() { return Linear.devPack; }
 
     /** Build the widened int8 copy once (10.12.16). Caller holds
      *  `ensureDevice()` already done — `packedDev` is the source. */

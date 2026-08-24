@@ -702,21 +702,42 @@ public final class LlamaForCausalLM extends InfModule {
                 + (Clock.nanoTime() - tp1);
             this.stageTag = this.stageTag + 1L;
             Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
-            d.mlp.gateProj.matmulInto(rows, gate, 0L);
-            d.mlp.upProj.matmulInto(rows, up, 0L);
-            int64 tp2 = Clock.nanoTime();
-            r = 0;
-            while (r < rows) {
-                int64 ri = (int64) r * (int64) inter;
-                Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
-                    d.activation);
-                r = r + 1;
+            if (Linear.devicePackOn()) {
+                // RESIDENT MLP CHAIN (10.12.7.a): gate and up never
+                // leave the device — the GLU runs in place on gate's
+                // yBatch and the down projection packs straight from
+                // it. 10.12.22 measured gate/up as two thirds of the
+                // downloaded bytes and the GLU as the largest host
+                // prim; all of it disappears here. Stream-ordered
+                // throughout: keep -> keep -> glu -> pack -> down all
+                // launch on the current stream, and down's launch
+                // syncs.
+                d.mlp.gateProj.matmulBatchKeep(rows);
+                d.mlp.upProj.matmulBatchKeep(rows);
+                Prim.gluDevice(d.mlp.gateProj.yBatch,
+                    d.mlp.upProj.yBatch,
+                    (int64) rows * (int64) inter, d.activation);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatchFromDevice(d.mlp.gateProj.yBatch,
+                    rows, inter, this.stageTag);
+                d.mlp.downProj.matmulInto(rows, mlpOut, 0L);
+            } else {
+                d.mlp.gateProj.matmulInto(rows, gate, 0L);
+                d.mlp.upProj.matmulInto(rows, up, 0L);
+                int64 tp2 = Clock.nanoTime();
+                r = 0;
+                while (r < rows) {
+                    int64 ri = (int64) r * (int64) inter;
+                    Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
+                        d.activation);
+                    r = r + 1;
+                }
+                LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                    + (Clock.nanoTime() - tp2);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatch(gate, 0L, rows, inter, this.stageTag);
+                d.mlp.downProj.matmulInto(rows, mlpOut, 0L);
             }
-            LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
-                + (Clock.nanoTime() - tp2);
-            this.stageTag = this.stageTag + 1L;
-            Linear.stageBatch(gate, 0L, rows, inter, this.stageTag);
-            d.mlp.downProj.matmulInto(rows, mlpOut, 0L);
             int64 tp3 = Clock.nanoTime();
             r = 0;
             while (r < rows) {
