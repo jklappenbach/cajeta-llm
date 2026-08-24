@@ -7,6 +7,7 @@ import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.Shared;
 import cajeta.xpu.KernelThread;
+import cajeta.xpu.Wave;
 
 /**
  * The DECODE attention tail on the device (plan 10.11): RoPE, the KV
@@ -407,6 +408,152 @@ public final class AttnKernel {
         }
     }
 
+    /**
+     * Prefill scores v2 (10.12.38): the SAME wave-per-(row,head) shape as
+     * {@link #attnScorePrefillRowKernel}, with the operators the profile
+     * said to fix. Both v1 kernels measured 98-99% MemUnitBusy with almost
+     * no DRAM traffic — bound by memory-INSTRUCTION issue — and the ISA
+     * showed why: four scalar b32 loads per K row chunk and a 13-op serial
+     * LDS ladder per key position.
+     *
+     *   - lane `l` owns dims [4l, 4l+3]: the four q/K reads are ADJACENT,
+     *     so the backend fuses them to one global_load_b128 (verified in
+     *     ISA), and a wave still covers 128 consecutive dwords — the same
+     *     coalescing as v1.
+     *   - the cross-lane sum is ONE Wave.reduceSumF32 (wave.reduce.fadd,
+     *     an all-VALU DPP tree): zero LDS traffic, zero barriers.
+     *   - @FastMath lets the dot contract to fmac.
+     *
+     * Requires hd == 128 (the only hd we run); the launch routes to v1
+     * otherwise.
+     */
+    @Kernel @FastMath
+    public static void attnScorePrefillRowV2Kernel(
+            KernelBuffer<float32> scores, KernelBuffer<float32> q,
+            KernelBuffer<float32> kPool, uint32 rows, uint32 nH,
+            uint32 nKv, uint32 startPos, uint32 stride, float32 scale) {
+        uint32 lane = KernelThread.x();
+        uint32 wv = KernelThread.globalIdX() / 32;
+        if (wv < rows * nH) {
+            uint32 r = wv / nH;
+            uint32 h = wv % nH;
+            uint32 kvDim = nKv * 128;
+            uint32 kvh = h / (nH / nKv);
+            uint32 qBase = r * (nH * 128) + h * 128 + lane * 4;
+            uint32 sBase = (r * nH + h) * stride;
+            uint32 count = startPos + r + 1;
+            float32 q0 = q[qBase];
+            float32 q1 = q[qBase + 1];
+            float32 q2 = q[qBase + 2];
+            float32 q3 = q[qBase + 3];
+            uint32 kBase = kvh * 128 + lane * 4;
+            // t unrolled x4 so four K-row loads are in flight before the
+            // first dot needs its data — the loop is otherwise a serial
+            // load -> dot -> reduce chain per position.
+            uint32 t = 0;
+            while (t + 4 <= count) {
+                uint32 kRow0 = t * kvDim + kBase;
+                uint32 kRow1 = kRow0 + kvDim;
+                uint32 kRow2 = kRow1 + kvDim;
+                uint32 kRow3 = kRow2 + kvDim;
+                float32 s0 = q0 * kPool[kRow0] + q1 * kPool[kRow0 + 1]
+                           + q2 * kPool[kRow0 + 2] + q3 * kPool[kRow0 + 3];
+                float32 s1 = q0 * kPool[kRow1] + q1 * kPool[kRow1 + 1]
+                           + q2 * kPool[kRow1 + 2] + q3 * kPool[kRow1 + 3];
+                float32 s2 = q0 * kPool[kRow2] + q1 * kPool[kRow2 + 1]
+                           + q2 * kPool[kRow2 + 2] + q3 * kPool[kRow2 + 3];
+                float32 s3 = q0 * kPool[kRow3] + q1 * kPool[kRow3 + 1]
+                           + q2 * kPool[kRow3 + 2] + q3 * kPool[kRow3 + 3];
+                float32 t0 = Wave.reduceSumF32(s0);
+                float32 t1 = Wave.reduceSumF32(s1);
+                float32 t2 = Wave.reduceSumF32(s2);
+                float32 t3 = Wave.reduceSumF32(s3);
+                if (lane == 0) {
+                    scores[sBase + t] = t0 * scale;
+                    scores[sBase + t + 1] = t1 * scale;
+                    scores[sBase + t + 2] = t2 * scale;
+                    scores[sBase + t + 3] = t3 * scale;
+                }
+                t = t + 4;
+            }
+            while (t < count) {
+                uint32 kRow = t * kvDim + kBase;
+                float32 s = q0 * kPool[kRow] + q1 * kPool[kRow + 1]
+                          + q2 * kPool[kRow + 2] + q3 * kPool[kRow + 3];
+                float32 tot = Wave.reduceSumF32(s);
+                if (lane == 0) { scores[sBase + t] = tot * scale; }
+                t = t + 1;
+            }
+        }
+    }
+
+    /**
+     * Prefill combine v2 (10.12.38): ONE WAVE per (query row, head) with
+     * lane `l` owning output dims [4l, 4l+3] — the b128 twin of the v2
+     * score kernel. The three passes keep v1's structure (max, exp+sum in
+     * place, weighted V), but the cross-lane reductions are single
+     * Wave.reduce*F32 ops instead of 7-step LDS ladders with 18 barriers,
+     * and the V accumulation reads one b128 per lane per position instead
+     * of four waves of scalar loads. Per output element the V sum still
+     * ascends in `t` from 0.0f, so v1 and v2 differ only by contraction
+     * and reduction-tree rounding. Requires hd == 128.
+     */
+    @Kernel @FastMath
+    public static void attnCombinePrefillV2Kernel(KernelBuffer<float32> out,
+            KernelBuffer<float32> scores, KernelBuffer<float32> vPool,
+            uint32 rows, uint32 nH, uint32 nKv, uint32 startPos,
+            uint32 stride) {
+        uint32 lane = KernelThread.x();
+        uint32 wv = KernelThread.globalIdX() / 32;
+        if (wv < rows * nH) {
+            uint32 r = wv / nH;
+            uint32 h = wv % nH;
+            uint32 kvDim = nKv * 128;
+            uint32 kvh = h / (nH / nKv);
+            uint32 sBase = (r * nH + h) * stride;
+            uint32 count = startPos + r + 1;
+            float32 mx = 0.0f - 3.0e38f;
+            uint32 t = lane;
+            while (t < count) {
+                float32 sv = scores[sBase + t];
+                if (sv > mx) { mx = sv; }
+                t = t + 32;
+            }
+            float32 m = Wave.reduceMaxF32(mx);
+            float32 sum = 0.0f;
+            t = lane;
+            while (t < count) {
+                float32 e = Math.exp(scores[sBase + t] - m);
+                scores[sBase + t] = e;
+                sum = sum + e;
+                t = t + 32;
+            }
+            float32 rs = 1.0f / Wave.reduceSumF32(sum);
+            uint32 vBase = kvh * 128 + lane * 4;
+            float32 a0 = 0.0f;
+            float32 a1 = 0.0f;
+            float32 a2 = 0.0f;
+            float32 a3 = 0.0f;
+            // No manual t-unroll here: LLVM already pipelines this loop
+            // (measured 30.2 ms plain vs 31.5 unrolled x4).
+            t = 0;
+            while (t < count) {
+                float32 p = scores[sBase + t];
+                uint32 vRow = t * kvDim + vBase;
+                a0 = a0 + p * vPool[vRow];
+                a1 = a1 + p * vPool[vRow + 1];
+                a2 = a2 + p * vPool[vRow + 2];
+                a3 = a3 + p * vPool[vRow + 3];
+                t = t + 1;
+            }
+            uint32 oBase = r * (nH * 128) + h * 128 + lane * 4;
+            out[oBase] = a0 * rs;
+            out[oBase + 1] = a1 * rs;
+            out[oBase + 2] = a2 * rs;
+            out[oBase + 3] = a3 * rs;
+        }
+    }
+
     /** Prefill softmax and V combine: one workgroup of 128 per
      *  `(query row, head)`, over that row's causal range. */
     @Kernel
@@ -505,6 +652,14 @@ public final class AttnKernel {
         AttnKernel.rowScoreOn = on;
     }
 
+    // 10.12.38: v2 operator-efficient prefill attention (b128 lane mapping,
+    // float wave reduce, @FastMath). Routes only when hd == 128; DEFAULT ON,
+    // `noattnv2` reverts to the v1 pair.
+    static boolean attnV2On = true;
+    public static void setAttnV2(boolean on) {
+        AttnKernel.attnV2On = on;
+    }
+
     public static void attendPrefillLaunch(KernelBuffer<float32> out,
             KernelBuffer<float32> scores, KernelBuffer<float32> q,
             KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
@@ -529,6 +684,18 @@ public final class AttnKernel {
             int32 stride, float32 scale) {
         KernelStream s = QuantKernel.stream();
         int32 tMax = startPos + rows;
+        if (AttnKernel.attnV2On && hd == 128) {
+            int64 wv = (int64) rows * (int64) nH;
+            attnScorePrefillRowV2Kernel.launch(s,
+                grid: [(uint32) wv], block: [32])
+                (scores, q, kPool, (uint32) rows, (uint32) nH,
+                 (uint32) nKv, (uint32) startPos, (uint32) stride, scale);
+            attnCombinePrefillV2Kernel.launch(s,
+                grid: [(uint32) wv], block: [32])
+                (out, scores, vPool, (uint32) rows, (uint32) nH,
+                 (uint32) nKv, (uint32) startPos, (uint32) stride);
+            return;
+        }
         if (AttnKernel.rowScoreOn) {
             int64 wv = (int64) rows * (int64) nH;
             attnScorePrefillRowKernel.launch(s,
