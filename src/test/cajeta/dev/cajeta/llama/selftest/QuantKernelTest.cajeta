@@ -4,6 +4,7 @@ import dev.cajeta.unit.Assert;
 import cajeta.xpu.Device;
 import dev.cajeta.llama.io.Quant;
 import dev.cajeta.llama.io.QuantKernel;
+import dev.cajeta.llama.io.WmmaKernel;
 import cajeta.io.file.File;
 import cajeta.lang.String;
 
@@ -658,4 +659,68 @@ public class QuantKernelTest {
         }
     }
 
+
+    /**
+     * 10.12.14 — the MATRIX-CORE Q4_K GEMM agrees with the shipped
+     * one-token-per-lane batch kernel on the same bytes.
+     *
+     * Not bit-identical and it must not be: `dotAccum` sums a 32-element
+     * group per call and the wave reduces the block serially, while WMMA
+     * accumulates a 16x16x16 tile in the matrix-core register file. The
+     * regrouping is the whole point of the change.
+     *
+     * What IS held exactly is the shape. Every row of the output must be
+     * live: a tiling that got `tilesN` or the tile origin wrong leaves a
+     * whole 16-wide stripe at zero, and against smooth data the surviving
+     * stripes still agree to tolerance.
+     */
+    @Test
+    public void theWmmaKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 outDim = 16L;
+        int64 cols = (blocks / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareInto(raw, x, rows, outDim, cols, want, got);
+
+        QuantKernelTest.assertLive(want, "batch kernel");
+        QuantKernelTest.assertLive(got, "WMMA kernel");
+        int64 t = 0;
+        while (t < rows) {
+            boolean live = false;
+            int64 i = 0;
+            while (i < outDim) {
+                if (got[t * outDim + i] != 0.0f) { live = true; }
+                i = i + 1;
+            }
+            if (!live) {
+                Assert.fail("token row " + t + " of " + rows
+                    + " is entirely zero - the tiling is short");
+            }
+            t = t + 1;
+        }
+        int64 n = rows * outDim;
+        int64 k = 0;
+        while (k < n) {
+            float32 a = want[k];
+            float32 b2 = got[k];
+            float32 diff = a - b2;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.002f + 0.002f) {
+                Assert.fail("element " + k + " (token " + (k / outDim)
+                    + ", row " + (k % outDim) + "): wmma " + b2
+                    + " vs batch " + a
+                    + " - further apart than reassociation explains");
+            }
+            k = k + 1;
+        }
+    }
 }
