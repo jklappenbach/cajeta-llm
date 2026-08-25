@@ -298,6 +298,257 @@ public final class MmqProbe {
         return bad;
     }
 
+    /**
+     * Stage 4 — the f16 COOPMAT road (llama.cpp's 0.43s architecture):
+     * dequantize Q4_K per-tile into LDS as float16 (scales folded at
+     * staging — no epilogue verbs, so the tiles stay on the NATIVE
+     * KHR-coopmat tier), then a plain f16x f16 -> f32 mma. v0 is the
+     * correctness shape: one wave per 16x16 output tile, scalar
+     * dequant staging, activations pre-converted to f16. The f16
+     * rounding of the dequantized weights means agreement with the
+     * integer kernels is APPROXIMATE by design — the probe reports the
+     * relative error distribution; llama.cpp's coopmat path makes the
+     * same trade.
+     */
+    @Kernel
+    public static void q4kF16CoopKernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            uint32 rows, uint32 outDim, uint32 nColTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[16 * 256];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 32;
+        uint32 to = wg % nColTiles;       // output-row tile (weights)
+        uint32 tt = wg / nColTiles;       // token tile
+        int64 rowWords = blocksPerRow * 36L;
+        CooperativeMatrix<float32,16,16,2> acc;
+        acc.splat(0.0f);
+        int64 b = 0;
+        while (b < blocksPerRow) {
+            // Stage: 16 rows x 256 cols dequantized to f16. Lanes 0..15
+            // each own one row; a lane walks its row's 8 nibble groups.
+            if (lane < 16) {
+                uint32 gRow = to * 16 + lane;
+                int64 ro = (int64) gRow * rowWords + b * 36L;
+                Vector<int32,4> hw = packed.vload<4>(ro);
+                int32 h0 = hw[0];
+                float32 d = GgufFile.halfBitsToF32(h0 & 65535);
+                float32 dmin = GgufFile.halfBitsToF32((h0 >> 16) & 65535);
+                int32 hA = hw[1];
+                int32 hB = hw[2];
+                int32 hC = hw[3];
+                int64 sb = (int64) lane * 256L;
+                int32 g = 0;
+                while (g < 4) {
+                    // Raw group g's lo nibbles are quant group 2g and its
+                    // hi nibbles group 2g+1; groups 0..3 use the d-byte
+                    // scale form, 4..7 the k-mixed form (Q4_K header).
+                    int32 i0 = 2 * g;
+                    int32 i1 = 2 * g + 1;
+                    int32 sLoRaw = 0;
+                    int32 sHiRaw = 0;
+                    int32 mLoRaw = 0;
+                    int32 mHiRaw = 0;
+                    if (g < 2) {
+                        sLoRaw = (hA >> (8 * i0)) & 63;
+                        sHiRaw = (hA >> (8 * i1)) & 63;
+                        mLoRaw = (hB >> (8 * i0)) & 63;
+                        mHiRaw = (hB >> (8 * i1)) & 63;
+                    } else {
+                        int32 j0 = i0 - 4;
+                        int32 j1 = i1 - 4;
+                        int32 kA = (hC >> (8 * j0)) & 255;
+                        int32 kB2 = (hC >> (8 * j1)) & 255;
+                        int32 dA = (hA >> (8 * j0)) & 255;
+                        int32 dB2 = (hA >> (8 * j1)) & 255;
+                        int32 mA = (hB >> (8 * j0)) & 255;
+                        int32 mB2 = (hB >> (8 * j1)) & 255;
+                        sLoRaw = (kA & 15) | ((dA >> 2) & 48);
+                        sHiRaw = (kB2 & 15) | ((dB2 >> 2) & 48);
+                        mLoRaw = (kA >> 4) | ((mA >> 2) & 48);
+                        mHiRaw = (kB2 >> 4) | ((mB2 >> 2) & 48);
+                    }
+                    float32 scLo = d * (float32) sLoRaw;
+                    float32 mnLo = dmin * (float32) mLoRaw;
+                    float32 scHi = d * (float32) sHiRaw;
+                    float32 mnHi = dmin * (float32) mHiRaw;
+                    Vector<int32,8> qw = packed.vload<8>(
+                        ro + 4L + (int64) (8 * g));
+                    int32 e = 0;
+                    while (e < 8) {
+                        int32 w = qw[e];
+                        int32 bb = 0;
+                        while (bb < 4) {
+                            int32 by = (w >> (8 * bb)) & 255;
+                            int64 ci = (int64) (64 * g + 4 * e + bb);
+                            sa[sb + ci] = (float16) (scLo
+                                * (float32) (by & 15) - mnLo);
+                            sa[sb + ci + 32L] = (float16) (scHi
+                                * (float32) ((by >> 4) & 15) - mnHi);
+                            bb = bb + 1;
+                        }
+                        e = e + 1;
+                    }
+                    g = g + 1;
+                }
+            }
+            Barrier.workgroup();
+            // 16 k-steps over the staged 256-column slab.
+            int32 kt = 0;
+            while (kt < 16) {
+                CooperativeMatrix<float16,16,16,0> ta;
+                CooperativeMatrix<float16,16,16,1> tb;
+                ta.load(sa, (uint32) (16 * kt), 0, 256);
+                // B pre-transposed on the host: xh is [cols x rows]
+                // row-major, so the (k, t) tile loads row-major — no
+                // layout=1 anywhere until its SPIR-V lowering is verified.
+                tb.load(xh, (uint32) ((b * 256L + (int64) (16 * kt))
+                    * (int64) rows + (int64) (tt * 16)), 0, rows);
+                acc.mma(ta, tb);
+                kt = kt + 1;
+            }
+            Barrier.workgroup();
+            b = b + 1;
+        }
+        // Row-major store into yT [outDim x rows]; the host transposes.
+        acc.store(y, (uint32) ((int64) (to * 16) * (int64) rows
+            + (int64) (tt * 16)), 0, rows);
+    }
+
+    @Kernel
+    public static void f32ToF16Kernel(KernelBuffer<float16> dst,
+            KernelBuffer<float32> src, uint32 n) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < n) {
+            dst[(int64) i] = (float16) src[(int64) i];
+        }
+    }
+
+    /** Stage 4 driver: correctness stats + wall-clock vs the mmq route. */
+    static int64 checkCoopF16(int64 rows, int64 outDim, int64 cols) {
+        int8[] fix #= File.readAllBytes(
+            "src/test/fixtures/gguf/kquant/q4_k.bin");
+        int64 bb = (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rowBytes = (cols / 256L) * bb;
+        int8[] raw #= heap int8[outDim * rowBytes];
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int64 blocks = outDim * (cols / 256L);
+        int64 b = 0;
+        while (b < blocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        float32[] x #= heap float32[rows * cols];
+        int64 i = 0;
+        while (i < rows * cols) {
+            x[i] = (float32) ((i * 31L + 7L) % 61L - 30L) * 0.03125f;
+            i = i + 1;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>(
+            (uint64) (outDim * rowBytes));
+        KernelBuffer<float32> xfD #= heap KernelBuffer<float32>(
+            (uint64) (rows * cols));
+        KernelBuffer<int8> xpD #= heap KernelBuffer<int8>(
+            (uint64) (rows * Quant.q8kPackedBytes(cols)));
+        float32[] xT #= heap float32[rows * cols];
+        i = 0;
+        while (i < rows) {
+            int64 k = 0;
+            while (k < cols) {
+                xT[k * rows + i] = x[i * cols + k];
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        KernelBuffer<float32> xtD #= heap KernelBuffer<float32>(
+            (uint64) (rows * cols));
+        KernelBuffer<float16> xhD #= heap KernelBuffer<float16>(
+            (uint64) (rows * cols));
+        KernelBuffer<float32> yA #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        KernelBuffer<float32> yB #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        wD.upload(raw);
+        xfD.upload(x);
+        xtD.upload(xT);
+        QuantKernel.q8kPackLaunch(xpD, xfD, rows * cols);
+        KernelStream s = QuantKernel.stream();
+        f32ToF16Kernel.launch(s,
+            grid: [(uint32) ((rows * cols + 63L) / 64L)], block: [64])
+            (xhD, xtD, (uint32) (rows * cols));
+        s.sync();
+
+        KernelBuffer<int32> wW #= wD.wordView();
+        KernelBuffer<int32> xpW #= xpD.wordView();
+        QuantKernel.q4kQ8BatchMatMulLaunchNoSync(yA, wD, xpD, rows,
+            outDim, cols);
+        s.sync();
+        int64 nCt = outDim / 16L;
+        int64 nWg = nCt * (rows / 16L);
+        q4kF16CoopKernel.launch(s, grid: [(uint32) nWg], block: [32])
+            (yB, wW, xhD, (uint32) rows, (uint32) outDim, (uint32) nCt,
+             cols / 256L);
+        s.sync();
+
+        float32[] a #= heap float32[rows * outDim];
+        float32[] g #= heap float32[rows * outDim];
+        yA.download(a);
+        yB.download(g);
+        int64 bad = 0;
+        float64 worst = 0.0;
+        i = 0;
+        while (i < rows * outDim) {
+            int64 tt2 = i / outDim;
+            int64 oo = i % outDim;
+            float32 gv = g[oo * rows + tt2];
+            float32 diff = a[i] - gv;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a[i] < 0.0f ? 0.0f - a[i] : a[i];
+            float64 rel = (float64) diff / ((float64) mag + 1.0);
+            if (rel > worst) { worst = rel; }
+            if (diff > mag * 0.02f + 0.05f) {
+                if (bad < 5L) {
+                    System.stdout.println("  coop[" + tt2 + ","
+                        + oo + "]: got " + gv + " want " + a[i]);
+                }
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        System.stdout.println("  coopF16 worstRel(+1): " + worst);
+
+        int32 iters = 5;
+        int64 t0 = Clock.nanoTime();
+        int32 it = 0;
+        while (it < iters) {
+            q4kF16CoopKernel.launch(s, grid: [(uint32) nWg], block: [32])
+                (yB, wW, xhD, (uint32) rows, (uint32) outDim,
+                 (uint32) nCt, cols / 256L);
+            it = it + 1;
+        }
+        s.sync();
+        float64 msC = (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) iters;
+        t0 = Clock.nanoTime();
+        it = 0;
+        while (it < iters) {
+            QuantKernel.q4kQ8MmqLaunchNoSync(yB, wW, xpW, rows, outDim,
+                cols);
+            it = it + 1;
+        }
+        s.sync();
+        float64 msM = (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) iters;
+        float64 tmacs = (float64) (rows * outDim * cols) / 1.0e12;
+        System.stdout.println("  coopF16 " + msC + " ms ("
+            + (tmacs / (msC / 1000.0)) + " TMAC/s)   mmq " + msM
+            + " ms (" + (tmacs / (msM / 1000.0)) + " TMAC/s)");
+        return bad;
+    }
+
     public static int32 run() {
         System.stdout.println("backend: " + Device.activeBackend());
         int64 b1 = MmqProbe.checkLdsDot();
@@ -312,6 +563,10 @@ public final class MmqProbe {
         int64 b4 = MmqProbe.checkMmq6(512L, 4096L, 14336L);
         System.stdout.println("stage3b q6mmq@512x4096x14336: " + b4
             + "/2097152 wrong");
-        return (b1 + b2 + b3 + b4) == 0L ? 0 : 1;
+        MmqProbe.checkCoopF16(16L, 16L, 256L);
+        int64 b5 = MmqProbe.checkCoopF16(512L, 4096L, 4096L);
+        System.stdout.println("stage4 coopF16@512x4096x4096: " + b5
+            + "/2097152 outside 2%+0.05");
+        return (b1 + b2 + b3 + b4 + b5) == 0L ? 0 : 1;
     }
 }
