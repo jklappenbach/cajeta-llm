@@ -1256,6 +1256,23 @@ public final class Linear extends InfModule {
     }
 
     /**
+     * As {@link #isBatchRouted} but for a KNOWN row count (10.12.45.D):
+     * Q5_K and Q8_0 have only the Mw8 deq GEMM, so they batch-route
+     * only in deq mode at rows % 128 — any other shape takes the
+     * announced per-row path rather than a throw.
+     */
+    boolean isBatchRoutedFor(int64 rows) {
+        if (this.isBatchRouted()) { return true; }
+        if (this.packedTy != Quant.GG_Q5_K
+                && this.packedTy != Quant.GG_Q8_0) {
+            return false;
+        }
+        return Linear.deqPrefill && Linear.wmmaOn
+            && QuantKernel.routingEnabled() && Linear.waveMv()
+            && WmmaKernel.fitsMw8(rows, (int64) this.outDim);
+    }
+
+    /**
      * `Y = X . W^T` for the `rows` activations last handed to
      * {@link #stageBatch}, into `dst[dstOff ..]` laid out `[rows x
      * outDim]`.
@@ -1313,6 +1330,16 @@ public final class Linear extends InfModule {
         boolean useWmma6 = Linear.wmmaOn && Linear.wmma6On
             && this.packedTy == Quant.GG_Q6_K
             && WmmaKernel.fits((int64) rows, (int64) this.outDim);
+        // 10.12.45.D: Q5_K and Q8_0 exist only in deq (int8) mode and
+        // only at the Mw8 shape — isBatchRoutedFor gates the batched
+        // entry on the same predicate, so reaching here with either
+        // means the shape fits.
+        boolean useDeq5 = Linear.deqPrefill && Linear.wmmaOn
+            && this.packedTy == Quant.GG_Q5_K
+            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
+        boolean useDeq8 = Linear.deqPrefill && Linear.wmmaOn
+            && this.packedTy == Quant.GG_Q8_0
+            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
         if (useDeq) {
             this.ensureDeq();
             if (Linear.q4Mw8On
@@ -1418,13 +1445,42 @@ public final class Linear extends InfModule {
                     Linear.btXp, (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
+        } else if (useDeq5) {
+            this.ensureDeq();
+            if (Linear.part32On) {
+                WmmaKernel.q5kWmmaDeqMw8PartLaunch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else {
+                WmmaKernel.q5kWmmaDeqMw8Launch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            }
+        } else if (useDeq8) {
+            this.ensureDeq();
+            if (Linear.part32On) {
+                WmmaKernel.q80WmmaDeqMw8PartLaunch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else {
+                WmmaKernel.q80WmmaDeqMw8Launch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            }
         } else {
             QuantKernel.batchMatMulLaunch(this.packedTy, this.yBatch,
                 this.packedDev, Linear.btXp, (int64) rows,
                 (int64) this.outDim, (int64) this.inDim);
         }
         int64 t1 = Clock.nanoTime();
-        if (useDeq) {
+        if (useDeq || useDeq5 || useDeq8) {
+            // useDeq5/useDeq8 ARE deq GEMMs (10.12.45.D) — counted as
+            // dotAccum fallback they would read as the silent-fallback
+            // signature this diagnostic exists to expose.
             Linear.wmmaDeqCalls = Linear.wmmaDeqCalls + 1L;
             Linear.btDeqNs = Linear.btDeqNs + (t1 - t0);
         } else if (useWmma) {
@@ -1476,7 +1532,11 @@ public final class Linear extends InfModule {
         if (this.packed == null) { return; }
         boolean q4 = this.packedTy == Quant.GG_Q4_K;
         boolean q6 = this.packedTy == Quant.GG_Q6_K && Linear.q6Mw4On;
-        if (!q4 && !q6) { return; }
+        // 10.12.45.D: Q5_K/Q8_0 widen off-clock too when their deq
+        // GEMM can route.
+        boolean q58 = (this.packedTy == Quant.GG_Q5_K
+            || this.packedTy == Quant.GG_Q8_0) && Linear.deqPrefill;
+        if (!q4 && !q6 && !q58) { return; }
         this.ensureDevice();
         this.ensureDeq();
         return;
@@ -1633,9 +1693,20 @@ public final class Linear extends InfModule {
         if (this.packedTy == Quant.GG_Q6_K) {
             WmmaKernel.q6kWidenLaunch(this.deqDev, this.packedDev,
                 (int64) this.outDim, (int64) this.inDim);
-        } else {
+        } else if (this.packedTy == Quant.GG_Q5_K) {
+            WmmaKernel.q5kWidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (this.packedTy == Quant.GG_Q8_0) {
+            WmmaKernel.q80WidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (this.packedTy == Quant.GG_Q4_K) {
             WmmaKernel.q4kWidenLaunch(this.deqDev, this.packedDev,
                 (int64) this.outDim, (int64) this.inDim);
+        } else {
+            // Was a bare else into the Q4 widen — one format's bytes
+            // through another's decoder (10.12.45's hazard class).
+            throw heap LlamaException("ensureDeq: no widen for packed "
+                + "type " + this.packedTy);
         }
         return;
     }
