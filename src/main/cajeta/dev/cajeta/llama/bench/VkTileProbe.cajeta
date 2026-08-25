@@ -229,6 +229,101 @@ public final class VkTileProbe {
         return bad;
     }
 
+    /**
+     * Stage 5 — the context-loss bisect. The engine's batched prefill
+     * loses the RADV context with 224 GEMMs in flight across two kernel
+     * families and four shapes; in-engine localization by value probes
+     * named "the first Q6 kernel" and was wrong twice. Here each family
+     * runs ALONE at each engine shape, a print before every launch, a
+     * sync after: the first line without its "ok" names the killer.
+     * Values are irrelevant to a hang probe, so the weight/activation
+     * buffers are whatever the allocator hands back.
+     */
+    static void s5(String name, int32 mode, int64 rows, int64 outDim,
+            int64 cols) {
+        System.stdout.println("stage5 " + name + ": " + rows + "x"
+            + outDim + "x" + cols);
+        int64 bb = (int64) Quant.blockBytes(
+            mode == 2 ? Quant.GG_Q6_K : Quant.GG_Q4_K);
+        int64 rowBytes = (cols / 256L) * bb;
+        int64 pb = Quant.q8kPackedBytes(cols);
+        KernelBuffer<int8> wDev #= heap KernelBuffer<int8>(
+            (uint64) (outDim * rowBytes));
+        KernelBuffer<int8> xDev #= heap KernelBuffer<int8>(
+            (uint64) (rows * pb));
+        KernelBuffer<float32> yDev #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        KernelStream s = QuantKernel.stream();
+        if (mode == 0) {
+            QuantKernel.q4kQ8BatchMatMulLaunchNoSync(yDev, wDev, xDev,
+                rows, outDim, cols);
+        } else if (mode == 1) {
+            KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+                (uint64) (outDim * cols));
+            WmmaKernel.q4kWidenLaunch(deqDev, wDev, outDim, cols);
+            WmmaKernel.q4kWmmaDeqMwLaunch(yDev, wDev, deqDev, xDev, rows,
+                outDim, cols);
+        } else if (mode == 3) {   // widen alone
+            KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+                (uint64) (outDim * cols));
+            WmmaKernel.q4kWidenLaunch(deqDev, wDev, outDim, cols);
+        } else if (mode == 4) {   // deqMw alone (deq contents are garbage)
+            KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+                (uint64) (outDim * cols));
+            WmmaKernel.q4kWmmaDeqMwLaunch(yDev, wDev, deqDev, xDev, rows,
+                outDim, cols);
+        } else if (mode == 5) {
+            // Canary: sentinel-filled guard bands around y, one deqMw run,
+            // then count scribbles outside [pad, pad+n). An OOB WRITE on the
+            // first execution — landing in GPU-resident metadata the SECOND
+            // dispatch consumes — is the standing hypothesis for
+            // first-ok-second-dies (correct first-run values, robustness
+            // does not save it).
+            int64 pad = 262144L;
+            int64 n = rows * outDim;
+            KernelBuffer<float32> yBig #= heap KernelBuffer<float32>(
+                (uint64) (n + pad * 2L));
+            float32[] sent #= heap float32[n + pad * 2L];
+            int64 q = 0;
+            while (q < n + pad * 2L) { sent[q] = 12345.0f; q = q + 1; }
+            yBig.upload(sent);
+            KernelBuffer<float32> yView #= yBig.slice((uint64) pad,
+                (uint64) n);
+            KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+                (uint64) (outDim * cols));
+            WmmaKernel.q4kWmmaDeqMwLaunch(yView, wDev, deqDev, xDev, rows,
+                outDim, cols);
+            s.sync();
+            yBig.download(sent, n + pad * 2L);
+            int64 loScr = 0;
+            int64 hiScr = 0;
+            int64 firstHi = 0L - 1L;
+            int64 lastLo = 0L - 1L;
+            q = 0;
+            while (q < pad) {
+                if (sent[q] != 12345.0f) { loScr = loScr + 1; lastLo = q; }
+                q = q + 1;
+            }
+            q = pad + n;
+            while (q < n + pad * 2L) {
+                if (sent[q] != 12345.0f) {
+                    hiScr = hiScr + 1;
+                    if (firstHi < 0L) { firstHi = q - pad - n; }
+                }
+                q = q + 1;
+            }
+            System.stdout.println("  canary: lo " + loScr + " (last idx "
+                + lastLo + " of pad " + pad + ")  hi " + hiScr
+                + " (first at +" + firstHi + ")");
+        } else {
+            QuantKernel.q6kQ8BatchMatMulLaunchNoSync(yDev, wDev, xDev,
+                rows, outDim, cols);
+        }
+        s.sync();
+        System.stdout.println("  ok " + name);
+        return;
+    }
+
     static #float32[] activationsL(int64 n) {
         float32[] x #= heap float32[n];
         int64 i = 0;
@@ -250,6 +345,11 @@ public final class VkTileProbe {
         int64 b4 = VkTileProbe.checkBatchAtScale();
         System.stdout.println("stage4 batch@512x4096x4096: " + b4
             + "/16384 wrong (first 4 rows)");
+        // Measured so far: the SECOND execution of q4kWmmaDeqMwKernel —
+        // identical shape, same pipeline — loses the context (widen and the
+        // dotAccum kernels are clean). Canary the output for an OOB write.
+        VkTileProbe.s5("canary-qo", 5, 512L, 4096L, 4096L);
+        VkTileProbe.s5("deqMwOnly-after-canary", 4, 512L, 4096L, 4096L);
         return (b1 + b2 + b3 + b4) == 0L ? 0 : 1;
     }
 }

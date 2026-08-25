@@ -1267,8 +1267,13 @@ public final class Linear extends InfModule {
     static boolean wmmaBeOk;
     static boolean wmmaBackend() {
         if (!Linear.wmmaBeSet) {
-            String be #= Device.activeBackend();
-            Linear.wmmaBeOk = !be.equals("vulkan");
+            // Vulkan joined 2026-08-25: the batch route there is the
+            // dotAccum GEMM pair (matmulBatchKeep gates the WMMA kernels
+            // off — their portable-tile demotion trips the gfx-ring
+            // watchdog), measured token-identical at ctx512 with prefill
+            // 8.0 s vs 48 s per-row. isBatchRouted's per-type vulkan gate
+            // decides which formats ride it.
+            Linear.wmmaBeOk = true;
             Linear.wmmaBeSet = true;
         }
         return Linear.wmmaBeOk;
@@ -1290,6 +1295,7 @@ public final class Linear extends InfModule {
     static boolean avQ80Mw8;
     static boolean avQ2Mw8;
     static boolean avQ3Mw8;
+    static boolean avQ6Batch;   // the dotAccum Q6 batch GEMM (vulkan's route)
     static void ensureKernelAvail() {
         if (Linear.kAvailSet) { return; }
         Linear.avQ4Mw8 = Device.kernelAvailable("q4kWmmaDeqMw8Kernel");
@@ -1300,6 +1306,7 @@ public final class Linear extends InfModule {
         Linear.avQ80Mw8 = Device.kernelAvailable("q80WmmaDeqMw8Kernel");
         Linear.avQ2Mw8 = Device.kernelAvailable("q2kWmmaDeqMw8Kernel");
         Linear.avQ3Mw8 = Device.kernelAvailable("q3kWmmaDeqMw8Kernel");
+        Linear.avQ6Batch = Device.kernelAvailable("q6kQ8BatchMatMulKernel");
         Linear.kAvailSet = true;
         // Routing decisions this size deserve one loud line: a false here
         // silently demotes a quant off its fastest GEMM (and a wrong false —
@@ -1329,12 +1336,38 @@ public final class Linear extends InfModule {
         Linear.wmmaBeSet = true;
     }
 
-    /** Is there a batched GEMM for this projection's weight format? */
+    // The actual backend, latched separately from the wmmaBackend()
+    // measurement override: the per-TYPE vulkan gate below must hold even
+    // when the vkwmma arm forces batching on.
+    static boolean vkBeSet;
+    static boolean vkBeIs;
+    static boolean backendIsVulkan() {
+        if (!Linear.vkBeSet) {
+            String be #= Device.activeBackend();
+            Linear.vkBeIs = be.equals("vulkan");
+            Linear.vkBeSet = true;
+        }
+        return Linear.vkBeIs;
+    }
+
+    /** Is there a batched GEMM for this projection's weight format?
+     *  On vulkan the WMMA Q6 kernels lose the RADV context at engine
+     *  scale (an execution hang — measured still occurring under
+     *  robustBufferAccess, so not an out-of-bounds read); Q6 batches
+     *  there through the dotAccum GEMM instead (matmulBatchKeep gates
+     *  useWmma6 off), which requires that kernel to be registered. */
     boolean isBatchRouted() {
-        return this.packedTy >= 0
-            && QuantKernel.hasBatchKernel(this.packedTy)
-            && QuantKernel.routingEnabled() && Linear.waveMv()
-            && Linear.wmmaBackend();
+        if (this.packedTy < 0 || !QuantKernel.hasBatchKernel(this.packedTy)
+                || !QuantKernel.routingEnabled() || !Linear.waveMv()
+                || !Linear.wmmaBackend()) {
+            return false;
+        }
+        if (Linear.backendIsVulkan()) {
+            Linear.ensureKernelAvail();
+            if (this.packedTy == Quant.GG_Q6_K) { return Linear.avQ6Batch; }
+            return this.packedTy == Quant.GG_Q4_K;
+        }
+        return true;
     }
 
     /**
@@ -1402,6 +1435,19 @@ public final class Linear extends InfModule {
      * 10.12.22 measured as two thirds of the downloaded bytes and the
      * largest host prim.
      */
+    // Which batch kernel actually ran, said once per (branch, shape): the
+    // vulkan context-loss hunt needs the LAST route printed before the hang
+    // to name the killer — in-engine localization by value probes pointed at
+    // "the first Q6 batch kernel" and was wrong twice (the dotAccum route
+    // hangs identically with every WMMA Q6 kernel gated off).
+    static int32 routeSaid;
+    void sayRoute(int32 bit, String name) {
+        if ((Linear.routeSaid & bit) != 0) { return; }
+        Linear.routeSaid = Linear.routeSaid | bit;
+        System.stdout.println("batch-route: " + name + " out="
+            + this.outDim + " in=" + this.inDim);
+    }
+
     void matmulBatchKeep(int32 rows) {
         Linear.ensureKernelAvail();
         this.ensureDevice();
@@ -1412,16 +1458,25 @@ public final class Linear extends InfModule {
         // its Q6_K projections — attn_v and some ffn_down — on the
         // dotAccum batch kernel beside it. That is a real mix, not a
         // fallback that never fires, and the diagnostic says which ran.
+        // NOT on vulkan: the epilogue-verb WMMA kernels have no native
+        // scaledAccumInto2 lowering there, so the compiler demotes their
+        // tiles to the portable software tile — correct, but a single
+        // dispatch then exceeds the ~10 s gfx-ring watchdog (measured:
+        // "ring gfx_0.0.0 timeout" from the VkTileProbe stage-5 isolation,
+        // ring reset, context lost — the defect the whole "Q6 hang" hunt
+        // was chasing). The dotAccum batch GEMMs are the vulkan route.
         boolean useWmma = Linear.wmmaOn
             && this.packedTy == Quant.GG_Q4_K
-            && WmmaKernel.fits((int64) rows, (int64) this.outDim);
+            && WmmaKernel.fits((int64) rows, (int64) this.outDim)
+            && !Linear.backendIsVulkan();
         boolean useDeq = useWmma && Linear.deqPrefill;
         // Q6_K on the matrix cores too (10.12.23): 10.12.22 measured the
         // dotAccum fallback at 1290 ms of the 2844 ms launch — 32 calls
         // costing ~as much as all 192 WMMA calls.
         boolean useWmma6 = Linear.wmmaOn && Linear.wmma6On
             && this.packedTy == Quant.GG_Q6_K
-            && WmmaKernel.fits((int64) rows, (int64) this.outDim);
+            && WmmaKernel.fits((int64) rows, (int64) this.outDim)
+            && !Linear.backendIsVulkan();   // RADV context-loss: dotAccum instead
         // 10.12.45.D: Q5_K and Q8_0 exist only in deq (int8) mode and
         // only at the Mw8 shape — isBatchRoutedFor gates the batched
         // entry on the same predicate, so reaching here with either
@@ -1444,11 +1499,13 @@ public final class Linear extends InfModule {
                     && WmmaKernel.fitsMw8((int64) rows,
                         (int64) this.outDim)) {
                 if (Linear.part32On) {
+                    this.sayRoute(1, "q4 deqMw8Part");
                     WmmaKernel.q4kWmmaDeqMw8PartLaunch(this.yBatch,
                         this.packedDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else {
+                    this.sayRoute(2, "q4 deqMw8");
                     WmmaKernel.q4kWmmaDeqMw8Launch(this.yBatch,
                         this.packedDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
@@ -1457,6 +1514,7 @@ public final class Linear extends InfModule {
             } else if (Linear.q4Mw4On && Linear.avQ4Mw4
                     && WmmaKernel.fitsMw4((int64) rows,
                         (int64) this.outDim)) {
+                this.sayRoute(4, "q4 deqMw4");
                 WmmaKernel.q4kWmmaDeqMw4Launch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
@@ -1464,6 +1522,7 @@ public final class Linear extends InfModule {
             } else if (Linear.q4MwOn
                     && WmmaKernel.fitsMw((int64) rows,
                         (int64) this.outDim)) {
+                this.sayRoute(8, "q4 deqMw");
                 WmmaKernel.q4kWmmaDeqMwLaunch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
@@ -1471,6 +1530,7 @@ public final class Linear extends InfModule {
             } else if (Linear.q4N4On
                     && WmmaKernel.fitsN4((int64) rows,
                         (int64) this.outDim)) {
+                this.sayRoute(16, "q4 deqN4");
                 WmmaKernel.q4kWmmaDeqN4Launch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
@@ -1478,26 +1538,31 @@ public final class Linear extends InfModule {
             } else if (Linear.q4T2On
                     && WmmaKernel.fitsT2((int64) rows,
                         (int64) this.outDim)) {
+                this.sayRoute(32, "q4 deqT2");
                 WmmaKernel.q4kWmmaDeqT2Launch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else if (Linear.q4EpiOn) {
+                this.sayRoute(64, "q4 deqEpi");
                 WmmaKernel.q4kWmmaDeqEpiLaunch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
+                this.sayRoute(128, "q4 deq");
                 WmmaKernel.q4kWmmaDeqLaunch(this.yBatch, this.packedDev,
                     this.deqDev, Linear.btXp, (int64) rows,
                     (int64) this.outDim, (int64) this.inDim);
             }
         } else if (useWmma) {
             if (Linear.q4EpiOn) {
+                this.sayRoute(256, "q4 epi");
                 WmmaKernel.q4kWmmaEpiLaunch(this.yBatch, this.packedDev,
                     Linear.btXp, (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
+                this.sayRoute(512, "q4 plain");
                 WmmaKernel.q4kWmmaLaunch(this.yBatch, this.packedDev,
                     Linear.btXp, (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
@@ -1596,6 +1661,7 @@ public final class Linear extends InfModule {
                     (int64) this.inDim);
             }
         } else {
+            this.sayRoute(1024, "dotAccum ty=" + this.packedTy);
             QuantKernel.batchMatMulLaunch(this.packedTy, this.yBatch,
                 this.packedDev, Linear.btXp, (int64) rows,
                 (int64) this.outDim, (int64) this.inDim);
