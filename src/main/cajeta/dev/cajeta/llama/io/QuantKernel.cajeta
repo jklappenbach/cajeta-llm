@@ -1446,6 +1446,237 @@ public final class QuantKernel {
         }
     }
 
+    /**
+     * One-time repack for the Q6_K mmq route: Q6_K blocks are 210 bytes,
+     * which is NOT dword-aligned, so a word view of the raw tensor cannot
+     * address block payloads. Pad each block to 212 bytes (53 dwords);
+     * bytes 0..209 keep the ggml layout (ql 0..127, qh 128..191,
+     * scales 192..207, d 208..209). One thread per block; scalar byte
+     * copies are slow on this backend but this runs once per tensor.
+     */
+    @Kernel
+    public static void q6kPadKernel(KernelBuffer<int8> dst,
+            KernelBuffer<int8> src, uint32 nBlocks) {
+        uint32 b = KernelThread.globalIdX();
+        if (b < nBlocks) {
+            int64 so = (int64) b * 210L;
+            int64 dof = (int64) b * 212L;
+            int32 i = 0;
+            while (i < 210) {
+                dst[dof + (int64) i] = src[so + (int64) i];
+                i = i + 1;
+            }
+        }
+    }
+
+    public static void q6kPadLaunch(KernelBuffer<int8> dst,
+            KernelBuffer<int8> src, int64 nBlocks) {
+        KernelStream s = QuantKernel.stream();
+        q6kPadKernel.launch(s, grid: [(uint32) ((nBlocks + 63L) / 64L)],
+            block: [64])(dst, src, (uint32) nBlocks);
+        s.sync();
+        return;
+    }
+
+    /**
+     * BATCHED Q6_K, LDS-TILED — {@link #q4kQ8MmqKernel}'s twin over the
+     * 212-byte PADDED layout ({@link #q6kPadKernel}). Same tile: one
+     * 256-thread workgroup per 64-row x 32-token tile, one 256-column
+     * super-block staged per step.
+     *
+     * The staging decodes values to `q - 32` SIGNED int8 directly (the
+     * mat-vec kernel's `dot - 32*asum` correction disappears — the shift
+     * is baked into the staged bytes), branchless in the dword domain:
+     * with q in 0..63, q-32 per byte is `low5 | 0xE0` when bit5 is clear
+     * and `low5` when set; the 0xE0 spread is shifts-and-ors, never a
+     * multiply (int32 multiply traps on signed overflow).
+     *
+     * Per sub-block sb (16 values): the same ql/qh indexing as
+     * q6kQ8BatchMatMulKernel, dword-wise; scales are SIGNED int8,
+     * sign-extended at staging. Math per (row, token):
+     *   acc += d_row * xs_tok * sum_sb sc[sb] * dot16(q-32, a)
+     */
+    @Kernel
+    public static void q6kQ8MmqKernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<int32> xp,
+            uint32 rows, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        BlockPadded<int32,64,1> swq = shared int32[64 * 65];
+        BlockPadded<int32,64,1> sxq = shared int32[32 * 65];
+        BlockPadded<int32,16,1> ssc = shared int32[64 * 17];
+        Shared<float32> sd = shared float32[64];
+        Shared<float32> sxd = shared float32[32];
+        uint32 tid = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 rowTile = wg % nRowTiles;
+        uint32 tokTile = wg / nRowTiles;
+        int64 rowWords = blocksPerRow * 53L;
+        int64 xRowWords = blocksPerRow * 80L;
+
+        uint32 wRow = tid / 4;            // 64 rows, 4 threads each
+        uint32 wG = tid % 4;              //   4 sub-blocks (64 values) each
+        uint32 aTok = tid / 8;            // 32 tokens, 8 threads each
+        uint32 aE = tid % 8;
+        uint32 gRow = rowTile * 64 + wRow;
+        uint32 gTok = tokTile * 32 + aTok;
+        int64 wBase = 0L;
+        int64 aBase = 0L;
+        if (gRow < outDim) { wBase = (int64) gRow * rowWords; }
+        if (gTok < rows) { aBase = (int64) gTok * xRowWords; }
+
+        uint32 lr0 = (tid % 32) * 2;
+        uint32 lt0 = (tid / 32) * 4;
+        int64 r0 = (int64) lr0 * 64L;
+        int64 r1 = r0 + 64L;
+        int64 a0o = (int64) lt0 * 64L;
+
+        float32 acc00 = 0.0f;
+        float32 acc01 = 0.0f;
+        float32 acc02 = 0.0f;
+        float32 acc03 = 0.0f;
+        float32 acc10 = 0.0f;
+        float32 acc11 = 0.0f;
+        float32 acc12 = 0.0f;
+        float32 acc13 = 0.0f;
+        int64 b = 0;
+        while (b < blocksPerRow) {
+            // ── stage weights: q-32 int8 + signed scales + d ────────
+            int64 ro = wBase + b * 53L;
+            int32 sb4 = 0;
+            while (sb4 < 4) {
+                int32 sb = (int32) wG * 4 + sb4;
+                int32 g = sb / 8;
+                int32 rr0 = sb * 16 - g * 128;
+                int32 sl = rr0 / 64;
+                int32 l64 = rr0 - sl * 64;
+                int32 shi = rr0 / 32;
+                int32 l32 = rr0 - shi * 32;
+                Vector<int32,4> qlw = packed.vload<4>(
+                    ro + (int64) (16 * g + l64 / 4));
+                Vector<int32,4> qhw = packed.vload<4>(
+                    ro + 32L + (int64) (8 * g + l32 / 4));
+                Vector<int32,4> lo = qlw & 252645135;
+                if (sl == 1) { lo = (qlw >> 4) & 252645135; }
+                Vector<int32,4> hi = (qhw >> (2 * shi)) & 50529027;
+                Vector<int32,4> q = lo | (hi << 4);
+                // q - 32 per byte, branchless (see doc comment).
+                Vector<int32,4> low5 = q & 522133279;
+                Vector<int32,4> m = (q & 538976288) ^ 538976288;
+                Vector<int32,4> qm = low5 | (m << 2) | (m << 1) | m;
+                swq.vstore((int64) wRow * 64L + (int64) (sb * 4), qm);
+                sb4 = sb4 + 1;
+            }
+            if (wG == 0) {
+                // 16 signed scales (4 dwords at +48) and d (f16 at +52).
+                Vector<int32,4> sw = packed.vload<4>(ro + 48L);
+                int64 scb = (int64) wRow * 16L;
+                int32 j = 0;
+                while (j < 4) {
+                    int32 w = sw[j];
+                    ssc[scb + (int64) (4 * j)] = (w << 24) >> 24;
+                    ssc[scb + (int64) (4 * j + 1)] = (w << 16) >> 24;
+                    ssc[scb + (int64) (4 * j + 2)] = (w << 8) >> 24;
+                    ssc[scb + (int64) (4 * j + 3)] = w >> 24;
+                    j = j + 1;
+                }
+                sd[(int64) wRow] = GgufFile.halfBitsToF32(
+                    packed[ro + 52L] & 65535);
+            }
+            // ── stage activations (same q8k layout as the Q4 twin) ──
+            int64 xb = aBase + b * 80L;
+            sxq.vstore((int64) aTok * 64L + (int64) (8 * aE),
+                xp.vload<8>(xb + (int64) (8 * aE)));
+            if (aE == 0) {
+                sxd[(int64) aTok] = Cajeta.bitsToF32(xp[xb + 72L]);
+            }
+            Barrier.workgroup();
+
+            // ── register-tiled inner product ────────────────────────
+            int32 si00 = 0;
+            int32 si01 = 0;
+            int32 si02 = 0;
+            int32 si03 = 0;
+            int32 si10 = 0;
+            int32 si11 = 0;
+            int32 si12 = 0;
+            int32 si13 = 0;
+            int64 s0 = (int64) lr0 * 16L;
+            int32 g16 = 0;
+            while (g16 < 16) {
+                int64 go = (int64) (4 * g16);
+                Vector<int8,16> w0 = swq.vload<4>(r0 + go).asBytes();
+                Vector<int8,16> w1 = swq.vload<4>(r1 + go).asBytes();
+                Vector<int8,16> av0 = sxq.vload<4>(a0o + go).asBytes();
+                Vector<int8,16> av1 = sxq.vload<4>(a0o + 64L + go).asBytes();
+                Vector<int8,16> av2 = sxq.vload<4>(a0o + 128L + go).asBytes();
+                Vector<int8,16> av3 = sxq.vload<4>(a0o + 192L + go).asBytes();
+                int32 sc0 = ssc[s0 + (int64) g16];
+                int32 sc1 = ssc[s0 + 16L + (int64) g16];
+                si00 = si00 + w0.dotSum(av0, 0) * sc0;
+                si01 = si01 + w0.dotSum(av1, 0) * sc0;
+                si02 = si02 + w0.dotSum(av2, 0) * sc0;
+                si03 = si03 + w0.dotSum(av3, 0) * sc0;
+                si10 = si10 + w1.dotSum(av0, 0) * sc1;
+                si11 = si11 + w1.dotSum(av1, 0) * sc1;
+                si12 = si12 + w1.dotSum(av2, 0) * sc1;
+                si13 = si13 + w1.dotSum(av3, 0) * sc1;
+                g16 = g16 + 1;
+            }
+            float32 d0f = sd[(int64) lr0];
+            float32 d1f = sd[(int64) lr0 + 1L];
+            int32 tt = 0;
+            while (tt < 4) {
+                float32 xs = sxd[(int64) (lt0 + tt)];
+                int32 sv0 = si00;
+                int32 sv1 = si10;
+                if (tt == 1) { sv0 = si01; sv1 = si11; }
+                if (tt == 2) { sv0 = si02; sv1 = si12; }
+                if (tt == 3) { sv0 = si03; sv1 = si13; }
+                float32 v0 = d0f * xs * (float32) sv0;
+                float32 v1 = d1f * xs * (float32) sv1;
+                if (tt == 0) { acc00 = acc00 + v0; acc10 = acc10 + v1; }
+                if (tt == 1) { acc01 = acc01 + v0; acc11 = acc11 + v1; }
+                if (tt == 2) { acc02 = acc02 + v0; acc12 = acc12 + v1; }
+                if (tt == 3) { acc03 = acc03 + v0; acc13 = acc13 + v1; }
+                tt = tt + 1;
+            }
+            Barrier.workgroup();
+            b = b + 1;
+        }
+
+        uint32 oR0 = rowTile * 64 + lr0;
+        uint32 oR1 = oR0 + 1;
+        uint32 oT = tokTile * 32 + lt0;
+        int64 od = (int64) outDim;
+        if (oR0 < outDim) {
+            if (oT < rows) { y[(int64) oT * od + (int64) oR0] = acc00; }
+            if (oT + 1 < rows) { y[(int64) (oT + 1) * od + (int64) oR0] = acc01; }
+            if (oT + 2 < rows) { y[(int64) (oT + 2) * od + (int64) oR0] = acc02; }
+            if (oT + 3 < rows) { y[(int64) (oT + 3) * od + (int64) oR0] = acc03; }
+        }
+        if (oR1 < outDim) {
+            if (oT < rows) { y[(int64) oT * od + (int64) oR1] = acc10; }
+            if (oT + 1 < rows) { y[(int64) (oT + 1) * od + (int64) oR1] = acc11; }
+            if (oT + 2 < rows) { y[(int64) (oT + 2) * od + (int64) oR1] = acc12; }
+            if (oT + 3 < rows) { y[(int64) (oT + 3) * od + (int64) oR1] = acc13; }
+        }
+    }
+
+    /** Q6_K mmq launch — `packed` is a word view of the PADDED (212-byte
+     *  block) copy, `xp` a word view of the q8k activations. */
+    public static void q6kQ8MmqLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<int32> xp,
+            int64 rows, int64 outDim, int64 cols) {
+        int64 nRowTiles = (outDim + 63L) / 64L;
+        int64 nTokTiles = (rows + 31L) / 32L;
+        KernelStream s = QuantKernel.stream();
+        q6kQ8MmqKernel.launch(s,
+            grid: [(uint32) (nRowTiles * nTokTiles)], block: [256])
+            (y, packed, xp, (uint32) rows, (uint32) outDim,
+             (uint32) nRowTiles, cols / 256L);
+        return;
+    }
+
     /** One 256-thread workgroup per (64-row, 32-token) output tile.
      *  `packed`/`xp` are WORD VIEWS ({@link KernelBuffer#wordView}) of the
      *  quant and q8k buffers — the kernel reads dwords only. The caller

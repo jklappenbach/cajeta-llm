@@ -652,6 +652,108 @@ public final class MmqProbe {
         return bad;
     }
 
+    /**
+     * Stage 3 — the Q6 twin against the token-proven Q6 batch kernel,
+     * through the padded copy. Same near-exact expectation as stage 2.
+     */
+    static int64 checkMmq6(int64 rows, int64 outDim, int64 cols) {
+        int8[] fix #= File.readAllBytes(
+            "src/test/fixtures/gguf/kquant/q6_k.bin");
+        int64 bb = (int64) Quant.blockBytes(Quant.GG_Q6_K);
+        int64 rowBytes = (cols / 256L) * bb;
+        int8[] raw #= heap int8[outDim * rowBytes];
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int64 blocks = outDim * (cols / 256L);
+        int64 b = 0;
+        while (b < blocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        float32[] x #= heap float32[rows * cols];
+        int64 i = 0;
+        while (i < rows * cols) {
+            x[i] = (float32) ((i * 31L + 7L) % 61L - 30L) * 0.03125f;
+            i = i + 1;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>(
+            (uint64) (outDim * rowBytes));
+        KernelBuffer<float32> xfD #= heap KernelBuffer<float32>(
+            (uint64) (rows * cols));
+        KernelBuffer<int8> xpD #= heap KernelBuffer<int8>(
+            (uint64) (rows * Quant.q8kPackedBytes(cols)));
+        KernelBuffer<float32> yA #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        KernelBuffer<float32> yB #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        wD.upload(raw);
+        xfD.upload(x);
+        QuantKernel.q8kPackLaunch(xpD, xfD, rows * cols);
+        KernelStream s = QuantKernel.stream();
+
+        KernelBuffer<int8> padD #= heap KernelBuffer<int8>(
+            (uint64) (blocks * 212L));
+        QuantKernel.q6kPadLaunch(padD, wD, blocks);
+        KernelBuffer<int32> padW #= padD.wordView();
+        KernelBuffer<int32> xpW #= xpD.wordView();
+
+        QuantKernel.q6kQ8BatchMatMulLaunchNoSync(yA, wD, xpD, rows,
+            outDim, cols);
+        s.sync();
+        QuantKernel.q6kQ8MmqLaunchNoSync(yB, padW, xpW, rows, outDim,
+            cols);
+        s.sync();
+
+        float32[] a #= heap float32[rows * outDim];
+        float32[] g #= heap float32[rows * outDim];
+        yA.download(a);
+        yB.download(g);
+        int64 bad = 0;
+        i = 0;
+        while (i < rows * outDim) {
+            float32 diff = a[i] - g[i];
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a[i] < 0.0f ? 0.0f - a[i] : a[i];
+            if (diff > mag * 0.001f + 0.001f) {
+                if (bad < 5L) {
+                    System.stdout.println("  mmq6[" + (i / outDim) + ","
+                        + (i % outDim) + "]: got " + g[i] + " want " + a[i]);
+                }
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+
+        int32 iters = 5;
+        int64 t0 = Clock.nanoTime();
+        int32 it = 0;
+        while (it < iters) {
+            QuantKernel.q6kQ8BatchMatMulLaunchNoSync(yA, wD, xpD, rows,
+                outDim, cols);
+            it = it + 1;
+        }
+        s.sync();
+        float64 msA = (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) iters;
+        t0 = Clock.nanoTime();
+        it = 0;
+        while (it < iters) {
+            QuantKernel.q6kQ8MmqLaunchNoSync(yB, padW, xpW, rows, outDim,
+                cols);
+            it = it + 1;
+        }
+        s.sync();
+        float64 msB = (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) iters;
+        float64 tmacs = (float64) (rows * outDim * cols) / 1.0e12;
+        System.stdout.println("  q6batch " + msA + " ms ("
+            + (tmacs / (msA / 1000.0)) + " TMAC/s)   q6mmq " + msB
+            + " ms (" + (tmacs / (msB / 1000.0)) + " TMAC/s)");
+        return bad;
+    }
+
     public static int32 run() {
         System.stdout.println("backend: " + Device.activeBackend());
         int64 b1 = MmqProbe.checkLdsDot();
@@ -660,9 +762,12 @@ public final class MmqProbe {
         int64 b2 = MmqProbe.checkMmq(512L, 4096L, 4096L);
         System.stdout.println("stage2 mmq@512x4096x4096: " + b2
             + "/2097152 wrong");
-        MmqProbe.checkMmq(1024L, 4096L, 4096L);
-        MmqProbe.checkMmq(512L, 14336L, 4096L);
-        MmqProbe.checkMmq(128L, 4096L, 4096L);
-        return (b1 + b2) == 0L ? 0 : 1;
+        int64 b3 = MmqProbe.checkMmq6(512L, 1024L, 4096L);
+        System.stdout.println("stage3 q6mmq@512x1024x4096: " + b3
+            + "/524288 wrong");
+        int64 b4 = MmqProbe.checkMmq6(512L, 4096L, 14336L);
+        System.stdout.println("stage3b q6mmq@512x4096x14336: " + b4
+            + "/2097152 wrong");
+        return (b1 + b2 + b3 + b4) == 0L ? 0 : 1;
     }
 }
