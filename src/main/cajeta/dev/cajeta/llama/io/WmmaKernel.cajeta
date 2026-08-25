@@ -2181,6 +2181,12 @@ public final class WmmaKernel {
      * see the same weight sub-block. Eight persistent float
      * accumulators (~64 VGPRs) are the price.
      */
+    // 10.12.42 NOTE: @Occupancy(minResident = 8) was MEASURED here and
+    // REFUTED: the VGPR cap engaged (256 -> 192, so the attr is not
+    // inert on gfx1151) but occupancy stayed ~20% — the limiter is the
+    // partitioned launch's WG supply, not registers — and the extra
+    // spill (124 -> 212 B/lane) cost ~190 ms. Do not re-add without a
+    // wider partition to feed the freed slots.
     @Kernel @FastMath
     public static void q4kWmmaDeqMw8Kernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> deq,
@@ -2199,8 +2205,16 @@ public final class WmmaKernel {
         // staging time, behind the block's barriers, into one array
         // indexed rgAll[(tile * 8 + j) * 16 + token]: read-only in
         // the j-loop (drift cannot touch it), sliced per (tile, j)
-        // by the verb. cf/cg stayed register-scalar (10.12.31).
+        // by the verb.
         Shared<float32> rgAll = shared float32[1024];
+        // 10.12.42: cf/cg pre-folded per (row-in-WG, j) at block
+        // staging — d*sc and -dmin*mn land in LDS ONCE per block, so
+        // the j-loop reads two scalars instead of holding the 24-
+        // register header decode + select chain across all 8 j
+        // (llama.cpp's (d*sc,-d*m)-at-tile-load shape). Indexed
+        // [(wid*16 + lane16) * 8 + j].
+        Shared<float32> cfAll = shared float32[1024];
+        Shared<float32> cgAll = shared float32[1024];
 
         uint32 tid = KernelThread.x();
         uint32 lane = tid % 32;
@@ -2220,8 +2234,14 @@ public final class WmmaKernel {
             int64 myRo = (int64) (i0 + lane16) * rowBytes;
 
             CooperativeMatrix<int8,16,16,0> ma;
+            // 10.12.42: ONE weight fragment, single-buffered — each
+            // K-half is loaded, used by four mmas, and overwritten.
+            // Halves the weight-fragment live range (the retile's
+            // register diet); the int32 accumulation is exact, so
+            // running all four half-0 mmas before the half-1 mmas is
+            // the same sum. Costs two extra (L0-hot) fragment loads
+            // per j for chunk 1.
             CooperativeMatrix<int8,16,16,1> mbA;
-            CooperativeMatrix<int8,16,16,1> mbB;
             CooperativeMatrix<int32,16,16,2> mc0;
             CooperativeMatrix<int32,16,16,2> mc1;
             CooperativeMatrix<int32,16,16,2> mc2;
@@ -2264,6 +2284,53 @@ public final class WmmaKernel {
                     else if (wid == 5) { xsF[lane] = xv; }
                     else if (wid == 6) { xsG[lane] = xv; }
                     else { xsH[lane] = xv; }
+                    // 10.12.42: this lane's ROW header, decoded once
+                    // per block and pre-folded to (cf, cg) per j —
+                    // nothing of it survives into the j-loop.
+                    int64 ro = myRo + b * 144L;
+                    float32 dv = GgufFile.halfBitsToF32(
+                        ((int32) packed[ro] & 255)
+                        | (((int32) packed[ro + 1L] & 255) << 8));
+                    float32 dmv = GgufFile.halfBitsToF32(
+                        ((int32) packed[ro + 2L] & 255)
+                        | (((int32) packed[ro + 3L] & 255) << 8));
+                    int32 d0 = (int32) packed[ro + 4L] & 255;
+                    int32 d1 = (int32) packed[ro + 5L] & 255;
+                    int32 d2 = (int32) packed[ro + 6L] & 255;
+                    int32 d3 = (int32) packed[ro + 7L] & 255;
+                    int32 m0 = (int32) packed[ro + 8L] & 255;
+                    int32 m1 = (int32) packed[ro + 9L] & 255;
+                    int32 m2 = (int32) packed[ro + 10L] & 255;
+                    int32 m3 = (int32) packed[ro + 11L] & 255;
+                    int32 k0 = (int32) packed[ro + 12L] & 255;
+                    int32 k1 = (int32) packed[ro + 13L] & 255;
+                    int32 k2 = (int32) packed[ro + 14L] & 255;
+                    int32 k3 = (int32) packed[ro + 15L] & 255;
+                    uint32 cb = (wid * 16 + lane) * 8;
+                    cfAll[cb] = dv * (float32) (d0 & 63);
+                    cfAll[cb + 1] = dv * (float32) (d1 & 63);
+                    cfAll[cb + 2] = dv * (float32) (d2 & 63);
+                    cfAll[cb + 3] = dv * (float32) (d3 & 63);
+                    cfAll[cb + 4] = dv
+                        * (float32) ((k0 & 15) | ((d0 >> 2) & 48));
+                    cfAll[cb + 5] = dv
+                        * (float32) ((k1 & 15) | ((d1 >> 2) & 48));
+                    cfAll[cb + 6] = dv
+                        * (float32) ((k2 & 15) | ((d2 >> 2) & 48));
+                    cfAll[cb + 7] = dv
+                        * (float32) ((k3 & 15) | ((d3 >> 2) & 48));
+                    cgAll[cb] = 0.0f - dmv * (float32) (m0 & 63);
+                    cgAll[cb + 1] = 0.0f - dmv * (float32) (m1 & 63);
+                    cgAll[cb + 2] = 0.0f - dmv * (float32) (m2 & 63);
+                    cgAll[cb + 3] = 0.0f - dmv * (float32) (m3 & 63);
+                    cgAll[cb + 4] = 0.0f - dmv
+                        * (float32) ((k0 >> 4) | ((m0 >> 2) & 48));
+                    cgAll[cb + 5] = 0.0f - dmv
+                        * (float32) ((k1 >> 4) | ((m1 >> 2) & 48));
+                    cgAll[cb + 6] = 0.0f - dmv
+                        * (float32) ((k2 >> 4) | ((m2 >> 2) & 48));
+                    cgAll[cb + 7] = 0.0f - dmv
+                        * (float32) ((k3 >> 4) | ((m3 >> 2) & 48));
                 } else {
                     uint32 tk = lane - 16;
                     int64 xb = (int64) (t0 + wid * 16 + tk)
@@ -2287,93 +2354,50 @@ public final class WmmaKernel {
                 }
                 Barrier.workgroup();
 
-                // Weight-side header: per-lane registers (as Mw4).
-                int64 ro = myRo + b * 144L;
-                float32 dv = GgufFile.halfBitsToF32(
-                    ((int32) packed[ro] & 255)
-                    | (((int32) packed[ro + 1L] & 255) << 8));
-                float32 dmv = GgufFile.halfBitsToF32(
-                    ((int32) packed[ro + 2L] & 255)
-                    | (((int32) packed[ro + 3L] & 255) << 8));
-                int32 d0 = (int32) packed[ro + 4L] & 255;
-                int32 d1 = (int32) packed[ro + 5L] & 255;
-                int32 d2 = (int32) packed[ro + 6L] & 255;
-                int32 d3 = (int32) packed[ro + 7L] & 255;
-                int32 m0 = (int32) packed[ro + 8L] & 255;
-                int32 m1 = (int32) packed[ro + 9L] & 255;
-                int32 m2 = (int32) packed[ro + 10L] & 255;
-                int32 m3 = (int32) packed[ro + 11L] & 255;
-                int32 k0 = (int32) packed[ro + 12L] & 255;
-                int32 k1 = (int32) packed[ro + 13L] & 255;
-                int32 k2 = (int32) packed[ro + 14L] & 255;
-                int32 k3 = (int32) packed[ro + 15L] & 255;
-                int32 s0 = d0 & 63;
-                int32 s1 = d1 & 63;
-                int32 s2 = d2 & 63;
-                int32 s3 = d3 & 63;
-                int32 s4 = (k0 & 15) | ((d0 >> 2) & 48);
-                int32 s5 = (k1 & 15) | ((d1 >> 2) & 48);
-                int32 s6 = (k2 & 15) | ((d2 >> 2) & 48);
-                int32 s7 = (k3 & 15) | ((d3 >> 2) & 48);
-                int32 n0 = m0 & 63;
-                int32 n1 = m1 & 63;
-                int32 n2 = m2 & 63;
-                int32 n3 = m3 & 63;
-                int32 n4 = (k0 >> 4) | ((m0 >> 2) & 48);
-                int32 n5 = (k1 >> 4) | ((m1 >> 2) & 48);
-                int32 n6 = (k2 >> 4) | ((m2 >> 2) & 48);
-                int32 n7 = (k3 >> 4) | ((m3 >> 2) & 48);
-
                 uint32 j = 0;
                 while (j < 8) {
-                    int32 scj = s0;
-                    int32 mnj = n0;
-                    if (j == 1) { scj = s1; mnj = n1; }
-                    else if (j == 2) { scj = s2; mnj = n2; }
-                    else if (j == 3) { scj = s3; mnj = n3; }
-                    else if (j == 4) { scj = s4; mnj = n4; }
-                    else if (j == 5) { scj = s5; mnj = n5; }
-                    else if (j == 6) { scj = s6; mnj = n6; }
-                    else if (j == 7) { scj = s7; mnj = n7; }
-                    float32 cfv = dv * (float32) scj;
-                    float32 cgv = 0.0f - dmv * (float32) mnj;
+                    // 10.12.42: the pre-folded row factors — two LDS
+                    // scalar reads replace the header decode + 8-way
+                    // select that used to live here.
+                    float32 cfv = cfAll[(wid * 16 + lane16) * 8 + j];
+                    float32 cgv = cgAll[(wid * 16 + lane16) * 8 + j];
                     uint32 kBase = 32 * j;
                     int64 aOff = (int64) t0 * xRowBytes + b * 320L
                         + (int64) kBase;
                     int64 kAbs = b * 256L + (int64) kBase;
                     int64 bOff = ((int64) (i0 / 16)
                         * (blocksPerRow * 16L) + kAbs / 16L) * 256L;
-                    // BOTH weight halves resident for the whole j.
-                    mbA.load(deq, (uint32) bOff, 1, 16);
-                    mbB.load(deq, (uint32) (bOff + 256L), 1, 16);
-                    // Chunk 0: tiles 0-3.
+                    // Chunk 0: tiles 0-3, half 0 then half 1 with the
+                    // single-buffered weight fragment.
                     mc0.splat(0);
                     mc1.splat(0);
                     mc2.splat(0);
                     mc3.splat(0);
+                    mbA.load(deq, (uint32) bOff, 1, 16);
                     ma.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
                     mc0.mma(ma, mbA);
-                    ma.load(xp, (uint32) (aOff + 16L), 0,
-                        (uint32) xRowBytes);
-                    mc0.mma(ma, mbB);
                     ma.load(xp, (uint32) (aOff + xRowBytes * 16L), 0,
                         (uint32) xRowBytes);
                     mc1.mma(ma, mbA);
-                    ma.load(xp, (uint32) (aOff + xRowBytes * 16L + 16L),
-                        0, (uint32) xRowBytes);
-                    mc1.mma(ma, mbB);
                     ma.load(xp, (uint32) (aOff + xRowBytes * 32L), 0,
                         (uint32) xRowBytes);
                     mc2.mma(ma, mbA);
-                    ma.load(xp, (uint32) (aOff + xRowBytes * 32L + 16L),
-                        0, (uint32) xRowBytes);
-                    mc2.mma(ma, mbB);
                     ma.load(xp, (uint32) (aOff + xRowBytes * 48L), 0,
                         (uint32) xRowBytes);
                     mc3.mma(ma, mbA);
+                    mbA.load(deq, (uint32) (bOff + 256L), 1, 16);
+                    ma.load(xp, (uint32) (aOff + 16L), 0,
+                        (uint32) xRowBytes);
+                    mc0.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 16L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc1.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 32L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc2.mma(ma, mbA);
                     ma.load(xp, (uint32) (aOff + xRowBytes * 48L + 16L),
                         0, (uint32) xRowBytes);
-                    mc3.mma(ma, mbB);
+                    mc3.mma(ma, mbA);
                     // 10.12.33: straight-line — rg comes from the
                     // block-precomputed rgAll via verb slices; no
                     // branch, no per-wave copies (rgAll is read-only
@@ -2388,35 +2412,39 @@ public final class WmmaKernel {
                         rgAll[(24 + j) * 16], cgv);
                     // Chunk 1: tiles 4-7 — mc and rg REUSED; within a
                     // wave the chunk-0 verb calls above are complete,
-                    // so the rewrite introduces no drift hazard.
+                    // so the rewrite introduces no drift hazard. The
+                    // weight halves reload (L0-hot) for the
+                    // single-buffered fragment.
                     mc0.splat(0);
                     mc1.splat(0);
                     mc2.splat(0);
                     mc3.splat(0);
+                    mbA.load(deq, (uint32) bOff, 1, 16);
                     ma.load(xp, (uint32) (aOff + xRowBytes * 64L), 0,
                         (uint32) xRowBytes);
                     mc0.mma(ma, mbA);
-                    ma.load(xp, (uint32) (aOff + xRowBytes * 64L + 16L),
-                        0, (uint32) xRowBytes);
-                    mc0.mma(ma, mbB);
                     ma.load(xp, (uint32) (aOff + xRowBytes * 80L), 0,
                         (uint32) xRowBytes);
                     mc1.mma(ma, mbA);
-                    ma.load(xp, (uint32) (aOff + xRowBytes * 80L + 16L),
-                        0, (uint32) xRowBytes);
-                    mc1.mma(ma, mbB);
                     ma.load(xp, (uint32) (aOff + xRowBytes * 96L), 0,
                         (uint32) xRowBytes);
                     mc2.mma(ma, mbA);
-                    ma.load(xp, (uint32) (aOff + xRowBytes * 96L + 16L),
-                        0, (uint32) xRowBytes);
-                    mc2.mma(ma, mbB);
                     ma.load(xp, (uint32) (aOff + xRowBytes * 112L), 0,
                         (uint32) xRowBytes);
                     mc3.mma(ma, mbA);
+                    mbA.load(deq, (uint32) (bOff + 256L), 1, 16);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 64L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc0.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 80L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc1.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 96L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc2.mma(ma, mbA);
                     ma.load(xp, (uint32) (aOff + xRowBytes * 112L + 16L),
                         0, (uint32) xRowBytes);
-                    mc3.mma(ma, mbB);
+                    mc3.mma(ma, mbA);
                     mc0.scaledAccumInto2S(facc4, xsE, cfv,
                         rgAll[(32 + j) * 16], cgv);
                     mc1.scaledAccumInto2S(facc5, xsF, cfv,
@@ -2478,13 +2506,21 @@ public final class WmmaKernel {
      * window keeps the activation slab MALL-resident. All slices
      * share every buffer; the stream keeps them in order.
      */
+    // 10.12.42: the partition width is SWEEPABLE — the 32-WG optimum
+    // was measured pre-retile (10.12.34) and the retile changed the
+    // kernel it was tuned for. `partw N` re-tunes it.
+    static int64 partWgs = 32L;
+    public static void setPartWgs(int64 n) {
+        WmmaKernel.partWgs = n;
+    }
+
     public static void q4kWmmaDeqMw8PartLaunch(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> deq,
             KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
-        // 32 WGs per launch: tilesM8 * sliceN8 = 32 -> sliceN8.
-        int64 sliceN8 = 32L / tilesM8;
+        // partWgs WGs per launch: tilesM8 * sliceN8 = partWgs -> sliceN8.
+        int64 sliceN8 = WmmaKernel.partWgs / tilesM8;
         if (sliceN8 < 1L) { sliceN8 = 1L; }
         KernelStream s = QuantKernel.stream();
         int64 base = 0L;
