@@ -1968,6 +1968,252 @@ public final class QuantKernel {
         return;
     }
 
+    /**
+     * WAVE-COOPERATIVE Q5_K x q8_K (10.12.39). The Q4_K kernel plus the
+     * fifth bit: same 16-byte header, same lane split (four lanes per
+     * block, lane `g` owns sub-blocks 2g and 2g+1), same dmin ones-dot.
+     * The high bits for the whole super-block live in qh[32] at +16 —
+     * element `e`'s bit is `qh[e % 32] >> (e / 32)`, and a lane's two
+     * sub-blocks are simply bits 2g and 2g+1 of all 32 bytes, so the
+     * fifth bit costs ONE 32-byte load and two vector shifts. Quants are
+     * 0..31, still inside the unsigned-x-signed dotAccum tier.
+     *
+     * Bounds: 31 x 127 x 32 = ~126k per block dot; x a 6-bit scale =
+     * ~7.9M — well inside int32.
+     */
+    @Kernel
+    public static void q5kQ8WaveMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        Shared<float32> part = shared float32[32];
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 32;
+        int64 rowBytes = blocksPerRow * 176L;
+        float32 acc = 0.0f;
+        if (row < rows) {
+            int64 i = (int64) row;
+            int32 g = (int32) (lane % 4);
+            int64 b = (int64) (lane / 4);
+            Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 176L;
+
+                // The Q4_K header, byte for byte (see q4kQ8WaveMatVecKernel
+                // for why only THIS lane's two sub-blocks are decoded).
+                Vector<int8,16> hv = packed.vload<16>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                int32 sc0 = 0;
+                int32 sc1 = 0;
+                int32 mn0 = 0;
+                int32 mn1 = 0;
+                if (g < 2) {
+                    int32 j = 2 * g;
+                    sc0 = (int32) hv[4 + j] & 63;
+                    sc1 = (int32) hv[5 + j] & 63;
+                    mn0 = (int32) hv[8 + j] & 63;
+                    mn1 = (int32) hv[9 + j] & 63;
+                } else {
+                    int32 j = 2 * g - 4;
+                    int32 k0 = (int32) hv[12 + j] & 255;
+                    int32 k1 = (int32) hv[13 + j] & 255;
+                    int32 d0 = (int32) hv[4 + j] & 255;
+                    int32 d1 = (int32) hv[5 + j] & 255;
+                    int32 m0 = (int32) hv[8 + j] & 255;
+                    int32 m1 = (int32) hv[9 + j] & 255;
+                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
+                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                }
+
+                Vector<uint8,32> qh = packed.vload<32>(ro + 16L)
+                    .asUnsigned();
+                Vector<uint8,32> raw = packed.vload<32>(
+                    ro + 48L + (int64) (32 * g)).asUnsigned();
+                Vector<uint8,32> lo = (raw & 15)
+                    | (((qh >> (2 * g)) & 1) << 4);
+                Vector<uint8,32> hi = ((raw >> 4) & 15)
+                    | (((qh >> (2 * g + 1)) & 1) << 4);
+                int64 xb = b * 320L + (int64) (64 * g);
+                Vector<int8,32> a0 = xp.vload<32>(xb);
+                Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
+                Vector<int32,8> tot = lo.dotAccum(a0, zv) * sc0
+                                    + hi.dotAccum(a1, zv) * sc1;
+                int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
+                           + tot[4] + tot[5] + tot[6] + tot[7];
+
+                Vector<uint8,32> ones = (lo ^ lo) | 1;
+                Vector<int32,8> tot2 = ones.dotAccum(a0, zv) * mn0
+                                     + ones.dotAccum(a1, zv) * mn1;
+                int32 dmins = tot2[0] + tot2[1] + tot2[2] + tot2[3]
+                            + tot2[4] + tot2[5] + tot2[6] + tot2[7];
+
+                Vector<int8,4> dv = xp.vload<4>(b * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+
+                acc = acc + d * xs * (float32) sumi
+                          - dmin * xs * (float32) dmins;
+                b = b + 8L;
+            }
+        }
+        part[lane] = acc;
+        Barrier.workgroup();
+        uint32 s = 16;
+        while (s > 0) {
+            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
+            Barrier.workgroup();
+            s = s / 2;
+        }
+        if (lane == 0 && row < rows) {
+            y[yOff + (int64) row] = part[0];
+        }
+    }
+
+    public static void q5kQ8WaveMatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        KernelStream s = QuantKernel.stream();
+        q5kQ8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+            (y, packed, xp, ur, cols / 256L, yOff);
+        return;
+    }
+
+    public static void q5kQ8WaveMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q5kQ8WaveMatVecLaunchNoSync(y, packed, xp, rows, cols,
+            yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
+    /** {@link #q5kQ8WaveMatVecKernel} over HOST arrays. */
+    public static void q5kQ8WaveMatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, xOff, cols, xp);
+        float32[] yh #= heap float32[rows];
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        pb.upload(packed);
+        xpb.upload(xp);
+        QuantKernel.q5kQ8WaveMatVecLaunch(yb, pb, xpb, rows, cols, 0L);
+        yb.download(yh);
+        int64 i = 0;
+        while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
+        return;
+    }
+
+    /**
+     * WAVE-COOPERATIVE Q8_0 x q8_K (10.12.39). The simplest member of the
+     * family: the weights are already int8, so there is nothing to unpack
+     * — one LANE per 32-element weight block, a signed x signed dotAccum,
+     * and the scale is the block's f16 `d` times the covering activation
+     * block's f32 `d`. Thirty-two weight blocks in flight per wave span
+     * exactly four activation blocks; a 4096-wide row is 4 lane
+     * iterations, 14336 is 14.
+     */
+    @Kernel
+    public static void q80Q8WaveMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        Shared<float32> part = shared float32[32];
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 32;
+        int64 rowBytes = blocksPerRow * 34L;
+        float32 acc = 0.0f;
+        if (row < rows) {
+            int64 i = (int64) row;
+            Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
+            int64 wb = (int64) lane;
+            while (wb < blocksPerRow) {
+                int64 ro = i * rowBytes + wb * 34L;
+                // The f16 scale is bytes 0..1; vload<4> because 2-byte
+                // vector loads are not a shape the loader has, and the
+                // two spilled bytes are this block's first quants.
+                Vector<int8,4> dh = packed.vload<4>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) dh[0] & 255)
+                    | (((int32) dh[1] & 255) << 8));
+                Vector<int8,32> w = packed.vload<32>(ro + 2L);
+                int64 ab = wb / 8L;
+                Vector<int8,32> a = xp.vload<32>(ab * 320L
+                    + (wb % 8L) * 32L);
+                Vector<int32,8> tot = w.dotAccum(a, zv);
+                int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
+                           + tot[4] + tot[5] + tot[6] + tot[7];
+                Vector<int8,4> dv = xp.vload<4>(ab * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+                acc = acc + d * xs * (float32) sumi;
+                wb = wb + 32L;
+            }
+        }
+        part[lane] = acc;
+        Barrier.workgroup();
+        uint32 s = 16;
+        while (s > 0) {
+            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
+            Barrier.workgroup();
+            s = s / 2;
+        }
+        if (lane == 0 && row < rows) {
+            y[yOff + (int64) row] = part[0];
+        }
+    }
+
+    public static void q80Q8WaveMatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        KernelStream s = QuantKernel.stream();
+        // Q8_0 blocks are 32-wide, not 256 — the one launch in this
+        // family whose blocksPerRow is cols / 32.
+        q80Q8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+            (y, packed, xp, ur, cols / 32L, yOff);
+        return;
+    }
+
+    public static void q80Q8WaveMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q80Q8WaveMatVecLaunchNoSync(y, packed, xp, rows, cols,
+            yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
+    /** {@link #q80Q8WaveMatVecKernel} over HOST arrays. */
+    public static void q80Q8WaveMatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, xOff, cols, xp);
+        float32[] yh #= heap float32[rows];
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        pb.upload(packed);
+        xpb.upload(xp);
+        QuantKernel.q80Q8WaveMatVecLaunch(yb, pb, xpb, rows, cols, 0L);
+        yb.download(yh);
+        int64 i = 0;
+        while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
+        return;
+    }
+
     /** {@link #q6kQ8WaveMatVecKernel} over HOST arrays. */
     public static void q6kQ8WaveMatVecIntoDevice(int8[] packed, int64 rows,
             int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {

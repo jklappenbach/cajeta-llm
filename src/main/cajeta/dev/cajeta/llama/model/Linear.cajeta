@@ -58,6 +58,8 @@ public final class Linear extends InfModule {
     boolean wave6;
     boolean wave2;
     boolean wave3;
+    boolean wave5;
+    boolean wave8;
     boolean packedAct;
     boolean qAct;
     float32[] yScratch;
@@ -711,7 +713,8 @@ public final class Linear extends InfModule {
                     && QuantKernel.routingEnabled()
                     && (QuantKernel.hasF32Kernel(this.packedTy)
                         || (Linear.waveMv() && Linear.packedActivations()
-                            && Linear.q8Route()))) {
+                            && Linear.q8Route()
+                            && this.inDim % 256 == 0))) {
                 // The second clause: Q2_K/Q3_K exist ONLY on the wave
                 // integer route, so with any of its switches pinned off
                 // they must take the host mat-vec below, not a device
@@ -1245,7 +1248,7 @@ public final class Linear extends InfModule {
             && QuantKernel.routingEnabled()
             && (QuantKernel.hasF32Kernel(this.packedTy)
                 || (Linear.waveMv() && Linear.packedActivations()
-                    && Linear.q8Route()));
+                    && Linear.q8Route() && this.inDim % 256 == 0));
     }
 
     /** Is there a batched GEMM for this projection's weight format? */
@@ -1905,7 +1908,20 @@ public final class Linear extends InfModule {
             // allocated, and flipping the static mid-run would desynchronize
             // the two into a silent no-op.
             this.unified = Linear.wantUnified;
-            this.q8 = Linear.q8Route() && this.packedTy == Quant.GG_Q4_K;
+            // The integer route quantizes activations into 256-element
+            // q8_K blocks, so EVERY flag below requires inDim % 256 == 0.
+            // Real checkpoints always satisfy it (4096/14336/1024); the
+            // 16-wide toy fixtures do not, and before this guard the
+            // Q8_0 wave route walked the activation pack off its buffer —
+            // a host bounds abort ("index 16000 out of bounds for 4432")
+            // and, on the device path, a Memory Fault that poisoned the
+            // HIP context for every test after it. The guard was LATENT
+            // for Q4_K/Q6_K/Q2/Q3 too: no tiny fixture carries those
+            // types, which is why it never fired before 10.12.39 routed
+            // Q8_0 (the one quant the toy model does carry).
+            boolean q8kDims = this.inDim % 256 == 0;
+            this.q8 = Linear.q8Route() && q8kDims
+                && this.packedTy == Quant.GG_Q4_K;
             this.packed1 = Linear.packedActivations();
             // `q8` is part of the condition, not an accident of ordering:
             // the wave kernel is the INTEGER route's kernel, and a Q6_K
@@ -1923,15 +1939,23 @@ public final class Linear extends InfModule {
             // and a caller that pins the switch off must still get the
             // exact path.
             this.wave6 = Linear.waveMv() && this.packed1 && Linear.q8Route()
-                && this.packedTy == Quant.GG_Q6_K;
+                && q8kDims && this.packedTy == Quant.GG_Q6_K;
             // 10.12.45.C: Q2_K/Q3_K have ONLY the wave integer route —
             // no f32 kernel exists for them, so these flags are their
             // whole device story (deviceLaunchable and the matvecInto
             // gate both encode that).
             this.wave2 = Linear.waveMv() && this.packed1 && Linear.q8Route()
-                && this.packedTy == Quant.GG_Q2_K;
+                && q8kDims && this.packedTy == Quant.GG_Q2_K;
             this.wave3 = Linear.waveMv() && this.packed1 && Linear.q8Route()
-                && this.packedTy == Quant.GG_Q3_K;
+                && q8kDims && this.packedTy == Quant.GG_Q3_K;
+            // 10.12.39: Q5_K and Q8_0 join the wave integer route. Until
+            // now they were the two types still decoding on the
+            // one-item-per-row f32 kernels — measured 14 and 10 ms/token
+            // above llama.cpp's bandwidth line at 512 context.
+            this.wave5 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+                && q8kDims && this.packedTy == Quant.GG_Q5_K;
+            this.wave8 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+                && q8kDims && this.packedTy == Quant.GG_Q8_0;
             // WHAT THE KERNEL READS, which is not the same question as
             // whether the integer route is on. A Q6_K wave weight has
             // `q8 == false` — it makes no activation-quantization switch —
@@ -1950,7 +1974,8 @@ public final class Linear extends InfModule {
             // so every Linear keyed alike and a Q6_K f32 weight took a hit
             // on an integer staging. Tokens went 15 198 334 62 334 ->
             // 15 13 40 13 40, which is the same signature 9.9 recorded.
-            this.qAct = this.q8 || this.wave6 || this.wave2 || this.wave3;
+            this.qAct = this.q8 || this.wave6 || this.wave2 || this.wave3
+                || this.wave5 || this.wave8;
             this.packedAct = this.qAct && this.packed1;
         if (this.unified) { this.yDev.allocate(MemoryKind.Unified); }
         return;
@@ -1980,7 +2005,8 @@ public final class Linear extends InfModule {
         // kernel puts one workgroup on each row, so 14336 rows is already
         // 14336 workgroups and splitting them costs: measured 185.9 GB/s
         // chunked against 197.3 whole, on the same weight in the same run.
-        if (this.wave || this.wave6 || this.wave2 || this.wave3) {
+        if (this.wave || this.wave6 || this.wave2 || this.wave3
+                || this.wave5 || this.wave8) {
             chunk = rows;
         }
         if (chunk >= rows) {
@@ -2050,6 +2076,22 @@ public final class Linear extends InfModule {
                     Linear.stXp, nr, (int64) this.inDim, r0);
             } else {
                 QuantKernel.q3kQ8WaveMatVecLaunch(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            }
+        } else if (this.wave5) {
+            if (Linear.oneSync) {
+                QuantKernel.q5kQ8WaveMatVecLaunchNoSync(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q5kQ8WaveMatVecLaunch(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            }
+        } else if (this.wave8) {
+            if (Linear.oneSync) {
+                QuantKernel.q80Q8WaveMatVecLaunchNoSync(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q80Q8WaveMatVecLaunch(this.yDev, w,
                     Linear.stXp, nr, (int64) this.inDim, r0);
             }
         } else if (Linear.oneSync) {
