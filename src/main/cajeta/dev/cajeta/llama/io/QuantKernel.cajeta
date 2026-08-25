@@ -237,6 +237,7 @@ public final class QuantKernel {
         return GgufFile.halfBitsToF32(h);
     }
 
+
     /**
      * `y[yOff + i] = W[i]·x` for one row per work item, W packed Q6_K.
      *
@@ -1760,13 +1761,23 @@ public final class QuantKernel {
         float32 acc = 0.0f;
         if (row < rows) {
             int64 i = (int64) row;
-            int32 sb = (int32) (lane % 16);
-            int64 b = (int64) (lane / 16);
-            // Sub-block geometry, hoisted once: e = 16*sb + t lives in
-            // qs bytes 16 + 32*(sb/8) + 16*(sb%2) + t at shift
-            // 2*((sb%8)/2).
-            int32 qOff = 16 + 32 * (sb / 8) + 16 * (sb % 2);
-            int32 sh = 2 * ((sb % 8) / 2);
+            // V2 (2026-08-25, the unpack-cost pass): one lane per
+            // 16-byte qs GROUP rather than per sub-block. The first
+            // shape had four lanes re-loading the SAME 16 qs bytes at
+            // four different shifts; llama.cpp's mmvq twin extracts
+            // all four 2-bit planes from one register instead
+            // (`(v >> 2i) & 0x03030303`), and this is that move at
+            // vector width. A group's four planes are sub-blocks
+            // 8*(g/2) + (g%2) + 2k for k = 0..3 at shift 2k, so one
+            // load feeds four dots; the per-plane scale multiplies
+            // stay in int32 VECTOR lanes and the horizontal reduce
+            // happens once per group, not once per sub-block; d, dmin
+            // and xs are decoded by 4 lanes per block instead of 16.
+            // Eight blocks in flight per wave.
+            int32 g = (int32) (lane % 4);
+            int64 b = (int64) (lane / 4);
+            int32 sb0 = 8 * (g / 2) + (g % 2);
+            int32 qOff = 16 + 16 * g;
             Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
             while (b < blocksPerRow) {
                 int64 ro = i * rowBytes + b * 84L;
@@ -1774,15 +1785,31 @@ public final class QuantKernel {
                 float32 dmin = QuantKernel.f16AtDev(packed, ro + 82L);
                 int64 xb = b * 320L;
                 Vector<int8,16> qv = packed.vload<16>(ro + (int64) qOff);
-                Vector<uint8,16> qu = ((qv >> sh) & 3).asUnsigned();
-                Vector<int8,16> a = xp.vload<16>(xb + (int64) (sb * 16));
-                Vector<uint8,16> ones = (qu ^ qu) | 1;
+                Vector<uint8,16> q0 = (qv & 3).asUnsigned();
+                Vector<uint8,16> q1 = ((qv >> 2) & 3).asUnsigned();
+                Vector<uint8,16> q2 = ((qv >> 4) & 3).asUnsigned();
+                Vector<uint8,16> q3 = ((qv >> 6) & 3).asUnsigned();
+                int64 ab = xb + (int64) (sb0 * 16);
+                Vector<int8,16> a0 = xp.vload<16>(ab);
+                Vector<int8,16> a1 = xp.vload<16>(ab + 32L);
+                Vector<int8,16> a2 = xp.vload<16>(ab + 64L);
+                Vector<int8,16> a3 = xp.vload<16>(ab + 96L);
+                int32 s0 = (int32) packed[ro + (int64) sb0] & 255;
+                int32 s1 = (int32) packed[ro + (int64) (sb0 + 2)] & 255;
+                int32 s2 = (int32) packed[ro + (int64) (sb0 + 4)] & 255;
+                int32 s3 = (int32) packed[ro + (int64) (sb0 + 6)] & 255;
+                Vector<uint8,16> ones = (q0 ^ q0) | 1;
 
-                Vector<int32,4> dv = qu.dotAccum(a, z4);
-                Vector<int32,4> sv = ones.dotAccum(a, z4);
-                int32 dot = dv[0] + dv[1] + dv[2] + dv[3];
-                int32 asum = sv[0] + sv[1] + sv[2] + sv[3];
-                int32 scb = (int32) packed[ro + (int64) sb] & 255;
+                Vector<int32,4> td = q0.dotAccum(a0, z4) * (s0 & 15)
+                    + q1.dotAccum(a1, z4) * (s1 & 15)
+                    + q2.dotAccum(a2, z4) * (s2 & 15)
+                    + q3.dotAccum(a3, z4) * (s3 & 15);
+                Vector<int32,4> tm = ones.dotAccum(a0, z4) * (s0 >> 4)
+                    + ones.dotAccum(a1, z4) * (s1 >> 4)
+                    + ones.dotAccum(a2, z4) * (s2 >> 4)
+                    + ones.dotAccum(a3, z4) * (s3 >> 4);
+                int32 dot = td[0] + td[1] + td[2] + td[3];
+                int32 msum = tm[0] + tm[1] + tm[2] + tm[3];
 
                 Vector<int8,4> dvs = xp.vload<4>(xb + 288L);
                 float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
@@ -1790,9 +1817,9 @@ public final class QuantKernel {
                     | (((int32) dvs[2] & 255) << 16)
                     | (((int32) dvs[3] & 255) << 24));
 
-                acc = acc + xs * (d * (float32) ((scb & 15) * dot)
-                    - dmin * (float32) ((scb >> 4) * asum));
-                b = b + 2L;
+                acc = acc + xs * (d * (float32) dot
+                    - dmin * (float32) msum);
+                b = b + 8L;
             }
         }
         part[lane] = acc;
@@ -1869,12 +1896,21 @@ public final class QuantKernel {
         float32 acc = 0.0f;
         if (row < rows) {
             int64 i = (int64) row;
-            int32 sb = (int32) (lane % 16);
-            int64 b = (int64) (lane / 16);
-            int32 qOff = 32 + 32 * (sb / 8) + 16 * (sb % 2);
-            int32 hOff = 16 * (sb % 2);
-            int32 sh = 2 * ((sb % 8) / 2);
-            int32 hbit = sb / 2;
+            // V2 (2026-08-25, the unpack-cost pass — see the Q2 kernel
+            // for the full argument): one lane per 16-byte qs group,
+            // all four 2-bit planes extracted from one register, and
+            // ONE hmask load serves the whole group — plane k of group
+            // g is sub-block 8*(g/2) + (g%2) + 2k, whose high bit is
+            // bit 4*(g/2) + k of the same 16 hmask bytes. Scale
+            // multiplies stay in int32 vector lanes; one horizontal
+            // reduce per group; d and xs decoded by 4 lanes per block
+            // instead of 16. Eight blocks in flight.
+            int32 g = (int32) (lane % 4);
+            int64 b = (int64) (lane / 4);
+            int32 sb0 = 8 * (g / 2) + (g % 2);
+            int32 qOff = 32 + 16 * g;
+            int32 hOff = 16 * (g % 2);
+            int32 hb0 = 4 * (g / 2);
             Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
             while (b < blocksPerRow) {
                 int64 ro = i * rowBytes + b * 110L;
@@ -1882,29 +1918,69 @@ public final class QuantKernel {
                 int64 xb = b * 320L;
                 Vector<int8,16> qv = packed.vload<16>(ro + (int64) qOff);
                 Vector<int8,16> hv = packed.vload<16>(ro + (int64) hOff);
-                Vector<int8,16> ql = (qv >> sh) & 3;
-                Vector<int8,16> hb = (hv >> hbit) & 1;
-                Vector<uint8,16> qu = (ql | (hb << 2)).asUnsigned();
-                Vector<int8,16> a = xp.vload<16>(xb + (int64) (sb * 16));
-                Vector<uint8,16> ones = (qu ^ qu) | 1;
+                Vector<uint8,16> q0 = ((qv & 3)
+                    | (((hv >> hb0) & 1) << 2)).asUnsigned();
+                Vector<uint8,16> q1 = (((qv >> 2) & 3)
+                    | (((hv >> (hb0 + 1)) & 1) << 2)).asUnsigned();
+                Vector<uint8,16> q2 = (((qv >> 4) & 3)
+                    | (((hv >> (hb0 + 2)) & 1) << 2)).asUnsigned();
+                Vector<uint8,16> q3 = (((qv >> 6) & 3)
+                    | (((hv >> (hb0 + 3)) & 1) << 2)).asUnsigned();
+                int64 ab = xb + (int64) (sb0 * 16);
+                Vector<int8,16> a0 = xp.vload<16>(ab);
+                Vector<int8,16> a1 = xp.vload<16>(ab + 32L);
+                Vector<int8,16> a2 = xp.vload<16>(ab + 64L);
+                Vector<int8,16> a3 = xp.vload<16>(ab + 96L);
+                Vector<uint8,16> ones = (q0 ^ q0) | 1;
 
-                Vector<int32,4> dv = qu.dotAccum(a, z4);
-                Vector<int32,4> sv = ones.dotAccum(a, z4);
-                int32 dot = dv[0] + dv[1] + dv[2] + dv[3];
-                int32 asum = sv[0] + sv[1] + sv[2] + sv[3];
-
-                // This lane's six-bit signed scale, decoded as the host
-                // floor decodes all sixteen.
-                int32 b0 = (int32) packed[ro + (int64) (96 + (sb % 8))]
+                // The four six-bit signed scales, decoded INLINE as the
+                // host floor decodes all sixteen (a static helper's
+                // KernelBuffer indexing does not resolve outside a
+                // kernel body). No ternary: expression-form conditionals
+                // do not lower in kernel bodies. sb0 is 0/1/8/9, so the
+                // low-nibble/high-nibble split (sb < 8 vs >= 8) is
+                // UNIFORM across a group's four sub-blocks sb0+2k.
+                int32 lb0 = (int32) packed[ro + (int64) (96 + (sb0 % 8))]
                     & 255;
-                // No ternary: expression-form conditionals do not lower
-                // in kernel bodies (the Q6 kernel's `if (sl == 1)` shape
-                // exists for the same reason).
-                int32 lo4 = b0 & 15;
-                if (sb >= 8) { lo4 = b0 >> 4; }
-                int32 hb2 = ((int32) packed[ro + (int64) (104 + (sb & 3))]
-                    & 255) >> (2 * (sb / 4));
-                int32 sc = (lo4 | ((hb2 & 3) << 4)) - 32;
+                int32 lb1 = (int32) packed[ro + (int64) (96 + ((sb0 + 2) % 8))]
+                    & 255;
+                int32 lb2 = (int32) packed[ro + (int64) (96 + ((sb0 + 4) % 8))]
+                    & 255;
+                int32 lb3 = (int32) packed[ro + (int64) (96 + ((sb0 + 6) % 8))]
+                    & 255;
+                int32 lo0 = lb0 & 15;
+                int32 lo1 = lb1 & 15;
+                int32 lo2 = lb2 & 15;
+                int32 lo3 = lb3 & 15;
+                if (sb0 >= 8) {
+                    lo0 = lb0 >> 4;
+                    lo1 = lb1 >> 4;
+                    lo2 = lb2 >> 4;
+                    lo3 = lb3 >> 4;
+                }
+                int32 h0 = ((int32) packed[ro + (int64) (104 + (sb0 & 3))]
+                    & 255) >> (2 * (sb0 / 4));
+                int32 h1 = ((int32) packed[ro + (int64) (104 + ((sb0 + 2) & 3))]
+                    & 255) >> (2 * ((sb0 + 2) / 4));
+                int32 h2 = ((int32) packed[ro + (int64) (104 + ((sb0 + 4) & 3))]
+                    & 255) >> (2 * ((sb0 + 4) / 4));
+                int32 h3 = ((int32) packed[ro + (int64) (104 + ((sb0 + 6) & 3))]
+                    & 255) >> (2 * ((sb0 + 6) / 4));
+                int32 sc0 = (lo0 | ((h0 & 3) << 4)) - 32;
+                int32 sc1 = (lo1 | ((h1 & 3) << 4)) - 32;
+                int32 sc2 = (lo2 | ((h2 & 3) << 4)) - 32;
+                int32 sc3 = (lo3 | ((h3 & 3) << 4)) - 32;
+
+                Vector<int32,4> td = q0.dotAccum(a0, z4) * sc0
+                    + q1.dotAccum(a1, z4) * sc1
+                    + q2.dotAccum(a2, z4) * sc2
+                    + q3.dotAccum(a3, z4) * sc3;
+                Vector<int32,4> ta = ones.dotAccum(a0, z4) * sc0
+                    + ones.dotAccum(a1, z4) * sc1
+                    + ones.dotAccum(a2, z4) * sc2
+                    + ones.dotAccum(a3, z4) * sc3;
+                int32 dot = td[0] + td[1] + td[2] + td[3];
+                int32 asum = ta[0] + ta[1] + ta[2] + ta[3];
 
                 Vector<int8,4> dvs = xp.vload<4>(xb + 288L);
                 float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
@@ -1912,8 +1988,8 @@ public final class QuantKernel {
                     | (((int32) dvs[2] & 255) << 16)
                     | (((int32) dvs[3] & 255) << 24));
 
-                acc = acc + d * xs * (float32) (sc * (dot - 4 * asum));
-                b = b + 2L;
+                acc = acc + d * xs * (float32) (dot - 4 * asum);
+                b = b + 8L;
             }
         }
         part[lane] = acc;
