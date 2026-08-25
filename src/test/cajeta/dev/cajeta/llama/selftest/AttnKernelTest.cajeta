@@ -619,6 +619,173 @@ public class AttnKernelTest {
         }
     }
 
+    // ── flash prefill attend at hd 128 (10.12.43) ───────────────────────
+    //
+    // The hd==128 route is the one the model actually runs, and until
+    // these tests it was UNTESTED here — the v1-shaped tests above use
+    // hd 64/32, which the launch routes AWAY from the v2/flash kernels.
+    // v2 shipped on bench-token equality alone; the flash kernel gets a
+    // real floor.
+
+    /**
+     * 10.12.43 — the fused online-softmax prefill attend agrees with the
+     * host floor at hd 128 (the routed shape), GQA, both at startPos 0
+     * and mid-sequence. The online (m, l) recurrence reorders the exp
+     * sums relative to the host's two-pass softmax, so tolerance is the
+     * bar, exactly as for the reduction trees.
+     */
+    @Test
+    public void theFlashPrefillAttendMatchesTheHostAtHd128() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        AttnKernel.setAttnFlash(true);
+        int32 nH = 8;
+        int32 hd = 128;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        // nKv = 2 is group 4 (the GQA x4 wave kernel); nKv = 4 is group
+        // 2 (the general fused fallback). Both routes get the floor.
+        int32 nKv = 2;
+        while (nKv <= 4) {
+            int32 sp = 0;
+            while (sp <= 10) {
+                int32 rows = 9;
+                int32 tMax = sp + rows;
+                int64 kvDim = (int64) (nKv * hd);
+                int64 qn = (int64) rows * (int64) (nH * hd);
+                float32[] q #= AttnKernelTest.spread(qn, 83 + sp + nKv);
+                float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim,
+                    89);
+                float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim,
+                    97);
+                float32[] want #= heap float32[qn];
+                AttnKernel.attendPrefillHost(want, q, k, v, rows, nH, nKv,
+                    hd, sp, scale);
+                float32[] got #= heap float32[qn];
+                AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv,
+                    hd, sp, scale);
+                AttnKernelTest.assertLive(got, "flash prefill attend nKv"
+                    + nKv + " sp" + sp);
+                AttnKernelTest.assertClose(want, got,
+                    "flash prefill attend nKv" + nKv + " sp" + sp);
+                sp = sp + 10;
+            }
+            nKv = nKv + 2;
+        }
+    }
+
+    /**
+     * 10.12.43 — the flash attend is causal at hd 128: moving the last
+     * key position moves only the last row. A fused kernel that ran its
+     * online loop one position long agrees with nothing here. Runs BOTH
+     * routed shapes: nKv = 1 (nH == 4 * nKv, the GQA x4 wave kernel) and
+     * nKv = 2 (group 2, the general fused fallback).
+     */
+    @Test
+    public void theFlashPrefillAttendIsCausalAtHd128() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        AttnKernel.setAttnFlash(true);
+        int32 nkv = 1;
+        while (nkv <= 2) {
+            AttnKernelTest.causalAtHd128(nkv);
+            nkv = nkv + 1;
+        }
+    }
+
+    static void causalAtHd128(int32 nKv) {
+        int32 rows = 7;
+        int32 nH = 4;
+        int32 hd = 128;
+        int32 tMax = rows;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        float32[] q #= AttnKernelTest.spread(qn, 101);
+        float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 103);
+        float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim, 107);
+        float32[] got #= heap float32[qn];
+        AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv, hd,
+            0, scale);
+        float32[] v2 #= heap float32[(int64) tMax * kvDim];
+        int64 i = 0;
+        while (i < (int64) tMax * kvDim) { v2[i] = v[i]; i = i + 1; }
+        int64 last = (int64) (tMax - 1) * kvDim;
+        int64 j = 0;
+        while (j < kvDim) { v2[last + j] = v2[last + j] + 5.0f; j = j + 1; }
+        float32[] moved #= heap float32[qn];
+        AttnKernel.attendPrefillInto(moved, q, k, v2, rows, nH, nKv, hd,
+            0, scale);
+        int64 rowLen = (int64) (nH * hd);
+        int32 r = 0;
+        while (r < rows - 1) {
+            int64 off = (int64) r * rowLen;
+            int64 c = 0;
+            while (c < rowLen) {
+                if (moved[off + c] != got[off + c]) {
+                    Assert.fail("flash row " + r + " changed when key "
+                        + "position " + (tMax - 1) + " changed - NOT "
+                        + "causal");
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        int64 lo = (int64) (rows - 1) * rowLen;
+        int64 diff = 0;
+        int64 c2 = 0;
+        while (c2 < rowLen) {
+            if (moved[lo + c2] != got[lo + c2]) { diff = diff + 1; }
+            c2 = c2 + 1;
+        }
+        if (diff == 0) {
+            Assert.fail("the last row did not move with the last key "
+                + "position - the flash attend is not reading it");
+        }
+    }
+
+    /**
+     * 10.12.43 — the flash attend's ONLINE normalizer sums to one. The
+     * two-pass softmax's normalizer is a plain sum; the online one is
+     * rebuilt through rescale-by-exp(mOld - mNew) corrections at every
+     * running-max update, and a correction applied to `l` but not to the
+     * accumulator (or vice versa) still produces plausible values on
+     * smooth data. With V all ones the output must be exactly a convex
+     * weight sum: 1.0 everywhere.
+     */
+    @Test
+    public void theFlashPrefillAttendNormalizesItsOnlineWeights() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        AttnKernel.setAttnFlash(true);
+        int32 rows = 8;
+        int32 nH = 4;
+        int32 nKv = 1;
+        int32 hd = 128;
+        int32 tMax = rows;
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        // Scale UP rather than down so the scores swing hard and the
+        // running max updates many times - a rescale bug needs max
+        // updates to fire at all.
+        float32 scale = 2.0f;
+        float32[] q #= AttnKernelTest.spread(qn, 113);
+        float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 127);
+        float32[] v #= heap float32[(int64) tMax * kvDim];
+        int64 i = 0;
+        while (i < (int64) tMax * kvDim) { v[i] = 1.0f; i = i + 1; }
+        float32[] got #= heap float32[qn];
+        AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv, hd,
+            0, scale);
+        i = 0;
+        while (i < qn) {
+            float32 e = got[i] - 1.0f;
+            if (e < 0.0f) { e = 0.0f - e; }
+            if (e > 0.0005f) {
+                Assert.fail("with V all ones the flash attend must return "
+                    + "1.0; element " + i + " is " + got[i]
+                    + " - the online normalizer does not sum to one");
+            }
+            i = i + 1;
+        }
+    }
+
     /**
      * 10.12.2 — the prefill attend honours a nonzero `startPos`, so a
      * second prefill chunk reads the first chunk's positions.

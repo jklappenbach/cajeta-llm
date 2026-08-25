@@ -554,6 +554,341 @@ public final class AttnKernel {
         }
     }
 
+    /**
+     * Flash prefill attend (10.12.43): the v2 score/combine PAIR fused
+     * into one online-softmax kernel — same wave-per-(row,head) shape,
+     * same b128 lane mapping (lane `l` owns dims [4l, 4l+3]), but the
+     * scores never touch memory. The pair pays 4 full passes of O(n^2)
+     * score traffic (write, max-read, exp-rewrite, combine-read) plus a
+     * second launch; here the softmax runs as the (m, l) recurrence with
+     * the V accumulation folded in, so per position the memory ops are
+     * exactly one K row and one V row.
+     *
+     * The reduced score is WAVE-UNIFORM (Wave.reduceSumF32 lands in an
+     * SGPR), so the running-max branch is a uniform s_cbranch: the
+     * common case (no new max) skips the accumulator rescale entirely.
+     * t = 0 is peeled to seed (m, l, a) directly — no sentinel max, so
+     * no exp of a huge negative argument ever forms under @FastMath.
+     * The main loop runs t x4 as a BLOCK online update: four K-row b128
+     * loads in flight before the first reduce, then ONE max and ONE
+     * rescale per block with the four exps independent. Fusion alone
+     * measured 47-50 ms vs the pair's 58.8 (block vs per-t update: a
+     * wash) — the loop is memory-issue bound, and the real win is the
+     * GQA x4 kernel above. Requires hd == 128; serves the group != 4
+     * shapes the GQA kernel cannot.
+     */
+    @Kernel @FastMath
+    public static void attnFlashPrefillKernel(KernelBuffer<float32> out,
+            KernelBuffer<float32> q, KernelBuffer<float32> kPool,
+            KernelBuffer<float32> vPool, uint32 rows, uint32 nH,
+            uint32 nKv, uint32 startPos, float32 scale) {
+        uint32 lane = KernelThread.x();
+        uint32 wv = KernelThread.globalIdX() / 32;
+        if (wv < rows * nH) {
+            uint32 r = wv / nH;
+            uint32 h = wv % nH;
+            uint32 kvDim = nKv * 128;
+            uint32 kvh = h / (nH / nKv);
+            uint32 qBase = r * (nH * 128) + h * 128 + lane * 4;
+            uint32 count = startPos + r + 1;
+            float32 q0 = q[qBase];
+            float32 q1 = q[qBase + 1];
+            float32 q2 = q[qBase + 2];
+            float32 q3 = q[qBase + 3];
+            uint32 kBase = kvh * 128 + lane * 4;
+            // t = 0 seeds the recurrence: weight exp(s - s) = 1.
+            float32 sd = q0 * kPool[kBase] + q1 * kPool[kBase + 1]
+                       + q2 * kPool[kBase + 2] + q3 * kPool[kBase + 3];
+            float32 m = Wave.reduceSumF32(sd) * scale;
+            float32 l = 1.0f;
+            float32 a0 = vPool[kBase];
+            float32 a1 = vPool[kBase + 1];
+            float32 a2 = vPool[kBase + 2];
+            float32 a3 = vPool[kBase + 3];
+            uint32 t = 1;
+            while (t + 4 <= count) {
+                uint32 kRow0 = t * kvDim + kBase;
+                uint32 kRow1 = kRow0 + kvDim;
+                uint32 kRow2 = kRow1 + kvDim;
+                uint32 kRow3 = kRow2 + kvDim;
+                float32 s0 = q0 * kPool[kRow0] + q1 * kPool[kRow0 + 1]
+                           + q2 * kPool[kRow0 + 2] + q3 * kPool[kRow0 + 3];
+                float32 s1 = q0 * kPool[kRow1] + q1 * kPool[kRow1 + 1]
+                           + q2 * kPool[kRow1 + 2] + q3 * kPool[kRow1 + 3];
+                float32 s2 = q0 * kPool[kRow2] + q1 * kPool[kRow2 + 1]
+                           + q2 * kPool[kRow2 + 2] + q3 * kPool[kRow2 + 3];
+                float32 s3 = q0 * kPool[kRow3] + q1 * kPool[kRow3 + 1]
+                           + q2 * kPool[kRow3 + 2] + q3 * kPool[kRow3 + 3];
+                float32 u0 = Wave.reduceSumF32(s0) * scale;
+                float32 u1 = Wave.reduceSumF32(s1) * scale;
+                float32 u2 = Wave.reduceSumF32(s2) * scale;
+                float32 u3 = Wave.reduceSumF32(s3) * scale;
+                // BLOCK online update: one max / one rescale per four
+                // positions, the four exps independent. MEASURED a wash
+                // vs the per-t form (49.7-50.8 vs 47.0 ms as the routed
+                // kernel) — this loop is memory-issue bound, not
+                // chain-bound, which is why the GQA x4 kernel above
+                // (2 loads where a group of waves issued 8) is the one
+                // that actually moved. This kernel now serves only the
+                // group != 4 fallback shapes.
+                float32 mb = u0;
+                if (u1 > mb) { mb = u1; }
+                if (u2 > mb) { mb = u2; }
+                if (u3 > mb) { mb = u3; }
+                if (mb > m) {
+                    float32 c = Math.exp(m - mb);
+                    float32 w0 = Math.exp(u0 - mb);
+                    float32 w1 = Math.exp(u1 - mb);
+                    float32 w2 = Math.exp(u2 - mb);
+                    float32 w3 = Math.exp(u3 - mb);
+                    a0 = a0 * c + w0 * vPool[kRow0] + w1 * vPool[kRow1]
+                       + w2 * vPool[kRow2] + w3 * vPool[kRow3];
+                    a1 = a1 * c + w0 * vPool[kRow0 + 1] + w1 * vPool[kRow1 + 1]
+                       + w2 * vPool[kRow2 + 1] + w3 * vPool[kRow3 + 1];
+                    a2 = a2 * c + w0 * vPool[kRow0 + 2] + w1 * vPool[kRow1 + 2]
+                       + w2 * vPool[kRow2 + 2] + w3 * vPool[kRow3 + 2];
+                    a3 = a3 * c + w0 * vPool[kRow0 + 3] + w1 * vPool[kRow1 + 3]
+                       + w2 * vPool[kRow2 + 3] + w3 * vPool[kRow3 + 3];
+                    l = l * c + w0 + w1 + w2 + w3;
+                    m = mb;
+                } else {
+                    float32 w0 = Math.exp(u0 - m);
+                    float32 w1 = Math.exp(u1 - m);
+                    float32 w2 = Math.exp(u2 - m);
+                    float32 w3 = Math.exp(u3 - m);
+                    a0 = a0 + w0 * vPool[kRow0] + w1 * vPool[kRow1]
+                       + w2 * vPool[kRow2] + w3 * vPool[kRow3];
+                    a1 = a1 + w0 * vPool[kRow0 + 1] + w1 * vPool[kRow1 + 1]
+                       + w2 * vPool[kRow2 + 1] + w3 * vPool[kRow3 + 1];
+                    a2 = a2 + w0 * vPool[kRow0 + 2] + w1 * vPool[kRow1 + 2]
+                       + w2 * vPool[kRow2 + 2] + w3 * vPool[kRow3 + 2];
+                    a3 = a3 + w0 * vPool[kRow0 + 3] + w1 * vPool[kRow1 + 3]
+                       + w2 * vPool[kRow2 + 3] + w3 * vPool[kRow3 + 3];
+                    l = l + w0 + w1 + w2 + w3;
+                }
+                t = t + 4;
+            }
+            while (t < count) {
+                uint32 kRow = t * kvDim + kBase;
+                float32 s = q0 * kPool[kRow] + q1 * kPool[kRow + 1]
+                          + q2 * kPool[kRow + 2] + q3 * kPool[kRow + 3];
+                float32 u = Wave.reduceSumF32(s) * scale;
+                if (u > m) {
+                    float32 c = Math.exp(m - u);
+                    a0 = a0 * c + vPool[kRow];
+                    a1 = a1 * c + vPool[kRow + 1];
+                    a2 = a2 * c + vPool[kRow + 2];
+                    a3 = a3 * c + vPool[kRow + 3];
+                    l = l * c + 1.0f;
+                    m = u;
+                } else {
+                    float32 w = Math.exp(u - m);
+                    a0 = a0 + w * vPool[kRow];
+                    a1 = a1 + w * vPool[kRow + 1];
+                    a2 = a2 + w * vPool[kRow + 2];
+                    a3 = a3 + w * vPool[kRow + 3];
+                    l = l + w;
+                }
+                t = t + 1;
+            }
+            float32 rs = 1.0f / l;
+            uint32 oBase = r * (nH * 128) + h * 128 + lane * 4;
+            out[oBase] = a0 * rs;
+            out[oBase + 1] = a1 * rs;
+            out[oBase + 2] = a2 * rs;
+            out[oBase + 3] = a3 * rs;
+        }
+    }
+
+    /**
+     * Flash prefill attend, GQA x4 (10.12.43): ONE WAVE serves all FOUR
+     * q-heads of a kv group. The fused single-head kernel measured 99.3%
+     * MemUnitBusy at VGPR 72 with no spill — memory-INSTRUCTION issue is
+     * the wall, and under GQA the four waves of a kv group issue the
+     * SAME K-row and V-row loads four times over. Folding the group into
+     * one wave cuts the memory ops per position from 8 b128 to 2, and
+     * the extra dots land on the VALU, which this wall leaves idle.
+     * State per head stays independent: four (m, l) pairs, four
+     * accumulator quads. Requires hd == 128 AND nH == 4 * nKv; the
+     * launch falls back to the general fused kernel otherwise.
+     */
+    @Kernel @FastMath
+    public static void attnFlashPrefillGqa4Kernel(KernelBuffer<float32> out,
+            KernelBuffer<float32> q, KernelBuffer<float32> kPool,
+            KernelBuffer<float32> vPool, uint32 rows, uint32 nH,
+            uint32 nKv, uint32 startPos, float32 scale) {
+        uint32 lane = KernelThread.x();
+        uint32 wv = KernelThread.globalIdX() / 32;
+        if (wv < rows * nKv) {
+            uint32 r = wv / nKv;
+            uint32 kvh = wv % nKv;
+            uint32 kvDim = nKv * 128;
+            uint32 h0 = kvh * 4;
+            uint32 count = startPos + r + 1;
+            uint32 qRow = r * (nH * 128) + h0 * 128 + lane * 4;
+            float32 qa0 = q[qRow];
+            float32 qa1 = q[qRow + 1];
+            float32 qa2 = q[qRow + 2];
+            float32 qa3 = q[qRow + 3];
+            float32 qb0 = q[qRow + 128];
+            float32 qb1 = q[qRow + 129];
+            float32 qb2 = q[qRow + 130];
+            float32 qb3 = q[qRow + 131];
+            float32 qc0 = q[qRow + 256];
+            float32 qc1 = q[qRow + 257];
+            float32 qc2 = q[qRow + 258];
+            float32 qc3 = q[qRow + 259];
+            float32 qd0 = q[qRow + 384];
+            float32 qd1 = q[qRow + 385];
+            float32 qd2 = q[qRow + 386];
+            float32 qd3 = q[qRow + 387];
+            uint32 kBase = kvh * 128 + lane * 4;
+            // t = 0 seeds every head's recurrence: weight exp(s-s) = 1.
+            float32 k0 = kPool[kBase];
+            float32 k1 = kPool[kBase + 1];
+            float32 k2 = kPool[kBase + 2];
+            float32 k3 = kPool[kBase + 3];
+            float32 mA = Wave.reduceSumF32(
+                qa0 * k0 + qa1 * k1 + qa2 * k2 + qa3 * k3) * scale;
+            float32 mB = Wave.reduceSumF32(
+                qb0 * k0 + qb1 * k1 + qb2 * k2 + qb3 * k3) * scale;
+            float32 mC = Wave.reduceSumF32(
+                qc0 * k0 + qc1 * k1 + qc2 * k2 + qc3 * k3) * scale;
+            float32 mD = Wave.reduceSumF32(
+                qd0 * k0 + qd1 * k1 + qd2 * k2 + qd3 * k3) * scale;
+            float32 lA = 1.0f;
+            float32 lB = 1.0f;
+            float32 lC = 1.0f;
+            float32 lD = 1.0f;
+            float32 v0 = vPool[kBase];
+            float32 v1 = vPool[kBase + 1];
+            float32 v2 = vPool[kBase + 2];
+            float32 v3 = vPool[kBase + 3];
+            float32 aa0 = v0;
+            float32 aa1 = v1;
+            float32 aa2 = v2;
+            float32 aa3 = v3;
+            float32 ab0 = v0;
+            float32 ab1 = v1;
+            float32 ab2 = v2;
+            float32 ab3 = v3;
+            float32 ac0 = v0;
+            float32 ac1 = v1;
+            float32 ac2 = v2;
+            float32 ac3 = v3;
+            float32 ad0 = v0;
+            float32 ad1 = v1;
+            float32 ad2 = v2;
+            float32 ad3 = v3;
+            uint32 t = 1;
+            while (t < count) {
+                uint32 kRow = t * kvDim + kBase;
+                k0 = kPool[kRow];
+                k1 = kPool[kRow + 1];
+                k2 = kPool[kRow + 2];
+                k3 = kPool[kRow + 3];
+                float32 uA = Wave.reduceSumF32(
+                    qa0 * k0 + qa1 * k1 + qa2 * k2 + qa3 * k3) * scale;
+                float32 uB = Wave.reduceSumF32(
+                    qb0 * k0 + qb1 * k1 + qb2 * k2 + qb3 * k3) * scale;
+                float32 uC = Wave.reduceSumF32(
+                    qc0 * k0 + qc1 * k1 + qc2 * k2 + qc3 * k3) * scale;
+                float32 uD = Wave.reduceSumF32(
+                    qd0 * k0 + qd1 * k1 + qd2 * k2 + qd3 * k3) * scale;
+                v0 = vPool[kRow];
+                v1 = vPool[kRow + 1];
+                v2 = vPool[kRow + 2];
+                v3 = vPool[kRow + 3];
+                if (uA > mA) {
+                    float32 c = Math.exp(mA - uA);
+                    aa0 = aa0 * c + v0;
+                    aa1 = aa1 * c + v1;
+                    aa2 = aa2 * c + v2;
+                    aa3 = aa3 * c + v3;
+                    lA = lA * c + 1.0f;
+                    mA = uA;
+                } else {
+                    float32 w = Math.exp(uA - mA);
+                    aa0 = aa0 + w * v0;
+                    aa1 = aa1 + w * v1;
+                    aa2 = aa2 + w * v2;
+                    aa3 = aa3 + w * v3;
+                    lA = lA + w;
+                }
+                if (uB > mB) {
+                    float32 c = Math.exp(mB - uB);
+                    ab0 = ab0 * c + v0;
+                    ab1 = ab1 * c + v1;
+                    ab2 = ab2 * c + v2;
+                    ab3 = ab3 * c + v3;
+                    lB = lB * c + 1.0f;
+                    mB = uB;
+                } else {
+                    float32 w = Math.exp(uB - mB);
+                    ab0 = ab0 + w * v0;
+                    ab1 = ab1 + w * v1;
+                    ab2 = ab2 + w * v2;
+                    ab3 = ab3 + w * v3;
+                    lB = lB + w;
+                }
+                if (uC > mC) {
+                    float32 c = Math.exp(mC - uC);
+                    ac0 = ac0 * c + v0;
+                    ac1 = ac1 * c + v1;
+                    ac2 = ac2 * c + v2;
+                    ac3 = ac3 * c + v3;
+                    lC = lC * c + 1.0f;
+                    mC = uC;
+                } else {
+                    float32 w = Math.exp(uC - mC);
+                    ac0 = ac0 + w * v0;
+                    ac1 = ac1 + w * v1;
+                    ac2 = ac2 + w * v2;
+                    ac3 = ac3 + w * v3;
+                    lC = lC + w;
+                }
+                if (uD > mD) {
+                    float32 c = Math.exp(mD - uD);
+                    ad0 = ad0 * c + v0;
+                    ad1 = ad1 * c + v1;
+                    ad2 = ad2 * c + v2;
+                    ad3 = ad3 * c + v3;
+                    lD = lD * c + 1.0f;
+                    mD = uD;
+                } else {
+                    float32 w = Math.exp(uD - mD);
+                    ad0 = ad0 + w * v0;
+                    ad1 = ad1 + w * v1;
+                    ad2 = ad2 + w * v2;
+                    ad3 = ad3 + w * v3;
+                    lD = lD + w;
+                }
+                t = t + 1;
+            }
+            uint32 oRow = r * (nH * 128) + h0 * 128 + lane * 4;
+            float32 rsA = 1.0f / lA;
+            float32 rsB = 1.0f / lB;
+            float32 rsC = 1.0f / lC;
+            float32 rsD = 1.0f / lD;
+            out[oRow] = aa0 * rsA;
+            out[oRow + 1] = aa1 * rsA;
+            out[oRow + 2] = aa2 * rsA;
+            out[oRow + 3] = aa3 * rsA;
+            out[oRow + 128] = ab0 * rsB;
+            out[oRow + 129] = ab1 * rsB;
+            out[oRow + 130] = ab2 * rsB;
+            out[oRow + 131] = ab3 * rsB;
+            out[oRow + 256] = ac0 * rsC;
+            out[oRow + 257] = ac1 * rsC;
+            out[oRow + 258] = ac2 * rsC;
+            out[oRow + 259] = ac3 * rsC;
+            out[oRow + 384] = ad0 * rsD;
+            out[oRow + 385] = ad1 * rsD;
+            out[oRow + 386] = ad2 * rsD;
+            out[oRow + 387] = ad3 * rsD;
+        }
+    }
+
     /** Prefill softmax and V combine: one workgroup of 128 per
      *  `(query row, head)`, over that row's causal range. */
     @Kernel
@@ -660,6 +995,14 @@ public final class AttnKernel {
         AttnKernel.attnV2On = on;
     }
 
+    // 10.12.43: fused online-softmax prefill attention — no score buffer
+    // on this path. Routes only when hd == 128; DEFAULT ON, `noflash`
+    // falls back to the v2 pair (and `noattnv2` below that to v1).
+    static boolean attnFlashOn = true;
+    public static void setAttnFlash(boolean on) {
+        AttnKernel.attnFlashOn = on;
+    }
+
     public static void attendPrefillLaunch(KernelBuffer<float32> out,
             KernelBuffer<float32> scores, KernelBuffer<float32> q,
             KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
@@ -684,6 +1027,22 @@ public final class AttnKernel {
             int32 stride, float32 scale) {
         KernelStream s = QuantKernel.stream();
         int32 tMax = startPos + rows;
+        if (AttnKernel.attnFlashOn && hd == 128) {
+            if (nH == 4 * nKv) {
+                int64 wg = (int64) rows * (int64) nKv;
+                attnFlashPrefillGqa4Kernel.launch(s,
+                    grid: [(uint32) wg], block: [32])
+                    (out, q, kPool, vPool, (uint32) rows, (uint32) nH,
+                     (uint32) nKv, (uint32) startPos, scale);
+                return;
+            }
+            int64 wv = (int64) rows * (int64) nH;
+            attnFlashPrefillKernel.launch(s,
+                grid: [(uint32) wv], block: [32])
+                (out, q, kPool, vPool, (uint32) rows, (uint32) nH,
+                 (uint32) nKv, (uint32) startPos, scale);
+            return;
+        }
         if (AttnKernel.attnV2On && hd == 128) {
             int64 wv = (int64) rows * (int64) nH;
             attnScorePrefillRowV2Kernel.launch(s,
