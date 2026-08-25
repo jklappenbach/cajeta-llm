@@ -1,6 +1,7 @@
 package dev.cajeta.llama.io;
 
 import cajeta.xpu.Barrier;
+import cajeta.xpu.BlockPadded;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelThread;
@@ -1210,6 +1211,255 @@ public final class QuantKernel {
             grid: [(uint32) (nTiles * outDim)], block: [32])
             (y, packed, xp, (uint32) rows, (uint32) outDim,
              (uint32) nTiles, cols / 256L);
+        return;
+    }
+
+    /**
+     * BATCHED Q4_K, LDS-TILED — llama.cpp's `mul_mmq` shape adapted to
+     * this DSL. Batch4 (above) still re-reads every token's activations
+     * once per OUTPUT ROW and re-decodes each weight block once per
+     * lane; at 512x4096x4096 that is ~10 GB of (L2-cached) activation
+     * traffic per GEMM and a 32x-redundant nibble decode, and it is why
+     * the Vulkan prefill sat at 8.0 s against llama.cpp's 0.43.
+     *
+     * One 256-thread workgroup owns a 64-output-row x 32-token tile.
+     * Per 256-column super-block it stages, ONCE, into LDS:
+     *   - the 64 weight rows' nibbles unpacked to uint8 (4 threads/row),
+     *   - each row's 8 (scale, min) pairs and d/dmin (1 thread/row),
+     *   - the 32 tokens' q8 quants (8 threads/token), block sums and
+     *     activation scale (1 thread/token),
+     * then every thread accumulates a 2-row x 4-token register tile
+     * straight out of LDS with dotAccum. The weight decode happens once
+     * per tile instead of once per lane; activation bytes come from
+     * global once per 64 output rows instead of once per row.
+     *
+     * Same math as the mat-vec kernel, folded per super-block:
+     *   acc(r,t) += d_r*xs_t*sum_g(sc_g*dot32) - dmin_r*xs_t*sum_g(mn_g*bsum_g)
+     *
+     * LDS: 16K nibbles + 8K quants + 2K sc + 2K mn + 1K bsums + 0.75K
+     * scale floats = 30.3 KB.
+     */
+    @Kernel
+    public static void q4kQ8MmqKernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<int32> xp,
+            uint32 rows, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        // Dword-typed tiles: SPIR-V types an LDS tile by ELEMENT and Mesa
+        // does not merge Workgroup byte accesses (384 scalar ds_read_u8 in
+        // the byte-tiled form of this loop) — int32 tiles keep every LDS
+        // access dword-shaped, with asWords()/asBytes() at the seams.
+        // Block-padded: a wave's lanes step whole 64-dword rows, and an
+        // unpadded stride puts every lane on the same LDS bank (32-way
+        // replay on each tile read). Pad=1 dword per row -> 2-way worst.
+        BlockPadded<int32,64,1> swq = shared int32[64 * 65];
+        BlockPadded<int32,64,1> sxq = shared int32[32 * 65];
+        BlockPadded<int32,8,1> ssc = shared int32[64 * 9];
+        BlockPadded<int32,8,1> smn = shared int32[64 * 9];
+        Shared<int32> sbs = shared int32[32 * 8];
+        Shared<float32> sd = shared float32[64];
+        Shared<float32> sdm = shared float32[64];
+        Shared<float32> sxd = shared float32[32];
+        uint32 tid = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 rowTile = wg % nRowTiles;
+        uint32 tokTile = wg / nRowTiles;
+        int64 rowWords = blocksPerRow * 36L;
+        int64 xRowWords = blocksPerRow * 80L;
+
+        // Staging roles (fixed per thread, applied each super-block):
+        uint32 wRow = tid / 4;            // 64 rows, 4 threads each
+        uint32 wG = tid % 4;              //   this thread's 32-byte quarter
+        uint32 aTok = tid / 8;            // 32 tokens, 8 threads each
+        uint32 aE = tid % 8;              //   this thread's 32-byte eighth
+        uint32 gRow = rowTile * 64 + wRow;
+        uint32 gTok = tokTile * 32 + aTok;
+        // A dead row/token still stages (from row/token 0) so every
+        // thread reaches both barriers; its results are never stored.
+        int64 wBase = 0L;
+        int64 aBase = 0L;
+        if (gRow < outDim) { wBase = (int64) gRow * rowWords; }
+        if (gTok < rows) { aBase = (int64) gTok * xRowWords; }
+
+        // Compute roles: 2 consecutive rows x 4 consecutive tokens.
+        uint32 lr0 = (tid % 32) * 2;
+        uint32 lt0 = (tid / 32) * 4;
+        int64 r0 = (int64) lr0 * 64L;
+        int64 r1 = r0 + 64L;
+        int64 a0o = (int64) lt0 * 64L;
+
+        float32 acc00 = 0.0f;
+        float32 acc01 = 0.0f;
+        float32 acc02 = 0.0f;
+        float32 acc03 = 0.0f;
+        float32 acc10 = 0.0f;
+        float32 acc11 = 0.0f;
+        float32 acc12 = 0.0f;
+        float32 acc13 = 0.0f;
+        int64 b = 0;
+        while (b < blocksPerRow) {
+            // ── stage weights: nibbles + header, once per tile ──────
+            // All dword-domain: byte-typed loads scalarize per byte under
+            // SPIR-V logical addressing and repack with shifts; the same
+            // nibble split is `w & 0x0F0F0F0F` on packed words.
+            int64 ro = wBase + b * 36L;
+            Vector<int32,8> qw = packed.vload<8>(ro + 4L + (int64) (8 * wG));
+            int64 wq = (int64) wRow * 64L + (int64) (16 * wG);
+            swq.vstore(wq, qw & 252645135);
+            swq.vstore(wq + 8L, (qw >> 4) & 252645135);
+            if (wG == 0) {
+                Vector<int32,4> hw = packed.vload<4>(ro);
+                int32 h0 = hw[0];
+                sd[(int64) wRow] = GgufFile.halfBitsToF32(h0 & 65535);
+                sdm[(int64) wRow] = GgufFile.halfBitsToF32(
+                    (h0 >> 16) & 65535);
+                int32 hA = hw[1];
+                int32 hB = hw[2];
+                int32 hC = hw[3];
+                int32 d0 = hA & 255;
+                int32 d1 = (hA >> 8) & 255;
+                int32 d2 = (hA >> 16) & 255;
+                int32 d3 = (hA >> 24) & 255;
+                int32 m0 = hB & 255;
+                int32 m1 = (hB >> 8) & 255;
+                int32 m2 = (hB >> 16) & 255;
+                int32 m3 = (hB >> 24) & 255;
+                int32 k0 = hC & 255;
+                int32 k1 = (hC >> 8) & 255;
+                int32 k2 = (hC >> 16) & 255;
+                int32 k3 = (hC >> 24) & 255;
+                int64 sb = (int64) wRow * 8L;
+                ssc[sb] = d0 & 63;
+                ssc[sb + 1L] = d1 & 63;
+                ssc[sb + 2L] = d2 & 63;
+                ssc[sb + 3L] = d3 & 63;
+                ssc[sb + 4L] = (k0 & 15) | ((d0 >> 2) & 48);
+                ssc[sb + 5L] = (k1 & 15) | ((d1 >> 2) & 48);
+                ssc[sb + 6L] = (k2 & 15) | ((d2 >> 2) & 48);
+                ssc[sb + 7L] = (k3 & 15) | ((d3 >> 2) & 48);
+                smn[sb] = m0 & 63;
+                smn[sb + 1L] = m1 & 63;
+                smn[sb + 2L] = m2 & 63;
+                smn[sb + 3L] = m3 & 63;
+                smn[sb + 4L] = (k0 >> 4) | ((m0 >> 2) & 48);
+                smn[sb + 5L] = (k1 >> 4) | ((m1 >> 2) & 48);
+                smn[sb + 6L] = (k2 >> 4) | ((m2 >> 2) & 48);
+                smn[sb + 7L] = (k3 >> 4) | ((m3 >> 2) & 48);
+            }
+            // ── stage activations, once per tile ────────────────────
+            int64 xb = aBase + b * 80L;
+            int64 aq = (int64) aTok * 64L + (int64) (8 * aE);
+            sxq.vstore(aq, xp.vload<8>(xb + (int64) (8 * aE)));
+            if (aE == 0) {
+                sbs.vstore((int64) aTok * 8L, xp.vload<8>(xb + 64L));
+                sxd[(int64) aTok] = Cajeta.bitsToF32(xp[xb + 72L]);
+            }
+            Barrier.workgroup();
+
+            // ── register-tiled inner product, all reads from LDS ────
+            // Scalar accumulators via dotSum's chained dp4a: the previous
+            // <8 x i32> accumulator per (row, token) pair cost 64 VGPRs and
+            // pinned the kernel at 256 VGPRs = 1 wave/SIMD (no spills — no
+            // latency hiding either, and the phases that measure 1.8 ms
+            // apart ran at 7.5 ms together).
+            int32 si00 = 0;
+            int32 si01 = 0;
+            int32 si02 = 0;
+            int32 si03 = 0;
+            int32 si10 = 0;
+            int32 si11 = 0;
+            int32 si12 = 0;
+            int32 si13 = 0;
+            int64 s0 = (int64) lr0 * 8L;
+            int32 g = 0;
+            while (g < 8) {
+                int64 go = (int64) (8 * g);
+                Vector<uint8,32> w0 = swq.vload<8>(r0 + go).asBytes().asUnsigned();
+                Vector<uint8,32> w1 = swq.vload<8>(r1 + go).asBytes().asUnsigned();
+                Vector<int8,32> av0 = sxq.vload<8>(a0o + go).asBytes();
+                Vector<int8,32> av1 = sxq.vload<8>(a0o + 64L + go).asBytes();
+                Vector<int8,32> av2 = sxq.vload<8>(a0o + 128L + go).asBytes();
+                Vector<int8,32> av3 = sxq.vload<8>(a0o + 192L + go).asBytes();
+                int32 sc0 = ssc[s0 + (int64) g];
+                int32 sc1 = ssc[s0 + 8L + (int64) g];
+                si00 = si00 + w0.dotSum(av0, 0) * sc0;
+                si01 = si01 + w0.dotSum(av1, 0) * sc0;
+                si02 = si02 + w0.dotSum(av2, 0) * sc0;
+                si03 = si03 + w0.dotSum(av3, 0) * sc0;
+                si10 = si10 + w1.dotSum(av0, 0) * sc1;
+                si11 = si11 + w1.dotSum(av1, 0) * sc1;
+                si12 = si12 + w1.dotSum(av2, 0) * sc1;
+                si13 = si13 + w1.dotSum(av3, 0) * sc1;
+                g = g + 1;
+            }
+            // Fold the block term: sumi and the min/bsum correction.
+            Vector<int32,8> mn0 = smn.vload<8>(s0);
+            Vector<int32,8> mn1 = smn.vload<8>(s0 + 8L);
+            float32 d0f = sd[(int64) lr0];
+            float32 dm0 = sdm[(int64) lr0];
+            float32 d1f = sd[(int64) lr0 + 1L];
+            float32 dm1 = sdm[(int64) lr0 + 1L];
+            int32 tt = 0;
+            while (tt < 4) {
+                Vector<int32,8> bs = sbs.vload<8>((int64) (lt0 + tt) * 8L);
+                float32 xs = sxd[(int64) (lt0 + tt)];
+                Vector<int32,8> dmv0 = mn0 * bs;
+                Vector<int32,8> dmv1 = mn1 * bs;
+                int32 dms0 = dmv0[0] + dmv0[1] + dmv0[2] + dmv0[3]
+                    + dmv0[4] + dmv0[5] + dmv0[6] + dmv0[7];
+                int32 dms1 = dmv1[0] + dmv1[1] + dmv1[2] + dmv1[3]
+                    + dmv1[4] + dmv1[5] + dmv1[6] + dmv1[7];
+                int32 sv0 = si00;
+                int32 sv1 = si10;
+                if (tt == 1) { sv0 = si01; sv1 = si11; }
+                if (tt == 2) { sv0 = si02; sv1 = si12; }
+                if (tt == 3) { sv0 = si03; sv1 = si13; }
+                float32 v0 = d0f * xs * (float32) sv0
+                    - dm0 * xs * (float32) dms0;
+                float32 v1 = d1f * xs * (float32) sv1
+                    - dm1 * xs * (float32) dms1;
+                if (tt == 0) { acc00 = acc00 + v0; acc10 = acc10 + v1; }
+                if (tt == 1) { acc01 = acc01 + v0; acc11 = acc11 + v1; }
+                if (tt == 2) { acc02 = acc02 + v0; acc12 = acc12 + v1; }
+                if (tt == 3) { acc03 = acc03 + v0; acc13 = acc13 + v1; }
+                tt = tt + 1;
+            }
+            Barrier.workgroup();
+            b = b + 1;
+        }
+
+        // Guarded stores: y is token-major, y[token*outDim + row].
+        uint32 oR0 = rowTile * 64 + lr0;
+        uint32 oR1 = oR0 + 1;
+        uint32 oT = tokTile * 32 + lt0;
+        int64 od = (int64) outDim;
+        if (oR0 < outDim) {
+            if (oT < rows) { y[(int64) oT * od + (int64) oR0] = acc00; }
+            if (oT + 1 < rows) { y[(int64) (oT + 1) * od + (int64) oR0] = acc01; }
+            if (oT + 2 < rows) { y[(int64) (oT + 2) * od + (int64) oR0] = acc02; }
+            if (oT + 3 < rows) { y[(int64) (oT + 3) * od + (int64) oR0] = acc03; }
+        }
+        if (oR1 < outDim) {
+            if (oT < rows) { y[(int64) oT * od + (int64) oR1] = acc10; }
+            if (oT + 1 < rows) { y[(int64) (oT + 1) * od + (int64) oR1] = acc11; }
+            if (oT + 2 < rows) { y[(int64) (oT + 2) * od + (int64) oR1] = acc12; }
+            if (oT + 3 < rows) { y[(int64) (oT + 3) * od + (int64) oR1] = acc13; }
+        }
+    }
+
+    /** One 256-thread workgroup per (64-row, 32-token) output tile.
+     *  `packed`/`xp` are WORD VIEWS ({@link KernelBuffer#wordView}) of the
+     *  quant and q8k buffers — the kernel reads dwords only. The caller
+     *  keeps the views alive across the launch. */
+    public static void q4kQ8MmqLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<int32> xp,
+            int64 rows, int64 outDim, int64 cols) {
+        int64 nRowTiles = (outDim + 63L) / 64L;
+        int64 nTokTiles = (rows + 31L) / 32L;
+        KernelStream s = QuantKernel.stream();
+        q4kQ8MmqKernel.launch(s,
+            grid: [(uint32) (nRowTiles * nTokTiles)], block: [256])
+            (y, packed, xp, (uint32) rows, (uint32) outDim,
+             (uint32) nRowTiles, cols / 256L);
         return;
     }
 

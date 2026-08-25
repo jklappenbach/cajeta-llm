@@ -42,6 +42,9 @@ public final class Linear extends InfModule {
     // of inDim·outDim/2 bytes; they go away when the activations themselves
     // become device-resident.
     KernelBuffer<int8> packedDev;
+    // Dword view of packedDev for the mmq route (created lazily, released
+    // with the layer). Non-owning: packedDev holds the storage.
+    KernelBuffer<int32> packedW;
     // The widened int8 prefill copy (10.12.16), built ONCE on the first
     // int8-routed matmulInto and only under that policy — a Linear that
     // never prefills under "int8" never pays the ~2x bytes. Decode never
@@ -599,6 +602,7 @@ public final class Linear extends InfModule {
         this.inDim = inDim;
         this.outDim = outDim;
         this.packedDev = null;
+        this.packedW = null;
         this.deqDev = null;
         this.yDev = null;
         this.yScratch = null;
@@ -987,6 +991,8 @@ public final class Linear extends InfModule {
     // and gate/up read another. The batch stage is `[rows x packedBytes]`
     // and the output `[rows x outDim]`.
     static KernelBuffer<int8> btXp;
+    static KernelBuffer<int32> btXpW;   // dword view, refreshed with btXp
+    static boolean mmqOn = true;        // vulkan Q4_K batch -> mmq kernel
     static int8[] btXph;
     static int32 btCap;      // rows the stage is sized for
     static int32 btDim;      // inDim the stage is sized for
@@ -1074,6 +1080,14 @@ public final class Linear extends InfModule {
     // `nopart32` reverts to monolithic launches.
     static boolean part32On = true;
     public static void setWmma(boolean on) { Linear.wmmaOn = on; }
+
+    public static void setMmq(boolean on) { Linear.mmqOn = on; }
+
+    void ensurePackedW() {
+        if (this.packedW == null) {
+            this.packedW #= this.packedDev.wordView();
+        }
+    }
     public static void setWmma6(boolean on) { Linear.wmma6On = on; }
     public static void setEpi(boolean on) { Linear.epiOn = on; }
     public static void setQ4Epi(boolean on) { Linear.q4EpiOn = on; }
@@ -1164,6 +1178,7 @@ public final class Linear extends InfModule {
         int64 pb = Quant.q8kPackedBytes((int64) wn);
         Linear.btXph #= heap int8[(int64) wr * pb];
         Linear.btXp #= heap KernelBuffer<int8>((uint64) ((int64) wr * pb));
+        Linear.btXpW #= Linear.btXp.wordView();
         Linear.btCap = wr;
         Linear.btDim = wn;
         Linear.btTag = 0L - 1L;
@@ -1660,6 +1675,16 @@ public final class Linear extends InfModule {
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
+        } else if (Linear.mmqOn && this.packedTy == Quant.GG_Q4_K
+                && Linear.backendIsVulkan()) {
+            // The LDS-tiled dp4a GEMM (q4kQ8MmqKernel): reads dwords only,
+            // so it takes WORD VIEWS of the packed and q8k buffers.
+            this.sayRoute(2048, "mmq q4");
+            this.ensurePackedW();
+            QuantKernel.q4kQ8MmqLaunchNoSync(this.yBatch, this.packedW,
+                Linear.btXpW, (int64) rows, (int64) this.outDim,
+                (int64) this.inDim);
+            QuantKernel.stream().sync();
         } else {
             this.sayRoute(1024, "dotAccum ty=" + this.packedTy);
             QuantKernel.batchMatMulLaunch(this.packedTy, this.yBatch,
