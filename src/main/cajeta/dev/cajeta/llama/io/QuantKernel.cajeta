@@ -1734,6 +1734,240 @@ public final class QuantKernel {
         return;
     }
 
+    /**
+     * WAVE-COOPERATIVE Q2_K x q8_K (10.12.45.C). The Q6 wave kernel's
+     * decomposition on Q2_K's shape: one workgroup of 32 per output
+     * row, one 16-element sub-block per lane, two blocks in flight.
+     * llama.cpp's mmvq twin (vec_dot_q2_K_q8_1_impl_mmvq) closes the
+     * min term by dotting the SPLATTED min against the activations —
+     * here that is the same all-ones dot the Q6 kernel already takes
+     * for its bias, scaled by the per-sub-block min. On RDNA2+ their
+     * launch geometry is nwarps 1 x rows_per_block 1 (mmvq.cu:86) —
+     * exactly this wave-per-row shape.
+     *
+     * Bounds: quants cap at 3, activations at 127, so a 16-element dot
+     * caps at 6096; a 4-bit scale takes it to ~91k, the min term to
+     * ~30k — both orders inside int32 (signed overflow TRAPS).
+     */
+    @Kernel
+    public static void q2kQ8WaveMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        Shared<float32> part = shared float32[32];
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 32;
+        int64 rowBytes = blocksPerRow * 84L;
+        float32 acc = 0.0f;
+        if (row < rows) {
+            int64 i = (int64) row;
+            int32 sb = (int32) (lane % 16);
+            int64 b = (int64) (lane / 16);
+            // Sub-block geometry, hoisted once: e = 16*sb + t lives in
+            // qs bytes 16 + 32*(sb/8) + 16*(sb%2) + t at shift
+            // 2*((sb%8)/2).
+            int32 qOff = 16 + 32 * (sb / 8) + 16 * (sb % 2);
+            int32 sh = 2 * ((sb % 8) / 2);
+            Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 84L;
+                float32 d = QuantKernel.f16AtDev(packed, ro + 80L);
+                float32 dmin = QuantKernel.f16AtDev(packed, ro + 82L);
+                int64 xb = b * 320L;
+                Vector<int8,16> qv = packed.vload<16>(ro + (int64) qOff);
+                Vector<uint8,16> qu = ((qv >> sh) & 3).asUnsigned();
+                Vector<int8,16> a = xp.vload<16>(xb + (int64) (sb * 16));
+                Vector<uint8,16> ones = (qu ^ qu) | 1;
+
+                Vector<int32,4> dv = qu.dotAccum(a, z4);
+                Vector<int32,4> sv = ones.dotAccum(a, z4);
+                int32 dot = dv[0] + dv[1] + dv[2] + dv[3];
+                int32 asum = sv[0] + sv[1] + sv[2] + sv[3];
+                int32 scb = (int32) packed[ro + (int64) sb] & 255;
+
+                Vector<int8,4> dvs = xp.vload<4>(xb + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
+                    | (((int32) dvs[1] & 255) << 8)
+                    | (((int32) dvs[2] & 255) << 16)
+                    | (((int32) dvs[3] & 255) << 24));
+
+                acc = acc + xs * (d * (float32) ((scb & 15) * dot)
+                    - dmin * (float32) ((scb >> 4) * asum));
+                b = b + 2L;
+            }
+        }
+        part[lane] = acc;
+        Barrier.workgroup();
+        uint32 s = 16;
+        while (s > 0) {
+            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
+            Barrier.workgroup();
+            s = s / 2;
+        }
+        if (lane == 0 && row < rows) {
+            y[yOff + (int64) row] = part[0];
+        }
+    }
+
+    public static void q2kQ8WaveMatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        KernelStream s = QuantKernel.stream();
+        q2kQ8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+            (y, packed, xp, ur, cols / 256L, yOff);
+        return;
+    }
+
+    public static void q2kQ8WaveMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q2kQ8WaveMatVecLaunchNoSync(y, packed, xp, rows, cols,
+            yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
+    /** {@link #q2kQ8WaveMatVecKernel} over HOST arrays. */
+    public static void q2kQ8WaveMatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, xOff, cols, xp);
+        float32[] yh #= heap float32[rows];
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        pb.upload(packed);
+        xpb.upload(xp);
+        QuantKernel.q2kQ8WaveMatVecLaunch(yb, pb, xpb, rows, cols, 0L);
+        yb.download(yh);
+        int64 i = 0;
+        while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
+        return;
+    }
+
+    /**
+     * WAVE-COOPERATIVE Q3_K x q8_K (10.12.45.C). Same decomposition;
+     * Q3's quant is `2-bit | hbit<<2` minus 4, so the raw 0..7 value
+     * goes into the unsigned-x-signed dotAccum fast tier and the bias
+     * leaves as `-4 * asum` — the Q6 kernel's bias trick with bias 4.
+     * The 16 six-bit scales decode per LANE (each lane needs only its
+     * own sub-block's), exactly as the host floor decodes them.
+     *
+     * Bounds: raw quants cap at 7 -> 16-element dot caps at 14224; a
+     * signed 6-bit scale takes it to ~455k — well inside int32.
+     */
+    @Kernel
+    public static void q3kQ8WaveMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        Shared<float32> part = shared float32[32];
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 32;
+        int64 rowBytes = blocksPerRow * 110L;
+        float32 acc = 0.0f;
+        if (row < rows) {
+            int64 i = (int64) row;
+            int32 sb = (int32) (lane % 16);
+            int64 b = (int64) (lane / 16);
+            int32 qOff = 32 + 32 * (sb / 8) + 16 * (sb % 2);
+            int32 hOff = 16 * (sb % 2);
+            int32 sh = 2 * ((sb % 8) / 2);
+            int32 hbit = sb / 2;
+            Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 110L;
+                float32 d = QuantKernel.f16AtDev(packed, ro + 108L);
+                int64 xb = b * 320L;
+                Vector<int8,16> qv = packed.vload<16>(ro + (int64) qOff);
+                Vector<int8,16> hv = packed.vload<16>(ro + (int64) hOff);
+                Vector<int8,16> ql = (qv >> sh) & 3;
+                Vector<int8,16> hb = (hv >> hbit) & 1;
+                Vector<uint8,16> qu = (ql | (hb << 2)).asUnsigned();
+                Vector<int8,16> a = xp.vload<16>(xb + (int64) (sb * 16));
+                Vector<uint8,16> ones = (qu ^ qu) | 1;
+
+                Vector<int32,4> dv = qu.dotAccum(a, z4);
+                Vector<int32,4> sv = ones.dotAccum(a, z4);
+                int32 dot = dv[0] + dv[1] + dv[2] + dv[3];
+                int32 asum = sv[0] + sv[1] + sv[2] + sv[3];
+
+                // This lane's six-bit signed scale, decoded as the host
+                // floor decodes all sixteen.
+                int32 b0 = (int32) packed[ro + (int64) (96 + (sb % 8))]
+                    & 255;
+                // No ternary: expression-form conditionals do not lower
+                // in kernel bodies (the Q6 kernel's `if (sl == 1)` shape
+                // exists for the same reason).
+                int32 lo4 = b0 & 15;
+                if (sb >= 8) { lo4 = b0 >> 4; }
+                int32 hb2 = ((int32) packed[ro + (int64) (104 + (sb & 3))]
+                    & 255) >> (2 * (sb / 4));
+                int32 sc = (lo4 | ((hb2 & 3) << 4)) - 32;
+
+                Vector<int8,4> dvs = xp.vload<4>(xb + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
+                    | (((int32) dvs[1] & 255) << 8)
+                    | (((int32) dvs[2] & 255) << 16)
+                    | (((int32) dvs[3] & 255) << 24));
+
+                acc = acc + d * xs * (float32) (sc * (dot - 4 * asum));
+                b = b + 2L;
+            }
+        }
+        part[lane] = acc;
+        Barrier.workgroup();
+        uint32 s = 16;
+        while (s > 0) {
+            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
+            Barrier.workgroup();
+            s = s / 2;
+        }
+        if (lane == 0 && row < rows) {
+            y[yOff + (int64) row] = part[0];
+        }
+    }
+
+    public static void q3kQ8WaveMatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        KernelStream s = QuantKernel.stream();
+        q3kQ8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+            (y, packed, xp, ur, cols / 256L, yOff);
+        return;
+    }
+
+    public static void q3kQ8WaveMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q3kQ8WaveMatVecLaunchNoSync(y, packed, xp, rows, cols,
+            yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
+    /** {@link #q3kQ8WaveMatVecKernel} over HOST arrays. */
+    public static void q3kQ8WaveMatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, xOff, cols, xp);
+        float32[] yh #= heap float32[rows];
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        pb.upload(packed);
+        xpb.upload(xp);
+        QuantKernel.q3kQ8WaveMatVecLaunch(yb, pb, xpb, rows, cols, 0L);
+        yb.download(yh);
+        int64 i = 0;
+        while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
+        return;
+    }
+
     /** {@link #q6kQ8WaveMatVecKernel} over HOST arrays. */
     public static void q6kQ8WaveMatVecIntoDevice(int8[] packed, int64 rows,
             int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
@@ -2191,6 +2425,16 @@ public final class QuantKernel {
      *  on "is packed" — a route written the other way would feed one
      *  format's bytes to another's decoder. */
     public static boolean hasKernel(int32 ty) {
+        return ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
+            || ty == Quant.GG_Q6_K || ty == Quant.GG_Q8_0
+            || ty == Quant.GG_Q2_K || ty == Quant.GG_Q3_K;
+    }
+
+    /** The subset of {@link #hasKernel} with an F32-activation kernel
+     *  (the matVecLaunch dispatch). Q2_K/Q3_K have ONLY the wave
+     *  integer route (10.12.45.C), so a caller that cannot take the
+     *  q8_K approximation has no device path for them. */
+    public static boolean hasF32Kernel(int32 ty) {
         return ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
             || ty == Quant.GG_Q6_K || ty == Quant.GG_Q8_0;
     }
