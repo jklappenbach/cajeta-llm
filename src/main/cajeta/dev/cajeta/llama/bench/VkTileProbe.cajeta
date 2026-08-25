@@ -1,0 +1,170 @@
+package dev.cajeta.llama.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.CooperativeMatrix;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llama.io.QuantKernel;
+
+/**
+ * Bisect of the shader-tier shared-tile WMMA miscompile (the KNOWN DEFECT
+ * recorded 2026-08-25: the portable software tile computes live but WRONG
+ * values under the SPIR-V backend while the SAME lowering is correct on
+ * the cpu backend).
+ *
+ * The portable tile is a per-invocation Function-storage array walked with
+ * computed indices — machinery source code cannot reach directly, so the
+ * bisect uses the tile verbs themselves, smallest first:
+ *
+ *   stage 1  splat -> store          (accumulator write path only)
+ *   stage 2  A x identity -> store   (isolates the A-tile load: result == A)
+ *   stage 3  A x B -> store          (the full multiply loop)
+ *
+ * (A first cut tried an A-fragment load->store roundtrip as stage 2; the
+ * AMDGPU control measured 239/256 wrong with a PERFECT stage 3 — storing a
+ * non-accumulator fragment is not a defined tile op, so that stage tested
+ * the probe, not the backend. A x identity reaches the same load path
+ * through the defined accumulator store.)
+ *
+ * Whichever stage goes wrong first names the defective lowering; the
+ * amdgpu native tier is the measured-good control.
+ */
+public final class VkTileProbe {
+
+    @Kernel
+    public static void tileSplatKernel(KernelBuffer<int32> c) {
+        CooperativeMatrix<int32,16,16,2> mc;
+        mc.splat(7);
+        mc.store(c, 0, 0, 16);
+    }
+
+    @Kernel
+    public static void tileMmaKernel(KernelBuffer<int32> c,
+            KernelBuffer<int8> a, KernelBuffer<int8> b, uint32 depth) {
+        CooperativeMatrix<int32,16,16,2> mc;
+        mc.splat(0);
+        CooperativeMatrix<int8,16,16,0> ma;
+        CooperativeMatrix<int8,16,16,1> mb;
+        ma.load(a, 0, 0, depth);
+        mb.load(b, 0, 0, depth);
+        mc.mma(ma, mb);
+        mc.store(c, 0, 0, 16);
+    }
+
+    static int64 checkSplat() {
+        int32[] cH #= heap int32[256];
+        KernelBuffer<int32> cD = heap KernelBuffer<int32>((uint64) 256);
+        KernelStream s = QuantKernel.stream();
+        tileSplatKernel.launch(s, grid: [1], block: [32])(cD);
+        s.sync();
+        cD.download(cH);
+        int64 bad = 0;
+        int32 i = 0;
+        while (i < 256) {
+            if (cH[i] != 7) {
+                if (bad < 3L) {
+                    System.stdout.println("  splat[" + i + "]: got " + cH[i]
+                        + " want 7");
+                }
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        return bad;
+    }
+
+    static int64 checkAxIdentity() {
+        int8[] a #= heap int8[256];
+        int8[] ident #= heap int8[256];
+        int32 i = 0;
+        while (i < 256) {
+            a[i] = (int8) ((i * 7 + 3) % 17 - 8);
+            ident[i] = (int8) 0;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 16) { ident[i * 16 + i] = (int8) 1; i = i + 1; }
+        int32[] cH #= heap int32[256];
+        KernelBuffer<int8> aD = heap KernelBuffer<int8>((uint64) 256);
+        KernelBuffer<int8> iD = heap KernelBuffer<int8>((uint64) 256);
+        KernelBuffer<int32> cD = heap KernelBuffer<int32>((uint64) 256);
+        aD.upload(a);
+        iD.upload(ident);
+        KernelStream s = QuantKernel.stream();
+        tileMmaKernel.launch(s, grid: [1], block: [32])(cD, aD, iD, (uint32) 16);
+        s.sync();
+        cD.download(cH);
+        int64 bad = 0;
+        i = 0;
+        while (i < 256) {
+            if (cH[i] != (int32) a[i]) {
+                if (bad < 3L) {
+                    System.stdout.println("  AxI[" + i + "]: got " + cH[i]
+                        + " want " + (int32) a[i]);
+                }
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        return bad;
+    }
+
+    static int64 checkMma() {
+        int32 dim = 16;
+        int8[] a #= heap int8[dim * dim];
+        int8[] b #= heap int8[dim * dim];
+        int32 i = 0;
+        while (i < dim * dim) {
+            a[i] = (int8) ((i * 7 + 3) % 17 - 8);
+            b[i] = (int8) ((i * 11 + 5) % 15 - 7);
+            i = i + 1;
+        }
+        int32[] cH #= heap int32[dim * dim];
+        KernelBuffer<int8> aD = heap KernelBuffer<int8>((uint64) (dim * dim));
+        KernelBuffer<int8> bD = heap KernelBuffer<int8>((uint64) (dim * dim));
+        KernelBuffer<int32> cD = heap KernelBuffer<int32>((uint64) (dim * dim));
+        aD.upload(a);
+        bD.upload(b);
+        KernelStream s = QuantKernel.stream();
+        tileMmaKernel.launch(s, grid: [1], block: [32])(cD, aD, bD, (uint32) 16);
+        s.sync();
+        cD.download(cH);
+        int64 bad = 0;
+        int32 r = 0;
+        while (r < dim) {
+            int32 cc = 0;
+            while (cc < dim) {
+                int32 want = 0;
+                int32 k = 0;
+                while (k < dim) {
+                    want = want + (int32) a[r * dim + k] * (int32) b[k * dim + cc];
+                    k = k + 1;
+                }
+                int32 got = cH[r * dim + cc];
+                if (got != want) {
+                    if (bad < 5L) {
+                        System.stdout.println("  mma[" + r + "," + cc
+                            + "]: got " + got + " want " + want);
+                    }
+                    bad = bad + 1;
+                }
+                cc = cc + 1;
+            }
+            r = r + 1;
+        }
+        return bad;
+    }
+
+    public static int32 run() {
+        System.stdout.println("backend: " + Device.activeBackend());
+        int64 b1 = VkTileProbe.checkSplat();
+        System.stdout.println("stage1 splat->store: " + b1 + "/256 wrong");
+        int64 b2 = VkTileProbe.checkAxIdentity();
+        System.stdout.println("stage2 A x identity: " + b2 + "/256 wrong");
+        int64 b3 = VkTileProbe.checkMma();
+        System.stdout.println("stage3 load->mma:    " + b3 + "/256 wrong");
+        return (b1 + b2 + b3) == 0L ? 0 : 1;
+    }
+}
