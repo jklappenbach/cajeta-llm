@@ -889,6 +889,307 @@ public final class AttnKernel {
         }
     }
 
+    // ── FUSED FLASH DECODE (2026-08-25 decode attribution) ──────────────
+    //
+    // The class doc's argument against fusing the decode attend — one
+    // workgroup per head is 32 workgroups, 20% occupancy, `count`
+    // barriers deep — predates two things: the GQA x4 fold (10.12.43)
+    // and split-S. With both, the fused kernel runs `nKv x splits`
+    // independent WAVES (256 at 512 context), each covering a position
+    // chunk for all four q-heads of its kv group with wave-level
+    // reductions only — no workgroup barriers at all. What fusion buys,
+    // measured before it was written: the two-kernel pair reads every K
+    // row 4x (once per q-head) and every V row 4x, 16.8 MB of traffic
+    // per layer where the fold reads 4.2, and the pair ran at 17 GB/s
+    // (score) and 43 GB/s (combine) effective — 5.54 ms of a 30.3 ms
+    // decode token, against a 3.7 ms llama.cpp counterpart and a 0.6 ms
+    // memory floor.
+
+    /**
+     * Split-S flash decode, GQA x4, hd == 128: wave `(kvh, sp)` runs the
+     * online-softmax recurrence over its position chunk for the four
+     * q-heads of kv group `kvh`, and writes one PARTIAL per head — the
+     * unscaled accumulator quad plus that chunk's `(m, l)` — for
+     * {@link #attnFlashDecodeReduceKernel} to combine. The first position
+     * of the chunk seeds the recurrence (weight exp(s-s) = 1) exactly as
+     * the prefill kernel's t = 0 peel does, so no sentinel-max exp runs
+     * under @FastMath; an EMPTY chunk (count < splits) writes l = 0 and
+     * m = -3e38, which the reduce weighs to zero.
+     *
+     * Partial layout: head h, split sp at `(h * splits + sp) * 130`;
+     * `[0,128)` the accumulator, `[128]` m, `[129]` l.
+     */
+    @Kernel @FastMath
+    public static void attnFlashDecodeGqa4Kernel(KernelBuffer<float32> part,
+            KernelBuffer<float32> q, KernelBuffer<float32> kPool,
+            KernelBuffer<float32> vPool, uint32 nKv, uint32 count,
+            uint32 from, uint32 splits, float32 scale) {
+        uint32 lane = KernelThread.x();
+        uint32 wv = KernelThread.globalIdX() / 32;
+        if (wv < nKv * splits) {
+            uint32 kvh = wv / splits;
+            uint32 sp = wv % splits;
+            uint32 chunk = (count + splits - 1) / splits;
+            uint32 t0 = sp * chunk;
+            uint32 t1 = t0 + chunk;
+            if (t1 > count) { t1 = count; }
+            uint32 kvDim = nKv * 128;
+            uint32 h0 = kvh * 4;
+            uint32 qRow = h0 * 128 + lane * 4;
+            float32 qa0 = q[qRow];
+            float32 qa1 = q[qRow + 1];
+            float32 qa2 = q[qRow + 2];
+            float32 qa3 = q[qRow + 3];
+            float32 qb0 = q[qRow + 128];
+            float32 qb1 = q[qRow + 129];
+            float32 qb2 = q[qRow + 130];
+            float32 qb3 = q[qRow + 131];
+            float32 qc0 = q[qRow + 256];
+            float32 qc1 = q[qRow + 257];
+            float32 qc2 = q[qRow + 258];
+            float32 qc3 = q[qRow + 259];
+            float32 qd0 = q[qRow + 384];
+            float32 qd1 = q[qRow + 385];
+            float32 qd2 = q[qRow + 386];
+            float32 qd3 = q[qRow + 387];
+            uint32 kBase = kvh * 128 + lane * 4;
+            float32 mA = 0.0f - 3.0e38f;
+            float32 mB = 0.0f - 3.0e38f;
+            float32 mC = 0.0f - 3.0e38f;
+            float32 mD = 0.0f - 3.0e38f;
+            float32 lA = 0.0f;
+            float32 lB = 0.0f;
+            float32 lC = 0.0f;
+            float32 lD = 0.0f;
+            float32 aa0 = 0.0f;
+            float32 aa1 = 0.0f;
+            float32 aa2 = 0.0f;
+            float32 aa3 = 0.0f;
+            float32 ab0 = 0.0f;
+            float32 ab1 = 0.0f;
+            float32 ab2 = 0.0f;
+            float32 ab3 = 0.0f;
+            float32 ac0 = 0.0f;
+            float32 ac1 = 0.0f;
+            float32 ac2 = 0.0f;
+            float32 ac3 = 0.0f;
+            float32 ad0 = 0.0f;
+            float32 ad1 = 0.0f;
+            float32 ad2 = 0.0f;
+            float32 ad3 = 0.0f;
+            if (t0 < t1) {
+                uint32 kRow0 = (from + t0) * kvDim + kBase;
+                float32 k0 = kPool[kRow0];
+                float32 k1 = kPool[kRow0 + 1];
+                float32 k2 = kPool[kRow0 + 2];
+                float32 k3 = kPool[kRow0 + 3];
+                mA = Wave.reduceSumF32(
+                    qa0 * k0 + qa1 * k1 + qa2 * k2 + qa3 * k3) * scale;
+                mB = Wave.reduceSumF32(
+                    qb0 * k0 + qb1 * k1 + qb2 * k2 + qb3 * k3) * scale;
+                mC = Wave.reduceSumF32(
+                    qc0 * k0 + qc1 * k1 + qc2 * k2 + qc3 * k3) * scale;
+                mD = Wave.reduceSumF32(
+                    qd0 * k0 + qd1 * k1 + qd2 * k2 + qd3 * k3) * scale;
+                lA = 1.0f;
+                lB = 1.0f;
+                lC = 1.0f;
+                lD = 1.0f;
+                float32 v0 = vPool[kRow0];
+                float32 v1 = vPool[kRow0 + 1];
+                float32 v2 = vPool[kRow0 + 2];
+                float32 v3 = vPool[kRow0 + 3];
+                aa0 = v0;
+                aa1 = v1;
+                aa2 = v2;
+                aa3 = v3;
+                ab0 = v0;
+                ab1 = v1;
+                ab2 = v2;
+                ab3 = v3;
+                ac0 = v0;
+                ac1 = v1;
+                ac2 = v2;
+                ac3 = v3;
+                ad0 = v0;
+                ad1 = v1;
+                ad2 = v2;
+                ad3 = v3;
+                uint32 t = t0 + 1;
+                while (t < t1) {
+                    uint32 kRow = (from + t) * kvDim + kBase;
+                    k0 = kPool[kRow];
+                    k1 = kPool[kRow + 1];
+                    k2 = kPool[kRow + 2];
+                    k3 = kPool[kRow + 3];
+                    float32 uA = Wave.reduceSumF32(
+                        qa0 * k0 + qa1 * k1 + qa2 * k2 + qa3 * k3) * scale;
+                    float32 uB = Wave.reduceSumF32(
+                        qb0 * k0 + qb1 * k1 + qb2 * k2 + qb3 * k3) * scale;
+                    float32 uC = Wave.reduceSumF32(
+                        qc0 * k0 + qc1 * k1 + qc2 * k2 + qc3 * k3) * scale;
+                    float32 uD = Wave.reduceSumF32(
+                        qd0 * k0 + qd1 * k1 + qd2 * k2 + qd3 * k3) * scale;
+                    float32 v0t = vPool[kRow];
+                    float32 v1t = vPool[kRow + 1];
+                    float32 v2t = vPool[kRow + 2];
+                    float32 v3t = vPool[kRow + 3];
+                    if (uA > mA) {
+                        float32 c = Math.exp(mA - uA);
+                        aa0 = aa0 * c + v0t;
+                        aa1 = aa1 * c + v1t;
+                        aa2 = aa2 * c + v2t;
+                        aa3 = aa3 * c + v3t;
+                        lA = lA * c + 1.0f;
+                        mA = uA;
+                    } else {
+                        float32 w = Math.exp(uA - mA);
+                        aa0 = aa0 + w * v0t;
+                        aa1 = aa1 + w * v1t;
+                        aa2 = aa2 + w * v2t;
+                        aa3 = aa3 + w * v3t;
+                        lA = lA + w;
+                    }
+                    if (uB > mB) {
+                        float32 c = Math.exp(mB - uB);
+                        ab0 = ab0 * c + v0t;
+                        ab1 = ab1 * c + v1t;
+                        ab2 = ab2 * c + v2t;
+                        ab3 = ab3 * c + v3t;
+                        lB = lB * c + 1.0f;
+                        mB = uB;
+                    } else {
+                        float32 w = Math.exp(uB - mB);
+                        ab0 = ab0 + w * v0t;
+                        ab1 = ab1 + w * v1t;
+                        ab2 = ab2 + w * v2t;
+                        ab3 = ab3 + w * v3t;
+                        lB = lB + w;
+                    }
+                    if (uC > mC) {
+                        float32 c = Math.exp(mC - uC);
+                        ac0 = ac0 * c + v0t;
+                        ac1 = ac1 * c + v1t;
+                        ac2 = ac2 * c + v2t;
+                        ac3 = ac3 * c + v3t;
+                        lC = lC * c + 1.0f;
+                        mC = uC;
+                    } else {
+                        float32 w = Math.exp(uC - mC);
+                        ac0 = ac0 + w * v0t;
+                        ac1 = ac1 + w * v1t;
+                        ac2 = ac2 + w * v2t;
+                        ac3 = ac3 + w * v3t;
+                        lC = lC + w;
+                    }
+                    if (uD > mD) {
+                        float32 c = Math.exp(mD - uD);
+                        ad0 = ad0 * c + v0t;
+                        ad1 = ad1 * c + v1t;
+                        ad2 = ad2 * c + v2t;
+                        ad3 = ad3 * c + v3t;
+                        lD = lD * c + 1.0f;
+                        mD = uD;
+                    } else {
+                        float32 w = Math.exp(uD - mD);
+                        ad0 = ad0 + w * v0t;
+                        ad1 = ad1 + w * v1t;
+                        ad2 = ad2 + w * v2t;
+                        ad3 = ad3 + w * v3t;
+                        lD = lD + w;
+                    }
+                    t = t + 1;
+                }
+            }
+            uint32 pA = ((h0) * splits + sp) * 130 + lane * 4;
+            uint32 pB = ((h0 + 1) * splits + sp) * 130 + lane * 4;
+            uint32 pC = ((h0 + 2) * splits + sp) * 130 + lane * 4;
+            uint32 pD = ((h0 + 3) * splits + sp) * 130 + lane * 4;
+            part[pA] = aa0;
+            part[pA + 1] = aa1;
+            part[pA + 2] = aa2;
+            part[pA + 3] = aa3;
+            part[pB] = ab0;
+            part[pB + 1] = ab1;
+            part[pB + 2] = ab2;
+            part[pB + 3] = ab3;
+            part[pC] = ac0;
+            part[pC + 1] = ac1;
+            part[pC + 2] = ac2;
+            part[pC + 3] = ac3;
+            part[pD] = ad0;
+            part[pD + 1] = ad1;
+            part[pD + 2] = ad2;
+            part[pD + 3] = ad3;
+            if (lane == 0) {
+                uint32 mBase = (h0 * splits + sp) * 130 + 128;
+                part[mBase] = mA;
+                part[mBase + 1] = lA;
+                uint32 mB2 = ((h0 + 1) * splits + sp) * 130 + 128;
+                part[mB2] = mB;
+                part[mB2 + 1] = lB;
+                uint32 mC2 = ((h0 + 2) * splits + sp) * 130 + 128;
+                part[mC2] = mC;
+                part[mC2 + 1] = lC;
+                uint32 mD2 = ((h0 + 3) * splits + sp) * 130 + 128;
+                part[mD2] = mD;
+                part[mD2 + 1] = lD;
+            }
+        }
+    }
+
+    /**
+     * Combine the split partials: one wave per head. The global max
+     * re-bases every chunk's `(m, l, acc)`, an empty chunk's l = 0
+     * contributes nothing, and the normalization happens ONCE here —
+     * the partials carry unscaled accumulators. Deliberately not
+     * @FastMath: the empty-chunk sentinel puts -3e38 through this exp,
+     * and the fast path's contract on extreme arguments is exactly what
+     * the prefill kernel's t = 0 peel exists to avoid.
+     */
+    @Kernel
+    public static void attnFlashDecodeReduceKernel(KernelBuffer<float32> out,
+            KernelBuffer<float32> part, uint32 nH, uint32 splits) {
+        uint32 lane = KernelThread.x();
+        uint32 h = KernelThread.globalIdX() / 32;
+        if (h < nH) {
+            uint32 base = h * splits * 130;
+            float32 gm = 0.0f - 3.0e38f;
+            uint32 s = 0;
+            while (s < splits) {
+                float32 ms = part[base + s * 130 + 128];
+                if (ms > gm) { gm = ms; }
+                s = s + 1;
+            }
+            float32 gl = 0.0f;
+            float32 a0 = 0.0f;
+            float32 a1 = 0.0f;
+            float32 a2 = 0.0f;
+            float32 a3 = 0.0f;
+            s = 0;
+            while (s < splits) {
+                uint32 pb = base + s * 130;
+                float32 ls = part[pb + 129];
+                if (ls > 0.0f) {
+                    float32 w = Math.exp(part[pb + 128] - gm);
+                    gl = gl + w * ls;
+                    uint32 d = pb + lane * 4;
+                    a0 = a0 + w * part[d];
+                    a1 = a1 + w * part[d + 1];
+                    a2 = a2 + w * part[d + 2];
+                    a3 = a3 + w * part[d + 3];
+                }
+                s = s + 1;
+            }
+            float32 rs = 1.0f / gl;
+            uint32 o = h * 128 + lane * 4;
+            out[o] = a0 * rs;
+            out[o + 1] = a1 * rs;
+            out[o + 2] = a2 * rs;
+            out[o + 3] = a3 * rs;
+        }
+    }
+
     /** Prefill softmax and V combine: one workgroup of 128 per
      *  `(query row, head)`, over that row's causal range. */
     @Kernel
@@ -1003,6 +1304,27 @@ public final class AttnKernel {
         AttnKernel.attnFlashOn = on;
     }
 
+    // Fused flash decode (2026-08-25): DEFAULT ON for the GQA x4 / hd 128
+    // shape; `nofd` falls back to the score+combine pair. `fdChunk` is the
+    // positions-per-split target — splits = ceil(count / fdChunk), capped
+    // at 32, so 512 context runs 256 waves. The partial scratch is lazy
+    // and sized once for the cap; the call counter is the tests'
+    // vacuous-green guard (a routing predicate that silently stopped
+    // matching would otherwise pass every tolerance while running the old
+    // kernels).
+    static boolean flashDecOn = true;
+    static int32 fdChunk = 16;
+    static KernelBuffer<float32> fdPart;
+    static int64 fdPartCap;
+    static int64 fdCallCount;
+    public static void setFlashDecode(boolean on) {
+        AttnKernel.flashDecOn = on;
+    }
+    public static void setFlashDecodeChunk(int32 c) {
+        AttnKernel.fdChunk = c;
+    }
+    public static int64 flashDecodeCalls() { return AttnKernel.fdCallCount; }
+
     public static void attendPrefillLaunch(KernelBuffer<float32> out,
             KernelBuffer<float32> scores, KernelBuffer<float32> q,
             KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
@@ -1111,6 +1433,27 @@ public final class AttnKernel {
             int32 nH, int32 nKv, int32 hd, int32 count, int32 from,
             int32 stride, float32 scale) {
         KernelStream s = QuantKernel.stream();
+        if (AttnKernel.flashDecOn && hd == 128 && nH == 4 * nKv) {
+            int32 splits = (count + AttnKernel.fdChunk - 1)
+                / AttnKernel.fdChunk;
+            if (splits > 32) { splits = 32; }
+            if (splits < 1) { splits = 1; }
+            int64 need = (int64) nH * 32L * 130L;
+            if (AttnKernel.fdPart == null || AttnKernel.fdPartCap < need) {
+                AttnKernel.fdPart #= heap KernelBuffer<float32>(
+                    (uint64) need);
+                AttnKernel.fdPartCap = need;
+            }
+            uint32 wg1 = (uint32) (nKv * splits);
+            attnFlashDecodeGqa4Kernel.launch(s, grid: [wg1], block: [32])
+                (AttnKernel.fdPart, q, kPool, vPool, (uint32) nKv,
+                 (uint32) count, (uint32) from, (uint32) splits, scale);
+            attnFlashDecodeReduceKernel.launch(s, grid: [(uint32) nH],
+                block: [32])
+                (out, AttnKernel.fdPart, (uint32) nH, (uint32) splits);
+            AttnKernel.fdCallCount = AttnKernel.fdCallCount + 1L;
+            return;
+        }
         uint32 waves = (uint32) (nH * count);
         // One wave per (head, position): `block` is 32 and `grid` counts
         // WORK ITEMS, so the item count is waves x 32.

@@ -290,11 +290,18 @@ public final class LlamaForCausalLM extends InfModule {
                 + this.maxSeq + ")");
         }
         ActivationPool p = this.pool;
+        int64 te0 = Clock.nanoTime();
         this.model.embedTokens.rowIntoTensor(token, p.x, 0,
             this.cfg.hiddenSize);
+        LlamaForCausalLM.dtPreNs = LlamaForCausalLM.dtPreNs
+            + (Clock.nanoTime() - te0);
         this.forwardRows(seq, p.x, p.xn, p.q, p.k, p.v, p.attnOut,
             p.attnProj, p.gate, p.up, p.mlpOut, 1, seqPos);
-        return HostOps.argmaxRow(p.logits, this.cfg.vocabSize);
+        int64 ta0 = Clock.nanoTime();
+        int32 am = HostOps.argmaxRow(p.logits, this.cfg.vocabSize);
+        LlamaForCausalLM.dtArgmaxNs = LlamaForCausalLM.dtArgmaxNs
+            + (Clock.nanoTime() - ta0);
+        return am;
     }
 
     /**
@@ -333,6 +340,7 @@ public final class LlamaForCausalLM extends InfModule {
             this.syncKvToHost(seq);
         }
         if (resident) {
+            int64 tp0 = Clock.nanoTime();
             this.ensureResidentBuffers(h);
             this.ensureDeviceKv(seq);
             float32[] hb = hs.hostBuffer();
@@ -343,6 +351,8 @@ public final class LlamaForCausalLM extends InfModule {
                 ci = ci + 1;
             }
             this.hsDev.upload(this.hsHost);
+            LlamaForCausalLM.dtPreNs = LlamaForCausalLM.dtPreNs
+                + (Clock.nanoTime() - tp0);
         }
 
         // BATCHED PREFILL (plan 10.12.1). The projections run over ALL
@@ -510,8 +520,12 @@ public final class LlamaForCausalLM extends InfModule {
             // Back to the host once, for the final norm and lm_head.
             // 10.12.37: the layer chain above is now launch-only, so
             // THIS is the token's one wait.
+            int64 ts0 = Clock.nanoTime();
             KernelStream ds = QuantKernel.stream();
             ds.sync();
+            int64 ts1 = Clock.nanoTime();
+            LlamaForCausalLM.dtSyncNs = LlamaForCausalLM.dtSyncNs
+                + (ts1 - ts0);
             this.hsDev.download(this.hsHost);
             float32[] hb2 = hs.hostBuffer();
             int64 hb2base = hs.hostBase();
@@ -520,18 +534,29 @@ public final class LlamaForCausalLM extends InfModule {
                 hb2[hb2base + co] = this.hsHost[co];
                 co = co + 1;
             }
+            LlamaForCausalLM.dtHsDownNs = LlamaForCausalLM.dtHsDownNs
+                + (Clock.nanoTime() - ts1);
+            LlamaForCausalLM.dtTok = LlamaForCausalLM.dtTok + 1L;
         }
 
         // Final norm of the last row, then the output projection.
+        int64 tn0 = Clock.nanoTime();
         int64 lastH = (int64) (rows - 1) * (int64) h;
         Prim.rmsnormRowHost(hs, lastH, this.model.norm.weight,
             this.model.norm.eps, xn, lastH, h, this.cfg.normForm);
+        int64 tn1 = Clock.nanoTime();
         if (this.lmHead != null) {
             this.lmHead.matvecInto(xn, lastH, this.pool.logits, 0);
         } else {
             // Tied output projection: logits against the embedding matrix.
             HostOps.rowsDotRow(this.model.embedTokens.weight, xn, lastH,
                 this.pool.logits, this.cfg.vocabSize, h);
+        }
+        if (resident) {
+            LlamaForCausalLM.dtNormNs = LlamaForCausalLM.dtNormNs
+                + (tn1 - tn0);
+            LlamaForCausalLM.dtLmHeadNs = LlamaForCausalLM.dtLmHeadNs
+                + (Clock.nanoTime() - tn1);
         }
     }
 
@@ -642,6 +667,39 @@ public final class LlamaForCausalLM extends InfModule {
         LlamaForCausalLM.pfPrimNs = 0L;
         LlamaForCausalLM.pfRopeNs = 0L;
         LlamaForCausalLM.pfAttendNs = 0L;
+        return;
+    }
+
+    // DECODE-TAIL attribution (2026-08-25): the per-token HOST work of a
+    // resident decode, phase by phase, because the kernel trace can only
+    // show the GPU idle it leaves behind — a ~3 ms gap between lm_head
+    // finishing and the next token's upload — not what the host was doing
+    // in it. Pre = embed row + hs fill + upload; sync = the token's one
+    // wait; hsDown = residual download + copy-out; norm = the host final
+    // rmsnorm; lmHead = matvecInto (its own launch/download/copyOut
+    // internals are Linear's dev timers); argmax = the 128k host scan.
+    static int64 dtPreNs;
+    static int64 dtSyncNs;
+    static int64 dtHsDownNs;
+    static int64 dtNormNs;
+    static int64 dtLmHeadNs;
+    static int64 dtArgmaxNs;
+    static int64 dtTok;
+    public static int64 decodePreNs()    { return LlamaForCausalLM.dtPreNs; }
+    public static int64 decodeSyncNs()   { return LlamaForCausalLM.dtSyncNs; }
+    public static int64 decodeHsDownNs() { return LlamaForCausalLM.dtHsDownNs; }
+    public static int64 decodeNormNs()   { return LlamaForCausalLM.dtNormNs; }
+    public static int64 decodeLmHeadNs() { return LlamaForCausalLM.dtLmHeadNs; }
+    public static int64 decodeArgmaxNs() { return LlamaForCausalLM.dtArgmaxNs; }
+    public static int64 decodeTokens()   { return LlamaForCausalLM.dtTok; }
+    public static void resetDecodeTimers() {
+        LlamaForCausalLM.dtPreNs = 0L;
+        LlamaForCausalLM.dtSyncNs = 0L;
+        LlamaForCausalLM.dtHsDownNs = 0L;
+        LlamaForCausalLM.dtNormNs = 0L;
+        LlamaForCausalLM.dtLmHeadNs = 0L;
+        LlamaForCausalLM.dtArgmaxNs = 0L;
+        LlamaForCausalLM.dtTok = 0L;
         return;
     }
 
