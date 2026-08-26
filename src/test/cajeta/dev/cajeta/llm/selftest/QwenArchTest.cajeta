@@ -1,0 +1,177 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+
+/**
+ * cajeta-llm plan Unit 20 TDD (20.1.1, 20.1.4, 20.1.5) — the SECOND
+ * architecture family.
+ *
+ * Every architecture-shaped decision in this engine had exactly one
+ * witness until now, and two of them turned out to be Llama facts wearing
+ * general clothes: the GGUF hyperparameter keys were read from a
+ * hard-coded `llama.*` family, and no projection could carry a bias.
+ * Both are silent failures — a config read under the wrong prefix comes
+ * back all-defaults, and a dropped bias still produces fluent text — so
+ * these tests assert numbers, never that something ran.
+ *
+ * Fixtures: `toy-qwen.gguf` / `toy-qwenvl.gguf` (tools/gguf/gen_qwen_fixture.py),
+ * 2 layers with non-trivial q/k/v biases, and `toy-badarch.gguf` for the
+ * unsupported-architecture message.
+ */
+public class QwenArchTest {
+
+    static final String QWEN = "src/test/fixtures/gguf/toy-qwen.gguf";
+    static final String QWENVL = "src/test/fixtures/gguf/toy-qwenvl.gguf";
+    static final String BADARCH = "src/test/fixtures/gguf/toy-badarch.gguf";
+
+    public QwenArchTest() { return; }
+
+    // ── 20.1.1 — the key family follows general.architecture ───────────
+
+    @Test
+    public void qwen2ConfigReadsItsOwnKeyFamily() {
+        GgufFile f #= heap GgufFile(QwenArchTest.QWEN);
+        ModelConfig c #= ModelConfig.fromGguf(f);
+        Assert.equals("Qwen2ForCausalLM", c.architecture);
+        Assert.equals(16, c.hiddenSize);
+        Assert.equals(2, c.numLayers);
+        Assert.equals(4, c.numHeads);
+        Assert.equals(2, c.numKvHeads);
+        Assert.equals(32, c.intermediateSize);
+        Assert.equals(4, c.headDim);
+        Assert.equals(64, c.vocabSize);
+        // The two that a llama-prefixed read would silently DEFAULT:
+        // theta would come back 10000 and eps 1e-5, and a model runs
+        // fluently-wrong on both.
+        Assert.isTrue(c.ropeTheta > 999999.0f);
+        Assert.isTrue(c.rmsNormEps < 0.000005f);
+        f.close();
+    }
+
+    /** 20.1.5 — qwen2vl carries M-RoPE sections; the TEXT path reads the
+     *  same config, and the sections change nothing for it (spec 4.13). */
+    @Test
+    public void qwen2vlConfigMatchesQwen2ForText() {
+        GgufFile a #= heap GgufFile(QwenArchTest.QWEN);
+        GgufFile b #= heap GgufFile(QwenArchTest.QWENVL);
+        ModelConfig ca #= ModelConfig.fromGguf(a);
+        ModelConfig cb #= ModelConfig.fromGguf(b);
+        Assert.equals(ca.architecture, cb.architecture);
+        Assert.equals(ca.hiddenSize, cb.hiddenSize);
+        Assert.equals(ca.numHeads, cb.numHeads);
+        Assert.equals(ca.headDim, cb.headDim);
+        Assert.isTrue(ca.ropeTheta == cb.ropeTheta);
+        a.close();
+        b.close();
+    }
+
+    /** 20.1.1's negative half — an unsupported architecture must SAY so,
+     *  and name what is supported (spec 4.5). Without this the prefix
+     *  logic would happily read `mamba.*` keys off a model it cannot
+     *  run. */
+    @Test
+    public void unsupportedArchitectureIsNamed() {
+        GgufFile f #= heap GgufFile(QwenArchTest.BADARCH);
+        boolean threw = false;
+        try {
+            ModelConfig c #= ModelConfig.fromGguf(f);
+        } catch (Throwable t) {
+            threw = true;
+            String m #= t.getMessage();
+            Assert.isTrue(m.contains("mamba"));
+            Assert.isTrue(m.contains("llama"));
+            Assert.isTrue(m.contains("qwen2"));
+        }
+        Assert.isTrue(threw);
+        f.close();
+    }
+
+    // ── 20.1.4 — the bias is APPLIED ───────────────────────────────────
+
+    /**
+     * The load-bearing numeric claim. A Linear bound to `attn_q` with its
+     * bias must produce `W·x + b`, and the SAME Linear without the bias
+     * bound must produce `W·x` — both checked against the reference, so
+     * neither a dropped bias nor a doubled one can pass.
+     */
+    @Test
+    public void attentionBiasIsAppliedOnTheHostPath() {
+        Checkpoint ck #= Checkpoint.open(QwenArchTest.QWEN);
+        String wName #= "model.layers.0.self_attn.q_proj.weight";
+        String bName #= "model.layers.0.self_attn.q_proj.bias";
+        Tensor<float32> w #= ck.loadF32(wName);
+        Tensor<float32> bv #= ck.loadF32(bName);
+        int32 outDim = (int32) w.shapeAt(0);
+        int32 inDim = (int32) w.shapeAt(1);
+        Assert.equals((int64) outDim, bv.shapeAt(0));
+
+        int64[] shp #= heap int64[1];
+        shp[0] = (int64) inDim;
+        Tensor<float32> src #= Tensor.zeros<float32>(shp);
+        int32 i = 0;
+        while (i < inDim) {
+            src.flatSet((int64) i, (float32) ((i % 7) - 3) * 0.25f);
+            i = i + 1;
+        }
+        int64[] oshp #= heap int64[1];
+        oshp[0] = (int64) outDim;
+
+        Linear biased #= heap Linear(inDim, outDim);
+        biased.bind(ck, wName, false);
+        biased.bindBias(ck, bName, false);
+        Tensor<float32> gotB #= Tensor.zeros<float32>(oshp);
+        biased.matvecInto(src, 0, gotB, 0);
+
+        Linear plain #= heap Linear(inDim, outDim);
+        plain.bind(ck, wName, false);
+        Tensor<float32> gotP #= Tensor.zeros<float32>(oshp);
+        plain.matvecInto(src, 0, gotP, 0);
+
+        int32 o = 0;
+        int32 differed = 0;
+        while (o < outDim) {
+            float32 acc = 0.0f;
+            i = 0;
+            while (i < inDim) {
+                acc = acc + w.get2((int64) o, (int64) i)
+                    * src.flatGet((int64) i);
+                i = i + 1;
+            }
+            float32 b = bv.flatGet((int64) o);
+            float64 dB = (float64) (acc + b)
+                - (float64) gotB.flatGet((int64) o);
+            if (dB < 0.0) { dB = 0.0 - dB; }
+            Assert.isTrue(dB < 1.0e-4);
+            float64 dP = (float64) acc - (float64) gotP.flatGet((int64) o);
+            if (dP < 0.0) { dP = 0.0 - dP; }
+            Assert.isTrue(dP < 1.0e-4);
+            float64 sep = (float64) b;
+            if (sep < 0.0) { sep = 0.0 - sep; }
+            if (sep > 1.0e-3) { differed = differed + 1; }
+            o = o + 1;
+        }
+        // The fixture's biases must actually be non-trivial, or the two
+        // arms above would agree for the wrong reason.
+        Assert.isTrue(differed > outDim / 2);
+        ck.close();
+    }
+
+    /** A checkpoint with NO bias tensor binds none — absence is not an
+     *  error, and Llama must keep loading (20.3.3). */
+    @Test
+    public void missingBiasBindsNothing() {
+        Checkpoint ck #= Checkpoint.open("src/test/fixtures/gguf/toy.gguf");
+        Linear lin #= heap Linear(16, 8);   // toy v_proj is [nKv*hd, h]
+        lin.bind(ck, "model.layers.1.self_attn.v_proj.weight", false);
+        lin.bindBias(ck, "model.layers.1.self_attn.v_proj.bias", false);
+        Assert.isFalse(lin.hasBias());
+        ck.close();
+    }
+}

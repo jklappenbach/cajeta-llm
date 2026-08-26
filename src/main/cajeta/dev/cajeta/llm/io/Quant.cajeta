@@ -38,6 +38,7 @@ public final class Quant {
     }
 
     public static final int32 GG_Q4_0 = 2;
+    public static final int32 GG_Q5_0 = 6;
     public static final int32 GG_Q8_0 = 8;
     public static final int32 GG_Q2_K = 10;
     public static final int32 GG_Q3_K = 11;
@@ -48,7 +49,8 @@ public final class Quant {
     private Quant() { }
 
     public static boolean supported(int32 ty) {
-        return ty == Quant.GG_Q4_0 || ty == Quant.GG_Q8_0
+        return ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
+            || ty == Quant.GG_Q8_0
             || ty == Quant.GG_Q2_K || ty == Quant.GG_Q3_K
             || ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
             || ty == Quant.GG_Q6_K;
@@ -56,7 +58,8 @@ public final class Quant {
 
     /** Elements per block for `ty`; -1 when unsupported. */
     public static int32 blockElems(int32 ty) {
-        if (ty == Quant.GG_Q4_0 || ty == Quant.GG_Q8_0) { return 32; }
+        if (ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
+                || ty == Quant.GG_Q8_0) { return 32; }
         if (Quant.supported(ty)) { return 256; }
         return -1;
     }
@@ -64,6 +67,7 @@ public final class Quant {
     /** Packed bytes per block for `ty`; -1 when unsupported. */
     public static int32 blockBytes(int32 ty) {
         if (ty == Quant.GG_Q4_0) { return 18; }
+        if (ty == Quant.GG_Q5_0) { return 22; }
         if (ty == Quant.GG_Q8_0) { return 34; }
         if (ty == Quant.GG_Q2_K) { return 84; }
         if (ty == Quant.GG_Q3_K) { return 110; }
@@ -100,6 +104,7 @@ public final class Quant {
             int64 ro = rawOff + b * bb;
             int64 oo = outOff + b * be;
             if (ty == Quant.GG_Q4_0) { Quant.q40Block(raw, ro, out, oo); }
+            else if (ty == Quant.GG_Q5_0) { Quant.q50Block(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q8_0) { Quant.q80Block(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q2_K) { Quant.q2kBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q3_K) { Quant.q3kBlock(raw, ro, out, oo); }
@@ -150,6 +155,69 @@ public final class Quant {
             out[oo + (int64) j] = d * (float32) ((int32) lo[j]);
             out[oo + (int64) (j + 16)] = d * (float32) ((int32) hi[j]);
             j = j + 1;
+        }
+    }
+
+    // ── Q5_0: { f16 d; u8 qh[4]; u8 qs[16] } — the 5th bit of every
+    // quant lives in the u32 `qh`, bit j for the low nibble of byte j and
+    // bit j+16 for the high nibble, biased -16. 22 bytes, 32 values.
+    // Half of Qwen2.5-VL-72B-Q4_K_L's ffn_down tensors are this format
+    // (spec 10.11): a legacy block inside a k-quant file.
+
+    static void q50Block(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        int32 qh = Quant.u8(raw, ro + 2L)
+            | (Quant.u8(raw, ro + 3L) << 8)
+            | (Quant.u8(raw, ro + 4L) << 16)
+            | (Quant.u8(raw, ro + 5L) << 24);
+        int32 j = 0;
+        while (j < 16) {
+            int32 q = Quant.u8(raw, ro + 6L + (int64) j);
+            // `qh >>> j` — the reference shifts a uint32, so the top bit
+            // must not sign-extend when j reaches 16..31 below.
+            int32 h0 = ((qh >> j) << 4) & 16;
+            int32 h1 = (qh >> (j + 12)) & 16;
+            out[oo + (int64) j] = d * (float32) (((q & 15) | h0) - 16);
+            out[oo + (int64) (j + 16)] =
+                d * (float32) ((((q >> 4) & 15) | h1) - 16);
+            j = j + 1;
+        }
+    }
+
+    /** Host mat-vec straight off Q5_0 blocks — unpack, dot, scale. */
+    public static void q50MatVecInto(int8[] packed, int64 rows, int64 cols,
+            float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int64 blocksPerRow = cols / 32L;
+        int64 rowBytes = blocksPerRow * 22L;
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 22L;
+                float32 dv = Quant.f16At(packed, ro);
+                int32 qh = Quant.u8(packed, ro + 2L)
+                    | (Quant.u8(packed, ro + 3L) << 8)
+                    | (Quant.u8(packed, ro + 4L) << 16)
+                    | (Quant.u8(packed, ro + 5L) << 24);
+                float32 dot = 0.0f;
+                int64 xb = xOff + b * 32L;
+                int32 j = 0;
+                while (j < 16) {
+                    int32 q = Quant.u8(packed, ro + 6L + (int64) j);
+                    int32 h0 = ((qh >> j) << 4) & 16;
+                    int32 h1 = (qh >> (j + 12)) & 16;
+                    dot = dot + (float32) (((q & 15) | h0) - 16)
+                        * x[xb + (int64) j];
+                    dot = dot + (float32) ((((q >> 4) & 15) | h1) - 16)
+                        * x[xb + (int64) (j + 16)];
+                    j = j + 1;
+                }
+                acc = acc + dv * dot;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
         }
     }
 

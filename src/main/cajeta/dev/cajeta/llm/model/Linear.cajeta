@@ -23,6 +23,11 @@ import dev.cajeta.llm.io.WmmaKernel;
 public final class Linear extends InfModule {
     Tensor<float32> weight;     // f32 path: [in, out] (transposed on import)
     int8[] packed;              // packed path: file bytes, [out, in] blocks
+    // Projection bias (spec 4.12) — Qwen2's q/k/v carry one, Llama's carry
+    // none. Always f32 in the file, never quantized. `biasDev` is its
+    // device copy, uploaded with the weight.
+    float32[] bias;
+    KernelBuffer<float32> biasDev;
     int32 packedTy;             // ggml type of `packed`, or -1
     int32 inDim;
     int32 outDim;
@@ -643,6 +648,32 @@ public final class Linear extends InfModule {
         return (int64) inDim % (int64) Quant.blockElems(ty) == 0L;
     }
 
+    /**
+     * Bind an OPTIONAL projection bias. Absent in the checkpoint means the
+     * architecture has none (Llama) — not an error. Present and dropped
+     * would be invisible: the model still produces fluent text, which is
+     * why 20.1.4 asserts the applied case numerically.
+     */
+    void bindBias(Checkpoint ckpt, String name, boolean toDevice) {
+        if (!ckpt.contains(name)) { return; }
+        Tensor<float32> t = ckpt.loadF32(name);
+        if (t.ndim() != 1 || t.shapeAt(0) != (int64) this.outDim) {
+            throw heap LlmException("bias binding: '" + name
+                + "' does not match [" + this.outDim + "]");
+        }
+        float32[] hb #= heap float32[(int64) this.outDim];
+        int64 i = 0;
+        while (i < (int64) this.outDim) {
+            hb[i] = t.flatGet(i);
+            i = i + 1;
+        }
+        this.bias #= hb;
+        return;
+    }
+
+    /** True when this projection carries a bias to apply. */
+    boolean hasBias() { return this.bias != null; }
+
     void bind(Checkpoint ckpt, String name, boolean toDevice) {
         // Packed path (spec §10): a Q8_0 weight stays in its block form and
         // is consumed as `d · Σ q·x` per 32 — no f32 weight tensor is ever
@@ -709,6 +740,18 @@ public final class Linear extends InfModule {
      * the forward path asks a projection to multiply, so the packed and
      * f32 weights differ only here.
      */
+    /** `db[doff .. doff+outDim) += bias` — the host counterpart of
+     *  Prim.addBiasRowsDevice. */
+    void addBiasHost(float32[] db, int64 doff) {
+        if (this.bias == null) { return; }
+        int64 i = 0;
+        while (i < (int64) this.outDim) {
+            db[doff + i] = db[doff + i] + this.bias[i];
+            i = i + 1;
+        }
+        return;
+    }
+
     void matvecInto(Tensor<float32> src, int64 srcOff,
             Tensor<float32> dst, int64 dstOff) {
         // Measurement instrument (QuantKernel.skipMatvecForMeasurement):
@@ -768,6 +811,9 @@ public final class Linear extends InfModule {
             } else if (this.packedTy == Quant.GG_Q6_K) {
                 Quant.q6kMatVecInto(this.packed, (int64) this.outDim,
                     (int64) this.inDim, sb, so, db, doff);
+            } else if (this.packedTy == Quant.GG_Q5_0) {
+                Quant.q50MatVecInto(this.packed, (int64) this.outDim,
+                    (int64) this.inDim, sb, so, db, doff);
             } else {
                 // A bare `else` here once routed every future type into
                 // the Q6_K decoder — one format's bytes through
@@ -775,10 +821,12 @@ public final class Linear extends InfModule {
                 throw heap LlmException("matvecInto: no host mat-vec "
                     + "for packed type " + this.packedTy);
             }
+            this.addBiasHost(db, doff);
             return;
         }
         HostOps.matvecRow(src, srcOff, this.weight, dst, dstOff,
             this.inDim, this.outDim);
+        this.addBiasHost(dst.hostBuffer(), dst.hostBase() + dstOff);
     }
 
     /**
@@ -829,6 +877,7 @@ public final class Linear extends InfModule {
                 db[doff + i] = this.yScratch[i];
                 i = i + 1;
             }
+            this.addBiasHost(db, doff);
             return;
         }
         // Timed twin of the block above. Kept as a SEPARATE arm rather than
@@ -1857,6 +1906,13 @@ public final class Linear extends InfModule {
         }
         Linear.btLaunchNs = Linear.btLaunchNs + (t1 - t0);
         Linear.btCalls = Linear.btCalls + 1L;
+        if (this.bias != null) {
+            // The GEMM wrote `rows x outDim`; the bias is one row wide and
+            // broadcasts down it (spec 4.12). Stream-ordered like the GEMM
+            // itself, so the NoSync routes stay NoSync.
+            Prim.addBiasRowsDevice(this.yBatch, this.biasDev,
+                (int64) rows, (int64) this.outDim);
+        }
         return;
     }
 
@@ -2021,6 +2077,11 @@ public final class Linear extends InfModule {
      *  `fusedYBatch`. Returns false (nothing launched) when the route
      *  does not apply. */
     boolean fusedPairBatchKeep(Linear b, int32 rows) {
+        // A fused launch writes ONE concatenated output; a per-projection
+        // bias does not belong to it (spec 4.12). Step aside rather than
+        // grow a concatenated-bias buffer for a route the coop GEMM
+        // already beats.
+        if (this.bias != null || b.bias != null) { return false; }
         if (Linear.coopOn && Linear.backendIsVulkan()
                 && Linear.btXhSrc != null) { return false; }
         if (!Linear.fuseRouteOn()) { return false; }
@@ -2040,6 +2101,11 @@ public final class Linear extends InfModule {
      *  per-projection yBatch buffers so rope/append/attend see
      *  exactly what the separate launches produced. */
     boolean fusedQkvBatchKeep(Linear kL, Linear vL, int32 rows) {
+        // See fusedPairBatchKeep: biased projections take the per-
+        // projection routes, which apply the bias themselves.
+        if (this.bias != null || kL.bias != null || vL.bias != null) {
+            return false;
+        }
         if (!Linear.fuseRouteOn()) { return false; }
         // The coop GEMM beats the fused dp4a launch by more than fusion
         // saves (5.4 vs 2.3 TMAC/s measured); step aside so the three
@@ -2181,6 +2247,10 @@ public final class Linear extends InfModule {
             }
         }
         this.launchRows();
+        if (this.bias != null) {
+            Prim.addBiasRowsDevice(this.yDev, this.biasDev, 1L,
+                (int64) this.outDim);
+        }
         return;
     }
 
@@ -2257,6 +2327,11 @@ public final class Linear extends InfModule {
             // Only the OUTPUT is per-Linear now; the activation side is
             // shared (see ensureStage), because that is the half that is
             // identical across q/k/v and across gate/up.
+            if (this.bias != null) {
+                this.biasDev #= heap KernelBuffer<float32>(
+                    (uint64) this.outDim);
+                this.biasDev.upload(this.bias, (int64) this.outDim);
+            }
             this.yScratch #= heap float32[(int64) this.outDim];
             this.yDev #= heap KernelBuffer<float32>((uint64) this.outDim);
             Linear.ensureStage(this.inDim);
