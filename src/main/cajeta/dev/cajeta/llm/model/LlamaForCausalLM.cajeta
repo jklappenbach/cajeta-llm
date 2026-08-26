@@ -510,6 +510,46 @@ public final class LlamaForCausalLM extends InfModule {
             l = l + 1;
         }
 
+        if (resident && LlamaForCausalLM.fuseTail && this.lmHead != null
+                && this.lmHead.isDeviceRouted()) {
+            if (this.dkv != null) {
+                // One position was appended to every layer's device
+                // planes. The paged cache is NOT advanced — see
+                // `seqLength`.
+                this.dkv.notePosition(startPos);
+            }
+            // FUSED TAIL (lm-head parity, 2026-08-25): the final norm
+            // and the output projection RIDE THE CHAIN'S STREAM, so the
+            // token's one wait covers them too — the way llama.cpp keeps
+            // lm_head inside the same graph submission. The unfused path
+            // below paid a second launch+sync round trip here (3.14 ms
+            // measured against the ~2.0 ms the lm_head's 0.43 GB of
+            // Q6_K weights cost to stream), and its residual download
+            // existed only to feed a HOST final norm — the next token's
+            // pre phase uploads a fresh embedding, it never reads hs.
+            // Timer semantics shift with the fuse: norm = the tail's
+            // launch cost, sync = chain AND tail GPU time, lmHead = the
+            // logits copy-out, hsDown = 0 by construction.
+            int64 tf0 = Clock.nanoTime();
+            Prim.rmsnormDevice(this.xnDev, this.hsDev,
+                this.model.norm.deviceWeight(), (int64) h,
+                this.model.norm.eps, this.cfg.normForm);
+            Linear.stageDeviceActivation(this.xnDev, (int64) h);
+            this.lmHead.matvecStagedKeep();
+            int64 tf1 = Clock.nanoTime();
+            KernelStream fs = QuantKernel.stream();
+            fs.sync();
+            int64 tf2 = Clock.nanoTime();
+            this.lmHead.fetchInto(this.pool.logits, 0L);
+            LlamaForCausalLM.dtNormNs = LlamaForCausalLM.dtNormNs
+                + (tf1 - tf0);
+            LlamaForCausalLM.dtSyncNs = LlamaForCausalLM.dtSyncNs
+                + (tf2 - tf1);
+            LlamaForCausalLM.dtLmHeadNs = LlamaForCausalLM.dtLmHeadNs
+                + (Clock.nanoTime() - tf2);
+            LlamaForCausalLM.dtTok = LlamaForCausalLM.dtTok + 1L;
+            return;
+        }
         if (resident) {
             if (this.dkv != null) {
                 // One position was appended to every layer's device
@@ -519,7 +559,9 @@ public final class LlamaForCausalLM extends InfModule {
             }
             // Back to the host once, for the final norm and lm_head.
             // 10.12.37: the layer chain above is now launch-only, so
-            // THIS is the token's one wait.
+            // THIS is the token's one wait. (The fused tail above is the
+            // default; this branch serves tied-embedding models, formats
+            // without a device route, and the bench's `nofuse` arm.)
             int64 ts0 = Clock.nanoTime();
             KernelStream ds = QuantKernel.stream();
             ds.sync();
@@ -678,6 +720,15 @@ public final class LlamaForCausalLM extends InfModule {
     // wait; hsDown = residual download + copy-out; norm = the host final
     // rmsnorm; lmHead = matvecInto (its own launch/download/copyOut
     // internals are Linear's dev timers); argmax = the 128k host scan.
+    // The fused decode tail: final norm + lm_head launched on the
+    // chain's stream before its one sync (llama.cpp keeps them in the
+    // same graph submission). Off = the two-round-trip host tail, kept
+    // for tied embeddings, un-routed formats, and the bench's A/B arm.
+    static boolean fuseTail = true;
+    public static void setFuseTail(boolean on) {
+        LlamaForCausalLM.fuseTail = on;
+    }
+
     static int64 dtPreNs;
     static int64 dtSyncNs;
     static int64 dtHsDownNs;
