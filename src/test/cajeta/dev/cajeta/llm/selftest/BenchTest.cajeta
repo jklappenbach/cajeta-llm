@@ -1,0 +1,351 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llm.bench.GreedyAgreement;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.bench.Perplexity;
+import dev.cajeta.llm.bench.RunReport;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.LlamaForCausalLM;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.sched.Scheduler;
+import dev.cajeta.llm.store.BlockStore;
+import dev.cajeta.llm.store.I64Codec;
+import cajeta.wire.Encoder;
+import cajeta.io.file.File;
+import cajeta.io.file.OpenMode;
+import cajeta.lang.Cajeta;
+import cajeta.lang.Math;
+import cajeta.lang.String;
+
+/**
+ * cajeta-llm plan Unit 15 TDD — the parity-gate INSTRUMENTS (15.2.3
+ * metrics, 15.2.4 perplexity, 15.2.5 report emitter) plus the load/free
+ * residency gate (15.1.11) at the mechanism level.
+ *
+ * Every reference number here is computed IN-TEST from Math.exp/Math.log
+ * on the same inputs — the tests pin the arithmetic, not a decimal
+ * transcribed from elsewhere. The real-model acceptance runs (8B parity
+ * fixture, llama.cpp baseline fractions) are recorded in the plan and in
+ * tools/, not asserted here: this suite must stay runnable on a bare CI
+ * runner with no model weights.
+ */
+public class BenchTest {
+
+    public BenchTest() { return; }
+
+    static boolean near64(float64 a, float64 b, float64 eps) {
+        float64 d = a - b;
+        if (d < 0.0) { d = 0.0 - d; }
+        return d < eps;
+    }
+
+    // ── 15.2.3 — the three parity detectors ─────────────────────────────
+
+    @Test
+    public void cosineMatchesHandComputation() {
+        float32[] a = [ 1.0f, 2.0f, 3.0f ];
+        float32[] b = [ 2.0f, 4.0f, 6.0f ];
+        Assert.isTrue(BenchTest.near64(Metrics.cosine(a, b, 3), 1.0, 1e-12));
+        float32[] c = [ 1.0f, 0.0f ];
+        float32[] d = [ 0.0f, 1.0f ];
+        Assert.isTrue(BenchTest.near64(Metrics.cosine(c, d, 2), 0.0, 1e-12));
+        // Hand case: [3,4]·[4,3] / (5·5) = 24/25.
+        float32[] e = [ 3.0f, 4.0f ];
+        float32[] f = [ 4.0f, 3.0f ];
+        Assert.isTrue(BenchTest.near64(Metrics.cosine(e, f, 2), 24.0 / 25.0, 1e-12));
+    }
+
+    @Test
+    public void logSumExpAndKlMatchHandComputation() {
+        float32[] two = [ 0.0f, 0.0f ];
+        Assert.isTrue(BenchTest.near64(Metrics.logSumExp(two, 2),
+            Math.log(2.0), 1e-12));
+        // P from logits [0, t] where t = f32(ln 3) — the QUANTIZED logit,
+        // not ln 3 itself: storing ln 3 at float32 moves it by ~6e-8, and
+        // a reference derived from exact (¼, ¾) misses the actual
+        // distribution by more than f64 noise (measured: the first draft
+        // failed at 1e-8). Deriving p from the same t the code reads
+        // makes this an independent formulation on identical inputs.
+        float32[] pl = [ 0.0f, (float32) Math.log(3.0) ];
+        float32[] ql = [ 0.0f, 0.0f ];
+        float64 t = pl[1];
+        float64 p1 = Math.exp(t) / (1.0 + Math.exp(t));
+        float64 p0 = 1.0 - p1;
+        float64 want = p0 * Math.log(p0 / 0.5) + p1 * Math.log(p1 / 0.5);
+        Assert.isTrue(BenchTest.near64(Metrics.softmaxKl(pl, ql, 2), want, 1e-12));
+        // KL of a distribution against itself is 0.
+        Assert.isTrue(BenchTest.near64(Metrics.softmaxKl(pl, pl, 2), 0.0, 1e-12));
+        // argmax = top-1 detector.
+        Assert.equals(1L, (int64) Metrics.argmax(pl, 2));
+    }
+
+    @Test
+    public void top2GapFindsTheTieMargin() {
+        float32[] a = [ 1.0f, 3.0f, 2.0f ];
+        Assert.isTrue(BenchTest.near64((float64) Metrics.top2Gap(a, 3), 1.0, 1e-9));
+        float32[] b = [ 5.0f, 1.0f ];
+        Assert.isTrue(BenchTest.near64((float64) Metrics.top2Gap(b, 2), 4.0, 1e-9));
+        // The two largest adjacent-at-front order.
+        float32[] c = [ 2.0f, 2.0f, -1.0f ];
+        Assert.isTrue(BenchTest.near64((float64) Metrics.top2Gap(c, 3), 0.0, 1e-9));
+    }
+
+    // ── 15.2.3 — greedy agreement with tie-only divergence (13.22) ─────
+
+    @Test
+    public void greedyAgreementEnforcesBothClauses() {
+        // 100 positions, one divergence at a 5e-4 gap: rate exactly 0.99
+        // and the divergence is a near-tie — passes.
+        GreedyAgreement ok = heap GreedyAgreement(8);
+        int32 i = 0;
+        while (i < 100) {
+            if (i == 37) {
+                ok.add(i, 5, 9, 0.0005f);
+            } else {
+                ok.add(i, 5, 5, 2.0f);
+            }
+            i = i + 1;
+        }
+        Assert.isTrue(BenchTest.near64(ok.agreementRate(), 0.99, 1e-12));
+        Assert.equals(1L, (int64) ok.divergences());
+        Assert.equals(37L, (int64) ok.divergencePosition(0));
+        Assert.isTrue(ok.passes(0.99, 0.001f));
+
+        // Same rate, but the divergence sits at a REAL gap: the tie
+        // clause alone must fail it — this is the systematic-bug case
+        // the rate would have passed.
+        GreedyAgreement tie = heap GreedyAgreement(8);
+        i = 0;
+        while (i < 100) {
+            if (i == 37) {
+                tie.add(i, 5, 9, 0.002f);
+            } else {
+                tie.add(i, 5, 5, 2.0f);
+            }
+            i = i + 1;
+        }
+        Assert.isTrue(BenchTest.near64(tie.agreementRate(), 0.99, 1e-12));
+        Assert.isFalse(tie.passes(0.99, 0.001f));
+
+        // Two divergences in 100: the rate clause fails it.
+        GreedyAgreement rate = heap GreedyAgreement(8);
+        i = 0;
+        while (i < 100) {
+            if (i == 37 || i == 71) {
+                rate.add(i, 5, 9, 0.0001f);
+            } else {
+                rate.add(i, 5, 5, 2.0f);
+            }
+            i = i + 1;
+        }
+        Assert.isFalse(rate.passes(0.99, 0.001f));
+    }
+
+    // ── 15.2.4 — perplexity ─────────────────────────────────────────────
+
+    @Test
+    public void perplexityMatchesHandComputation() {
+        // Logits [0, t] with t = f32(ln 3) — derived from the QUANTIZED
+        // logit for the same reason as the KL test: p(target 1) =
+        // e^t/(1+e^t), so one position has ppl = (1+e^t)/e^t, and adding
+        // target 0 makes the mean NLL ½(ln((1+e^t)/e^t) + ln(1+e^t)).
+        Perplexity one = heap Perplexity();
+        float32[] l = [ 0.0f, (float32) Math.log(3.0) ];
+        float64 t = l[1];
+        float64 et = Math.exp(t);
+        one.add(l, 2, 1);
+        Assert.equals(1L, (int64) one.positions());
+        Assert.isTrue(BenchTest.near64(one.ppl(), (1.0 + et) / et, 1e-12));
+
+        Perplexity two = heap Perplexity();
+        two.add(l, 2, 1);
+        two.add(l, 2, 0);
+        float64 mean = 0.5 * (Math.log((1.0 + et) / et) + Math.log(1.0 + et));
+        Assert.isTrue(BenchTest.near64(two.ppl(), Math.exp(mean), 1e-12));
+    }
+
+    // ── 15.2.5 — the report carries every §12.10 / §12.16 field ────────
+
+    @Test
+    public void reportCarriesAllFields() {
+        RunReport r = heap RunReport("Meta-Llama-3.1-8B-Instruct", "Q4_K_M",
+            "rocm/gfx1151", 4096, 1, "Release", "Bounded");
+        r.decodeTps = 12.5;
+        r.prefillTps = 800.0;
+        r.residentKb = 5000000;
+        String s #= r.render();
+        Assert.isTrue(s.contains("model: Meta-Llama-3.1-8B-Instruct"));
+        Assert.isTrue(s.contains("quantization: Q4_K_M"));
+        Assert.isTrue(s.contains("backend: rocm/gfx1151"));
+        Assert.isTrue(s.contains("contextLength: 4096"));
+        Assert.isTrue(s.contains("batchSize: 1"));
+        Assert.isTrue(s.contains("compilerMode: Release"));
+        Assert.isTrue(s.contains("liveSet: Bounded"));
+        Assert.isTrue(s.contains("decodeTps: "));
+        Assert.isTrue(s.contains("prefillTps: "));
+        Assert.isTrue(s.contains("residentKb: 5000000"));
+        // Not preempted: the §12.16 block is absent.
+        Assert.isFalse(s.contains("evictions:"));
+
+        r.preempted = true;
+        r.evictions = 3;
+        r.storeBytesWritten = 65536;
+        r.cacheHitRate = 0.5;
+        String s2 #= r.render();
+        Assert.isTrue(s2.contains("evictions: 3"));
+        Assert.isTrue(s2.contains("storeBytesWritten: 65536"));
+        Assert.isTrue(s2.contains("cacheHitRate: "));
+    }
+
+    // ── 15.1.9 — a preempted run reports the §12.16 store counters ─────
+
+    @Test
+    public void preemptedRunReportPopulatesStoreCounters() {
+        String base = "tmp/cajeta_llama_bench_rpt";
+        StoreTest.wipe(base);
+        LlamaForCausalLM m #= StoreTest.mk("rpt", 2, 20);
+        Encoder<int64> enc = heap I64Codec();
+        BlockStore st = heap BlockStore(base,
+            m.kvCache().blockPayloadBytes(), 0, enc);
+        Scheduler sch = heap Scheduler(m, 4);
+        sch.attachStore(st, "toyA", "F32", "none");
+        int32[] pa #= SchedulerTest.promptOf(2, 9);
+        int32[] pb #= SchedulerTest.promptOf(8, 4);
+        sch.submit(pa, 2, 30);
+        sch.submit(pb, 8, 24);
+        sch.runAll(600);
+        Assert.isTrue(sch.preemptedCount() >= 1);   // the run DID preempt
+        RunReport r = heap RunReport("toy", "f32", "cpu", 64, 2,
+            "Debug", "Unbounded");
+        r.recordStore(sch, st);
+        // 12.16: eviction-with-store is a WRITE, so the counts are real.
+        Assert.isTrue(r.preempted);
+        Assert.isTrue(r.evictions >= (int64) 1);
+        Assert.isTrue(r.storeBytesWritten >= (int64) 1);
+        Assert.isTrue(r.cacheHitRate >= 0.0);
+        Assert.isTrue(r.cacheHitRate <= 1.0);
+        String out #= r.render();
+        Assert.isTrue(out.contains("evictions: "));
+        Assert.isTrue(out.contains("storeBytesWritten: "));
+        Assert.isTrue(out.contains("cacheHitRate: "));
+        st.close();
+    }
+
+    // ── 15.1.11 — load/free cycles return resident memory to baseline ──
+
+    static void loadOnce(String cfgPath, String stPath) {
+        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        cfg.blockTokens = 4;
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 64, 1, 0);
+        Checkpoint ck = Checkpoint.open(stPath);
+        m.bind(ck, false);
+        ck.close();
+        int32[] toks = heap int32[4];
+        toks[0] = 3; toks[1] = 7; toks[2] = 11; toks[3] = 2;
+        m.prefill(toks, 4);
+        return;   // model, checkpoint, and cache all drop here
+    }
+
+    // Leak bisection for the red cycle test below: 2026-08-20's first
+    // run measured +732 live objects over six full cycles (~122/cycle).
+    // Each probe isolates one stage; the failing ones name the leak by
+    // their delta. Warm twice, measure four.
+
+    @Test
+    public void probeCfgParseCycleIsBalanced() {
+        String cfgPath = "tmp/cajeta_llama_bench_cfg.json";
+        String stPath = "tmp/cajeta_llama_bench.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        ModelConfig w1 = ModelConfig.parse(cfgPath);
+        ModelConfig w2 = ModelConfig.parse(cfgPath);
+        int64 live0 = Cajeta.liveCount();
+        int32 i = 0;
+        while (i < 4) {
+            ModelConfig c = ModelConfig.parse(cfgPath);
+            i = i + 1;
+        }
+        Assert.equals(0L, Cajeta.liveCount() - live0);
+    }
+
+    @Test
+    public void probeCheckpointCycleIsBalanced() {
+        String cfgPath = "tmp/cajeta_llama_bench_cfg.json";
+        String stPath = "tmp/cajeta_llama_bench.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        Checkpoint w = Checkpoint.open(stPath);
+        w.close();
+        int64 live0 = Cajeta.liveCount();
+        int32 i = 0;
+        while (i < 4) {
+            Checkpoint ck = Checkpoint.open(stPath);
+            ck.close();
+            i = i + 1;
+        }
+        Assert.equals(0L, Cajeta.liveCount() - live0);
+    }
+
+    static void bindOnly(String cfgPath, String stPath) {
+        ModelConfig cfg = ModelConfig.parse(cfgPath);
+        cfg.blockTokens = 4;
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 64, 1, 0);
+        Checkpoint ck = Checkpoint.open(stPath);
+        m.bind(ck, false);
+        ck.close();
+        return;
+    }
+
+    // The last residual — a constant 4 objects per MODEL-CONSTRUCTION
+    // cycle — was NOT a field-store miss in llama: LlamaModel.bind builds
+    // its weight names with `"model.layers." + l + "."`, and every
+    // INTERIOR node of a chained concat leaked its wrapper (plus its byte
+    // buffer past the 12-byte inline capacity). Fixed in the compiler
+    // (element-ownership 3.4.3, ChainedConcatTempDropTests); 2 layers x 2
+    // objects = the 4 seen here. Re-enabled with that fix.
+    @Test
+    public void probeBindCycleIsBalanced() {
+        String cfgPath = "tmp/cajeta_llama_bench_cfg.json";
+        String stPath = "tmp/cajeta_llama_bench.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        BenchTest.bindOnly(cfgPath, stPath);
+        BenchTest.bindOnly(cfgPath, stPath);
+        int64 live0 = Cajeta.liveCount();
+        int32 i = 0;
+        while (i < 4) {
+            BenchTest.bindOnly(cfgPath, stPath);
+            i = i + 1;
+        }
+        Assert.equals(0L, Cajeta.liveCount() - live0);
+    }
+
+    // 15.1.11 (spec 12.5). Was parked on the same chained-concat leak as
+    // probeBindCycleIsBalanced: the RSS bound always passed, the exact
+    // liveCount clause did not until the compiler fix.
+    @Test
+    public void loadFreeCyclesReturnResidentToBaseline() {
+        String cfgPath = "tmp/cajeta_llama_bench_cfg.json";
+        String stPath = "tmp/cajeta_llama_bench.safetensors";
+        ForwardTest.writeA(cfgPath, stPath, 2);
+        // Two warm cycles: allocator pools, JIT paths, page cache.
+        BenchTest.loadOnce(cfgPath, stPath);
+        BenchTest.loadOnce(cfgPath, stPath);
+        int64 live0 = Cajeta.liveCount();
+        int64 rss0 = SafetensorsTest.rssKb();
+        int32 i = 0;
+        while (i < 6) {
+            BenchTest.loadOnce(cfgPath, stPath);
+            i = i + 1;
+        }
+        // No object leaks across cycles…
+        Assert.equals(live0, Cajeta.liveCount());
+        // …and resident memory is flat: six more cycles may not grow RSS
+        // by more than allocator-retention noise (toy model ≈ 300 KB of
+        // weights per cycle; a real leak of even one cycle's weights per
+        // iteration would blow far past this bound).
+        int64 grownKb = SafetensorsTest.rssKb() - rss0;
+        if (grownKb < 0) {
+            grownKb = 0;
+        }
+        Assert.isTrue(grownKb < 16384);
+    }
+}

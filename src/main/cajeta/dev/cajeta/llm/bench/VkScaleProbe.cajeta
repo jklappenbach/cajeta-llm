@@ -1,0 +1,108 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import cajeta.xpu.Device;
+
+/**
+ * The suite's wave-vs-host agreement at REAL 8B dims: the toy-scale tests
+ * are green on vulkan while the 8B forward returns all-zero logits, so
+ * something between "2 rows x 2k cols" and "4096 rows x 4096 cols" breaks.
+ * Three shapes bisect it: the suite's shape, an attention-projection shape,
+ * and the lm_head shape (128k rows — the widest grid any launch uses).
+ */
+public final class VkScaleProbe {
+
+    static #float32[] activations(int64 n) {
+        float32[] x #= heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            x[i] = (float32) ((i * 31L + 7L) % 61L - 30L) * 0.03125f;
+            i = i + 1;
+        }
+        return #x;
+    }
+
+    static void check(String label, int8[] fix, int64 rows, int64 cols) {
+        VkScaleProbe.checkTy(label, fix, rows, cols, Quant.GG_Q4_K);
+    }
+
+    static void checkTy(String label, int8[] fix, int64 rows, int64 cols,
+            int32 ty) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 rowBytes = (cols / (int64) Quant.blockElems(ty)) * bb;
+        int8[] raw #= heap int8[rows * rowBytes];
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int64 blocks = rows * (cols / (int64) Quant.blockElems(ty));
+        int64 b = 0;
+        while (b < blocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) {
+                raw[dst + j] = fix[src + j];
+                j = j + 1;
+            }
+            b = b + 1;
+        }
+        float32[] x #= VkScaleProbe.activations(cols);
+        // Host reference on the first 4 and last 4 rows only — the full host
+        // mat-vec at 128k rows would dominate the probe's runtime for no
+        // extra information (the tiling repeats every fixBlocks blocks).
+        float32[] got #= heap float32[rows];
+        int64 checkRows = rows < 8L ? rows : 8L;
+        float32[] wantHead #= heap float32[checkRows];
+        if (ty == Quant.GG_Q6_K) {
+            QuantKernel.q6kQ8WaveMatVecIntoDevice(raw, rows, cols, x, 0L,
+                got, 0L);
+            Quant.q6kMatVecInto(raw, checkRows, cols, x, 0L, wantHead, 0L);
+        } else {
+            QuantKernel.q4kQ8WaveMatVecIntoDevice(raw, rows, cols, x, 0L,
+                got, 0L);
+            Quant.q4kMatVecInto(raw, checkRows, cols, x, 0L, wantHead, 0L);
+        }
+        int64 zero = 0;
+        int64 r = 0;
+        while (r < rows) {
+            if (got[r] == 0.0f) { zero = zero + 1; }
+            r = r + 1;
+        }
+        int64 bad = 0;
+        r = 0;
+        while (r < checkRows) {
+            float32 a = wantHead[r];
+            float32 g = got[r];
+            float32 diff = a - g;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.02f + 0.02f) { bad = bad + 1; }
+            r = r + 1;
+        }
+        System.stdout.println(label + ": rows " + rows + " cols " + cols
+            + "  zeroRows " + zero + "/" + rows
+            + "  headMismatch " + bad + "/" + checkRows
+            + "  got0 " + got[0] + " want0 " + wantHead[0]);
+    }
+
+    public static int32 run() {
+        System.stdout.println("backend: " + Device.activeBackend());
+        int8[] fix #= File.readAllBytes(
+            "src/test/fixtures/gguf/kquant/q4_k.bin");
+        VkScaleProbe.check("suite-scale", fix, 2L, 2048L);
+        VkScaleProbe.check("proj-scale", fix, 4096L, 4096L);
+        VkScaleProbe.check("ffn-scale", fix, 14336L, 4096L);
+        VkScaleProbe.check("lmhead-scale", fix, 128256L, 4096L);
+        int8[] fix6 #= File.readAllBytes(
+            "src/test/fixtures/gguf/kquant/q6_k.bin");
+        VkScaleProbe.checkTy("q6-suite-scale", fix6, 2L, 2048L,
+            Quant.GG_Q6_K);
+        VkScaleProbe.checkTy("q6-proj-scale", fix6, 4096L, 4096L,
+            Quant.GG_Q6_K);
+        VkScaleProbe.checkTy("q6-lmhead-scale", fix6, 128256L, 4096L,
+            Quant.GG_Q6_K);
+        return 0;
+    }
+}

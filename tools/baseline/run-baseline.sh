@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cajeta-llama plan 15.2.1 / 15.1.1 — the llama.cpp baseline at the spec
+# cajeta-llm plan 15.2.1 / 15.1.1 — the llama.cpp baseline at the spec
 # 13.20 reference configuration: Llama-3.1-8B-Instruct Q4_K_M, gfx1151 /
 # ROCm, 4096-token context. Every fraction in §12.8/12.9/12.11 divides by
 # the numbers this script records; they are meaningless against an

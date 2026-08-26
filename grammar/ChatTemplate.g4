@@ -1,6 +1,6 @@
 /*
  * ChatTemplate.g4 — the normative grammar of the chat-template dialect
- * (cajeta-llama spec 7.11–7.14, 13.18).
+ * (cajeta-llm spec 7.11–7.14, 13.18).
  *
  * STATUS: this grammar is the CONTRACT, not a code-generator input.
  * ANTLR4 ships no cajeta target and there is no ANTLR runtime on the

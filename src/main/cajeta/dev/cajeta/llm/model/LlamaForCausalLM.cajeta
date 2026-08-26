@@ -1,0 +1,1325 @@
+package dev.cajeta.llm.model;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.math.Tensor;
+import dev.cajeta.llm.LlamaException;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.Quant;
+
+/**
+ * The tape-free inference model (plan Unit 6; spec §4). Construction
+ * builds the decoder stack from a HF `config.json`; binding loads HF
+ * safetensors by torch `state_dict` name with no rename table; the
+ * forward path is decode-first:
+ *
+ * - {@link #decodeStep} runs one token through pooled activations and
+ *   the in-place KV cache — ZERO heap allocations per step (6.1.6), so
+ *   the global live-set mutex never enters the hot path.
+ * - {@link #prefill} runs the prompt through ONE arena block sized to the
+ *   actual sequence length, carved into borrowed slices (spec 4.9/4.10);
+ *   nothing survives the call, so peak activation memory is O(one layer)
+ *   regardless of depth (6.1.1).
+ *
+ * Under `tie_word_embeddings` the `lmHead` field stays null and logits
+ * are produced against the embedding matrix (spec 4.7).
+ *
+ * v1 computes on the HOST at f32; a model loaded `toDevice` is fully
+ * device-resident after binding (6.1.4), and Unit 7's kernels take the
+ * forward path to the device behind the same HostOps seams.
+ */
+public final class LlamaForCausalLM extends InfModule {
+    // Walked fields first: these two produce the state_dict key space.
+    LlamaModel model;
+    Linear lmHead;          // null when tie_word_embeddings (spec 4.7)
+
+    // Non-parameter state (skipped by the reflective walk).
+    ModelConfig cfg;
+    ActivationPool pool;
+    PagedKvCache cache;
+    int32 maxSeq;
+    int32 maxSeqsN;
+    int32 pos;
+
+    /**
+     * `maxSeqs` sequences share the cache pool; `numBlocks` 0 auto-sizes
+     * so every sequence can hold a full context (the scheduler passes a
+     * deliberately scarcer pool to exercise admission and preemption).
+     */
+    public LlamaForCausalLM(#ModelConfig cfg, int32 maxSeq, int32 maxSeqs,
+            int32 numBlocks) {
+        this.cfg #= cfg;
+        this.model = heap LlamaModel(this.cfg);
+        if (this.cfg.tieWordEmbeddings) {
+            this.lmHead = null;
+        } else {
+            this.lmHead = heap Linear(this.cfg.hiddenSize,
+                this.cfg.vocabSize);
+        }
+        this.pool = heap ActivationPool(this.cfg, maxSeq);
+        // Pool capacity: every unwindowed layer can hold a full-context
+        // sequence (windowed layers keep rings and draw no blocks).
+        int32 blocksPerSeq = (maxSeq + this.cfg.blockTokens - 1)
+            / this.cfg.blockTokens;
+        int32 fullLayers = 0;
+        int32 li = 0;
+        while (li < this.cfg.numLayers) {
+            if (this.cfg.windowForLayer(li) == 0) {
+                fullLayers = fullLayers + 1;
+            }
+            li = li + 1;
+        }
+        int32 nb = numBlocks;
+        if (nb == 0) {
+            nb = fullLayers * blocksPerSeq * maxSeqs;
+        }
+        if (nb == 0) {
+            nb = 1;
+        }
+        this.cache = heap PagedKvCache(this.cfg, maxSeq, maxSeqs, nb);
+        this.maxSeq = maxSeq;
+        this.maxSeqsN = maxSeqs;
+        this.pos = 0;
+    }
+
+    public int32 maxSequences() {
+        return this.maxSeqsN;
+    }
+
+    /**
+     * Build the prefill-weight state OFF the prefill clock (the
+     * profiling audit): under `prefillWeights = "int8"` the per-tensor
+     * widen kernels measured 179 ms INSIDE the first prefill —
+     * one-time work misattributed to prompt latency. Call after bind;
+     * a no-op under the packed policy.
+     */
+    public void prewarmPrefillWeights() {
+        if (!Linear.deqPrefillOn()) { return; }
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            if (Linear.fuseEnabled()) {
+                // 10.12.32: the fused buffers replace the per-tensor
+                // deq for the fused tensors — building both would
+                // double their footprint for nothing. Layers whose
+                // attn_v is Q6_K cannot fuse q|k|v (half of Q4_K_M):
+                // their trio prewarms per-tensor, or the widens land
+                // inside the first timed prefill.
+                if (d.selfAttn.vProj.packedTy == Quant.GG_Q4_K) {
+                    d.selfAttn.qProj.ensureFused3(d.selfAttn.kProj,
+                        d.selfAttn.vProj);
+                } else {
+                    d.selfAttn.qProj.prewarmDeq();
+                    d.selfAttn.kProj.prewarmDeq();
+                    d.selfAttn.vProj.prewarmDeq();
+                }
+                d.mlp.gateProj.ensureFused2(d.mlp.upProj);
+            } else {
+                d.selfAttn.qProj.prewarmDeq();
+                d.selfAttn.kProj.prewarmDeq();
+                d.selfAttn.vProj.prewarmDeq();
+                d.mlp.gateProj.prewarmDeq();
+                d.mlp.upProj.prewarmDeq();
+            }
+            d.selfAttn.oProj.prewarmDeq();
+            d.mlp.downProj.prewarmDeq();
+            // 10.12.35: the yBatch buffers were allocated lazily by the
+            // FIRST prefill — rocprofv3 put ~40 ms of hipMalloc inside
+            // its pack->GEMM gaps. Allocate them off the clock, at the
+            // full-context bound they would reach anyway.
+            d.selfAttn.qProj.ensureBatchOut(this.maxSeq);
+            d.selfAttn.kProj.ensureBatchOut(this.maxSeq);
+            d.selfAttn.vProj.ensureBatchOut(this.maxSeq);
+            d.selfAttn.oProj.ensureBatchOut(this.maxSeq);
+            d.mlp.gateProj.ensureBatchOut(this.maxSeq);
+            d.mlp.upProj.ensureBatchOut(this.maxSeq);
+            d.mlp.downProj.ensureBatchOut(this.maxSeq);
+            l = l + 1;
+        }
+        Linear.ensureBatchStage(this.maxSeq,
+            this.cfg.intermediateSize);
+        if (this.lmHead != null) {
+            // The output projection's ~430 MB device upload happened
+            // lazily INSIDE the first prefill's logits tail.
+            this.lmHead.ensureDevice();
+        }
+        KernelStream ps = QuantKernel.stream();
+        ps.sync();
+        return;
+    }
+
+    public int32 layerCount() {
+        return this.cfg.numLayers;
+    }
+
+    /** The cache — observable occupancy for tests and the scheduler. */
+    /** The vocabulary width, for a caller inspecting logits. */
+    public int32 vocabSize() { return this.cfg.vocabSize; }
+
+    /** Logit `i` of the last step — the measurement surface for the
+     *  top-2 gap at a divergence. */
+    public float32 logitAt(int32 i) {
+        return this.pool.logits.flatGet((int64) i);
+    }
+
+    public PagedKvCache kvCache() {
+        return this.cache;
+    }
+
+    /** Parse config, build the stack, bind the checkpoint. */
+    public static #LlamaForCausalLM load(String configPath, String ckptPath,
+            int32 maxSeq, boolean toDevice) {
+        LlamaForCausalLM m = heap LlamaForCausalLM(
+            ModelConfig.parse(configPath), maxSeq, 1, 0);
+        Checkpoint ckpt = Checkpoint.open(ckptPath);
+        m.bind(ckpt, toDevice);
+        ckpt.close();
+        return #m;
+    }
+
+    /** Bind every parameter from `ckpt` by its torch state_dict key. */
+    public void bind(Checkpoint ckpt, boolean toDevice) {
+        this.model.bind(ckpt, toDevice);
+        if (this.lmHead != null) {
+            this.lmHead.bind(ckpt, "lm_head.weight", toDevice);
+        }
+    }
+
+    public int32 position() {
+        return this.pos;
+    }
+
+    public int32 vocabSize() {
+        return this.cfg.vocabSize;
+    }
+
+    /** The logits of the most recent step — a borrow of pooled storage. */
+    public Tensor<float32> logits() {
+        return this.pool.logits;
+    }
+
+    /**
+     * Run the prompt `tokens[0, n)` from the current position of the
+     * DEFAULT sequence — sequence 0's convenience wrapper over
+     * {@link #stepSeq}.
+     */
+    public int32 prefill(int32[] tokens, int32 n) {
+        int32 r = this.stepSeq(0, tokens, 0, n);
+        this.pos = this.seqLength(0);
+        return r;
+    }
+
+    /**
+     * THE step function (spec 13.14): consume `n` tokens
+     * `tokens[off, off+n)` of sequence `seq` from its current cache
+     * length — a prefill chunk at n=chunk, a decode at n=1, one forward
+     * path. Returns the argmax over the LAST consumed position's logits
+     * (meaningful when that position is the sequence's newest token;
+     * interior chunks' argmax is discarded by the caller). n=1 runs in
+     * pooled buffers (zero allocations); larger chunks carve one arena
+     * block sized to the actual chunk (spec 4.9).
+     */
+    public int32 stepSeq(int32 seq, int32[] tokens, int32 off, int32 n) {
+        if (n <= 0) {
+            throw heap LlamaException("step: token count must be positive");
+        }
+        int32 seqPos = this.seqLength(seq);
+        if (seqPos + n > this.maxSeq) {
+            throw heap LlamaException("step: " + n
+                + " tokens at position " + seqPos
+                + " exceeds maxSeq " + this.maxSeq);
+        }
+        if (n == 1) {
+            return this.stepOne(seq, tokens[off]);
+        }
+        int64 rows = (int64) n;
+        int64 h = (int64) this.cfg.hiddenSize;
+        int64 qd = (int64) this.cfg.qDim();
+        int64 kvd = (int64) this.cfg.kvDim();
+        int64 inter = (int64) this.cfg.intermediateSize;
+
+        // One block sized to the ACTUAL sequence length (spec 4.9).
+        int64 total = rows * (h * 4 + qd * 2 + kvd * 2 + inter * 2);
+        PrefillArena arena = heap PrefillArena(total);
+        Tensor<float32> hs = arena.take(rows, h);
+        Tensor<float32> xn = arena.take(rows, h);
+        Tensor<float32> proj = arena.take(rows, h);
+        Tensor<float32> mlpOut = arena.take(rows, h);
+        Tensor<float32> q = arena.take(rows, qd);
+        Tensor<float32> ao = arena.take(rows, qd);
+        Tensor<float32> k = arena.take(rows, kvd);
+        Tensor<float32> v = arena.take(rows, kvd);
+        Tensor<float32> gate = arena.take(rows, inter);
+        Tensor<float32> up = arena.take(rows, inter);
+
+        Tensor<float32> emb = this.model.embedTokens.weight;
+        int32 r = 0;
+        while (r < n) {
+            this.model.embedTokens.rowIntoTensor(tokens[off + r], hs,
+                (int64) r * h, this.cfg.hiddenSize);
+            r = r + 1;
+        }
+        int32 seqPos2 = this.seqLength(seq);
+        this.forwardRows(seq, hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
+            n, seqPos2);
+        return HostOps.argmaxRow(this.pool.logits, this.cfg.vocabSize);
+    }
+
+    /**
+     * One decode step for `token` at the current position of sequence 0,
+     * entirely in pooled buffers: zero heap allocations (6.1.6). Returns
+     * the argmax of the resulting logits.
+     */
+    public int32 decodeStep(int32 token) {
+        int32 r = this.stepOne(0, token);
+        this.pos = this.seqLength(0);
+        return r;
+    }
+
+    /** The N=1 specialization of {@link #stepSeq}: pooled buffers, zero
+     *  heap allocations, same `forwardRows`. */
+    int32 stepOne(int32 seq, int32 token) {
+        int32 seqPos = this.seqLength(seq);
+        if (seqPos >= this.maxSeq) {
+            throw heap LlamaException("decode: context is full (maxSeq "
+                + this.maxSeq + ")");
+        }
+        ActivationPool p = this.pool;
+        int64 te0 = Clock.nanoTime();
+        this.model.embedTokens.rowIntoTensor(token, p.x, 0,
+            this.cfg.hiddenSize);
+        LlamaForCausalLM.dtPreNs = LlamaForCausalLM.dtPreNs
+            + (Clock.nanoTime() - te0);
+        this.forwardRows(seq, p.x, p.xn, p.q, p.k, p.v, p.attnOut,
+            p.attnProj, p.gate, p.up, p.mlpOut, 1, seqPos);
+        int64 ta0 = Clock.nanoTime();
+        int32 am = HostOps.argmaxRow(p.logits, this.cfg.vocabSize);
+        LlamaForCausalLM.dtArgmaxNs = LlamaForCausalLM.dtArgmaxNs
+            + (Clock.nanoTime() - ta0);
+        return am;
+    }
+
+    /**
+     * The shared step function over `rows` consecutive positions starting
+     * at absolute `startPos`: the layer stack (norm → GQA attention with
+     * causal-by-construction cache reads → norm → SwiGLU, residuals in
+     * place on `hs`), then the final norm and the output projection of
+     * the LAST row into `pool.logits`. Buffers are caller-owned; row `r`
+     * of a buffer is its flat range `[r·dim, (r+1)·dim)`.
+     */
+    void forwardRows(int32 seq, Tensor<float32> hs, Tensor<float32> xn,
+            Tensor<float32> q, Tensor<float32> k, Tensor<float32> v,
+            Tensor<float32> ao, Tensor<float32> proj,
+            Tensor<float32> gate, Tensor<float32> up,
+            Tensor<float32> mlpOut, int32 rows, int32 startPos) {
+        int32 h = this.cfg.hiddenSize;
+        int32 qd = this.cfg.qDim();
+        int32 kvd = this.cfg.kvDim();
+        int32 inter = this.cfg.intermediateSize;
+        int32 nH = this.cfg.numHeads;
+        int32 nKv = this.cfg.numKvHeads;
+        int32 hd = this.cfg.headDim;
+        Tensor<float32> scores = this.pool.scores;
+
+        // FULL LAYER RESIDENCY (plan 10.2), when the layout allows it.
+        // Gated on the Llama shape — no QK-norm, no four-norm — because the
+        // extra norms in the other layouts have no device path yet, and a
+        // half-resident layer that silently used a stale `hs` would be the
+        // worst of both. rows==1 because only decode has a residual chain
+        // short enough for one buffer.
+        boolean resident = rows == 1 && this.deviceResidentReady();
+        if (!resident) {
+            // The host path reads K/V bytes, so the device planes owe the
+            // cache whatever they hold beyond it (10.11.2). Prefill, a
+            // non-Llama layout and a disabled route all land here.
+            this.syncKvToHost(seq);
+        }
+        if (resident) {
+            int64 tp0 = Clock.nanoTime();
+            this.ensureResidentBuffers(h);
+            this.ensureDeviceKv(seq);
+            float32[] hb = hs.hostBuffer();
+            int64 hbase = hs.hostBase();
+            int64 ci = 0;
+            while (ci < (int64) h) {
+                this.hsHost[ci] = hb[hbase + ci];
+                ci = ci + 1;
+            }
+            this.hsDev.upload(this.hsHost);
+            LlamaForCausalLM.dtPreNs = LlamaForCausalLM.dtPreNs
+                + (Clock.nanoTime() - tp0);
+        }
+
+        // BATCHED PREFILL (plan 10.12.1). The projections run over ALL
+        // rows at once so a 32-token tile shares one pass over the
+        // weights; the per-row path below reads all 4.58 GB of an 8B
+        // checkpoint once PER PROMPT TOKEN, which is 2.4 TB for a
+        // 512-token prompt and is why prefill(512) took 34 s.
+        boolean batched = rows > 1 && this.batchReady(rows);
+        if (batched && LlamaForCausalLM.devAttnOn
+                && DeviceKv.supports(this.cfg)) {
+            // The prefill attend needs the device planes; the same ones
+            // decode then inherits, already holding the prompt, so the
+            // 10.11 seed becomes free.
+            if (this.dkv == null) {
+                this.dkv #= heap DeviceKv(this.cfg, this.maxSeq);
+                this.dkv.bindRope(this.model);
+            }
+        }
+        if (rows > 1 && !this.batchSaid) {
+            // SAY whether it engaged. The first version of this only knew
+            // Q4_K, and Q4_K_M is a MIXTURE — attn_v and some ffn_down are
+            // Q6_K — so `batchReady` was false and the whole prefill ran
+            // per row. It read as "batching bought 4%" when it never ran.
+            this.batchSaid = true;
+            if (batched) {
+                System.stdout.println("prefill: BATCHED projections");
+            } else {
+                System.stdout.println("prefill: per-row projections "
+                    + "(no batched GEMM for some weight type)");
+            }
+        }
+        if (batched) {
+            this.forwardRowsBatched(seq, hs, xn, q, k, v, ao, proj, gate,
+                up, mlpOut, rows, startPos, h, qd, kvd, inter, nH, nKv, hd,
+                scores);
+            return;
+        }
+
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.selfAttn;
+            if (resident) {
+                this.residentLayer(seq, l, d, a, q, k, v, ao, scores,
+                    h, qd, kvd, inter, nH, nKv, hd, startPos);
+                l = l + 1;
+                continue;
+            }
+            int32 r = 0;
+            while (r < rows) {
+                int64 rh = (int64) r * (int64) h;
+                int64 rq = (int64) r * (int64) qd;
+                int64 rkv = (int64) r * (int64) kvd;
+                int64 ri = (int64) r * (int64) inter;
+                int32 p = startPos + r;
+
+                // Attention sublayer.
+                Prim.rmsnormRowHost(hs, rh, d.inputLayernorm.weight,
+                    d.inputLayernorm.eps, xn, rh, h, d.normForm);
+                // A NEW activation is current: `xn` was just rewritten at
+                // `rh`. q, k and v then all read that same window, and the
+                // shared stage quantizes and uploads it once instead of three
+                // times. Declared here rather than inferred, because `xn` is
+                // reused at the same offset every layer — identity and offset
+                // cannot tell layer N's activation from layer N+1's.
+                Linear.beginSharedActivation();
+                a.qProj.matvecInto(xn, rh, q, rq);
+                a.kProj.matvecInto(xn, rh, k, rkv);
+                a.vProj.matvecInto(xn, rh, v, rkv);
+                Linear.endSharedActivation();
+                if (a.qNorm != null) {
+                    // QK-norm BEFORE RoPE (spec 5.10), per head.
+                    int32 hh = 0;
+                    while (hh < nH) {
+                        Prim.rmsnormRowHost(q, rq + (int64) (hh * hd),
+                            a.qNorm.weight, a.qNorm.eps,
+                            q, rq + (int64) (hh * hd), hd, d.normForm);
+                        hh = hh + 1;
+                    }
+                    hh = 0;
+                    while (hh < nKv) {
+                        Prim.rmsnormRowHost(k, rkv + (int64) (hh * hd),
+                            a.kNorm.weight, a.kNorm.eps,
+                            k, rkv + (int64) (hh * hd), hd, d.normForm);
+                        hh = hh + 1;
+                    }
+                }
+                // RoPE at the ABSOLUTE position, per-layer frequencies —
+                // never the ring slot (spec 6.10).
+                Prim.ropeRowHost(q, rq, nH, hd, p, a.ropeInv);
+                Prim.ropeRowHost(k, rkv, nKv, hd, p, a.ropeInv);
+                if (!this.cache.appendRow(seq, l, k, rkv, v, rkv, p)) {
+                    // The scheduler's admission/headroom arithmetic must
+                    // prevent this; hitting it here is an invariant
+                    // violation, not a schedulable event (6.4, 13.15).
+                    throw heap LlamaException("kv pool exhausted at layer "
+                        + l + " position " + p);
+                }
+                // Causal by construction; the layer's window clamps in
+                // prefill AND decode inside the cache read (spec 5.9).
+                this.cache.attendRow(seq, l, q, rq, a.scale, scores, ao, rq,
+                    nH, nKv, hd);
+                a.oProj.matvecInto(ao, rq, proj, rh);
+                if (d.fourNorm) {
+                    // Gemma layout: post-norm on the sublayer OUTPUT.
+                    Prim.rmsnormRowHost(proj, rh,
+                        d.postAttentionLayernorm.weight,
+                        d.postAttentionLayernorm.eps, proj, rh, h,
+                        d.normForm);
+                }
+                HostOps.addRow(hs, rh, proj, rh, h);
+
+                // MLP sublayer. Two-norm layout uses
+                // post_attention_layernorm as the pre-MLP norm.
+                RMSNorm pre = d.postAttentionLayernorm;
+                if (d.fourNorm) {
+                    pre = d.preFeedforwardLayernorm;
+                }
+                Prim.rmsnormRowHost(hs, rh, pre.weight, pre.eps,
+                    xn, rh, h, d.normForm);
+                Linear.beginSharedActivation();
+                if (d.mlp.gateProj.isDeviceRouted()
+                        && d.mlp.upProj.isDeviceRouted()
+                        && d.mlp.downProj.isDeviceRouted()) {
+                    // THE MLP MIDDLE NEVER LEAVES THE DEVICE (plan 10.2).
+                    // gate and up are produced there, the SwiGLU runs there,
+                    // and down quantizes the result there — where the host
+                    // path downloads gate and up, folds them, and uploads
+                    // the fold again, three crossings a layer for a value
+                    // no one on this side ever looks at.
+                    d.mlp.gateProj.matvecKeepOnDevice(xn, rh);
+                    d.mlp.upProj.matvecKeepOnDevice(xn, rh);
+                    Linear.endSharedActivation();
+                    Prim.gluDevice(d.mlp.gateProj.out(), d.mlp.upProj.out(),
+                        (int64) inter, d.activation);
+                    d.mlp.downProj.matvecFromDevice(d.mlp.gateProj.out(),
+                        (int64) inter, mlpOut, rh);
+                } else {
+                    d.mlp.gateProj.matvecInto(xn, rh, gate, ri);
+                    d.mlp.upProj.matvecInto(xn, rh, up, ri);
+                    Linear.endSharedActivation();
+                    Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
+                        d.activation);
+                    d.mlp.downProj.matvecInto(gate, ri, mlpOut, rh);
+                }
+                if (d.fourNorm) {
+                    Prim.rmsnormRowHost(mlpOut, rh,
+                        d.postFeedforwardLayernorm.weight,
+                        d.postFeedforwardLayernorm.eps, mlpOut, rh, h,
+                        d.normForm);
+                }
+                HostOps.addRow(hs, rh, mlpOut, rh, h);
+                r = r + 1;
+            }
+            l = l + 1;
+        }
+
+        if (resident) {
+            if (this.dkv != null) {
+                // One position was appended to every layer's device
+                // planes. The paged cache is NOT advanced — see
+                // `seqLength`.
+                this.dkv.notePosition(startPos);
+            }
+            // Back to the host once, for the final norm and lm_head.
+            // 10.12.37: the layer chain above is now launch-only, so
+            // THIS is the token's one wait.
+            int64 ts0 = Clock.nanoTime();
+            KernelStream ds = QuantKernel.stream();
+            ds.sync();
+            int64 ts1 = Clock.nanoTime();
+            LlamaForCausalLM.dtSyncNs = LlamaForCausalLM.dtSyncNs
+                + (ts1 - ts0);
+            this.hsDev.download(this.hsHost);
+            float32[] hb2 = hs.hostBuffer();
+            int64 hb2base = hs.hostBase();
+            int64 co = 0;
+            while (co < (int64) h) {
+                hb2[hb2base + co] = this.hsHost[co];
+                co = co + 1;
+            }
+            LlamaForCausalLM.dtHsDownNs = LlamaForCausalLM.dtHsDownNs
+                + (Clock.nanoTime() - ts1);
+            LlamaForCausalLM.dtTok = LlamaForCausalLM.dtTok + 1L;
+        }
+
+        // Final norm of the last row, then the output projection.
+        int64 tn0 = Clock.nanoTime();
+        int64 lastH = (int64) (rows - 1) * (int64) h;
+        Prim.rmsnormRowHost(hs, lastH, this.model.norm.weight,
+            this.model.norm.eps, xn, lastH, h, this.cfg.normForm);
+        int64 tn1 = Clock.nanoTime();
+        if (this.lmHead != null) {
+            this.lmHead.matvecInto(xn, lastH, this.pool.logits, 0);
+        } else {
+            // Tied output projection: logits against the embedding matrix.
+            HostOps.rowsDotRow(this.model.embedTokens.weight, xn, lastH,
+                this.pool.logits, this.cfg.vocabSize, h);
+        }
+        if (resident) {
+            LlamaForCausalLM.dtNormNs = LlamaForCausalLM.dtNormNs
+                + (tn1 - tn0);
+            LlamaForCausalLM.dtLmHeadNs = LlamaForCausalLM.dtLmHeadNs
+                + (Clock.nanoTime() - tn1);
+        }
+    }
+
+    // Device-resident decode state (plan 10.2). One hidden-wide buffer for
+    // the residual stream and one for the norm output, allocated once.
+    KernelBuffer<float32> hsDev;
+    KernelBuffer<float32> xnDev;
+    float32[] hsHost;
+
+    // Prefill-resident hidden state (10.12.7.b): `[rows x h]` device
+    // twins of hs/xn for the batched path, plus the scratch host array
+    // the one-per-prefill upload/download bounces through — an arena
+    // slice's `hostBase` is nonzero and `KernelBuffer.upload` starts at
+    // index 0, the exact trap that broke `prefillAttend` (spec 9).
+    KernelBuffer<float32> pfHsDev;
+    KernelBuffer<float32> pfXnDev;
+    float32[] pfHsHost;
+    int64 pfHsCap;
+    // 10.12.7.c: per-row positions for the batched device rope, and the
+    // scratch the roped k/v come down through for the paged cache's
+    // host append (the cache stays authoritative).
+    KernelBuffer<int32> pfPosDev;
+    int32[] pfPosHost;
+    int32 pfPosCap;
+    float32[] pfKScr;
+    float32[] pfVScr;
+    int64 pfKvCap;
+
+    void ensurePrefillRes(int64 n) {
+        if (this.pfHsCap >= n) { return; }
+        this.pfHsDev #= heap KernelBuffer<float32>((uint64) n);
+        this.pfXnDev #= heap KernelBuffer<float32>((uint64) n);
+        this.pfHsHost #= heap float32[n];
+        this.pfHsCap = n;
+        return;
+    }
+
+    void ensurePrefillPos(int32 rows, int32 startPos) {
+        if (this.pfPosCap < rows) {
+            this.pfPosDev #= heap KernelBuffer<int32>((uint64) rows);
+            this.pfPosHost #= heap int32[(int64) rows];
+            this.pfPosCap = rows;
+        }
+        int32 i = 0;
+        while (i < rows) {
+            this.pfPosHost[(int64) i] = startPos + i;
+            i = i + 1;
+        }
+        this.pfPosDev.upload(this.pfPosHost, (int64) rows);
+        return;
+    }
+
+    KernelBuffer<float32> pfLastDev;
+    int64 pfLastCap;
+
+    void ensurePrefillLast(int64 n) {
+        if (this.pfLastDev != null && this.pfLastCap >= n) { return; }
+        this.pfLastDev #= heap KernelBuffer<float32>((uint64) n);
+        this.pfLastCap = n;
+        return;
+    }
+
+    void ensurePrefillKv(int64 n) {
+        if (this.pfKvCap >= n) { return; }
+        this.pfKScr #= heap float32[n];
+        this.pfVScr #= heap float32[n];
+        this.pfKvCap = n;
+        return;
+    }
+
+    // Device attention (plan 10.11): RoPE, the KV planes and the attend.
+    DeviceKv dkv;
+
+    static boolean devAttnOn = true;
+    static boolean forceReseed = false;
+
+    // 10.12.38: the prefill cache-authority pass is LAZY by default —
+    // the planes adopt with the host cache behind and `writeback` pays
+    // the catch-up only when a host path actually reads K/V. The
+    // profiler measured the eager pass at ~36 ms (4 ms downloads +
+    // ~32 ms per-row host appends) that resident decode never reads.
+    // `eagerauth` reverts; `reseed` forces eager regardless, since its
+    // whole point is to seed decode FROM the host cache.
+    static boolean eagerAuthOn = false;
+
+    public static void setEagerAuth(boolean on) {
+        LlamaForCausalLM.eagerAuthOn = on;
+    }
+
+    // Prefill phase timers (10.12.22): the batch phases in Linear cover
+    // the projections; these cover the rest of `forwardRowsBatched`, so
+    // the whole prefill is accounted rather than "launch plus a
+    // mystery". Host prims = the rmsnorm/GLU/add row loops.
+    static int64 pfPrimNs;
+    static int64 pfRopeNs;
+    static int64 pfAttendNs;
+    static int64 pfHeadNs;
+    static int64 pfTailHsNs;
+    static int64 pfLogitsNs;
+    public static int64 prefillHeadNs() { return LlamaForCausalLM.pfHeadNs; }
+    public static int64 prefillTailHsNs() { return LlamaForCausalLM.pfTailHsNs; }
+    public static int64 prefillLogitsNs() { return LlamaForCausalLM.pfLogitsNs; }
+
+    public static int64 prefillPrimNs()   { return LlamaForCausalLM.pfPrimNs; }
+    public static int64 prefillRopeNs()   { return LlamaForCausalLM.pfRopeNs; }
+    public static int64 prefillAttendNs() { return LlamaForCausalLM.pfAttendNs; }
+    public static void resetPrefillTimers() {
+        LlamaForCausalLM.pfPrimNs = 0L;
+        LlamaForCausalLM.pfRopeNs = 0L;
+        LlamaForCausalLM.pfAttendNs = 0L;
+        return;
+    }
+
+    // DECODE-TAIL attribution (2026-08-25): the per-token HOST work of a
+    // resident decode, phase by phase, because the kernel trace can only
+    // show the GPU idle it leaves behind — a ~3 ms gap between lm_head
+    // finishing and the next token's upload — not what the host was doing
+    // in it. Pre = embed row + hs fill + upload; sync = the token's one
+    // wait; hsDown = residual download + copy-out; norm = the host final
+    // rmsnorm; lmHead = matvecInto (its own launch/download/copyOut
+    // internals are Linear's dev timers); argmax = the 128k host scan.
+    static int64 dtPreNs;
+    static int64 dtSyncNs;
+    static int64 dtHsDownNs;
+    static int64 dtNormNs;
+    static int64 dtLmHeadNs;
+    static int64 dtArgmaxNs;
+    static int64 dtTok;
+    public static int64 decodePreNs()    { return LlamaForCausalLM.dtPreNs; }
+    public static int64 decodeSyncNs()   { return LlamaForCausalLM.dtSyncNs; }
+    public static int64 decodeHsDownNs() { return LlamaForCausalLM.dtHsDownNs; }
+    public static int64 decodeNormNs()   { return LlamaForCausalLM.dtNormNs; }
+    public static int64 decodeLmHeadNs() { return LlamaForCausalLM.dtLmHeadNs; }
+    public static int64 decodeArgmaxNs() { return LlamaForCausalLM.dtArgmaxNs; }
+    public static int64 decodeTokens()   { return LlamaForCausalLM.dtTok; }
+    public static void resetDecodeTimers() {
+        LlamaForCausalLM.dtPreNs = 0L;
+        LlamaForCausalLM.dtSyncNs = 0L;
+        LlamaForCausalLM.dtHsDownNs = 0L;
+        LlamaForCausalLM.dtNormNs = 0L;
+        LlamaForCausalLM.dtLmHeadNs = 0L;
+        LlamaForCausalLM.dtArgmaxNs = 0L;
+        LlamaForCausalLM.dtTok = 0L;
+        return;
+    }
+
+    public static void setForceReseed(boolean on) {
+        LlamaForCausalLM.forceReseed = on;
+    }
+
+    /** Arm for 10.11 — the attention tail on the device. On by default:
+     *  the host tail is 3 ms of a 32 ms token at 12 positions of context
+     *  but 97 ms of a 125 ms token at 512, and it is the only part of a
+     *  decode token that grows with context. */
+    public static void setDeviceAttention(boolean on) {
+        LlamaForCausalLM.devAttnOn = on;
+    }
+
+    public static boolean deviceAttentionEnabled() {
+        return LlamaForCausalLM.devAttnOn;
+    }
+
+    /**
+     * The sequence's length in POSITIONS, device-held rows included.
+     *
+     * While the device owns rows the paged cache is deliberately behind —
+     * its length and its bytes stay consistent with each other, and
+     * `DeviceKv.writeback` catches it up in one pass (10.11.2). Every
+     * position decision has to ask here rather than the cache, or a
+     * device-resident generation would emit the same position forever.
+     */
+    int32 seqLength(int32 seq) {
+        if (this.dkv != null && this.dkv.owns() && this.dkv.seq == seq) {
+            return this.dkv.length();
+        }
+        return this.cache.lengthOf(seq, 0);
+    }
+
+    /** Bring the paged cache back up to date, so a host-path token — or
+     *  anything that reads K/V — sees real bytes. */
+    void syncKvToHost(int32 seq) {
+        if (this.dkv != null && this.dkv.owns()) {
+            this.dkv.writeback(this.cache, seq);
+        }
+        return;
+    }
+
+    /** Is every projection in the stack on a device route, and is the
+     *  layout the plain Llama one the resident path implements? */
+    boolean deviceResidentReady() {
+        if (!Linear.residentEnabled()) { return false; }
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.selfAttn;
+            if (d.fourNorm || a.qNorm != null) { return false; }
+            if (!a.qProj.isDeviceRouted() || !a.kProj.isDeviceRouted()
+                    || !a.vProj.isDeviceRouted()
+                    || !a.oProj.isDeviceRouted()
+                    || !d.mlp.gateProj.isDeviceRouted()
+                    || !d.mlp.upProj.isDeviceRouted()
+                    || !d.mlp.downProj.isDeviceRouted()) {
+                return false;
+            }
+            l = l + 1;
+        }
+        return true;
+    }
+
+    /** Every projection in the stack has a batched GEMM kernel for
+     *  THIS row count (10.12.45.D: Q5_K/Q8_0 batch only at the Mw8
+     *  shape, so the answer depends on rows). */
+    boolean batchReady(int32 rows) {
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.selfAttn;
+            if (d.fourNorm || a.qNorm != null) { return false; }
+            if (!a.qProj.isBatchRoutedFor((int64) rows)
+                    || !a.kProj.isBatchRoutedFor((int64) rows)
+                    || !a.vProj.isBatchRoutedFor((int64) rows)
+                    || !a.oProj.isBatchRoutedFor((int64) rows)
+                    || !d.mlp.gateProj.isBatchRoutedFor((int64) rows)
+                    || !d.mlp.upProj.isBatchRoutedFor((int64) rows)
+                    || !d.mlp.downProj.isBatchRoutedFor((int64) rows)) {
+                return false;
+            }
+            l = l + 1;
+        }
+        return true;
+    }
+
+    /**
+     * Every projection can launch on the DEVICE-RESIDENT decode path
+     * (10.12.45): a device mat-vec kernel exists for its format. Q2_K
+     * and Q3_K bind packed but have no kernel yet, and letting them
+     * onto the resident path would hit matVecLaunch's no-kernel throw
+     * mid-token; they take the host decode until their unit C lands.
+     */
+    boolean residentRouted() {
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.selfAttn;
+            if (!a.qProj.deviceLaunchable()
+                    || !a.kProj.deviceLaunchable()
+                    || !a.vProj.deviceLaunchable()
+                    || !a.oProj.deviceLaunchable()
+                    || !d.mlp.gateProj.deviceLaunchable()
+                    || !d.mlp.upProj.deviceLaunchable()
+                    || !d.mlp.downProj.deviceLaunchable()) {
+                return false;
+            }
+            l = l + 1;
+        }
+        return true;
+    }
+
+    /** Monotonic, so the batch stage can never hit on a stale window:
+     *  `xn` is rewritten at the SAME address every layer, and identity
+     *  plus offset cannot tell layer N's activation from layer N+1's. */
+    int64 stageTag;
+    boolean batchSaid;
+
+    /**
+     * The layer stack with the PROJECTIONS BATCHED over all rows.
+     *
+     * Same arithmetic as the per-row path and the same order within a
+     * row; what changes is that the row loop moved INSIDE each
+     * projection, so the weights are streamed once per 32-row tile
+     * instead of once per row. Attention stays per row for now — it is
+     * O(n^2) and the next unit — but it is no longer competing with 2.4
+     * TB of redundant weight traffic.
+     */
+    void forwardRowsBatched(int32 seq, Tensor<float32> hs,
+            Tensor<float32> xn, Tensor<float32> q, Tensor<float32> k,
+            Tensor<float32> v, Tensor<float32> ao, Tensor<float32> proj,
+            Tensor<float32> gate, Tensor<float32> up,
+            Tensor<float32> mlpOut, int32 rows, int32 startPos,
+            int32 h, int32 qd, int32 kvd, int32 inter,
+            int32 nH, int32 nKv, int32 hd, Tensor<float32> scores) {
+        // RESIDENT HIDDEN STATE (10.12.7.b): hs lives on the device for
+        // the whole layer stack — norms, residual adds and the MLP chain
+        // never read it on the host. It crosses the bus exactly twice: up
+        // here, down after the last layer. q/k/v still come down each
+        // layer because rope/append/attend keep their host seam (.c).
+        boolean res = Linear.devicePackOn();
+        int64 nHs = (int64) rows * (int64) h;
+        if (res) {
+            int64 th0 = Clock.nanoTime();
+            this.ensurePrefillRes(nHs);
+            float32[] hb = hs.hostBuffer();
+            int64 hb0 = hs.hostBase();
+            int64 c = 0;
+            while (c < nHs) {
+                this.pfHsHost[c] = hb[hb0 + c];
+                c = c + 1;
+            }
+            this.pfHsDev.upload(this.pfHsHost, nHs);
+            LlamaForCausalLM.pfHeadNs = LlamaForCausalLM.pfHeadNs
+                + (Clock.nanoTime() - th0);
+        }
+        // Layer-invariant (10.12.24's extraneous-call audit): the
+        // per-row positions were re-filled and re-uploaded once PER
+        // LAYER — 32 identical 2 KB uploads per prefill.
+        boolean resAttn = res && this.dkv != null;
+        if (resAttn) {
+            this.ensurePrefillPos(rows, startPos);
+            // 10.12.38 lazy authority: a mid-sequence chunk appends host
+            // cache rows at exactly `startPos`, so any debt a lazy first
+            // chunk left must be paid before the layer loop's inline
+            // appends. A no-op when nothing is owed.
+            if (startPos != 0) { this.syncKvToHost(seq); }
+        }
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.selfAttn;
+
+            // ── attention sublayer ──────────────────────────────────────
+            if (res) {
+                Prim.rmsnormBatchDevice(this.pfXnDev, this.pfHsDev,
+                    d.inputLayernorm.deviceWeight(), (int64) rows,
+                    (int64) h, d.inputLayernorm.eps, d.normForm);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatchFromDevice(this.pfXnDev, rows, h,
+                    this.stageTag);
+            } else {
+                int64 tp0 = Clock.nanoTime();
+                int32 r0 = 0;
+                while (r0 < rows) {
+                    Prim.rmsnormRowHost(hs, (int64) r0 * (int64) h,
+                        d.inputLayernorm.weight, d.inputLayernorm.eps,
+                        xn, (int64) r0 * (int64) h, h, d.normForm);
+                    r0 = r0 + 1;
+                }
+                LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                    + (Clock.nanoTime() - tp0);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
+            }
+            int32 r = 0;
+            // 10.12.7.c: with the device attend available, q/k/v never
+            // exist on the host at all — roped on the device, appended
+            // to the planes there, attended there, and the o input
+            // packed straight from the attend's output. The paged cache
+            // stays authoritative through ONE k/v download per layer
+            // into appendRowRaw, replacing per-row host rope + append.
+            if (resAttn) {
+                // 10.12.32: one fused q|k|v launch when the route
+                // applies; the scatter leaves rope/append untouched.
+                if (!a.qProj.fusedQkvBatchKeep(a.kProj, a.vProj,
+                        rows)) {
+                    a.qProj.matmulBatchKeep(rows);
+                    a.kProj.matmulBatchKeep(rows);
+                    a.vProj.matmulBatchKeep(rows);
+                }
+                int64 tr0 = Clock.nanoTime();
+                Prim.ropeBatchDevice(a.qProj.yBatch, a.deviceRopeInv(),
+                    this.pfPosDev, (int64) rows, nH, hd);
+                Prim.ropeBatchDevice(a.kProj.yBatch, a.deviceRopeInv(),
+                    this.pfPosDev, (int64) rows, nKv, hd);
+                int64 ta0 = Clock.nanoTime();
+                LlamaForCausalLM.pfRopeNs = LlamaForCausalLM.pfRopeNs
+                    + (ta0 - tr0);
+                KernelBuffer<float32> aoDev = this.dkv
+                    .prefillAttendResident(l, a.qProj.yBatch,
+                        a.kProj.yBatch, a.vProj.yBatch, rows, startPos,
+                        a.scale);
+                // Cache authority (10.12.30): at startPos == 0 the k/v
+                // download + paged append are DEFERRED to one pass
+                // after the layer loop, reading the persistent planes
+                // — the loop stays launch-only and the GPU never waits
+                // for the host between layers. Mid-sequence prefill
+                // keeps the in-loop path (the planes hold absolute
+                // positions; a prefix download cannot reach them).
+                if (startPos != 0) {
+                    KernelStream as = QuantKernel.stream();
+                    as.sync();
+                    int64 kvn = (int64) rows * (int64) kvd;
+                    this.ensurePrefillKv(kvn);
+                    a.kProj.yBatch.download(this.pfKScr, kvn);
+                    a.vProj.yBatch.download(this.pfVScr, kvn);
+                    r = 0;
+                    while (r < rows) {
+                        if (!this.cache.appendRowRaw(seq, l, this.pfKScr,
+                                (int64) r * (int64) kvd, this.pfVScr,
+                                (int64) r * (int64) kvd, startPos + r)) {
+                            throw heap LlamaException("kv pool exhausted"
+                                + " at layer " + l + " position "
+                                + (startPos + r));
+                        }
+                        r = r + 1;
+                    }
+                }
+                LlamaForCausalLM.pfAttendNs = LlamaForCausalLM.pfAttendNs
+                    + (Clock.nanoTime() - ta0);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatchFromDevice(aoDev, rows, qd,
+                    this.stageTag);
+            } else {
+            a.qProj.matmulInto(rows, q, 0L);
+            a.kProj.matmulInto(rows, k, 0L);
+            a.vProj.matmulInto(rows, v, 0L);
+
+            // RoPE and the cache append stay on the host: they are O(n)
+            // and they are what keeps the paged cache authoritative for
+            // everything outside this pass. The ATTEND is O(n^2) and is
+            // 16.5 s of a 23.6 s prefill at 512 tokens, so it goes to the
+            // device for every row at once (10.12.2).
+            if (this.dkv != null) {
+                // Device attend: RoPE and the append for every row first,
+                // then ONE attend for all of them. Safe here only because
+                // the kernel takes `startPos` and derives each row's
+                // causal range from it.
+                int64 tr0 = Clock.nanoTime();
+                r = 0;
+                while (r < rows) {
+                    int64 rkv = (int64) r * (int64) kvd;
+                    int32 p = startPos + r;
+                    Prim.ropeRowHost(q, (int64) r * (int64) qd, nH, hd, p,
+                        a.ropeInv);
+                    Prim.ropeRowHost(k, rkv, nKv, hd, p, a.ropeInv);
+                    if (!this.cache.appendRow(seq, l, k, rkv, v, rkv, p)) {
+                        throw heap LlamaException("kv pool exhausted at "
+                            + "layer " + l + " position " + p);
+                    }
+                    r = r + 1;
+                }
+                int64 ta0 = Clock.nanoTime();
+                LlamaForCausalLM.pfRopeNs = LlamaForCausalLM.pfRopeNs
+                    + (ta0 - tr0);
+                this.dkv.prefillAttend(l, q, k, v, ao, rows, startPos,
+                    a.scale);
+                LlamaForCausalLM.pfAttendNs = LlamaForCausalLM.pfAttendNs
+                    + (Clock.nanoTime() - ta0);
+            } else {
+                // INTERLEAVED, and it must be. `attendRow` takes the query
+                // position from `lenSL - 1`, so appending every row before
+                // attending makes every row attend as the LAST one — a
+                // causality break that still decodes, just wrongly. It
+                // decoded 1882 1889 1882 1889 rather than 198 14196.
+                r = 0;
+                while (r < rows) {
+                    int64 rq = (int64) r * (int64) qd;
+                    int64 rkv = (int64) r * (int64) kvd;
+                    int32 p = startPos + r;
+                    Prim.ropeRowHost(q, rq, nH, hd, p, a.ropeInv);
+                    Prim.ropeRowHost(k, rkv, nKv, hd, p, a.ropeInv);
+                    if (!this.cache.appendRow(seq, l, k, rkv, v, rkv, p)) {
+                        throw heap LlamaException("kv pool exhausted at "
+                            + "layer " + l + " position " + p);
+                    }
+                    this.cache.attendRow(seq, l, q, rq, a.scale, scores,
+                        ao, rq, nH, nKv, hd);
+                    r = r + 1;
+                }
+            }
+
+            this.stageTag = this.stageTag + 1L;
+            Linear.stageBatch(ao, 0L, rows, qd, this.stageTag);
+            }
+            if (res) {
+                // o_proj's output joins the resident hs; the second
+                // norm reads it there.
+                a.oProj.matmulBatchKeep(rows);
+                Prim.addDevice(this.pfHsDev, a.oProj.yBatch, nHs);
+                Prim.rmsnormBatchDevice(this.pfXnDev, this.pfHsDev,
+                    d.postAttentionLayernorm.deviceWeight(),
+                    (int64) rows, (int64) h,
+                    d.postAttentionLayernorm.eps, d.normForm);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatchFromDevice(this.pfXnDev, rows, h,
+                    this.stageTag);
+            } else {
+                a.oProj.matmulInto(rows, proj, 0L);
+                int64 tp1 = Clock.nanoTime();
+                r = 0;
+                while (r < rows) {
+                    HostOps.addRow(hs, (int64) r * (int64) h, proj,
+                        (int64) r * (int64) h, h);
+                    r = r + 1;
+                }
+
+                // ── MLP sublayer ────────────────────────────────────────
+                r = 0;
+                while (r < rows) {
+                    Prim.rmsnormRowHost(hs, (int64) r * (int64) h,
+                        d.postAttentionLayernorm.weight,
+                        d.postAttentionLayernorm.eps, xn,
+                        (int64) r * (int64) h, h, d.normForm);
+                    r = r + 1;
+                }
+                LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                    + (Clock.nanoTime() - tp1);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
+            }
+            if (Linear.devicePackOn()) {
+                // RESIDENT MLP CHAIN (10.12.7.a): gate and up never
+                // leave the device — the GLU runs in place on gate's
+                // yBatch and the down projection packs straight from
+                // it. 10.12.22 measured gate/up as two thirds of the
+                // downloaded bytes and the GLU as the largest host
+                // prim; all of it disappears here. Stream-ordered
+                // throughout: keep -> keep -> glu -> pack -> down all
+                // launch on the current stream, and down's launch
+                // syncs.
+                // 10.12.32: one fused gate|up launch; the fused GLU
+                // reads the concatenated rows in place and writes the
+                // compact [rows x inter] result, so the split copy a
+                // separate gate/up would need never exists.
+                if (d.mlp.gateProj.fusedPairBatchKeep(d.mlp.upProj,
+                        rows)) {
+                    d.mlp.gateProj.ensureBatchOut(rows);
+                    Prim.gluFusedDevice(d.mlp.gateProj.yBatch,
+                        d.mlp.gateProj.fusedYBatch, (int64) rows,
+                        (int64) inter, d.activation);
+                } else {
+                    d.mlp.gateProj.matmulBatchKeep(rows);
+                    d.mlp.upProj.matmulBatchKeep(rows);
+                    Prim.gluDevice(d.mlp.gateProj.yBatch,
+                        d.mlp.upProj.yBatch,
+                        (int64) rows * (int64) inter, d.activation);
+                }
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatchFromDevice(d.mlp.gateProj.yBatch,
+                    rows, inter, this.stageTag);
+                // With hs resident (.b) the down projection joins it on
+                // the device; devicePackOn == res here, so both arms of
+                // the residual agree on where hs lives.
+                d.mlp.downProj.matmulBatchKeep(rows);
+                Prim.addDevice(this.pfHsDev, d.mlp.downProj.yBatch,
+                    nHs);
+            } else {
+                d.mlp.gateProj.matmulInto(rows, gate, 0L);
+                d.mlp.upProj.matmulInto(rows, up, 0L);
+                int64 tp2 = Clock.nanoTime();
+                r = 0;
+                while (r < rows) {
+                    int64 ri = (int64) r * (int64) inter;
+                    Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
+                        d.activation);
+                    r = r + 1;
+                }
+                LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                    + (Clock.nanoTime() - tp2);
+                this.stageTag = this.stageTag + 1L;
+                Linear.stageBatch(gate, 0L, rows, inter, this.stageTag);
+                d.mlp.downProj.matmulInto(rows, mlpOut, 0L);
+            }
+            if (!res) {
+                int64 tp3 = Clock.nanoTime();
+                r = 0;
+                while (r < rows) {
+                    HostOps.addRow(hs, (int64) r * (int64) h, mlpOut,
+                        (int64) r * (int64) h, h);
+                    r = r + 1;
+                }
+                LlamaForCausalLM.pfPrimNs = LlamaForCausalLM.pfPrimNs
+                    + (Clock.nanoTime() - tp3);
+            }
+            l = l + 1;
+        }
+        if (res) {
+            // Only the LAST row of hs comes home (10.12.35): the sole
+            // consumer after this loop is the final rmsnorm + logits
+            // over row rows-1, and hs is an arena slice that dies with
+            // the call — nothing reads the other rows. 16 KB down
+            // instead of 8 MB + a 2M-element host copy loop.
+            int64 tt0 = Clock.nanoTime();
+            this.ensurePrefillLast((int64) h);
+            Prim.sliceF32Device(this.pfLastDev, this.pfHsDev,
+                (int64) h, (int64) (rows - 1) * (int64) h);
+            KernelStream ps = QuantKernel.stream();
+            ps.sync();
+            this.pfLastDev.download(this.pfHsHost, (int64) h);
+            float32[] hb2 = hs.hostBuffer();
+            int64 hb02 = hs.hostBase()
+                + (int64) (rows - 1) * (int64) h;
+            int64 c2 = 0;
+            while (c2 < (int64) h) {
+                hb2[hb02 + c2] = this.pfHsHost[c2];
+                c2 = c2 + 1;
+            }
+            LlamaForCausalLM.pfTailHsNs = LlamaForCausalLM.pfTailHsNs
+                + (Clock.nanoTime() - tt0);
+        }
+
+        if (resAttn && startPos == 0
+                && (LlamaForCausalLM.eagerAuthOn
+                    || LlamaForCausalLM.forceReseed)) {
+            // The deferred cache-authority pass (10.12.30): ONE sync,
+            // then every layer's roped k/v out of the persistent
+            // planes into the paged cache. Position dr IS the row
+            // index here — that is what the startPos == 0 guard buys.
+            // 10.12.38 made it LAZY by default (adoptLazy below +
+            // on-demand writeback); this eager form remains for the
+            // `eagerauth` arm and for `reseed`, which seeds decode
+            // from the host cache and therefore needs it filled.
+            int64 tda = Clock.nanoTime();
+            KernelStream ks = QuantKernel.stream();
+            ks.sync();
+            int64 kvnD = (int64) rows * (int64) kvd;
+            this.ensurePrefillKv(kvnD);
+            int32 dl = 0;
+            while (dl < this.model.numLayers) {
+                this.dkv.kPlane(dl).download(this.pfKScr, kvnD);
+                this.dkv.vPlane(dl).download(this.pfVScr, kvnD);
+                int32 dr = 0;
+                while (dr < rows) {
+                    if (!this.cache.appendRowRaw(seq, dl, this.pfKScr,
+                            (int64) dr * (int64) kvd, this.pfVScr,
+                            (int64) dr * (int64) kvd, dr)) {
+                        throw heap LlamaException("kv pool exhausted at "
+                            + "layer " + dl + " position " + dr);
+                    }
+                    dr = dr + 1;
+                }
+                dl = dl + 1;
+            }
+            LlamaForCausalLM.pfAttendNs = LlamaForCausalLM.pfAttendNs
+                + (Clock.nanoTime() - tda);
+        }
+
+        if (this.dkv != null && !LlamaForCausalLM.forceReseed) {
+            // The planes now hold every prompt position, written by
+            // `prefillAttend`, and the paged cache holds them too. Say so,
+            // or the first decode token re-seeds 134 MB it already has.
+            //
+            // `forceReseed` is the CONTROL for that claim: it skips the
+            // adopt so decode seeds from the paged cache instead. If a
+            // run agrees with the host only under `reseed`, the planes
+            // prefill wrote are wrong; if it disagrees either way, they
+            // are fine and the difference is the softmax reassociation
+            // moving a near-tied argmax.
+            if (startPos == 0 && !LlamaForCausalLM.eagerAuthOn) {
+                // Lazy authority (10.12.38): the planes hold the rows;
+                // the host cache stays behind until a host path asks.
+                this.dkv.adoptLazy(seq, startPos + rows,
+                    this.cache.lengthOf(seq, 0));
+            } else {
+                this.dkv.adopt(seq, startPos + rows);
+            }
+        }
+
+        int64 tl0 = Clock.nanoTime();
+        int64 lastH = (int64) (rows - 1) * (int64) h;
+        Prim.rmsnormRowHost(hs, lastH, this.model.norm.weight,
+            this.model.norm.eps, xn, lastH, h, this.cfg.normForm);
+        if (this.lmHead != null) {
+            this.lmHead.matvecInto(xn, lastH, this.pool.logits, 0);
+        } else {
+            HostOps.rowsDotRow(this.model.embedTokens.weight, xn, lastH,
+                this.pool.logits, this.cfg.vocabSize, h);
+        }
+        LlamaForCausalLM.pfLogitsNs = LlamaForCausalLM.pfLogitsNs
+            + (Clock.nanoTime() - tl0);
+        return;
+    }
+
+    /**
+     * Allocate the device K/V planes on first use and make them agree
+     * with the paged cache (plan 10.11.2).
+     *
+     * A configuration the flat planes cannot serve — a windowed layer, a
+     * head wider than the combine kernel's workgroup — leaves `dkv` null,
+     * and `residentLayer` then runs its host attention tail. Falling back
+     * is checked rather than assumed: both of those produce a silently
+     * wrong answer, not a crash.
+     */
+    void ensureDeviceKv(int32 seq) {
+        if (!LlamaForCausalLM.devAttnOn || !DeviceKv.supports(this.cfg)
+                || !this.residentRouted()) {
+            this.syncKvToHost(seq);
+            this.dkv = null;
+            return;
+        }
+        if (this.dkv == null) {
+            this.dkv #= heap DeviceKv(this.cfg, this.maxSeq);
+            this.dkv.bindRope(this.model);
+        }
+        if (!this.dkv.isCurrentFor(this.cache, seq)) {
+            this.dkv.seed(this.cache, seq);
+        }
+        return;
+    }
+
+    void ensureResidentBuffers(int32 h) {
+        if (this.hsDev != null) { return; }
+        this.hsHost #= heap float32[(int64) h];
+        this.hsDev #= heap KernelBuffer<float32>((uint64) h);
+        this.xnDev #= heap KernelBuffer<float32>((uint64) h);
+        return;
+    }
+
+    /**
+     * One decoder layer with the residual stream LEFT ON THE DEVICE.
+     *
+     * `hs` never crosses the bus inside the stack: the two norms, the
+     * SwiGLU and both residual adds all run on the device, and the
+     * activation is quantized there. What still crosses is attention —
+     * q, k and v come back so RoPE, the KV cache and the attend can run on
+     * the host, and the attention output goes up again. Four crossings a
+     * layer where the host-driven path has eleven.
+     */
+    void residentLayer(int32 seq, int32 li, DecoderLayer d, Attention a,
+            Tensor<float32> q, Tensor<float32> k, Tensor<float32> v,
+            Tensor<float32> ao, Tensor<float32> scores,
+            int32 h, int32 qd, int32 kvd, int32 inter,
+            int32 nH, int32 nKv, int32 hd, int32 p) {
+        // Attention sublayer.
+        Prim.rmsnormDevice(this.xnDev, this.hsDev,
+            d.inputLayernorm.deviceWeight(), (int64) h,
+            d.inputLayernorm.eps, d.normForm);
+        Linear.stageDeviceActivation(this.xnDev, (int64) h);
+        if (this.dkv != null) {
+            // THE ATTENTION TAIL NEVER LEAVES THE DEVICE (plan 10.11).
+            // q, k and v stay in the projections' own output buffers;
+            // RoPE rotates them there, the append writes the K/V planes
+            // there, the attend reads them there, and o_proj quantizes
+            // the result there. Nothing in this branch crosses the bus.
+            //
+            // Ordering is the stream's, not a sync's: append writes the
+            // planes the attend reads and rope rewrites the q the attend
+            // reads, and all of them are NoSync launches on one stream.
+            a.qProj.matvecStagedKeep();
+            a.kProj.matvecStagedKeep();
+            a.vProj.matvecStagedKeep();
+            this.dkv.rope(li, a.qProj.out(), a.kProj.out(), p);
+            this.dkv.append(li, a.kProj.out(), a.vProj.out(), p);
+            this.dkv.attend(li, a.qProj.out(), p, a.scale);
+            Linear.stageDeviceActivation(this.dkv.out(), (int64) qd);
+            a.oProj.matvecStagedKeep();
+        } else {
+            a.qProj.matvecStaged(q, 0L);
+            a.kProj.matvecStaged(k, 0L);
+            a.vProj.matvecStaged(v, 0L);
+            Prim.ropeRowHost(q, 0L, nH, hd, p, a.ropeInv);
+            Prim.ropeRowHost(k, 0L, nKv, hd, p, a.ropeInv);
+            if (!this.cache.appendRow(seq, li, k, 0L, v, 0L, p)) {
+                throw heap LlamaException("kv pool exhausted at layer "
+                    + li + " position " + p);
+            }
+            this.cache.attendRow(seq, li, q, 0L, a.scale, scores,
+                ao, 0L, nH, nKv, hd);
+            a.oProj.matvecKeepOnDevice(ao, 0L);
+        }
+        Prim.addDevice(this.hsDev, a.oProj.out(), (int64) h);
+
+        // MLP sublayer.
+        Prim.rmsnormDevice(this.xnDev, this.hsDev,
+            d.postAttentionLayernorm.deviceWeight(), (int64) h,
+            d.postAttentionLayernorm.eps, d.normForm);
+        Linear.stageDeviceActivation(this.xnDev, (int64) h);
+        d.mlp.gateProj.matvecStagedKeep();
+        d.mlp.upProj.matvecStagedKeep();
+        Prim.gluDevice(d.mlp.gateProj.out(), d.mlp.upProj.out(),
+            (int64) inter, d.activation);
+        Linear.stageDeviceActivation(d.mlp.gateProj.out(), (int64) inter);
+        d.mlp.downProj.matvecStagedKeep();
+        Prim.addDevice(this.hsDev, d.mlp.downProj.out(), (int64) h);
+        return;
+    }
+
+}

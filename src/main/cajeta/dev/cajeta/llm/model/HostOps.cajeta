@@ -1,0 +1,147 @@
+package dev.cajeta.llm.model;
+
+import cajeta.lang.Math;
+import cajeta.math.Tensor;
+import dev.cajeta.llm.LlamaException;
+
+/**
+ * The v1 host forward-path math: straightforward f32 loops over flat
+ * offsets, writing into caller-owned buffers. EVERY method here is
+ * allocation-free — that is the load-bearing property (6.1.6), not
+ * speed; Unit 7 replaces the internals with XPU kernels behind the same
+ * into-buffer shapes.
+ *
+ * Each method hoists its tensors' HOST BUFFERS once (`hostBuffer` /
+ * `hostBase`) and then indexes raw `float32[]`. Going through
+ * `Tensor.get2`/`flatGet` per element measured ~12x slower for identical
+ * arithmetic — 802 ms vs 65 ms for one 4096x4096 projection
+ * (bench/MatvecProbe, --release) — because every element carried a
+ * generic `Tensor<T>` -> `Storage<T>` call, a placement check and a
+ * bounds check, none of it inlined. The placement check still happens,
+ * once per call, inside `hostBuffer`. Note the cost was NOT stride
+ * arithmetic: `flatGet` with a precomputed index measured no better
+ * (823 ms) than `get2`.
+ *
+ * Row addressing is by flat offset rather than tensor views so the
+ * prefill path can run over arena slices without constructing a view
+ * header per row.
+ */
+public final class HostOps {
+
+    /** dst[dstOff .. +dim) = table[token, :]. */
+    static void embedRow(Tensor<float32> table, int32 token,
+            Tensor<float32> dst, int64 dstOff, int32 dim) {
+        if (table.strideAt(1) != (int64) 1 || table.strideAt(0) != (int64) dim) {
+            throw heap LlamaException("HostOps.embedRow: table must be "
+                + "[vocab, dim] row-contiguous (strides " + table.strideAt(0)
+                + ", " + table.strideAt(1) + " for dim " + dim + ")");
+        }
+        float32[] tb = table.hostBuffer();
+        float32[] db = dst.hostBuffer();
+        int64 trow = table.hostBase() + (int64) token * (int64) dim;
+        int64 dbase = dst.hostBase() + dstOff;
+        int64 d = 0;
+        while (d < (int64) dim) {
+            db[dbase + d] = tb[trow + d];
+            d = d + 1;
+        }
+        return;
+    }
+
+    /** dst row = src row · W, with W `[in, out]` contiguous. */
+    static void matvecRow(Tensor<float32> src, int64 srcOff,
+            Tensor<float32> w,
+            Tensor<float32> dst, int64 dstOff, int32 inDim, int32 outDim) {
+        // Raw-buffer indexing assumes W is `[in, out]` ROW-CONTIGUOUS, which
+        // Linear.bind guarantees (transpose().copy()). get2 honoured arbitrary
+        // strides; this does not, so say so loudly rather than compute a wrong
+        // answer from a view someone reshapes in later.
+        if (w.strideAt(1) != (int64) 1 || w.strideAt(0) != (int64) outDim) {
+            throw heap LlamaException("HostOps.matvecRow: weight must be "
+                + "[in, out] row-contiguous (strides " + w.strideAt(0) + ", "
+                + w.strideAt(1) + " for outDim " + outDim + ")");
+        }
+        float32[] sb = src.hostBuffer();
+        float32[] wb = w.hostBuffer();
+        float32[] db = dst.hostBuffer();
+        int64 sbase = src.hostBase() + srcOff;
+        int64 wbase = w.hostBase();
+        int64 dbase = dst.hostBase() + dstOff;
+        int64 o = 0;
+        while (o < (int64) outDim) {
+            float32 acc = 0.0f;
+            int64 wi = wbase + o;
+            int64 i = 0;
+            while (i < (int64) inDim) {
+                acc = acc + sb[sbase + i] * wb[wi];
+                wi = wi + (int64) outDim;
+                i = i + 1;
+            }
+            db[dbase + o] = acc;
+            o = o + 1;
+        }
+        return;
+    }
+
+    /** out[r] = rows[r, :] · x — the tied-embedding output projection. */
+    static void rowsDotRow(Tensor<float32> rows, Tensor<float32> x,
+            int64 xOff, Tensor<float32> outv, int32 rCount, int32 cols) {
+        if (rows.strideAt(1) != (int64) 1 || rows.strideAt(0) != (int64) cols) {
+            throw heap LlamaException("HostOps.rowsDotRow: rows must be "
+                + "row-contiguous (strides " + rows.strideAt(0) + ", "
+                + rows.strideAt(1) + " for cols " + cols + ")");
+        }
+        float32[] rb = rows.hostBuffer();
+        float32[] xb = x.hostBuffer();
+        float32[] ob = outv.hostBuffer();
+        int64 rbase = rows.hostBase();
+        int64 xbase = x.hostBase() + xOff;
+        int64 obase = outv.hostBase();
+        int64 r = 0;
+        while (r < (int64) rCount) {
+            float32 acc = 0.0f;
+            int64 ri = rbase + r * (int64) cols;
+            int64 c = 0;
+            while (c < (int64) cols) {
+                acc = acc + rb[ri + c] * xb[xbase + c];
+                c = c + 1;
+            }
+            ob[obase + r] = acc;
+            r = r + 1;
+        }
+        return;
+    }
+
+    /** a row += b row. */
+    static void addRow(Tensor<float32> a, int64 aOff,
+            Tensor<float32> b, int64 bOff, int32 n) {
+        float32[] ab = a.hostBuffer();
+        float32[] bb = b.hostBuffer();
+        int64 abase = a.hostBase() + aOff;
+        int64 bbase = b.hostBase() + bOff;
+        int64 i = 0;
+        while (i < (int64) n) {
+            ab[abase + i] = ab[abase + i] + bb[bbase + i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** First-occurrence argmax over v[0, n). */
+    static int32 argmaxRow(Tensor<float32> v, int32 n) {
+        float32[] vb = v.hostBuffer();
+        int64 vbase = v.hostBase();
+        int32 best = 0;
+        float32 bv = vb[vbase];
+        int64 i = 1;
+        while (i < (int64) n) {
+            float32 x = vb[vbase + i];
+            if (x > bv) {
+                bv = x;
+                best = (int32) i;
+            }
+            i = i + 1;
+        }
+        return best;
+    }
+}

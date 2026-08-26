@@ -1,0 +1,256 @@
+package dev.cajeta.llm.cli;
+
+import cajeta.codec.json.JsonArray;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonValue;
+import cajeta.io.file.FileReader;
+import cajeta.lang.String;
+import dev.cajeta.llm.LlamaEngine;
+import dev.cajeta.llm.chat.ChatTemplate;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.gen.TokenSink;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.sched.Request;
+import dev.cajeta.llm.tok.Tokenizer;
+
+/**
+ * `cajeta-llm` — the CLI (spec 11.1; plan 19.2.1): one caller of the
+ * {@link LlamaEngine} batching API (11.7).
+ *
+ *   cajeta-llm run --model m.gguf --prompt "…" [-n 128 --temp 0.7
+ *       --top-k 40 --top-p 0.95 --seed 42 --repeat-penalty 1.1
+ *       --ctx 4096 --device cpu --max-seqs 4 --block-size 16 --chunk 128
+ *       --kv-store /path/prefix --kv-store-size N | --no-kv-store]
+ *
+ *   cajeta-llm chat --model m.gguf [--system "…"] [sampling flags]
+ *
+ * `chat` is an interactive REPL over the model's OWN chat template
+ * (`tokenizer.chat_template` from the GGUF, rendered by Unit 13's
+ * interpreter — no template table). Each turn re-renders the whole
+ * conversation and resubmits; `/exit` or EOF ends the session. The
+ * rendered prompt carries its own special tokens, so the turn goes
+ * through `encode` + `submitTokens`, NOT `submitText` (whose
+ * `encodePrompt` would add a second BOS).
+ */
+public final class Main {
+
+    public static int32 main(String[] args) {
+        boolean isRun = (int32) args.count() >= 1 && args[0].equals("run");
+        boolean isChat = (int32) args.count() >= 1 && args[0].equals("chat");
+        if (!isRun && !isChat) {
+            System.stdout.println("usage: cajeta-llm run --model <path> "
+                + "--prompt <text> [flags]");
+            System.stdout.println("       cajeta-llm chat --model <path> "
+                + "[--system <text>] [flags]");
+            return 2;
+        }
+        int32 rest = (int32) args.count() - 1;
+        String[] verbArgs #= heap String[rest];
+        int32 i = 0;
+        while (i < rest) {
+            verbArgs[i] = args[i + 1];
+            i = i + 1;
+        }
+        if (isChat) {
+            return Main.chatMain(verbArgs);
+        }
+        CliArgs c #= CliArgs.parse(verbArgs);
+        LlamaEngine e #= LlamaEngine.load(#c.engine);
+        StreamPrinter sink = heap StreamPrinter(e);
+        e.setSink(sink);
+        int32 id = e.submitText(c.prompt, #c.sampling, c.maxNew);
+        e.runAll(c.engine.ctx * 4);
+        System.stdout.println("");
+        Request r = e.request(id);
+        String why = "budget";
+        if (r.finishReason() == Request.FINISH_EOS) { why = "eos"; }
+        if (r.finishReason() == Request.FINISH_STOP) { why = "stop"; }
+        System.stdout.println("[" + r.generatedCount() + " tokens, "
+            + why + "]");
+        e.close();
+        return 0;
+    }
+
+    /** The interactive chat REPL (spec 7.11/7.13, 11.1). */
+    static int32 chatMain(String[] chatArgs) {
+        CliArgs c #= CliArgs.parse(chatArgs);
+
+        // The template and the EOS id come from the model's own metadata.
+        String model = c.engine.model;
+        GgufFile g #= heap GgufFile(model);
+        String tpl = g.chatTemplate();
+        if (tpl == null) {
+            System.stdout.println("cajeta-llm: this model ships no "
+                + "tokenizer.chat_template - use `run` with a raw prompt");
+            return 2;
+        }
+        int64 eosId = g.metaInt("tokenizer.ggml.eos_token_id", -1L);
+
+        LlamaEngine e #= LlamaEngine.load(#c.engine);
+        Tokenizer tok = e.tokenizer();
+        String bosText = "";
+        if (tok.addsBos()) {
+            bosText = "" + Main.tokenText(tok, tok.bosToken());
+        }
+        String eosText = "";
+        if (eosId >= 0L) {
+            eosText = "" + Main.tokenText(tok, (int32) eosId);
+        }
+        ChatTemplate t #= ChatTemplate.fromString(tpl, "gguf", bosText,
+            eosText);
+        StreamPrinter sink = heap StreamPrinter(e);
+        if (eosId >= 0L) {
+            sink.suppress = (int32) eosId;
+        }
+        e.setSink(sink);
+
+        // The conversation lives in one JsonValue holding the messages
+        // array; turns append through the borrow `conv.array()` hands out.
+        JsonValue conv = heap JsonValue();
+        JsonArray arr0 = heap JsonArray();
+        conv.setArray(#arr0);
+        if (!c.system.equals("")) {
+            conv.array().add(Main.chatMsg("system", c.system));
+        }
+
+        System.stdout.println("chat: " + model);
+        System.stdout.println("  (/exit to quit; each turn re-renders the "
+            + "conversation through the model's template)");
+        FileReader in = heap FileReader(0);
+        while (true) {
+            System.stdout.print("\n> ");
+            String line #= Main.readLine(in);
+            if (line == null || line.equals("/exit")
+                    || line.equals("/quit")) {
+                break;
+            }
+            if (line.equals("")) {
+                continue;
+            }
+            conv.array().add(Main.chatMsg("user", line));
+            String prompt #= t.render(conv, null, true);
+            // Raw encode: the render already carries BOS and the role
+            // headers (see the class doc).
+            int32[] ids #= tok.encode(prompt);
+            SampleParams p = heap SampleParams(c.sampling.temperature,
+                c.sampling.seed);
+            p.topK = c.sampling.topK;
+            p.topP = c.sampling.topP;
+            p.repeatPenalty = c.sampling.repeatPenalty;
+            if (eosId >= 0L) {
+                int32[] st #= heap int32[1];
+                st[0] = (int32) eosId;
+                p.stopTokens #= st;
+            }
+            int32 id = e.submitTokens(ids, (int32) ids.count(), c.maxNew,
+                #p);
+            e.runAll(c.engine.ctx * 4);
+            Request r = e.request(id);
+            if (r.finishReason() == Request.FINISH_BUDGET) {
+                System.stdout.print(" [-n " + c.maxNew + " reached]");
+            }
+            System.stdout.println("");
+            String out #= e.textOf(id);
+            if (!eosText.equals("") && out.endsWith(eosText)) {
+                // substring is byte-indexed (lenTag's low bits) and the
+                // EOS marker is ASCII, so byte math is exact here.
+                out #= out.substring(0,
+                    out.byteLength() - eosText.byteLength());
+            }
+            conv.array().add(Main.chatMsg("assistant", out));
+        }
+        e.close();
+        return 0;
+    }
+
+    /** One {role, content} message object, all values OWNED — a chat
+     *  turn must not borrow the REPL's line buffer (ownership §3). */
+    static #JsonValue chatMsg(String role, String content) {
+        JsonObject o = heap JsonObject();
+        String rk = "role";
+        int8[] rkb #= rk.toBytes();
+        o.put(#rkb, rk.byteLength(), Main.strValue(role));
+        String ck = "content";
+        int8[] ckb #= ck.toBytes();
+        o.put(#ckb, ck.byteLength(), Main.strValue(content));
+        JsonValue v = heap JsonValue();
+        v.setObject(#o);
+        return #v;
+    }
+
+    static #JsonValue strValue(String s) {
+        JsonValue v = heap JsonValue();
+        int8[] w #= s.toBytes();
+        v.setStringOwned(#w, s.byteLength());
+        return #v;
+    }
+
+    /** A special/added token's text (BOS/EOS strings for the template). */
+    static #String tokenText(Tokenizer tok, int32 id) {
+        int32[] one #= heap int32[1];
+        one[0] = id;
+        int8[] b #= tok.decode(one, 1);
+        String s = heap String(#b, (int32) b.count());
+        return #s;
+    }
+
+    /** Read one line from fd 0. Byte-at-a-time is fine at typing speed.
+     *  Returns null on EOF with nothing buffered; strips a trailing CR. */
+    static #String readLine(FileReader in) {
+        int8[] buf = heap int8[4096];
+        int8[] one = heap int8[1];
+        int32 n = 0;
+        while (true) {
+            int32 got = in.read(one, 1);
+            if (got <= 0) {
+                if (n == 0) {
+                    return null;
+                }
+                break;
+            }
+            if (one[0] == (int8) 10) {
+                break;
+            }
+            if (one[0] == (int8) 13) {
+                continue;
+            }
+            if (n < 4096) {
+                buf[n] = one[0];
+                n = n + 1;
+            }
+        }
+        int8[] out = heap int8[n];
+        int32 i = 0;
+        while (i < n) {
+            out[i] = buf[i];
+            i = i + 1;
+        }
+        String s = heap String(#out, n);
+        return #s;
+    }
+}
+
+/** Streams each token's text as it lands (spec 8.8/11.1). A stop
+ *  token also reaches the sink before the scheduler halts on it, so
+ *  chat sets `suppress` to the EOS id to keep it off the terminal. */
+class StreamPrinter implements TokenSink {
+    LlamaEngine engine;   // borrow
+    int32 suppress;
+
+    StreamPrinter(LlamaEngine engine) {
+        this.engine #= engine;
+        this.suppress = -1;
+    }
+
+    public void onToken(int32 reqId, int32 token) {
+        if (token == this.suppress) {
+            return;
+        }
+        int32[] one #= heap int32[1];
+        one[0] = token;
+        int8[] b #= this.engine.tokenizer().decode(one, 1);
+        String s = heap String(#b, (int32) b.count());
+        System.stdout.print(s);
+        return;
+    }
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cajeta-llama plan 18.3.2 — the real-model acceptance for the GGUF rope
+# cajeta-llm plan 18.3.2 — the real-model acceptance for the GGUF rope
 # un-permute.
 #
 # Greedy-decodes the RAW 6-token prompt "<|begin_of_text|>The capital of France
@@ -38,7 +38,7 @@ CAJETA_OWNED_BIND=warn CAJETA_CAPTURED_BORROW=warn \
 "$CAJETA" --emit=exe --release \
     --classpath="$CODEC_CJA,$JINJA_CJA" \
     -o "$out/bosprobe" \
-    dev.cajeta.llama.bench.BosProbe.run "$here/src/main/cajeta" "$out" >/dev/null
+    dev.cajeta.llm.bench.BosProbe.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> $MODEL"
 cd "$here"

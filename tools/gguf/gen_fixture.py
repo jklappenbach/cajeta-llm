@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cajeta-llama plan Unit 16 — generate the GGUF test fixtures:
+# cajeta-llm plan Unit 16 — generate the GGUF test fixtures:
 #
 #   src/test/fixtures/gguf/toy.gguf          the toy model, four storage
 #                                            types (F32/F16/BF16/Q8_0),

@@ -1,0 +1,255 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * Does making the weight reads COALESCED actually help?
+ *
+ * The mat-vec kernels give one output row to one work item, so the 64 lanes
+ * of a block read addresses `rowBytes` apart — 2304 for Q4_K — and each
+ * 16-byte load becomes 64 separate cache-line requests. That is the standing
+ * hypothesis for why the best dispatch measured ~106 GB/s on a part with
+ * roughly 256, and it is a hypothesis, not a finding: nothing is WASTED by
+ * the strided reads (a lane consumes its whole line over its next seven
+ * loads), so the cost is outstanding-request and L1 pressure rather than
+ * discarded bytes. Those are not obviously worth 2x.
+ *
+ * So it is measured before it is adopted, on one weight, at the launch
+ * geometry both arms want, with the arm order alternated. The interleaved
+ * arm reads a re-laid COPY of the same bytes and performs the same
+ * arithmetic in the same order, so the two must agree BIT FOR BIT — and
+ * that is checked before any timing, because a layout mapping that is
+ * subtly wrong would otherwise show up as a very fast wrong answer.
+ */
+public class CoalesceProbe {
+    // 144 MB, deliberately PAST this part's 32 MB MALL. At the 14336-row
+    // ffn shape the whole weight is cache-resident after one pass and both
+    // arms read 111-170 GB/s — well above anything the engine sees, because
+    // a decode reads 96 DIFFERENT 31.5 MB weights per token and every one of
+    // them is cold. Measuring the cached case would answer a question nobody
+    // asked.
+    static final int32 ROWS = 65536;
+    static final int32 COLS = 4096;
+    static final int32 GROUP = 64;        // = QuantKernel.ROWS_PER_BLOCK
+    static final int32 CHUNK = 5120;      // the measured launch optimum
+
+    public static void run() {
+        int64 bpr = (int64) (CoalesceProbe.COLS / 256);
+        int64 rowBytes = bpr * 144L;
+        int64 rows = (int64) CoalesceProbe.ROWS;
+        int64 nbytes = rows * rowBytes;
+        System.stdout.println("Q4_K [" + rows + " x " + CoalesceProbe.COLS
+            + "]  " + ((float64) nbytes / 1048576.0) + " MB  rowBytes "
+            + rowBytes);
+
+        int8[] packed #= heap int8[nbytes];
+        ScalingProbe.fillBlocks(packed, Quant.GG_Q4_K, 3);
+        int64 ilBytes = Quant.interleavedBytes(rows, rowBytes,
+            (int64) CoalesceProbe.GROUP);
+        int8[] il #= heap int8[ilBytes];
+        Quant.interleaveRows16(packed, il, rows, rowBytes,
+            (int64) CoalesceProbe.GROUP);
+
+        float32[] hx #= heap float32[(int64) CoalesceProbe.COLS];
+        int64 i = 0;
+        while (i < (int64) CoalesceProbe.COLS) {
+            hx[i] = 0.02f * (float32) ((i % 11L) - 5L);
+            i = i + 1;
+        }
+        KernelBuffer<float32> xb #= heap KernelBuffer<float32>(
+            (uint64) CoalesceProbe.COLS);
+        xb.upload(hx);
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>((uint64) nbytes);
+        pb.upload(packed);
+        KernelBuffer<int8> ib #= heap KernelBuffer<int8>((uint64) ilBytes);
+        ib.upload(il);
+
+        // q8_K activations, uploaded ONCE. The engine would pay a quantize
+        // and three uploads per projection; excluded here on purpose, so
+        // this arm answers only "what does the integer KERNEL cost", which
+        // is the thing that decides whether solving the transfer problem is
+        // worth doing at all.
+        int64 cols = (int64) CoalesceProbe.COLS;
+        int8[] xqH #= heap int8[cols];
+        float32[] xdH #= heap float32[cols / 256L];
+        int32[] xbsH #= heap int32[cols / 16L];
+        Quant.q8kQuantize(hx, 0L, cols, xqH, xdH, xbsH);
+        KernelBuffer<int8> xqb #= heap KernelBuffer<int8>((uint64) cols);
+        KernelBuffer<float32> xdb #= heap KernelBuffer<float32>(
+            (uint64) (cols / 256L));
+        KernelBuffer<int32> xbb #= heap KernelBuffer<int32>(
+            (uint64) (cols / 16L));
+        xqb.upload(xqH);
+        xdb.upload(xdH);
+        xbb.upload(xbsH);
+
+        // ── bit-identity FIRST ──────────────────────────────────────────
+        float32[] yA #= heap float32[rows];
+        float32[] yB #= heap float32[rows];
+        CoalesceProbe.passPlain(yb, pb, xb, rows, bpr);
+        yb.download(yA);
+        CoalesceProbe.passIL(yb, ib, xb, rows, bpr);
+        yb.download(yB);
+        int64 bad = -1L;
+        boolean allZero = true;
+        i = 0;
+        while (i < rows) {
+            if (yA[i] != 0.0f) { allZero = false; }
+            if (yA[i] != yB[i] && bad < 0L) { bad = i; }
+            i = i + 1;
+        }
+        if (allZero) {
+            System.stdout.println("BOTH ARMS ARE ALL ZERO - a kernel that "
+                + "never ran produces this; timing would mean nothing");
+            return;
+        }
+        if (bad >= 0L) {
+            System.stdout.println("INTERLEAVE MISMATCH at row " + bad
+                + ": plain " + yA[bad] + " interleaved " + yB[bad]);
+            return;
+        }
+        System.stdout.println("bit-identity: " + rows + "/" + rows
+            + " rows agree exactly");
+
+        // ── timing, alternating arm order ───────────────────────────────
+        int32 r = 0;
+        while (r < 4) {
+            boolean plainFirst = (r - (r / 2) * 2) == 0;
+            float64 tA = 0.0;
+            float64 tB = 0.0;
+            if (plainFirst) {
+                tA = CoalesceProbe.timePlain(yb, pb, xb, rows, bpr);
+                tB = CoalesceProbe.timeIL(yb, ib, xb, rows, bpr);
+            } else {
+                tB = CoalesceProbe.timeIL(yb, ib, xb, rows, bpr);
+                tA = CoalesceProbe.timePlain(yb, pb, xb, rows, bpr);
+            }
+            float64 tR = CoalesceProbe.timeRead(yb, pb, rows, bpr);
+            float64 tQ = CoalesceProbe.timeQ8(yb, pb, xqb, xdb, xbb, rows, bpr);
+            float64 mb = (float64) nbytes / 1048576.0;
+            System.stdout.println("   roofline (read-only, same grid) "
+                + tR + " ms " + (mb / tR * 1000.0 / 1024.0) + " GB/s"
+                + "   q8 integer kernel " + tQ + " ms "
+                + (mb / tQ * 1000.0 / 1024.0) + " GB/s");
+            System.stdout.println("round " + r
+                + (plainFirst ? " (plain first)" : " (interleaved first)")
+                + "   plain " + tA + " ms " + (mb / tA * 1000.0 / 1024.0)
+                + " GB/s   interleaved " + tB + " ms "
+                + (mb / tB * 1000.0 / 1024.0) + " GB/s   speedup "
+                + (tA / tB));
+            r = r + 1;
+        }
+        return;
+    }
+
+    static void passPlain(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            KernelBuffer<float32> x, int64 rows, int64 bpr) {
+        int64 rowBytes = bpr * 144L;
+        int64 r0 = 0L;
+        while (r0 < rows) {
+            int64 nr = (int64) CoalesceProbe.CHUNK;
+            if (r0 + nr > rows) { nr = rows - r0; }
+            KernelBuffer<int8> sub #= p.slice((uint64) (r0 * rowBytes),
+                (uint64) (nr * rowBytes));
+            QuantKernel.q4kMatVecLaunch(y, sub, x, nr,
+                (int64) CoalesceProbe.COLS, 0L, r0);
+            r0 = r0 + nr;
+        }
+        return;
+    }
+
+    /** The interleaved arm slices on the same row boundaries — CHUNK is a
+     *  multiple of GROUP, so a slice never splits a group. */
+    static void passIL(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            KernelBuffer<float32> x, int64 rows, int64 bpr) {
+        int64 rowBytes = bpr * 144L;
+        int64 r0 = 0L;
+        while (r0 < rows) {
+            int64 nr = (int64) CoalesceProbe.CHUNK;
+            if (r0 + nr > rows) { nr = rows - r0; }
+            KernelBuffer<int8> sub #= p.slice((uint64) (r0 * rowBytes),
+                (uint64) (nr * rowBytes));
+            QuantKernel.q4kILMatVecLaunch(y, sub, x, nr,
+                (int64) CoalesceProbe.COLS, 0L, r0);
+            r0 = r0 + nr;
+        }
+        return;
+    }
+
+    static float64 timePlain(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            KernelBuffer<float32> x, int64 rows, int64 bpr) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 4) { CoalesceProbe.passPlain(y, p, x, rows, bpr); k = k + 1; }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0 / 4.0;
+    }
+
+    /** Read-only arm: the same grid and the same 16-byte loads, with the
+     *  decode removed. Chunked identically so the launch geometry matches. */
+    static void passRead(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            int64 rows, int64 bpr) {
+        int64 rowBytes = bpr * 144L;
+        int64 r0 = 0L;
+        while (r0 < rows) {
+            int64 nr = (int64) CoalesceProbe.CHUNK;
+            if (r0 + nr > rows) { nr = rows - r0; }
+            KernelBuffer<int8> sub #= p.slice((uint64) (r0 * rowBytes),
+                (uint64) (nr * rowBytes));
+            KernelBuffer<float32> ys #= y.slice((uint64) r0, (uint64) nr);
+            QuantKernel.rowReadLaunch(ys, sub, nr, rowBytes);
+            r0 = r0 + nr;
+        }
+        return;
+    }
+
+    static float64 timeRead(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            int64 rows, int64 bpr) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 4) { CoalesceProbe.passRead(y, p, rows, bpr); k = k + 1; }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0 / 4.0;
+    }
+
+    static void passQ8(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            KernelBuffer<int8> xq, KernelBuffer<float32> xd,
+            KernelBuffer<int32> xbs, int64 rows, int64 bpr) {
+        int64 rowBytes = bpr * 144L;
+        int64 r0 = 0L;
+        while (r0 < rows) {
+            int64 nr = (int64) CoalesceProbe.CHUNK;
+            if (r0 + nr > rows) { nr = rows - r0; }
+            KernelBuffer<int8> sub #= p.slice((uint64) (r0 * rowBytes),
+                (uint64) (nr * rowBytes));
+            QuantKernel.q4kQ8MatVecLaunch(y, sub, xq, xd, xbs, nr,
+                (int64) CoalesceProbe.COLS, r0);
+            r0 = r0 + nr;
+        }
+        return;
+    }
+
+    static float64 timeQ8(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            KernelBuffer<int8> xq, KernelBuffer<float32> xd,
+            KernelBuffer<int32> xbs, int64 rows, int64 bpr) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 4) {
+            CoalesceProbe.passQ8(y, p, xq, xd, xbs, rows, bpr);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0 / 4.0;
+    }
+
+    static float64 timeIL(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            KernelBuffer<float32> x, int64 rows, int64 bpr) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 4) { CoalesceProbe.passIL(y, p, x, rows, bpr); k = k + 1; }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0 / 4.0;
+    }
+}

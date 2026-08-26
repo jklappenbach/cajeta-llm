@@ -1,0 +1,2323 @@
+package dev.cajeta.llm.model;
+
+import cajeta.lang.String;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.MemoryKind;
+import cajeta.math.Tensor;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.LlamaException;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+
+/**
+ * A bias-free linear projection. The weight is held in cajeta orientation
+ * `[in, out]` for the plain `x·W` the forward path computes; torch stores
+ * `nn.Linear` as `[out, in]` (it computes `x·Wᵀ`), so {@link #bind}
+ * transposes on import — the ONE place that conversion lives (plan 6.1.3,
+ * the `Checkpoints.transposeLinearWeights` discipline).
+ */
+public final class Linear extends InfModule {
+    Tensor<float32> weight;     // f32 path: [in, out] (transposed on import)
+    int8[] packed;              // packed path: file bytes, [out, in] blocks
+    int32 packedTy;             // ggml type of `packed`, or -1
+    int32 inDim;
+    int32 outDim;
+
+    // ── the routed (kernel) path's resident state ───────────────────────
+    //
+    // `packedDev` is the one that matters: the weight is the only operand
+    // that does not change between tokens, so it is uploaded ONCE and kept.
+    // Uploading it per call would cost more than the mat-vec it feeds.
+    //
+    // The activation buffers are a bridge, not a design. `matvecInto` is
+    // handed a row inside a possibly much larger `[rows, dim]` tensor, and
+    // `KernelBuffer.upload` takes a whole array of matching length, so one
+    // row is copied through fixed-size scratch rather than uploading the
+    // caller's whole tensor (which would be O(rows) work inside an O(1)
+    // call). The copies are 2·(inDim + outDim) floats against a weight read
+    // of inDim·outDim/2 bytes; they go away when the activations themselves
+    // become device-resident.
+    KernelBuffer<int8> packedDev;
+    // Dword view of packedDev for the mmq route (created lazily, released
+    // with the layer). Non-owning: packedDev holds the storage.
+    KernelBuffer<int32> packedW;
+    // Q6_K mmq route: 212-byte-padded copy of the packed tensor (Q6's
+    // 210-byte blocks are not dword-aligned) plus its word view. Costs a
+    // duplicate of the Q6 tensor; packedDev keeps the 210-stride the
+    // decode mat-vecs read.
+    KernelBuffer<int8> q6PadDev;
+    KernelBuffer<int32> q6PadW;
+    // The widened int8 prefill copy (10.12.16), built ONCE on the first
+    // int8-routed matmulInto and only under that policy — a Linear that
+    // never prefills under "int8" never pays the ~2x bytes. Decode never
+    // reads it.
+    KernelBuffer<int8> deqDev;
+    KernelBuffer<float32> yDev;
+    boolean unified;
+    boolean q8;
+    // Latched beside `q8` and for the same reason: the staging spelling and
+    // the launch must agree, and flipping the static mid-run would put one
+    // buffer's bytes under the other's kernel.
+    boolean packed1;
+    boolean wave;
+    boolean wave6;
+    boolean wave2;
+    boolean wave3;
+    boolean wave5;
+    boolean wave8;
+    boolean packedAct;
+    boolean qAct;
+    float32[] yScratch;
+
+    // ── device-path phase timers (MEASUREMENT INSTRUMENT, plan 9.1) ──────
+    //
+    // The GPU arm runs at the same ~48 GB/s as the CPU on hardware with
+    // roughly 5x the bandwidth, which is the signature of launch-bound
+    // rather than bandwidth-bound. That is a DERIVED claim, so it gets
+    // measured directly: each of the five phases a routed projection walks
+    // through is timed separately and the totals printed per run. The
+    // clock reads cost ~10 calls x 25 ns x 224 projections = ~56 us per
+    // token against a ~100 ms token, i.e. below the noise floor of the
+    // thing being measured.
+    static int64 tCopyIn;
+    static int64 tUpload;
+    // The upload phase is not one thing. Quantizing an activation into
+    // packed form is HOST arithmetic over 4096-14336 floats and sits inside
+    // the same window as the driver call, so a change that removes driver
+    // calls can look like it did almost nothing. Split, so the two are
+    // attributable separately.
+    static int64 tPack;
+    static int64 nPack;
+    static int64 nUploadCalls;
+    static int64 tLaunch;
+    static int64 tDownload;
+    static int64 tCopyOut;
+    static int64 nDevCalls;
+    static boolean timeDev;
+
+    // Launch time bucketed by WEIGHT SIZE, which is what separates a fixed
+    // per-launch overhead from real memory traffic. A token's projections
+    // span 2.36 MB (k/v) to 33 MB (ffn); if launch cost were fixed the
+    // per-call times would be flat across those, and if it were bandwidth
+    // they would scale with the bytes. One run answers it either way,
+    // whereas a synthetic probe would only measure a synthetic launch.
+    static int64[] bkBytes;      // packed bytes of the bucket's weight
+    // ROWS is part of the key, not decoration: `gate` is 14336 rows x 3360 B
+    // and `down` is 4096 rows x 11760 B — the SAME 45.9375 MB, at opposite
+    // ends of the rows-per-launch curve. Keyed on bytes alone the two fold
+    // into one bucket and the average reads as a middling number that
+    // neither shape ever achieves.
+    static int64[] bkRows;
+    static int64[] bkCount;
+    static int64[] bkNs;
+    // MIN and MAX per bucket, because an AVERAGE over 4 launches cannot
+    // distinguish a steady 40 ms from one 120 ms first touch and three
+    // 13 ms steady reads — and those two readings call for opposite fixes.
+    static int64[] bkMin;
+    static int64[] bkMax;
+    static int32 bkUsed;
+
+    // Output ROWS per dispatch (0 = one launch per weight).
+    //
+    // ROWS, not bytes, and that is measured (LaunchShapeProbe, on an idle
+    // box, one weight, one variable). Both a 420 MB and a 46 MB Q6_K weight
+    // peak at the SAME absolute row count — ~5120 — and fall away in both
+    // directions from it, so what the dispatch costs is set by its GRID and
+    // not by how much memory the weight occupies:
+    //
+    //   420 MB   1 launch  10.7 GB/s      46 MB   1 launch  20.3 GB/s
+    //           26 launches 102.9                 3 launches 106.0
+    //          128 launches  41.5                14 launches  38.5
+    //
+    // 5120 rows / 64 rows per workgroup = 80 workgroups x 2 wave32 waves
+    // = 160 waves = exactly one per SIMD on this part's 40 CUs. Below that
+    // the machine is not full; above it the waves share L1/L2 and each one's
+    // 64-lane stride of 3360 bytes evicts the others.
+    //
+    // So this is a DEVICE property (CU count) crossed with a KERNEL property
+    // (per-wave footprint), not a model or format property — which is why it
+    // is a settable constant with its derivation recorded rather than a
+    // ratio of the weight size.
+    // 80 workgroups is the target, not 5120 rows — the row count is what
+    // that many workgroups covers at this kernel's block size.
+    static final int32 TARGET_BLOCKS = 80;
+
+    static int64 chunkRows;
+    static boolean chunkSet;
+
+    // Dispatches issued by `launchRows`. Not a timer: it is how a test can
+    // tell "the answer matched because slicing is correct" apart from "the
+    // answer matched because slicing never happened".
+    static int64 nLaunches;
+
+    // Activation residency: Unified (managed) instead of Device, so the two
+    // per-projection transfers become plain memcpys in the shared address
+    // space rather than driver calls.
+    //
+    // Worth trying because the phase split says so, not because an APU has
+    // unified memory in principle: at the new baseline an upload costs 22.9
+    // us for a 16 KB payload and a download 9.0 us, which is fixed cost, not
+    // bandwidth — 8.4 ms of a 56 ms token spent moving 4 MB.
+    //
+    // A HARD REQUIREMENT comes with it. `__cajeta_xpu_buffer_host_copy`
+    // returns silently when the buffer is not host-accessible, so a
+    // mis-allocated buffer does not fail — it feeds the kernel stale bytes.
+    // Any measurement of this arm has to check the OUTPUT, never just the
+    // clock.
+    static boolean wantUnified;
+
+    // CEILING INSTRUMENT, not a feature: skip the host<->device transfers
+    // and the scratch copies, keeping the launches. The output is garbage by
+    // construction (the kernel reads whatever x last held), so any timing
+    // taken with this set describes COST and never correctness.
+    //
+    // It exists because "device-resident activations are worth 8.4 ms" is
+    // otherwise a sum of five clock brackets, and the last time a token split
+    // was derived rather than observed it was wrong three times running.
+    // Removing the transfers can also move the launches — a cache is shared —
+    // which a sum of brackets cannot show.
+    static boolean skipTransfers;
+
+    public static void setSkipTransfersForMeasurement(boolean on) {
+        Linear.skipTransfers = on;
+    }
+
+    // The instrument that actually works. `skipTransfers` above REMOVES the
+    // uploads, which leaves uninitialized bytes in x — and the token then
+    // costs 94.95 ms against a 56.5 ms baseline, because denormal arithmetic
+    // is slower than the transfers it saved. Removing a thing changed two
+    // variables, so it bounds nothing.
+    //
+    // Repeating the transfers changes ONE. Same data, same arithmetic, same
+    // launches; only the number of transfer calls moves. The token's rise
+    // per extra round is the per-round cost, directly.
+    static int32 xferReps;
+
+    public static void setTransferReps(int32 n) { Linear.xferReps = n; }
+
+    // ── shared activation staging ───────────────────────────────────────
+    //
+    // q, k and v are three Linears reading the SAME `xn` at the same offset;
+    // gate and up are two more. Staged per Linear, that activation is
+    // quantized and uploaded 5 times a layer when twice would do — and under
+    // the integer route a staging is THREE uploads, so a layer pays 21 where
+    // 12 would do. Uploads are 8.83 ms of a 50.25 ms token.
+    //
+    // One shared set of buffers, sized to the largest inDim ever asked for,
+    // plus a validity triple. It is deliberately a SINGLE set rather than one
+    // per dimension: the forward path never interleaves two live activations,
+    // it just walks hidden -> intermediate -> hidden, so a second set would
+    // buy nothing and add a way to be stale.
+    //
+    // SHARING IS OPT-IN, and the default is to stage every time.
+    //
+    // The first cut had it the other way: cache always, and let the caller
+    // declare `activationChanged()` when the contents moved. That is the
+    // wrong default, and a test caught it rather than a review —
+    // `routedMatvecIsCorrectOnRepeatedCallsWithNewActivations` writes new
+    // activations into the same tensor at the same offset without declaring
+    // anything, which is a perfectly reasonable thing for a caller to do, and
+    // it silently got the previous call's answer. A contract where FORGETTING
+    // to call something yields a wrong number instead of a slow one does not
+    // belong in a library.
+    //
+    // So: a caller that says nothing always gets a fresh staging. The forward
+    // path opens a window around the runs it knows share an activation — q/k/v
+    // off one `xn`, gate/up off another — and closes it immediately after.
+    static boolean stShare;
+    static int64 stOff;
+    static int32 stDim;
+    // WHICH REPRESENTATION is staged, and it belongs in the key.
+    //
+    // A Q4_K weight stages the integer form (quants + scales + group sums);
+    // a Q6_K weight beside it stages the f32 form. Both come out of the SAME
+    // activation, so tag, offset and dimension all match — and without this
+    // flag the Q6_K projection takes a hit on a staging that only ever filled
+    // the integer buffers, and multiplies against whatever the f32 buffer
+    // last held. Measured: a Q4_K_M has Q6_K k/v beside Q4_K q in some
+    // layers, and the decode produced `15 13 40 13 40` instead of
+    // `15 198 334 62 334` — the counts were exactly right (96 hits, 129
+    // misses per token) while the answer was wrong, which is why the token
+    // sequence is printed on every arm and not just the clock.
+    static boolean stQ8;
+    static boolean stValid;
+    static int32 stCap;
+    static KernelBuffer<float32> stX;
+    // ONE buffer for the integer form (plan 10.1). It was three — quants,
+    // scales, group sums — and three is three driver calls per distinct
+    // activation, where the block layout `Quant.q8kPack` writes is
+    // self-contained.
+    static KernelBuffer<int8> stXp;
+    static KernelBuffer<int8> stXq;
+    static KernelBuffer<float32> stXd;
+    static KernelBuffer<int32> stXbs;
+    static float32[] stXh;
+    static int8[] stXph;
+    static int8[] stXqh;
+    static float32[] stXdh;
+    static int32[] stXbsh;
+    // 10.12.45.B — the device source `stageDeviceActivation` last saw,
+    // held as a deliberate non-owning alias (#=): an f32-route consumer
+    // (Q5_K, Q8_0) copies it into `stX` LAZILY on first use, so the
+    // packed-route decode (Q4_K/Q6_K, the hot path) never pays the
+    // extra kernel. Reset per staging.
+    static KernelBuffer<float32> stSrcDev;
+    static int64 stSrcN;
+    static boolean stSrcF32Done;
+    static int64 stHits;
+    static int64 stMisses;
+
+    /**
+     * Open a window in which consecutive projections read the SAME activation
+     * window, so it is staged once. Everything staged before is discarded, so
+     * opening a window can never serve an older entry.
+     */
+    public static void beginSharedActivation() {
+        Linear.stValid = false;
+        Linear.stShare = true;
+    }
+
+    /** Close the window. Nothing is cached again until the next
+     *  {@link #beginSharedActivation}. */
+    public static void endSharedActivation() {
+        Linear.stShare = false;
+        Linear.stValid = false;
+    }
+
+    public static int64 stageHits() { return Linear.stHits; }
+    public static int64 stageMisses() { return Linear.stMisses; }
+    public static void resetStageCounts() {
+        Linear.stHits = 0L; Linear.stMisses = 0L;
+    }
+
+    // ── the q8_K integer route (Q4_K weights only) ──────────────────────
+    //
+    // Quantizes the activations to int8 so the nibbles never leave integer
+    // space: `dotAccum` becomes `vpdpbusd` on x86 with VNNI, measured 2.9x
+    // over the f32 arm on the host form with the instruction confirmed in
+    // the disassembly.
+    //
+    // IT CHANGES THE ANSWER. The f32 path is exact against the scalar
+    // floor; this one carries q8_K's activation-quantization error. That is
+    // the trade llama.cpp makes by default, and it is why this is a switch
+    // rather than a replacement — and why the arm is reported with its
+    // token sequence, not only its clock.
+    static boolean q8Want;
+    static boolean q8Set;
+
+    // STREAM-ORDERED transfers instead of the default synchronous ones.
+    //
+    // The phase clocks say an upload costs 22.9 us for a 16 KB payload —
+    // about 93% overhead at any plausible bandwidth, which is the signature
+    // of a synchronous hipMemcpy rather than of moving bytes. Enqueuing on
+    // the launch stream lets the copy ride the same submission the kernel
+    // does, and the sync that already follows the launch covers it.
+    //
+    // It matters twice over: it is worth something on the f32 path we ship,
+    // and it decides whether the integer route is viable on the GPU at all,
+    // since that one needs three uploads per projection where f32 needs one.
+    // MEASURED AND REJECTED, kept as an arm so it is not re-proposed:
+    // no change on the f32 path (56.89/56.70 sync against 56.01/56.73
+    // async) and 1.7x WORSE on the integer one (50.4 -> 87.2). Both host
+    // scratch arrays are pageable, so hipMemcpyHtoDAsync stages through a
+    // bounce buffer instead of doing DMA, and the download then needs its
+    // own stream sync per projection on top. It would need MemoryKind.Pinned
+    // host staging to be worth anything.
+    static boolean asyncXfer;
+
+    public static void setAsyncTransfers(boolean on) { Linear.asyncXfer = on; }
+
+    public static void setQ8Route(boolean on) {
+        Linear.q8Want = on;
+        Linear.q8Set = true;
+    }
+
+    /**
+     * Whether to take the integer route, resolved once from the backend.
+     *
+     * ON BOTH BACKENDS, measured — the transfer-shape argument for keeping
+     * it off the GPU turned out to be wrong, and it was worth checking
+     * rather than reasoning about. The route does need THREE device buffers
+     * per activation where f32 needs one, and on the GPU a transfer really
+     * is a ~23 us driver call. But the kernel is 1.47x there (110 -> 165
+     * GB/s, within 3% of a read-only kernel over the same blocks, so it is
+     * fully memory-bound), and 1.47x on 43.4 ms of launch beats the ~6.8 ms
+     * the two extra uploads cost. End to end, alternating arm order:
+     * 56.89/56.70 f32 against 50.39/50.51 q8.
+     *
+     * Still resolved per backend rather than hardcoded on, because the two
+     * win for DIFFERENT reasons and by different amounts — 1.47x on the CPU
+     * (VNNI removes the decode) and 1.13x on the GPU (the kernel is at its
+     * roofline and pays back some of it in transfers) — so a backend where
+     * neither holds should be able to answer no.
+     */
+    /**
+     * Does the integer route stage its activation as ONE packed buffer
+     * (plan 10.1) or as the three typed ones?
+     *
+     * A DEVICE property crossed with a KERNEL property, resolved the same
+     * way 9.1's launch geometry is, and for the same reason. Packing trades
+     * driver calls for arithmetic: the block's scale and eight sub-block
+     * sums are rebuilt from bytes on every block of every row.
+     *
+     * On a real device that trade is free on the compute side and worth
+     * ~2.7%: the scalars' addresses do not depend on the work item, so the
+     * assembly is uniform and runs on the scalar unit beside the vector
+     * loads, while three uploads at ~23us each become one.
+     *
+     * On the CPU backend there is nothing to buy. An "upload" is a memcpy,
+     * so collapsing three into one saves nothing — and the decode is redone
+     * per ROW, because each work item is its own call and there is no
+     * scalar unit to hide it behind. MEASURED at 76.6/75.9 ms/token against
+     * the three-buffer form's 73.6/71.0, in both arm orders. So the CPU
+     * keeps the typed buffers.
+     */
+    static boolean packedActivations() {
+        if (!Linear.packSet) {
+            String be #= Device.activeBackend();
+            Linear.packWant = !(be.equals("cpu") || be.equals("none"));
+            Linear.packSet = true;
+        }
+        return Linear.packWant;
+    }
+
+    static boolean packSet;
+    static boolean packWant;
+
+    /**
+     * The WAVE-COOPERATIVE mat-vec (plan 11.1) — one workgroup of 32
+     * threads per output row instead of one work item.
+     *
+     * Backend-resolved for two reasons, not one. It is a device
+     * optimization: 11.0 measured this machine's read ceiling at ~208 GB/s
+     * for a coalesced pattern against ~162-170 for one-row-per-work-item,
+     * so the whole point is a lane mapping the CPU backend has no analogue
+     * for. And it is presently WRONG on that backend — every row comes back
+     * exactly 0.0 (plan 11.5) — so this is a correctness gate as much as a
+     * performance one.
+     */
+    static boolean waveMv() {
+        if (!Linear.waveSet) {
+            String be #= Device.activeBackend();
+            Linear.waveWant = !(be.equals("cpu") || be.equals("none"));
+            Linear.waveSet = true;
+        }
+        return Linear.waveWant;
+    }
+
+    static boolean waveSet;
+    static boolean waveWant;
+
+    /**
+     * The device-resident decode path (plan 10.2) — the residual stream
+     * stays on the device across the layer stack.
+     *
+     * DEFAULT OFF, because on this hardware it MEASURED SLOWER: 32.40/32.06/
+     * 31.74 against the host-driven path's 31.25/31.26/31.12, every round,
+     * both arm orders, idle box. Correct on every run — the tokens are
+     * unchanged — just not faster.
+     *
+     * The reason is the machine, not the code. Strix Halo's host and device
+     * share one pool of LPDDR5X, so an "upload" is a memcpy in the same
+     * memory rather than PCIe traffic: it costs ~30us for 5-18 KB, and the
+     * four crossings a layer this removes do not pay for the norm, add and
+     * quantize dispatches that replace them.
+     *
+     * Kept, and expected to FLIP in two situations. On a discrete GPU those
+     * crossings are real bus traffic. And once attention runs on the device
+     * (rope, the KV cache, the attend), the resident path removes the LAST
+     * four crossings instead of four of eight — at which point its extra
+     * dispatches are amortized against a layer that never touches the host.
+     * It is a prerequisite for that work, not a competitor to it.
+     */
+    // ON since 10.11. It was off from 10.2b, which measured full-layer
+    // residency 0.86 ms SLOWER: unified memory makes an "upload" a memcpy
+    // in the same pool, so removing four cheap crossings a layer did not
+    // pay for the dispatches that replaced them. That measurement stands
+    // and is still why residency is worth nothing on its own here. What
+    // changed is what rides on it — the attention tail only has a device
+    // path inside `residentLayer`, and that is worth 128.3 -> 41.4
+    // ms/token at 512 positions of context. The crossover is around 20
+    // positions; below it residency costs about 2%.
+    static boolean residentOn = true;
+
+    public static boolean residentEnabled() {
+        return Linear.residentOn && Linear.waveMv();
+    }
+
+    public static void setDeviceResident(boolean on) {
+        Linear.residentOn = on;
+    }
+
+    /** Arm for 11.1: force the one-item-per-row kernel back on. */
+    public static void setWaveMatVec(boolean on) {
+        Linear.waveWant = on;
+        Linear.waveSet = true;
+    }
+
+    /**
+     * ONE sync per projection instead of one per dispatch (plan 10.3).
+     *
+     * `launchRows` issues a weight in row slices, and every slice used to
+     * end in a wait for the device to go idle. The slices are independent
+     * and nothing reads the result until `fetchResult`, so all but the last
+     * wait bought nothing — 378 dispatches a token, of which ~153 are
+     * intermediate.
+     *
+     * An ARM rather than a rewrite, because "the sync was not needed" is a
+     * claim about the driver's ordering guarantees and this codebase
+     * measures those instead of reading them. `oneSync(false)` restores the
+     * shipped behaviour in the same binary.
+     */
+    static boolean oneSync = true;
+
+    public static void setOneSyncPerProjection(boolean on) {
+        Linear.oneSync = on;
+    }
+
+    static boolean q8Route() {
+        if (!Linear.q8Set) {
+            String be #= Device.activeBackend();
+            // vulkan joined 2026-08-25: the wave integer kernels and the
+            // device q8_K packer all compile and pass the suite on the
+            // SPIR-V backend, and Q2_K/Q3_K exist ONLY on this route — with
+            // it off, their shared-stage prefill (matvecKeepOnDevice has no
+            // route gate) fell through launchOne to matVecLaunch's
+            // no-kernel throw (measured on the 8B sweep).
+            Linear.q8Want = be.equals("cpu") || be.equals("hip")
+                || be.equals("cuda") || be.equals("vulkan");
+            Linear.q8Set = true;
+        }
+        return Linear.q8Want;
+    }
+
+    public static void setUnifiedActivations(boolean on) {
+        Linear.wantUnified = on;
+    }
+    public static boolean unifiedActivations() { return Linear.wantUnified; }
+
+    public static int64 launchCount() { return Linear.nLaunches; }
+    public static void resetLaunchCount() { Linear.nLaunches = 0L; }
+
+    /** Override the resolved default; 0 disables chunking. */
+    public static void setLaunchChunkRows(int64 r) {
+        Linear.chunkRows = r;
+        Linear.chunkSet = true;
+    }
+
+    /**
+     * The chunk size for the backend actually in use, resolved once.
+     *
+     * MEASURED both ways, on the same binary one call apart. gfx1151:
+     * 98.8 ms/token in one dispatch per weight, 56.7 chunked — 1.74x. CPU
+     * backend, alternating the arm order across two rounds: 108.5 / 110.0
+     * unchunked against 117.9 / 116.0 chunked, i.e. 6% the WRONG way. The
+     * CPU backend fans a launch across a persistent worker pool and pays a
+     * dispatch for each one; it has no occupancy cliff to stay under, so
+     * splitting a weight buys nothing and costs the extra dispatches.
+     *
+     * Hence {@link Device#activeBackend} rather than a build-time constant:
+     * one binary can bundle several backends and pick at run time, so the
+     * geometry has to be picked there too.
+     */
+    static int64 effectiveChunkRows() {
+        if (!Linear.chunkSet) {
+            Linear.chunkRows = (int64) Linear.TARGET_BLOCKS
+                * (int64) QuantKernel.rowsPerBlock();
+            String be #= Device.activeBackend();
+            if (be.equals("cpu") || be.equals("none")) { Linear.chunkRows = 0L; }
+            Linear.chunkSet = true;
+        }
+        return Linear.chunkRows;
+    }
+
+    public static int64 launchChunkRows() { return Linear.effectiveChunkRows(); }
+
+    public static int32 devBucketCount() { return Linear.bkUsed; }
+    public static int64 devBucketBytes(int32 i) { return Linear.bkBytes[(int64) i]; }
+    public static int64 devBucketRows(int32 i)  { return Linear.bkRows[(int64) i]; }
+    public static int64 devBucketCalls(int32 i) { return Linear.bkCount[(int64) i]; }
+    public static int64 devBucketNs(int32 i)    { return Linear.bkNs[(int64) i]; }
+    public static int64 devBucketMinNs(int32 i) { return Linear.bkMin[(int64) i]; }
+    public static int64 devBucketMaxNs(int32 i) { return Linear.bkMax[(int64) i]; }
+
+    public static void setDeviceTimingEnabled(boolean on) {
+        Linear.timeDev = on;
+        // Allocate the buckets HERE, not at first use: enabling timing is
+        // what arms `recordLaunch`, and prefill runs through it long before
+        // the decode-loop reset. A null-array read is a segfault, not a
+        // wrong number, so the two must be armed together.
+        if (on) { Linear.resetDeviceTimers(); }
+    }
+    public static void resetDeviceTimers() {
+        Linear.tPack = 0L; Linear.nPack = 0L; Linear.nUploadCalls = 0L;
+        Linear.tCopyIn = 0L; Linear.tUpload = 0L; Linear.tLaunch = 0L;
+        Linear.tDownload = 0L; Linear.tCopyOut = 0L; Linear.nDevCalls = 0L;
+        Linear.bkBytes #= heap int64[16];
+        Linear.bkRows #= heap int64[16];
+        Linear.bkCount #= heap int64[16];
+        Linear.bkNs #= heap int64[16];
+        Linear.bkMin #= heap int64[16];
+        Linear.bkMax #= heap int64[16];
+        Linear.bkUsed = 0;
+    }
+
+    /** Fold one launch into the bucket for its weight size (linear scan —
+     *  there are under a dozen distinct shapes in a transformer). */
+    static void recordLaunch(int64 bytes, int64 rows, int64 ns) {
+        int32 i = 0;
+        while (i < Linear.bkUsed) {
+            if (Linear.bkBytes[(int64) i] == bytes
+                    && Linear.bkRows[(int64) i] == rows) {
+                Linear.bkCount[(int64) i] = Linear.bkCount[(int64) i] + 1L;
+                Linear.bkNs[(int64) i] = Linear.bkNs[(int64) i] + ns;
+                if (ns < Linear.bkMin[(int64) i]) { Linear.bkMin[(int64) i] = ns; }
+                if (ns > Linear.bkMax[(int64) i]) { Linear.bkMax[(int64) i] = ns; }
+                return;
+            }
+            i = i + 1;
+        }
+        if (Linear.bkUsed >= 16) { return; }
+        Linear.bkBytes[(int64) Linear.bkUsed] = bytes;
+        Linear.bkRows[(int64) Linear.bkUsed] = rows;
+        Linear.bkCount[(int64) Linear.bkUsed] = 1L;
+        Linear.bkNs[(int64) Linear.bkUsed] = ns;
+        Linear.bkMin[(int64) Linear.bkUsed] = ns;
+        Linear.bkMax[(int64) Linear.bkUsed] = ns;
+        Linear.bkUsed = Linear.bkUsed + 1;
+        return;
+    }
+    public static int64 devCopyInNs()   { return Linear.tCopyIn; }
+    public static int64 devUploadNs()   { return Linear.tUpload; }
+    public static int64 devPackNs()     { return Linear.tPack; }
+    public static int64 devPackCalls()  { return Linear.nPack; }
+    public static int64 devUploadCalls(){ return Linear.nUploadCalls; }
+    public static int64 devLaunchNs()   { return Linear.tLaunch; }
+    public static int64 devDownloadNs() { return Linear.tDownload; }
+    public static int64 devCopyOutNs()  { return Linear.tCopyOut; }
+    public static int64 devCalls()      { return Linear.nDevCalls; }
+
+    Linear(int32 inDim, int32 outDim) {
+        this.weight = null;
+        this.packed = null;
+        this.packedTy = -1;
+        this.inDim = inDim;
+        this.outDim = outDim;
+        this.packedDev = null;
+        this.packedW = null;
+        this.q6PadW = null;
+        this.q6PadDev = null;
+        this.deqDev = null;
+        this.yDev = null;
+        this.yScratch = null;
+        this.unified = false;
+        this.q8 = false;
+    }
+
+    /** True when the weight is held in its PACKED block form and consumed
+     *  without ever materializing an f32 tensor. */
+    public boolean isPacked() {
+        return this.packedTy >= 0;
+    }
+
+    /** The ggml type this weight is held as, or -1 for the f32 path. */
+    public int32 packedType() {
+        return this.packedTy;
+    }
+
+    /** The block types with a direct mat-vec (no dequantized weight
+     *  tensor). A row must be a whole number of blocks. */
+    static boolean packedSupported(int32 ty, int32 inDim) {
+        if (!Quant.packingEnabled()) {
+            return false;
+        }
+        if (ty != Quant.GG_Q8_0 && ty != Quant.GG_Q4_K
+                && ty != Quant.GG_Q5_K && ty != Quant.GG_Q6_K
+                && ty != Quant.GG_Q2_K && ty != Quant.GG_Q3_K) {
+            return false;
+        }
+        return (int64) inDim % (int64) Quant.blockElems(ty) == 0L;
+    }
+
+    void bind(Checkpoint ckpt, String name, boolean toDevice) {
+        // Packed path (spec §10): a Q8_0 weight stays in its block form and
+        // is consumed as `d · Σ q·x` per 32 — no f32 weight tensor is ever
+        // materialized. Decode is memory-bandwidth bound, so reading 1 byte
+        // per weight instead of 4 is the win; the unpack rides in registers
+        // where the block scale is already hot. Device placement still needs
+        // the f32 tensor, so `toDevice` keeps the old path for now.
+        int32 pty = toDevice ? -1 : ckpt.packedTypeOf(name);
+        if (Linear.packedSupported(pty, this.inDim)) {
+            // ORIENTATION first. The byte count below is symmetric under
+            // transpose — [out, in] and [in, out] of the same tensor occupy
+            // the same bytes — so it cannot catch a swapped projection,
+            // while the f32 path's shape check would have. Check the shape
+            // the same way, or the packed path is the weaker of the two.
+            int64[] shp = ckpt.shapeOf(name);
+            if (shp == null || (int32) shp.count() != 2) {
+                throw heap LlamaException("weight binding: '" + name
+                    + "' has rank " + (shp == null ? 0 : (int32) shp.count())
+                    + "; expected 2");
+            }
+            if (shp[0] != (int64) this.outDim
+                    || shp[1] != (int64) this.inDim) {
+                throw heap LlamaException("weight binding: '" + name
+                    + "' has shape [" + shp[0] + ", " + shp[1]
+                    + "]; expected [out, in] = [" + this.outDim + ", "
+                    + this.inDim + "]");
+            }
+            int8[] p #= ckpt.loadPacked(name);
+            int64 be = (int64) Quant.blockElems(pty);
+            int64 want = (int64) this.outDim * ((int64) this.inDim / be)
+                * (int64) Quant.blockBytes(pty);
+            if ((int64) p.count() != want) {
+                throw heap LlamaException("weight binding: '" + name
+                    + "' packed " + pty + " is " + (int64) p.count()
+                    + " bytes; expected " + want + " for [" + this.outDim
+                    + ", " + this.inDim + "]");
+            }
+            this.packed #= p;
+            this.packedTy = pty;
+            return;
+        }
+        Tensor<float32> t = ckpt.loadF32(name);
+        if (t.ndim() != 2) {
+            throw heap LlamaException("weight binding: '" + name
+                + "' has rank " + (int32) t.ndim() + "; expected 2");
+        }
+        if (t.shapeAt(0) != (int64) this.outDim
+                || t.shapeAt(1) != (int64) this.inDim) {
+            throw heap LlamaException("weight binding: '" + name
+                + "' has torch shape [" + (int32) t.shapeAt(0) + ", "
+                + (int32) t.shapeAt(1) + "]; expected [out, in] = ["
+                + this.outDim + ", " + this.inDim + "]");
+        }
+        Tensor<float32> tv = t.transpose();
+        Tensor<float32> c = tv.copy();
+        if (toDevice) {
+            c.gpu();
+        }
+        this.weight #= c;
+    }
+
+    /**
+     * `dst[dstOff .. +outDim) = src[srcOff .. +inDim) · W` — the ONE place
+     * the forward path asks a projection to multiply, so the packed and
+     * f32 weights differ only here.
+     */
+    void matvecInto(Tensor<float32> src, int64 srcOff,
+            Tensor<float32> dst, int64 dstOff) {
+        // Measurement instrument (QuantKernel.skipMatvecForMeasurement):
+        // time a forward pass with the projections removed. Garbage output
+        // by construction.
+        if (QuantKernel.skipMatvecForMeasurement()) {
+            return;
+        }
+        if (this.packedTy >= 0) {
+            float32[] sb = src.hostBuffer();
+            float32[] db = dst.hostBuffer();
+            int64 so = src.hostBase() + srcOff;
+            int64 doff = dst.hostBase() + dstOff;
+            // Through the kernel when this format has one (plan 6.2.2).
+            // The test is on the TYPE, never on "is packed": a route
+            // written the other way would feed one format's bytes to
+            // another's decoder, and every per-format test would still
+            // pass.
+            if (QuantKernel.hasKernel(this.packedTy)
+                    && QuantKernel.routingEnabled()
+                    && (QuantKernel.hasF32Kernel(this.packedTy)
+                        || (Linear.waveMv() && Linear.packedActivations()
+                            && Linear.q8Route()
+                            && this.inDim % 256 == 0))) {
+                // The second clause: Q2_K/Q3_K exist ONLY on the wave
+                // integer route, so with any of its switches pinned off
+                // they must take the host mat-vec below, not a device
+                // path that ends in matVecLaunch's no-kernel throw.
+                this.matvecIntoDevice(sb, so, db, doff);
+                return;
+            }
+            if (this.packedTy == Quant.GG_Q8_0) {
+                Quant.q8MatVecInto(this.packed, (int64) this.outDim,
+                    (int64) this.inDim, sb, so, db, doff);
+            } else if (this.packedTy == Quant.GG_Q4_K) {
+                Quant.q4kMatVecInto(this.packed, (int64) this.outDim,
+                    (int64) this.inDim, sb, so, db, doff);
+            } else if (this.packedTy == Quant.GG_Q5_K) {
+                Quant.q5kMatVecInto(this.packed, (int64) this.outDim,
+                    (int64) this.inDim, sb, so, db, doff);
+            } else if (this.packedTy == Quant.GG_Q2_K) {
+                Quant.q2kMatVecInto(this.packed, (int64) this.outDim,
+                    (int64) this.inDim, sb, so, db, doff);
+            } else if (this.packedTy == Quant.GG_Q3_K) {
+                Quant.q3kMatVecInto(this.packed, (int64) this.outDim,
+                    (int64) this.inDim, sb, so, db, doff);
+            } else if (this.packedTy == Quant.GG_Q6_K) {
+                Quant.q6kMatVecInto(this.packed, (int64) this.outDim,
+                    (int64) this.inDim, sb, so, db, doff);
+            } else {
+                // A bare `else` here once routed every future type into
+                // the Q6_K decoder — one format's bytes through
+                // another's tables is fluent wrong output, not a crash.
+                throw heap LlamaException("matvecInto: no host mat-vec "
+                    + "for packed type " + this.packedTy);
+            }
+            return;
+        }
+        HostOps.matvecRow(src, srcOff, this.weight, dst, dstOff,
+            this.inDim, this.outDim);
+    }
+
+    /**
+     * The routed Q4_K mat-vec: one row of activations in, one row of
+     * results out, over buffers this Linear keeps.
+     *
+     * Built on FIRST routed call rather than at bind time, because the
+     * routing switch is flippable at run time (plan 4.2.2) and a Linear
+     * that is never routed should not pay for a second copy of its weight.
+     */
+    void matvecIntoDevice(float32[] sb, int64 so, float32[] db, int64 doff) {
+        this.ensureDevice();
+        if (!Linear.timeDev) {
+            int64 i = 0;
+            // Hoisted: the bound, not the body. A static read per element in
+            // a per-token copy loop is exactly the kind of overhead that
+            // shows up as a mysterious percent.
+            // Skipped entirely on a stage hit: the shared host scratch
+            // already holds this exact window, so re-copying it would be the
+            // work the cache exists to avoid.
+            int64 nIn = (Linear.skipTransfers || this.stageHit(so))
+                ? 0L : (int64) this.inDim;
+            while (i < nIn) {
+                Linear.stXh[i] = sb[so + i];
+                i = i + 1;
+            }
+            // Offsets are zero HERE and not dropped: the scratch is exactly
+            // one row wide, so the caller's `so`/`doff` are consumed by the
+            // copies above and below.
+            if (!Linear.skipTransfers) {
+                int32 rep = 0;
+                while (rep <= Linear.xferReps) {
+                    this.sendActivations(so);
+                    rep = rep + 1;
+                }
+            }
+            this.launchRows();
+            if (!Linear.skipTransfers) {
+                int32 rep2 = 0;
+                while (rep2 <= Linear.xferReps) {
+                    this.fetchResult();
+                    rep2 = rep2 + 1;
+                }
+            }
+            i = 0;
+            int64 nOut = Linear.skipTransfers ? 0L : (int64) this.outDim;
+            while (i < nOut) {
+                db[doff + i] = this.yScratch[i];
+                i = i + 1;
+            }
+            return;
+        }
+        // Timed twin of the block above. Kept as a SEPARATE arm rather than
+        // one body with conditional clock reads, so the untimed path carries
+        // no branch per phase and the two cannot drift in what they compute.
+        int64 c0 = Clock.nanoTime();
+        int64 i = 0;
+        int64 nIn2 = this.stageHit(so) ? 0L : (int64) this.inDim;
+        while (i < nIn2) {
+            Linear.stXh[i] = sb[so + i];
+            i = i + 1;
+        }
+        int64 c1 = Clock.nanoTime();
+        this.sendActivations(so);
+        int64 c2 = Clock.nanoTime();
+        this.launchRows();
+        int64 c3 = Clock.nanoTime();
+        this.fetchResult();
+        int64 c4 = Clock.nanoTime();
+        i = 0;
+        while (i < (int64) this.outDim) {
+            db[doff + i] = this.yScratch[i];
+            i = i + 1;
+        }
+        int64 c5 = Clock.nanoTime();
+        Linear.tCopyIn = Linear.tCopyIn + (c1 - c0);
+        Linear.tUpload = Linear.tUpload + (c2 - c1);
+        Linear.tLaunch = Linear.tLaunch + (c3 - c2);
+        Linear.tDownload = Linear.tDownload + (c4 - c3);
+        Linear.tCopyOut = Linear.tCopyOut + (c5 - c4);
+        Linear.nDevCalls = Linear.nDevCalls + 1L;
+        Linear.recordLaunch((int64) this.packed.count(),
+            (int64) this.outDim, c3 - c2);
+        return;
+    }
+
+    /** Is the shared stage already holding exactly this window? Used by BOTH
+     *  the host copy and the upload, so the two cannot disagree about whether
+     *  a staging happened. */
+    boolean stageHit(int64 srcOff) {
+        return Linear.stShare && Linear.stValid
+            && Linear.stOff == srcOff && Linear.stDim == this.inDim
+            && Linear.stQ8 == this.qAct && Linear.stCap >= this.inDim;
+    }
+
+    /** Grow the shared staging buffers to hold `n` activations. Sized to
+     *  the LARGEST inDim seen, so a smaller projection simply uses a
+     *  prefix — the kernels index by block and never read past `cols`. */
+    static void ensureStage(int32 n) {
+        if (Linear.stCap >= n) { return; }
+        int64 ln = (int64) n;
+        int64 pb = Quant.q8kPackedBytes(ln);
+        Linear.stXh #= heap float32[ln];
+        Linear.stX #= heap KernelBuffer<float32>((uint64) ln);
+        // Both integer stagings are allocated; which one is FILLED is the
+        // backend's answer (packedActivations). ~18 KB for the unused one.
+        Linear.stXph #= heap int8[pb];
+        Linear.stXp #= heap KernelBuffer<int8>((uint64) pb);
+        Linear.stXqh #= heap int8[ln];
+        Linear.stXdh #= heap float32[ln / 256L];
+        Linear.stXbsh #= heap int32[ln / 16L];
+        Linear.stXq #= heap KernelBuffer<int8>((uint64) ln);
+        Linear.stXd #= heap KernelBuffer<float32>((uint64) (ln / 256L));
+        Linear.stXbs #= heap KernelBuffer<int32>((uint64) (ln / 16L));
+        Linear.stCap = n;
+        // A resize invalidates whatever was staged: the buffers are new.
+        Linear.stValid = false;
+        return;
+    }
+
+    /** Stage this call's activations on the device. */
+    void sendActivations(int64 srcOff) {
+        Linear.ensureStage(this.inDim);
+        // The staged copy is reusable only if the forward path has not
+        // declared a change AND this projection wants the same window of it.
+        if (this.stageHit(srcOff)) {
+            Linear.stHits = Linear.stHits + 1L;
+            return;
+        }
+        Linear.stMisses = Linear.stMisses + 1L;
+        if (this.packedAct) {
+            int64 p0 = Clock.nanoTime();
+            Quant.q8kPack(Linear.stXh, 0L, (int64) this.inDim, Linear.stXph);
+            Linear.tPack = Linear.tPack + (Clock.nanoTime() - p0);
+            Linear.nPack = Linear.nPack + 1L;
+            Linear.nUploadCalls = Linear.nUploadCalls + 1L;
+            // ONE call, and only over this projection's OWN bytes.
+            //
+            // The stage is sized to the largest inDim ever seen, so a plain
+            // `upload(host)` would ship 17920 bytes where 5120 are live —
+            // charged for capacity rather than content. Measured: with the
+            // whole buffer going, three small uploads were CHEAPER than one
+            // big one, and 10.1 read as a 1.5% win instead of what it is.
+            Linear.stXp.upload(Linear.stXph,
+                Quant.q8kPackedBytes((int64) this.inDim));
+        } else if (this.q8) {
+            int64 p0 = Clock.nanoTime();
+            Quant.q8kQuantize(Linear.stXh, 0L, (int64) this.inDim,
+                Linear.stXqh, Linear.stXdh, Linear.stXbsh);
+            Linear.tPack = Linear.tPack + (Clock.nanoTime() - p0);
+            Linear.nPack = Linear.nPack + 1L;
+            Linear.nUploadCalls = Linear.nUploadCalls + 3L;
+            int64 n = (int64) this.inDim;
+            Linear.stXq.upload(Linear.stXqh, n);
+            Linear.stXd.upload(Linear.stXdh, n / 256L);
+            Linear.stXbs.upload(Linear.stXbsh, n / 16L);
+        } else if (this.unified) {
+            Linear.stX.hostStore(Linear.stXh);
+        } else {
+            // Same prefix, same reason — and this path had the bug FIRST.
+            // Before the shared stage each Linear owned an `xScratch` sized
+            // to its own inDim, so the f32 upload was exactly right; making
+            // the stage shared silently made every 4096-wide projection ship
+            // a 14336-wide buffer. The staging win covered for it.
+            Linear.nUploadCalls = Linear.nUploadCalls + 1L;
+            Linear.stX.upload(Linear.stXh, (int64) this.inDim);
+        }
+        Linear.stOff = srcOff;
+        Linear.stDim = this.inDim;
+        Linear.stQ8 = this.qAct;
+        Linear.stValid = true;
+        return;
+    }
+
+    /** Read this call's result back. The async form needs its own sync: the
+     *  launch's sync happened BEFORE the copy was enqueued. */
+    void fetchResult() {
+        // 10.12.37: the wait lives HERE, not in launchRows — a chain of
+        // keep-on-device projections is launch-only (decode paid 224
+        // hipDeviceSynchronize per token, one per matvec, 142 ms of
+        // pure serialization over 4 tokens), and only a host READ owes
+        // a sync. The unified hostLoad and the plain download both
+        // read memory directly, so they sync first; downloadAsync is
+        // stream-ordered and syncs after enqueueing.
+        if (Linear.asyncXfer && !this.unified) {
+            KernelStream s = QuantKernel.stream();
+            this.yDev.downloadAsync(this.yScratch, s);
+            s.sync();
+            return;
+        }
+        KernelStream sw = QuantKernel.stream();
+        sw.sync();
+        if (this.unified) { this.yDev.hostLoad(this.yScratch); return; }
+        this.yDev.download(this.yScratch);
+        return;
+    }
+
+    /**
+     * The DEVICE-RESIDENT pair (plan 10.2). Together they let a chain of
+     * projections run without the host in the middle:
+     *
+     *   gate.matvecKeepOnDevice(xn, rh)     // result stays in gate.yDev
+     *   up.matvecKeepOnDevice(xn, rh)
+     *   Prim.gluDevice(gate.out(), up.out(), inter, act)
+     *   down.matvecFromDevice(gate.out(), inter, mlpOut, rh)
+     *
+     * where the old shape downloaded gate and up, ran the SwiGLU on the
+     * host, and uploaded the result again — three crossings a layer for a
+     * value that never needed to leave.
+     *
+     * Only valid on a routed device path; a caller must check
+     * {@link #isDeviceRouted}.
+     */
+    boolean isDeviceRouted() {
+        return this.packedTy >= 0 && QuantKernel.hasKernel(this.packedTy)
+            && QuantKernel.routingEnabled() && Linear.waveMv();
+    }
+
+    /** This Linear's output buffer — a BORROW of interior state, valid
+     *  until its next mat-vec overwrites it. The caller must not outlive
+     *  the Linear and must not free it. */
+    KernelBuffer<float32> out() { return this.yDev; }
+
+    // ── BATCHED prefill (plan 10.12.1) ──────────────────────────────────
+    //
+    // Shared across every Linear, like the single-row stage and for the
+    // same reason: q/k/v read one staging of the same activation block,
+    // and gate/up read another. The batch stage is `[rows x packedBytes]`
+    // and the output `[rows x outDim]`.
+    static KernelBuffer<int8> btXp;
+    static KernelBuffer<int32> btXpW;   // dword view, refreshed with btXp
+    static boolean mmqOn = true;        // vulkan Q4_K batch -> mmq kernel
+    static int8[] btXph;
+    static int32 btCap;      // rows the stage is sized for
+    static int32 btDim;      // inDim the stage is sized for
+    /** Tag of what is currently staged: -1 = nothing. */
+    static int64 btTag = 0L - 1L;
+    static int32 btRows;
+    static int32 btN;
+    static KernelBuffer<float32> btXf;
+    static float32[] btXfh;
+    static int64 btInCap;
+    static boolean devPack = true;
+    static int64 btDeqNs;
+    static int64 btWmmaNs;
+    static int64 btQ6Ns;
+    static int64 btFbNs;
+    static int64 wmma6Calls;
+    static boolean wmmaOn = true;
+    // Prefill weight residency (10.12.16): false = "packed" (the staged
+    // WMMA kernel, default), true = "int8" (the widened resident copy).
+    // Set from EngineOptions.prefillWeights before any prefill runs.
+    static boolean deqPrefill = false;
+    static int64 wmmaCalls;
+    static int64 wmmaDeqCalls;
+    static int64 batchFallbackCalls;
+
+    static boolean wmma6On = true;
+    // Register epilogues (epilogue plan U3), routed PER FORMAT by
+    // measurement: Q6_K's epi kernel won 521 -> 340 ms (16 spills/block
+    // removed, no dmin) and is the default; Q4_K's epi measured SLOWER
+    // than its spill form even after the merged-fold fix (1938 vs 1570
+    // - the dmin rank-1 and triple fold cost more than its 8 spills),
+    // so Q4_K stays on the spill kernels. `noepi` reverts Q6; `q4epi`
+    // opts Q4 in for future re-measurement (10.12.21's multi-wave
+    // tiling may change the balance).
+    static boolean epiOn = true;
+    static boolean q4EpiOn = false;
+    // 10.12.21: the register-tiled T=2 deq kernel — two token-tiles
+    // per wave sharing every B fragment. Off until measured.
+    static boolean q4T2On = false;
+    static boolean q4N4On = false;
+    // 10.12.21 final: 8 waves/WG + register epilogue (dual verb) +
+    // barrier-free K-loop. Beats the spill champion 1850 vs 1902 ms
+    // prefill(512) over 3 alternated rounds — DEFAULT ON. The profile
+    // says why the win is only 3%: the kernel runs at ~155 GB/s, the
+    // memory wall, because every 16-token tile re-reads the whole
+    // weight matrix (32 re-reads at ctx512). Token blocking is next.
+    static boolean q4MwOn = true;
+    // 10.12.21 token blocking: 64 tokens per WG — 4x less weight
+    // traffic against the measured ~155 GB/s memory wall. Measured
+    // 1550 vs 1857 ms prefill(512) over 3 alternated rounds (kernel
+    // 1097 -> 784 ms, and now UNDER the wall at ~84 GB/s implied —
+    // the constraint moved back to latency), so DEFAULT ON; `nomw4`
+    // reverts to Mw, `nomw` to the spill champion.
+    static boolean q4Mw4On = true;
+    // 10.12.28: T=8 token blocking (128 tok/WG, weights /8, both
+    // halves register-resident, mc/rg reused across chunks). Measured
+    // 1187 vs 1287 ms prefill(512) over 3 alternated rounds — the
+    // latency-hiding side paid even though Mw4 was already under the
+    // traffic wall. DEFAULT ON; `nomw8` reverts to Mw4. Smaller
+    // batches (rows % 128 != 0) fall through to Mw4/Mw on their own.
+    static boolean q4Mw8On = true;
+    // 10.12.27: Q6_K on the same token-blocked deq route (one-time
+    // signed widen, +~1.9 GB in int8 mode for the 8B's ffn_down
+    // tensors). Measured 1282 vs 1553 ms prefill(512) over 3
+    // alternated rounds — DEFAULT ON; `noq6mw4` reverts to the epi
+    // kernel. Only fires in deq (int8) mode; packed mode keeps epi.
+    static boolean q6Mw4On = true;
+    // 10.12.39: the Q6_K T=8 twin (Q4 Mw8 retile ported — cf prefold
+    // to LDS, eight token tiles per weight fragment). Preferred over
+    // Mw4 when rows % 128 == 0; `noq6mw8` reverts to Mw4.
+    static boolean q6Mw8On = true;
+    // 10.12.32: fused q|k|v and gate|up projections — one launch over
+    // the concatenated outDim, so the thin k/v grids ride the q
+    // projection's occupancy and two thirds of the projection
+    // launches disappear. Deq mode only; costs a fused packed copy
+    // (~2.6 GB — the fused deq REPLACES the per-tensor deq for the
+    // fused tensors, so that side is neutral). Off until measured
+    // (the `fuse` arm).
+    static boolean fuseOn = false;
+    // 10.12.34: partition the big GEMMs into ~32-WG launches — the
+    // grid-sweep sweet spot (6.85 vs 5.3-5.5 TMAC/s at constant work:
+    // 32 WGs fills the ~40-concurrent-WG capacity with no scheduling
+    // tail and keeps the activation slab MALL-resident). Measured 846
+    // vs 959 ms prefill(512) over 3 alternated rounds — DEFAULT ON;
+    // `nopart32` reverts to monolithic launches.
+    static boolean part32On = true;
+    public static void setWmma(boolean on) { Linear.wmmaOn = on; }
+
+    public static void setMmq(boolean on) { Linear.mmqOn = on; }
+
+    void ensurePackedW() {
+        if (this.packedW == null) {
+            this.packedW #= this.packedDev.wordView();
+        }
+    }
+
+    void ensureQ6Pad() {
+        if (this.q6PadW == null) {
+            int64 nBlocks = (int64) this.outDim
+                * ((int64) this.inDim / 256L);
+            this.q6PadDev #= heap KernelBuffer<int8>(
+                (uint64) (nBlocks * 212L));
+            QuantKernel.q6kPadLaunch(this.q6PadDev, this.packedDev,
+                nBlocks);
+            this.q6PadW #= this.q6PadDev.wordView();
+        }
+    }
+    public static void setWmma6(boolean on) { Linear.wmma6On = on; }
+    public static void setEpi(boolean on) { Linear.epiOn = on; }
+    public static void setQ4Epi(boolean on) { Linear.q4EpiOn = on; }
+    public static void setQ4T2(boolean on) { Linear.q4T2On = on; }
+    public static void setQ4N4(boolean on) { Linear.q4N4On = on; }
+    public static void setQ4Mw(boolean on) { Linear.q4MwOn = on; }
+    public static void setQ4Mw4(boolean on) { Linear.q4Mw4On = on; }
+    public static void setQ6Mw4(boolean on) { Linear.q6Mw4On = on; }
+    public static void setQ6Mw8(boolean on) { Linear.q6Mw8On = on; }
+    public static void setQ4Mw8(boolean on) { Linear.q4Mw8On = on; }
+    public static void setFuse(boolean on) { Linear.fuseOn = on; }
+    public static void setPart32(boolean on) { Linear.part32On = on; }
+    public static boolean fuseEnabled() { return Linear.fuseOn; }
+    public static boolean epiEnabled() { return Linear.epiOn; }
+    public static boolean q6Mw4Enabled() { return Linear.q6Mw4On; }
+    public static boolean q4EpiEnabled() { return Linear.q4EpiOn; }
+    public static void setDeqPrefill(boolean on) {
+        Linear.deqPrefill = on;
+    }
+    public static int64 wmmaCallCount() { return Linear.wmmaCalls; }
+    public static int64 wmmaDeqCallCount() { return Linear.wmmaDeqCalls; }
+    public static int64 batchFallbackCount() {
+        return Linear.batchFallbackCalls;
+    }
+
+    public static void setDeviceBatchPack(boolean on) {
+        Linear.devPack = on;
+    }
+
+    static void ensureBatchIn(int64 span) {
+        if (Linear.btInCap >= span) { return; }
+        Linear.btXf #= heap KernelBuffer<float32>((uint64) span);
+        Linear.btXfh #= heap float32[span];
+        Linear.btInCap = span;
+        return;
+    }
+
+    // Phase timers for the batched path (plan 10.12.4). The existing
+    // devCopyIn/devUpload/... timers only see `matvecIntoDevice`, so the
+    // batched entry points are invisible to them — and "prefill is 7 s"
+    // is not a diagnosis.
+    static int64 btPackNs;
+    static int64 btUploadNs;
+    static int64 btLaunchNs;
+    static int64 btDownNs;
+    static int64 btCopyNs;
+    static int64 btCalls;
+
+    public static int64 batchPackNs()   { return Linear.btPackNs; }
+    public static int64 batchUploadNs() { return Linear.btUploadNs; }
+    public static int64 batchLaunchNs() { return Linear.btLaunchNs; }
+    public static int64 batchDownNs()   { return Linear.btDownNs; }
+    public static int64 batchCopyNs()   { return Linear.btCopyNs; }
+    public static int64 batchCalls()    { return Linear.btCalls; }
+    // The launch split by ROUTE (10.12.22): 2855 ms of launch covers
+    // both the WMMA calls and the Q6_K dotAccum fallbacks, and which
+    // dominates decides whether a Q6_K WMMA twin outranks the seam work.
+    public static int64 batchDeqNs()    { return Linear.btDeqNs; }
+    public static int64 batchWmmaNs()   { return Linear.btWmmaNs; }
+    public static int64 batchQ6Ns()     { return Linear.btQ6Ns; }
+    public static int64 batchFbNs()     { return Linear.btFbNs; }
+    public static int64 wmma6CallCount() { return Linear.wmma6Calls; }
+
+    public static void resetBatchTimers() {
+        Linear.btPackNs = 0L;
+        Linear.btUploadNs = 0L;
+        Linear.btLaunchNs = 0L;
+        Linear.btDownNs = 0L;
+        Linear.btCopyNs = 0L;
+        Linear.btDeqNs = 0L;
+        Linear.btWmmaNs = 0L;
+        Linear.btQ6Ns = 0L;
+        Linear.btFbNs = 0L;
+        Linear.btCalls = 0L;
+        Linear.wmmaCalls = 0L;
+        Linear.wmmaDeqCalls = 0L;
+        Linear.wmma6Calls = 0L;
+        Linear.batchFallbackCalls = 0L;
+        return;
+    }
+
+    static void ensureBatchStage(int32 rows, int32 n) {
+        if (Linear.btCap >= rows && Linear.btDim >= n) { return; }
+        int32 wr = rows;
+        if (Linear.btCap > wr) { wr = Linear.btCap; }
+        int32 wn = n;
+        if (Linear.btDim > wn) { wn = Linear.btDim; }
+        int64 pb = Quant.q8kPackedBytes((int64) wn);
+        Linear.btXph #= heap int8[(int64) wr * pb];
+        Linear.btXp #= heap KernelBuffer<int8>((uint64) ((int64) wr * pb));
+        Linear.btXpW #= Linear.btXp.wordView();
+        Linear.btCap = wr;
+        Linear.btDim = wn;
+        Linear.btTag = 0L - 1L;
+        Linear.btN = 0;
+        return;
+    }
+
+    /**
+     * Quantize `rows` activations and upload them ONCE, for the
+     * projections that follow.
+     *
+     * `tag` identifies the activation window the way the single-row
+     * stage's (tag, offset, dimension) key does — q/k/v share one
+     * staging, gate/up share the next. It must CHANGE whenever the
+     * contents change, and `xn` is rewritten at the same address every
+     * layer, so identity and offset alone cannot tell layer N from layer
+     * N+1. Callers pass a monotonically increasing value. A stale hit
+     * here multiplies against the previous activation, which is 9.9 and
+     * 11.3 both.
+     */
+    public static void stageBatch(Tensor<float32> src, int64 srcOff,
+            int32 rows, int32 n, int64 tag) {
+        Linear.ensureBatchStage(rows, n);
+        if (Linear.btTag == tag && Linear.btRows == rows
+                && Linear.btN == n) {
+            return;
+        }
+        float32[] sb = src.hostBuffer();
+        int64 base = src.hostBase() + srcOff;
+        // THE ROW STRIDE IS THIS PROJECTION'S, NOT THE BUFFER'S. The
+        // buffer is sized to the LARGEST inDim ever staged (14336, from
+        // down_proj), but the kernel derives its stride from the `cols`
+        // it is given — `blocksPerRow * 320` — so packing at the
+        // buffer's stride puts row r where the kernel will not look for
+        // it. Row 0 still lands at offset 0, so the output is plausible
+        // and wrong: the first prefill token came back as 55110 instead
+        // of 198.
+        int64 pb = Quant.q8kPackedBytes((int64) n);
+        int64 span = (int64) rows * (int64) n;
+        if (Linear.devPack) {
+            // PACK ON THE DEVICE. The host packer was 877 ms of a 7.9 s
+            // prefill — 11% — quantizing `rows x inDim` floats one at a
+            // time. The existing q8_K pack kernel needs no batched
+            // variant: block `b` of a flat vector lands at `out[b*320]`,
+            // and row `r`'s blocks are `r*nb .. r*nb+nb-1`, so a
+            // contiguous `[rows x n]` activation packs to exactly the
+            // `[rows x pb]` layout the GEMM reads. One long vector.
+            int64 t0 = Clock.nanoTime();
+            Linear.ensureBatchIn(span);
+            float32[] fh = Linear.btXfh;
+            int64 c = 0;
+            while (c < span) {
+                fh[c] = sb[base + c];
+                c = c + 1;
+            }
+            int64 t1 = Clock.nanoTime();
+            Linear.btXf.upload(fh, span);
+            QuantKernel.q8kPackLaunch(Linear.btXp, Linear.btXf, span);
+            int64 t2 = Clock.nanoTime();
+            Linear.btPackNs = Linear.btPackNs + (t1 - t0);
+            Linear.btUploadNs = Linear.btUploadNs + (t2 - t1);
+        } else {
+            int64 t0 = Clock.nanoTime();
+            int64 r = 0;
+            while (r < (int64) rows) {
+                Quant.q8kPack(sb, base + r * (int64) n, (int64) n,
+                    Linear.btXph, r * pb);
+                r = r + 1;
+            }
+            int64 t1 = Clock.nanoTime();
+            Linear.btXp.upload(Linear.btXph, (int64) rows * pb);
+            int64 t2 = Clock.nanoTime();
+            Linear.btPackNs = Linear.btPackNs + (t1 - t0);
+            Linear.btUploadNs = Linear.btUploadNs + (t2 - t1);
+        }
+        Linear.btTag = tag;
+        Linear.btRows = rows;
+        Linear.btN = n;
+        return;
+    }
+
+    /** Can this projection launch on the device-resident decode path —
+     *  packed weights AND a device mat-vec kernel for the format
+     *  (10.12.45; Q2_K/Q3_K bind packed but fail this until their
+     *  device kernels land). */
+    boolean deviceLaunchable() {
+        return this.packedTy >= 0 && QuantKernel.hasKernel(this.packedTy)
+            && QuantKernel.routingEnabled()
+            && (QuantKernel.hasF32Kernel(this.packedTy)
+                || (Linear.waveMv() && Linear.packedActivations()
+                    && Linear.q8Route() && this.inDim % 256 == 0));
+    }
+
+    // The batch GEMMs are WMMA kernels whose scaledAccumInto*S verbs are
+    // NATIVE-tier-only — on the SPIR-V/Vulkan backend all seven are
+    // SKIPPED at build, so a launch would find no registered kernel.
+    // hasBatchKernel is a TYPE check and cannot know that; the backend
+    // gate is latched once here (10.12.44: the first Vulkan run announced
+    // "BATCHED projections" and then launched kernels that do not exist).
+    static boolean wmmaBeSet;
+    static boolean wmmaBeOk;
+    static boolean wmmaBackend() {
+        if (!Linear.wmmaBeSet) {
+            // Vulkan joined 2026-08-25: the batch route there is the
+            // dotAccum GEMM pair (matmulBatchKeep gates the WMMA kernels
+            // off — their portable-tile demotion trips the gfx-ring
+            // watchdog), measured token-identical at ctx512 with prefill
+            // 8.0 s vs 48 s per-row. isBatchRouted's per-type vulkan gate
+            // decides which formats ride it.
+            Linear.wmmaBeOk = true;
+            Linear.wmmaBeSet = true;
+        }
+        return Linear.wmmaBeOk;
+    }
+
+    // Which deq-GEMM kernel VARIANTS exist on the ACTIVE backend.
+    // hasBatchKernel is a TYPE check; a backend can SKIP a kernel at build
+    // (the shader tier skips all seven *S-verb Mw kernels), and launching a
+    // skipped kernel is a loud-on-stderr no-op the route read as SUCCESS:
+    // the vkwmma measurement dropped 1,344 launches and produced garbage
+    // logits at an impossibly fast 130 ms — the fast-plus-wrong signature.
+    // Latched once from Device.kernelAvailable, the runtime's own registry.
+    static boolean kAvailSet;
+    static boolean avQ4Mw8;
+    static boolean avQ4Mw4;
+    static boolean avQ6Mw8;
+    static boolean avQ6Mw4;
+    static boolean avQ5Mw8;
+    static boolean avQ80Mw8;
+    static boolean avQ2Mw8;
+    static boolean avQ3Mw8;
+    static boolean avQ6Batch;   // the dotAccum Q6 batch GEMM (vulkan's route)
+    static void ensureKernelAvail() {
+        if (Linear.kAvailSet) { return; }
+        Linear.avQ4Mw8 = Device.kernelAvailable("q4kWmmaDeqMw8Kernel");
+        Linear.avQ4Mw4 = Device.kernelAvailable("q4kWmmaDeqMw4Kernel");
+        Linear.avQ6Mw8 = Device.kernelAvailable("q6kWmmaDeqMw8Kernel");
+        Linear.avQ6Mw4 = Device.kernelAvailable("q6kWmmaDeqMw4Kernel");
+        Linear.avQ5Mw8 = Device.kernelAvailable("q5kWmmaDeqMw8Kernel");
+        Linear.avQ80Mw8 = Device.kernelAvailable("q80WmmaDeqMw8Kernel");
+        Linear.avQ2Mw8 = Device.kernelAvailable("q2kWmmaDeqMw8Kernel");
+        Linear.avQ3Mw8 = Device.kernelAvailable("q3kWmmaDeqMw8Kernel");
+        Linear.avQ6Batch = Device.kernelAvailable("q6kQ8BatchMatMulKernel");
+        Linear.kAvailSet = true;
+        // Routing decisions this size deserve one loud line: a false here
+        // silently demotes a quant off its fastest GEMM (and a wrong false —
+        // a registry/name/backend-id mismatch — would read as a plain perf
+        // regression, the least debuggable failure shape there is).
+        if (!Linear.avQ4Mw8 || !Linear.avQ6Mw8) {
+            System.stdout.println("kernel-avail: q4Mw8=" + (Linear.avQ4Mw8 ? 1 : 0)
+                + " q4Mw4=" + (Linear.avQ4Mw4 ? 1 : 0)
+                + " q6Mw8=" + (Linear.avQ6Mw8 ? 1 : 0)
+                + " q6Mw4=" + (Linear.avQ6Mw4 ? 1 : 0)
+                + " q5Mw8=" + (Linear.avQ5Mw8 ? 1 : 0)
+                + " q80Mw8=" + (Linear.avQ80Mw8 ? 1 : 0)
+                + " q2Mw8=" + (Linear.avQ2Mw8 ? 1 : 0)
+                + " q3Mw8=" + (Linear.avQ3Mw8 ? 1 : 0)
+                + " — unavailable variants take the next kernel down");
+        }
+    }
+
+    /** Measurement override for the latch above (the `vkwmma` bench arm):
+     *  after the coop-matrix signedness fix the non-*S batch GEMMs are
+     *  numerically correct on the Vulkan tier, so the question became a
+     *  PERFORMANCE one — whether KHR-tile batching beats per-row there.
+     *  This forces the answer to be measurable without changing the
+     *  shipped default. */
+    public static void setWmmaBackendOverride(boolean on) {
+        Linear.wmmaBeOk = on;
+        Linear.wmmaBeSet = true;
+    }
+
+    // The actual backend, latched separately from the wmmaBackend()
+    // measurement override: the per-TYPE vulkan gate below must hold even
+    // when the vkwmma arm forces batching on.
+    static boolean vkBeSet;
+    static boolean vkBeIs;
+    static boolean backendIsVulkan() {
+        if (!Linear.vkBeSet) {
+            String be #= Device.activeBackend();
+            Linear.vkBeIs = be.equals("vulkan");
+            Linear.vkBeSet = true;
+        }
+        return Linear.vkBeIs;
+    }
+
+    /** Is there a batched GEMM for this projection's weight format?
+     *  On vulkan the WMMA Q6 kernels lose the RADV context at engine
+     *  scale (an execution hang — measured still occurring under
+     *  robustBufferAccess, so not an out-of-bounds read); Q6 batches
+     *  there through the dotAccum GEMM instead (matmulBatchKeep gates
+     *  useWmma6 off), which requires that kernel to be registered. */
+    boolean isBatchRouted() {
+        if (this.packedTy < 0 || !QuantKernel.hasBatchKernel(this.packedTy)
+                || !QuantKernel.routingEnabled() || !Linear.waveMv()
+                || !Linear.wmmaBackend()) {
+            return false;
+        }
+        if (Linear.backendIsVulkan()) {
+            Linear.ensureKernelAvail();
+            if (this.packedTy == Quant.GG_Q6_K) { return Linear.avQ6Batch; }
+            return this.packedTy == Quant.GG_Q4_K;
+        }
+        return true;
+    }
+
+    /**
+     * As {@link #isBatchRouted} but for a KNOWN row count (10.12.45.D):
+     * Q5_K and Q8_0 have only the Mw8 deq GEMM, so they batch-route
+     * only in deq mode at rows % 128 — any other shape takes the
+     * announced per-row path rather than a throw.
+     */
+    boolean isBatchRoutedFor(int64 rows) {
+        if (this.isBatchRouted()) { return true; }
+        if (this.packedTy != Quant.GG_Q5_K
+                && this.packedTy != Quant.GG_Q8_0
+                && this.packedTy != Quant.GG_Q2_K
+                && this.packedTy != Quant.GG_Q3_K) {
+            return false;
+        }
+        Linear.ensureKernelAvail();
+        boolean mw8Avail =
+            this.packedTy == Quant.GG_Q5_K ? Linear.avQ5Mw8
+            : this.packedTy == Quant.GG_Q8_0 ? Linear.avQ80Mw8
+            : this.packedTy == Quant.GG_Q2_K ? Linear.avQ2Mw8
+            : Linear.avQ3Mw8;
+        return Linear.deqPrefill && Linear.wmmaOn
+            && QuantKernel.routingEnabled() && Linear.waveMv()
+            && Linear.wmmaBackend() && mw8Avail
+            && WmmaKernel.fitsMw8(rows, (int64) this.outDim);
+    }
+
+    /**
+     * `Y = X . W^T` for the `rows` activations last handed to
+     * {@link #stageBatch}, into `dst[dstOff ..]` laid out `[rows x
+     * outDim]`.
+     *
+     * The whole reason this exists: the per-row path re-reads every byte
+     * of this projection's weights once PER PROMPT TOKEN, so a 512-token
+     * prompt reads a 4.58 GB checkpoint 512 times. Here a 32-token tile
+     * shares one pass.
+     */
+    void matmulInto(int32 rows, Tensor<float32> dst, int64 dstOff) {
+        this.matmulBatchKeep(rows);
+        int64 n = (int64) rows * (int64) this.outDim;
+        int64 t2s = Clock.nanoTime();
+        // The launches are NoSync (10.12.24); the read is the seam.
+        KernelStream ms = QuantKernel.stream();
+        ms.sync();
+        this.yBatch.download(this.yBatchH, n);
+        int64 t2 = Clock.nanoTime();
+        float32[] db = dst.hostBuffer();
+        int64 doff = dst.hostBase() + dstOff;
+        int64 i = 0;
+        while (i < n) {
+            db[doff + i] = this.yBatchH[i];
+            i = i + 1;
+        }
+        int64 t3 = Clock.nanoTime();
+        Linear.btDownNs = Linear.btDownNs + (t2 - t2s);
+        Linear.btCopyNs = Linear.btCopyNs + (t3 - t2);
+        return;
+    }
+
+    /**
+     * As {@link #matmulInto} but the result STAYS on the device in
+     * `yBatch` (10.12.7.a): the MLP chain feeds the GLU and the next
+     * projection's pack without the host ever reading gate/up — which
+     * 10.12.22 measured as two thirds of the downloaded bytes and the
+     * largest host prim.
+     */
+    // Which batch kernel actually ran, said once per (branch, shape): the
+    // vulkan context-loss hunt needs the LAST route printed before the hang
+    // to name the killer — in-engine localization by value probes pointed at
+    // "the first Q6 batch kernel" and was wrong twice (the dotAccum route
+    // hangs identically with every WMMA Q6 kernel gated off).
+    static int32 routeSaid;
+    void sayRoute(int32 bit, String name) {
+        if ((Linear.routeSaid & bit) != 0) { return; }
+        Linear.routeSaid = Linear.routeSaid | bit;
+        System.stdout.println("batch-route: " + name + " out="
+            + this.outDim + " in=" + this.inDim);
+    }
+
+    void matmulBatchKeep(int32 rows) {
+        Linear.ensureKernelAvail();
+        this.ensureDevice();
+        this.ensureBatchOut(rows);
+        int64 t0 = Clock.nanoTime();
+        // MATRIX CORES when the shape tiles and the format has a kernel
+        // (plan 10.12.14). Only Q4_K has one, so a Q4_K_M checkpoint runs
+        // its Q6_K projections — attn_v and some ffn_down — on the
+        // dotAccum batch kernel beside it. That is a real mix, not a
+        // fallback that never fires, and the diagnostic says which ran.
+        // NOT on vulkan: the epilogue-verb WMMA kernels have no native
+        // scaledAccumInto2 lowering there, so the compiler demotes their
+        // tiles to the portable software tile — correct, but a single
+        // dispatch then exceeds the ~10 s gfx-ring watchdog (measured:
+        // "ring gfx_0.0.0 timeout" from the VkTileProbe stage-5 isolation,
+        // ring reset, context lost — the defect the whole "Q6 hang" hunt
+        // was chasing). The dotAccum batch GEMMs are the vulkan route.
+        boolean useWmma = Linear.wmmaOn
+            && this.packedTy == Quant.GG_Q4_K
+            && WmmaKernel.fits((int64) rows, (int64) this.outDim)
+            && !Linear.backendIsVulkan();
+        boolean useDeq = useWmma && Linear.deqPrefill;
+        // Q6_K on the matrix cores too (10.12.23): 10.12.22 measured the
+        // dotAccum fallback at 1290 ms of the 2844 ms launch — 32 calls
+        // costing ~as much as all 192 WMMA calls.
+        boolean useWmma6 = Linear.wmmaOn && Linear.wmma6On
+            && this.packedTy == Quant.GG_Q6_K
+            && WmmaKernel.fits((int64) rows, (int64) this.outDim)
+            && !Linear.backendIsVulkan();   // RADV context-loss: dotAccum instead
+        // 10.12.45.D: Q5_K and Q8_0 exist only in deq (int8) mode and
+        // only at the Mw8 shape — isBatchRoutedFor gates the batched
+        // entry on the same predicate, so reaching here with either
+        // means the shape fits.
+        boolean useDeq5 = Linear.deqPrefill && Linear.wmmaOn
+            && this.packedTy == Quant.GG_Q5_K && Linear.avQ5Mw8
+            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
+        boolean useDeq8 = Linear.deqPrefill && Linear.wmmaOn
+            && this.packedTy == Quant.GG_Q8_0 && Linear.avQ80Mw8
+            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
+        boolean useDeq2 = Linear.deqPrefill && Linear.wmmaOn
+            && this.packedTy == Quant.GG_Q2_K && Linear.avQ2Mw8
+            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
+        boolean useDeq3 = Linear.deqPrefill && Linear.wmmaOn
+            && this.packedTy == Quant.GG_Q3_K && Linear.avQ3Mw8
+            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
+        if (useDeq) {
+            this.ensureDeq();
+            if (Linear.q4Mw8On && Linear.avQ4Mw8
+                    && WmmaKernel.fitsMw8((int64) rows,
+                        (int64) this.outDim)) {
+                if (Linear.part32On) {
+                    this.sayRoute(1, "q4 deqMw8Part");
+                    WmmaKernel.q4kWmmaDeqMw8PartLaunch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                } else {
+                    this.sayRoute(2, "q4 deqMw8");
+                    WmmaKernel.q4kWmmaDeqMw8Launch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                }
+            } else if (Linear.q4Mw4On && Linear.avQ4Mw4
+                    && WmmaKernel.fitsMw4((int64) rows,
+                        (int64) this.outDim)) {
+                this.sayRoute(4, "q4 deqMw4");
+                WmmaKernel.q4kWmmaDeqMw4Launch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else if (Linear.q4MwOn
+                    && WmmaKernel.fitsMw((int64) rows,
+                        (int64) this.outDim)) {
+                this.sayRoute(8, "q4 deqMw");
+                WmmaKernel.q4kWmmaDeqMwLaunch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else if (Linear.q4N4On
+                    && WmmaKernel.fitsN4((int64) rows,
+                        (int64) this.outDim)) {
+                this.sayRoute(16, "q4 deqN4");
+                WmmaKernel.q4kWmmaDeqN4Launch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else if (Linear.q4T2On
+                    && WmmaKernel.fitsT2((int64) rows,
+                        (int64) this.outDim)) {
+                this.sayRoute(32, "q4 deqT2");
+                WmmaKernel.q4kWmmaDeqT2Launch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else if (Linear.q4EpiOn) {
+                this.sayRoute(64, "q4 deqEpi");
+                WmmaKernel.q4kWmmaDeqEpiLaunch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else {
+                this.sayRoute(128, "q4 deq");
+                WmmaKernel.q4kWmmaDeqLaunch(this.yBatch, this.packedDev,
+                    this.deqDev, Linear.btXp, (int64) rows,
+                    (int64) this.outDim, (int64) this.inDim);
+            }
+        } else if (useWmma) {
+            if (Linear.q4EpiOn) {
+                this.sayRoute(256, "q4 epi");
+                WmmaKernel.q4kWmmaEpiLaunch(this.yBatch, this.packedDev,
+                    Linear.btXp, (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else {
+                this.sayRoute(512, "q4 plain");
+                WmmaKernel.q4kWmmaLaunch(this.yBatch, this.packedDev,
+                    Linear.btXp, (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            }
+        } else if (useWmma6) {
+            if (Linear.deqPrefill && Linear.q6Mw4On && Linear.avQ6Mw4
+                    && WmmaKernel.fitsMw4((int64) rows,
+                        (int64) this.outDim)) {
+                this.ensureDeq();
+                // 10.12.39: T=8 twin preferred when the rows fit —
+                // eight token tiles per weight fragment plus the cf
+                // prefold; Mw4 stays the odd-shape fallback.
+                boolean mw8 = Linear.q6Mw8On && Linear.avQ6Mw8
+                    && WmmaKernel.fitsMw8((int64) rows,
+                        (int64) this.outDim);
+                if (mw8 && Linear.part32On) {
+                    WmmaKernel.q6kWmmaDeqMw8PartLaunch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                } else if (mw8) {
+                    WmmaKernel.q6kWmmaDeqMw8Launch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                } else if (Linear.part32On) {
+                    WmmaKernel.q6kWmmaDeqMw4PartLaunch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                } else {
+                    WmmaKernel.q6kWmmaDeqMw4Launch(this.yBatch,
+                        this.packedDev, this.deqDev, Linear.btXp,
+                        (int64) rows, (int64) this.outDim,
+                        (int64) this.inDim);
+                }
+            } else if (Linear.epiOn) {
+                WmmaKernel.q6kWmmaEpiLaunch(this.yBatch, this.packedDev,
+                    Linear.btXp, (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else {
+                WmmaKernel.q6kWmmaLaunch(this.yBatch, this.packedDev,
+                    Linear.btXp, (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            }
+        } else if (useDeq5) {
+            this.ensureDeq();
+            if (Linear.part32On) {
+                WmmaKernel.q5kWmmaDeqMw8PartLaunch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else {
+                WmmaKernel.q5kWmmaDeqMw8Launch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            }
+        } else if (useDeq8) {
+            this.ensureDeq();
+            if (Linear.part32On) {
+                WmmaKernel.q80WmmaDeqMw8PartLaunch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else {
+                WmmaKernel.q80WmmaDeqMw8Launch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            }
+        } else if (useDeq2) {
+            this.ensureDeq();
+            if (Linear.part32On) {
+                WmmaKernel.q2kWmmaDeqMw8PartLaunch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else {
+                WmmaKernel.q2kWmmaDeqMw8Launch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            }
+        } else if (useDeq3) {
+            this.ensureDeq();
+            if (Linear.part32On) {
+                WmmaKernel.q3kWmmaDeqMw8PartLaunch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            } else {
+                WmmaKernel.q3kWmmaDeqMw8Launch(this.yBatch,
+                    this.packedDev, this.deqDev, Linear.btXp,
+                    (int64) rows, (int64) this.outDim,
+                    (int64) this.inDim);
+            }
+        } else if (Linear.mmqOn && this.packedTy == Quant.GG_Q4_K
+                && Linear.backendIsVulkan()) {
+            // The LDS-tiled dp4a GEMM (q4kQ8MmqKernel): reads dwords only,
+            // so it takes WORD VIEWS of the packed and q8k buffers.
+            this.sayRoute(2048, "mmq q4");
+            this.ensurePackedW();
+            QuantKernel.q4kQ8MmqLaunchNoSync(this.yBatch, this.packedW,
+                Linear.btXpW, (int64) rows, (int64) this.outDim,
+                (int64) this.inDim);
+            QuantKernel.stream().sync();
+        } else if (Linear.mmqOn && this.packedTy == Quant.GG_Q6_K
+                && Linear.backendIsVulkan()) {
+            this.sayRoute(4096, "mmq q6");
+            this.ensureQ6Pad();
+            QuantKernel.q6kQ8MmqLaunchNoSync(this.yBatch, this.q6PadW,
+                Linear.btXpW, (int64) rows, (int64) this.outDim,
+                (int64) this.inDim);
+            QuantKernel.stream().sync();
+        } else {
+            this.sayRoute(1024, "dotAccum ty=" + this.packedTy);
+            QuantKernel.batchMatMulLaunch(this.packedTy, this.yBatch,
+                this.packedDev, Linear.btXp, (int64) rows,
+                (int64) this.outDim, (int64) this.inDim);
+        }
+        int64 t1 = Clock.nanoTime();
+        if (useDeq || useDeq5 || useDeq8 || useDeq2 || useDeq3) {
+            // useDeq5/useDeq8 ARE deq GEMMs (10.12.45.D) — counted as
+            // dotAccum fallback they would read as the silent-fallback
+            // signature this diagnostic exists to expose.
+            Linear.wmmaDeqCalls = Linear.wmmaDeqCalls + 1L;
+            Linear.btDeqNs = Linear.btDeqNs + (t1 - t0);
+        } else if (useWmma) {
+            Linear.wmmaCalls = Linear.wmmaCalls + 1L;
+            Linear.btWmmaNs = Linear.btWmmaNs + (t1 - t0);
+        } else if (useWmma6) {
+            Linear.wmma6Calls = Linear.wmma6Calls + 1L;
+            Linear.btQ6Ns = Linear.btQ6Ns + (t1 - t0);
+        } else {
+            Linear.batchFallbackCalls = Linear.batchFallbackCalls + 1L;
+            Linear.btFbNs = Linear.btFbNs + (t1 - t0);
+        }
+        Linear.btLaunchNs = Linear.btLaunchNs + (t1 - t0);
+        Linear.btCalls = Linear.btCalls + 1L;
+        return;
+    }
+
+    /**
+     * As {@link #stageBatch} but the activations are ALREADY a device
+     * buffer (10.12.7.a) — pack straight from it, no host walk, no
+     * upload. Only meaningful on the device-pack path; callers gate on
+     * {@link #devicePackOn}.
+     */
+    public static void stageBatchFromDevice(KernelBuffer<float32> src,
+            int32 rows, int32 n, int64 tag) {
+        Linear.ensureBatchStage(rows, n);
+        if (Linear.btTag == tag && Linear.btRows == rows
+                && Linear.btN == n) {
+            return;
+        }
+        int64 t0 = Clock.nanoTime();
+        QuantKernel.q8kPackLaunchNoSync(Linear.btXp, src,
+            (int64) rows * (int64) n);
+        Linear.btPackNs = Linear.btPackNs + (Clock.nanoTime() - t0);
+        Linear.btTag = tag;
+        Linear.btRows = rows;
+        Linear.btN = n;
+        return;
+    }
+
+    public static boolean devicePackOn() { return Linear.devPack; }
+    public static boolean deqPrefillOn() { return Linear.deqPrefill; }
+
+    /** Off-clock widen for the int8 prefill policy: build the packed
+     *  device copy and the tile-major int8 copy now, so the first
+     *  prefill does not pay them. Q4_K always; Q6_K only when its
+     *  token-blocked deq route is on (10.12.27). */
+    void prewarmDeq() {
+        if (this.packed == null) { return; }
+        boolean q4 = this.packedTy == Quant.GG_Q4_K;
+        boolean q6 = this.packedTy == Quant.GG_Q6_K && Linear.q6Mw4On;
+        // 10.12.45.D: Q5_K/Q8_0 widen off-clock too when their deq
+        // GEMM can route.
+        boolean q58 = (this.packedTy == Quant.GG_Q5_K
+            || this.packedTy == Quant.GG_Q8_0
+            || this.packedTy == Quant.GG_Q2_K
+            || this.packedTy == Quant.GG_Q3_K) && Linear.deqPrefill;
+        if (!q4 && !q6 && !q58) { return; }
+        this.ensureDevice();
+        this.ensureDeq();
+        return;
+    }
+
+    // 10.12.32: fused-projection state, held by the FIRST Linear of
+    // the group (qProj for q|k|v, gateProj for gate|up). The fused
+    // deq replaces the per-tensor deq for these tensors (which stays
+    // lazily unallocated as long as the fused route runs); the fused
+    // packed copy is additional — the GEMM reads per-row headers.
+    KernelBuffer<int8> fusedPackedDev;
+    KernelBuffer<int8> fusedDeqDev;
+    KernelBuffer<float32> fusedYBatch;
+    int64 fusedOut;
+    int32 fusedYRows;
+
+    /** Build the fused packed + deq buffers once (device-side concat
+     *  of the resident per-tensor packed copies, then one widen over
+     *  the concatenated rows). Two-way group.
+     *
+     *  (An earlier probe suggested a null-param compiler defect here;
+     *  it was WRONG — the probe printed only two of three types, and
+     *  the third really was Q6_K. attn_v is Q6 in half the layers of
+     *  Q4_K_M.) */
+    void ensureFused2(Linear b) {
+        if (this.fusedDeqDev != null) { return; }
+        this.ensureDevice();
+        b.ensureDevice();
+        int64 an = (int64) this.packed.count();
+        int64 bn = (int64) b.packed.count();
+        this.fusedOut = (int64) this.outDim + (int64) b.outDim;
+        this.fusedPackedDev #= heap KernelBuffer<int8>(
+            (uint64) (an + bn));
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, this.packedDev,
+            an, 0L);
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, b.packedDev,
+            bn, an);
+        int64 n = this.fusedOut * (int64) this.inDim;
+        this.fusedDeqDev #= heap KernelBuffer<int8>((uint64) n);
+        WmmaKernel.q4kWidenLaunch(this.fusedDeqDev, this.fusedPackedDev,
+            this.fusedOut, (int64) this.inDim);
+        return;
+    }
+
+    /** Three-way group (q|k|v). */
+    void ensureFused3(Linear b, Linear c) {
+        if (this.fusedDeqDev != null) { return; }
+        this.ensureDevice();
+        b.ensureDevice();
+        c.ensureDevice();
+        int64 an = (int64) this.packed.count();
+        int64 bn = (int64) b.packed.count();
+        int64 cn = (int64) c.packed.count();
+        this.fusedOut = (int64) this.outDim + (int64) b.outDim
+            + (int64) c.outDim;
+        this.fusedPackedDev #= heap KernelBuffer<int8>(
+            (uint64) (an + bn + cn));
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, this.packedDev,
+            an, 0L);
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, b.packedDev,
+            bn, an);
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, c.packedDev,
+            cn, an + bn);
+        int64 n = this.fusedOut * (int64) this.inDim;
+        this.fusedDeqDev #= heap KernelBuffer<int8>((uint64) n);
+        WmmaKernel.q4kWidenLaunch(this.fusedDeqDev, this.fusedPackedDev,
+            this.fusedOut, (int64) this.inDim);
+        return;
+    }
+
+    void ensureFusedY(int32 rows) {
+        if (this.fusedYBatch != null && this.fusedYRows >= rows) {
+            return;
+        }
+        this.fusedYBatch #= heap KernelBuffer<float32>(
+            (uint64) ((int64) rows * this.fusedOut));
+        this.fusedYRows = rows;
+        return;
+    }
+
+    /** The shared launch tail: the group's fused buffers exist and
+     *  the shape fits — launch ONE Mw8 GEMM over the concatenated
+     *  outDim and account it as one deq call. */
+    void fusedLaunch(int32 rows) {
+        this.ensureFusedY(rows);
+        int64 t0 = Clock.nanoTime();
+        WmmaKernel.q4kWmmaDeqMw8Launch(this.fusedYBatch,
+            this.fusedPackedDev, this.fusedDeqDev, Linear.btXp,
+            (int64) rows, this.fusedOut, (int64) this.inDim);
+        int64 t1 = Clock.nanoTime();
+        Linear.wmmaDeqCalls = Linear.wmmaDeqCalls + 1L;
+        Linear.btDeqNs = Linear.btDeqNs + (t1 - t0);
+        Linear.btLaunchNs = Linear.btLaunchNs + (t1 - t0);
+        Linear.btCalls = Linear.btCalls + 1L;
+        return;
+    }
+
+    static boolean fuseRouteOn() {
+        return Linear.fuseOn && Linear.deqPrefill && Linear.wmmaOn
+            && Linear.q4Mw8On;
+    }
+
+    /** Fused gate|up: one launch; the caller runs the fused GLU over
+     *  `fusedYBatch`. Returns false (nothing launched) when the route
+     *  does not apply. */
+    boolean fusedPairBatchKeep(Linear b, int32 rows) {
+        if (!Linear.fuseRouteOn()) { return false; }
+        if (this.packedTy != Quant.GG_Q4_K
+                || b.packedTy != Quant.GG_Q4_K) {
+            return false;
+        }
+        this.ensureFused2(b);
+        if (!WmmaKernel.fitsMw8((int64) rows, this.fusedOut)) {
+            return false;
+        }
+        this.fusedLaunch(rows);
+        return true;
+    }
+
+    /** Fused q|k|v: one launch, then a scatter into the three
+     *  per-projection yBatch buffers so rope/append/attend see
+     *  exactly what the separate launches produced. */
+    boolean fusedQkvBatchKeep(Linear kL, Linear vL, int32 rows) {
+        if (!Linear.fuseRouteOn()) { return false; }
+        if (this.packedTy != Quant.GG_Q4_K
+                || kL.packedTy != Quant.GG_Q4_K
+                || vL.packedTy != Quant.GG_Q4_K) {
+            // Real in Q4_K_M: attn_v is Q6_K in 16 of 32 layers (and
+            // ffn_down Q6 in the other 16), so this fallback fires on
+            // half the layers by MODEL layout, not by accident.
+            return false;
+        }
+        this.ensureFused3(kL, vL);
+        if (!WmmaKernel.fitsMw8((int64) rows, this.fusedOut)) {
+            return false;
+        }
+        this.fusedLaunch(rows);
+        this.ensureBatchOut(rows);
+        kL.ensureBatchOut(rows);
+        vL.ensureBatchOut(rows);
+        Prim.splitRows3Device(this.yBatch, kL.yBatch, vL.yBatch,
+            this.fusedYBatch, (int64) rows, (int64) this.outDim,
+            (int64) kL.outDim, (int64) vL.outDim);
+        return true;
+    }
+
+    /** Build the widened int8 copy once (10.12.16; Q6 10.12.27).
+     *  Caller holds `ensureDevice()` already done — `packedDev` is the
+     *  source. Both widens write the same tile-major layout. */
+    void ensureDeq() {
+        if (this.deqDev != null) { return; }
+        int64 n = (int64) this.outDim * (int64) this.inDim;
+        this.deqDev #= heap KernelBuffer<int8>((uint64) n);
+        if (this.packedTy == Quant.GG_Q6_K) {
+            WmmaKernel.q6kWidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (this.packedTy == Quant.GG_Q5_K) {
+            WmmaKernel.q5kWidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (this.packedTy == Quant.GG_Q8_0) {
+            WmmaKernel.q80WidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (this.packedTy == Quant.GG_Q2_K) {
+            WmmaKernel.q2kWidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (this.packedTy == Quant.GG_Q3_K) {
+            WmmaKernel.q3kWidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (this.packedTy == Quant.GG_Q4_K) {
+            WmmaKernel.q4kWidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else {
+            // Was a bare else into the Q4 widen — one format's bytes
+            // through another's decoder (10.12.45's hazard class).
+            throw heap LlamaException("ensureDeq: no widen for packed "
+                + "type " + this.packedTy);
+        }
+        return;
+    }
+
+    KernelBuffer<float32> yBatch;
+    float32[] yBatchH;
+    int32 yBatchRows;
+
+    void ensureBatchOut(int32 rows) {
+        if (this.yBatch != null && this.yBatchRows >= rows) { return; }
+        int64 n = (int64) rows * (int64) this.outDim;
+        this.yBatch #= heap KernelBuffer<float32>((uint64) n);
+        this.yBatchH #= heap float32[n];
+        this.yBatchRows = rows;
+        return;
+    }
+
+    /** As `matvecInto`, but the result is LEFT on the device. */
+    void matvecKeepOnDevice(Tensor<float32> src, int64 srcOff) {
+        float32[] sb = src.hostBuffer();
+        int64 so = src.hostBase() + srcOff;
+        this.ensureDevice();
+        int64 i = 0;
+        int64 nIn = this.stageHit(so) ? 0L : (int64) this.inDim;
+        while (i < nIn) {
+            Linear.stXh[i] = sb[so + i];
+            i = i + 1;
+        }
+        this.sendActivations(so);
+        this.launchRows();
+        return;
+    }
+
+    /**
+     * Quantize a DEVICE-RESIDENT activation into the shared stage, once,
+     * for the projections that follow (plan 10.2).
+     *
+     * The device twin of `sendActivations`, and it does the same job the
+     * shared stage does on the host side: q/k/v read one staging, gate/up
+     * read another. What it cannot do is participate in the stage's HIT
+     * bookkeeping — `xDev` is a device pointer, and the (tag, offset,
+     * dimension) key describes a host tensor window. So it invalidates
+     * instead, and the caller decides when to re-stage. A stale hit here
+     * would multiply against the previous activation, which is 9.9 and
+     * 11.3 both.
+     */
+    public static void stageDeviceActivation(KernelBuffer<float32> xDev,
+            int64 n) {
+        Linear.ensureStage((int32) n);
+        QuantKernel.q8kPackLaunchNoSync(Linear.stXp, xDev, n);
+        // 10.12.45.B: remember the source so an f32-route consumer can
+        // stage its copy lazily — the pack above serves only the
+        // packed-activation kernels.
+        Linear.stSrcDev #= xDev;
+        Linear.stSrcN = n;
+        Linear.stSrcF32Done = false;
+        Linear.stValid = false;
+        return;
+    }
+
+    /** Launch against whatever {@link #stageDeviceActivation} last staged,
+     *  leaving the result on the device. */
+    void matvecStagedKeep() {
+        this.ensureDevice();
+        if (!this.packedAct) {
+            // The f32 route (Q5_K, Q8_0): its kernels read `stX`, which
+            // the packed staging never fills. Copy from the remembered
+            // device source, once per staging (10.12.45.B — this THREW
+            // until the quant sweep crashed on it).
+            if (Linear.stSrcDev == null) {
+                throw heap LlamaException("matvecStagedKeep: no staged "
+                    + "device activation for packed type " + this.packedTy);
+            }
+            if (!Linear.stSrcF32Done) {
+                QuantKernel.f32CopyLaunchNoSync(Linear.stX,
+                    Linear.stSrcDev, Linear.stSrcN);
+                Linear.stSrcF32Done = true;
+            }
+        }
+        this.launchRows();
+        return;
+    }
+
+    /** Launch against the staged activation and bring the result back. */
+    void matvecStaged(Tensor<float32> dst, int64 dstOff) {
+        this.matvecStagedKeep();
+        this.fetchResult();
+        float32[] db = dst.hostBuffer();
+        int64 doff = dst.hostBase() + dstOff;
+        int64 i = 0;
+        while (i < (int64) this.outDim) {
+            db[doff + i] = this.yScratch[i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /**
+     * `y = W · x` where x is ALREADY ON THE DEVICE — quantized there by
+     * `q8kPackKernel` rather than shipped to the host and back.
+     *
+     * The shared stage is invalidated rather than consulted: `xDev` is
+     * identified by a device pointer the stage's (tag, offset, dimension)
+     * key cannot describe, and a stale hit here would multiply against the
+     * previous activation. 9.9 and 11.3 are both that mistake.
+     */
+    void matvecFromDevice(KernelBuffer<float32> xDev, int64 n,
+            Tensor<float32> dst, int64 dstOff) {
+        this.ensureDevice();
+        Linear.stValid = false;
+        if (this.packedAct) {
+            QuantKernel.q8kPackLaunchNoSync(Linear.stXp, xDev, n);
+        } else if (this.qAct) {
+            // A quantized staging with no device quantizer for it (the
+            // three-buffer q8 form). Nothing resident produces it, so
+            // reaching here is a routing bug, not a missing feature.
+            throw heap LlamaException("matvecFromDevice: no device-resident "
+                + "path for packed type " + this.packedTy);
+        } else {
+            // The f32 route (Q5_K, Q8_0): the kernels read `stX`, so a
+            // device-to-device copy stages `xDev` there (10.12.45.B —
+            // this THREW until the quant sweep crashed on it). llama.cpp
+            // avoids the copy by quantizing activations on device for
+            // every format; that is units C/D's shape, not this seam's.
+            QuantKernel.f32CopyLaunchNoSync(Linear.stX, xDev, n);
+        }
+        this.launchRows();
+        this.fetchResult();
+        float32[] db = dst.hostBuffer();
+        int64 doff = dst.hostBase() + dstOff;
+        int64 i = 0;
+        while (i < (int64) this.outDim) {
+            db[doff + i] = this.yScratch[i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** Build this Linear's device side — the weight upload, the output
+     *  buffer, the shared stage, and every latched routing flag. */
+    void ensureDevice() {
+        if (this.packedDev != null) { return; }
+            this.packedDev #= heap KernelBuffer<int8>(
+                (uint64) this.packed.count());
+            this.packedDev.upload(this.packed);
+            // Only the OUTPUT is per-Linear now; the activation side is
+            // shared (see ensureStage), because that is the half that is
+            // identical across q/k/v and across gate/up.
+            this.yScratch #= heap float32[(int64) this.outDim];
+            this.yDev #= heap KernelBuffer<float32>((uint64) this.outDim);
+            Linear.ensureStage(this.inDim);
+            // Latched per Linear at build time, not read per call: the
+            // store/load spelling below must match how the buffer was
+            // allocated, and flipping the static mid-run would desynchronize
+            // the two into a silent no-op.
+            this.unified = Linear.wantUnified;
+            // The integer route quantizes activations into 256-element
+            // q8_K blocks, so EVERY flag below requires inDim % 256 == 0.
+            // Real checkpoints always satisfy it (4096/14336/1024); the
+            // 16-wide toy fixtures do not, and before this guard the
+            // Q8_0 wave route walked the activation pack off its buffer —
+            // a host bounds abort ("index 16000 out of bounds for 4432")
+            // and, on the device path, a Memory Fault that poisoned the
+            // HIP context for every test after it. The guard was LATENT
+            // for Q4_K/Q6_K/Q2/Q3 too: no tiny fixture carries those
+            // types, which is why it never fired before 10.12.39 routed
+            // Q8_0 (the one quant the toy model does carry).
+            boolean q8kDims = this.inDim % 256 == 0;
+            this.q8 = Linear.q8Route() && q8kDims
+                && this.packedTy == Quant.GG_Q4_K;
+            this.packed1 = Linear.packedActivations();
+            // `q8` is part of the condition, not an accident of ordering:
+            // the wave kernel is the INTEGER route's kernel, and a Q6_K
+            // weight beside it still dispatches the f32 one — which is
+            // chunked, and collapses to 9.6 GB/s if this flag turns
+            // chunking off on its behalf.
+            this.wave = Linear.waveMv() && this.packed1 && this.q8;
+            // Q6_K gets the wave decomposition too (plan 11.2), on its own
+            // kernel and WITHOUT the q8 integer route's activation switch —
+            // it reads the same packed q8_K block.
+            // Behind `q8Route` like every other route that CHANGES THE
+            // ANSWER (9.4's rule). Q6_K's wave kernel reads q8_K-quantized
+            // activations, so it carries the same approximation the Q4_K
+            // integer route does — measured at 0.028% on a real v_proj —
+            // and a caller that pins the switch off must still get the
+            // exact path.
+            this.wave6 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+                && q8kDims && this.packedTy == Quant.GG_Q6_K;
+            // 10.12.45.C: Q2_K/Q3_K have ONLY the wave integer route —
+            // no f32 kernel exists for them, so these flags are their
+            // whole device story (deviceLaunchable and the matvecInto
+            // gate both encode that).
+            this.wave2 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+                && q8kDims && this.packedTy == Quant.GG_Q2_K;
+            this.wave3 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+                && q8kDims && this.packedTy == Quant.GG_Q3_K;
+            // 10.12.39: Q5_K and Q8_0 join the wave integer route. Until
+            // now they were the two types still decoding on the
+            // one-item-per-row f32 kernels — measured 14 and 10 ms/token
+            // above llama.cpp's bandwidth line at 512 context.
+            this.wave5 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+                && q8kDims && this.packedTy == Quant.GG_Q5_K;
+            this.wave8 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+                && q8kDims && this.packedTy == Quant.GG_Q8_0;
+            // WHAT THE KERNEL READS, which is not the same question as
+            // whether the integer route is on. A Q6_K wave weight has
+            // `q8 == false` — it makes no activation-quantization switch —
+            // and still reads the PACKED block. Keying the staging off `q8`
+            // fed it the f32 buffer instead.
+            // TWO predicates, because they answer different questions.
+            //
+            // `qAct` — does this weight read a QUANTIZED activation staging
+            // at all? That is what the shared stage keys on, because a
+            // weight reading the integer form and one reading the f32 form
+            // must not share an entry.
+            //
+            // `packedAct` — is that staging the PACKED block rather than the
+            // three typed buffers? A backend question, and folding it into
+            // the key is what broke the CPU arm: `packed1` is false there,
+            // so every Linear keyed alike and a Q6_K f32 weight took a hit
+            // on an integer staging. Tokens went 15 198 334 62 334 ->
+            // 15 13 40 13 40, which is the same signature 9.9 recorded.
+            this.qAct = this.q8 || this.wave6 || this.wave2 || this.wave3
+                || this.wave5 || this.wave8;
+            this.packedAct = this.qAct && this.packed1;
+        if (this.unified) { this.yDev.allocate(MemoryKind.Unified); }
+        return;
+    }
+
+    /**
+     * Launch this weight's mat-vec over the output rows, in one dispatch or
+     * in row slices of `chunkBytes` packed bytes each.
+     *
+     * The slice is a VIEW of the resident weight (`KernelBuffer.slice` is
+     * non-owning), so chunking changes the grid and the per-launch footprint
+     * and nothing else — no extra copy, no second residency. That is what
+     * makes it a clean experiment as well as a candidate fix: the bytes read
+     * and the arithmetic performed are identical either way, and the kernel
+     * indexes `packed` from its own base and writes `y[yOff + i]`, which is
+     * exactly the pair of adjustments a row slice needs.
+     */
+    void launchRows() {
+        int64 rows = (int64) this.outDim;
+        int64 rowBytes = (int64) this.packed.count() / rows;
+        int64 chunk = rows;
+        int64 want = Linear.effectiveChunkRows();
+        if (want > 0L) { chunk = want; }
+        // 9.1's chunking is a property of the ONE-ITEM-PER-ROW kernel, not
+        // of the dispatch. That kernel gives 5120 rows = 160 waves = one per
+        // SIMD, and slows down in both directions from there. The wave
+        // kernel puts one workgroup on each row, so 14336 rows is already
+        // 14336 workgroups and splitting them costs: measured 185.9 GB/s
+        // chunked against 197.3 whole, on the same weight in the same run.
+        if (this.wave || this.wave6 || this.wave2 || this.wave3
+                || this.wave5 || this.wave8) {
+            chunk = rows;
+        }
+        if (chunk >= rows) {
+            Linear.nLaunches = Linear.nLaunches + 1L;
+            this.launchOne(this.packedDev, rows, 0L);
+            return;
+        }
+        int64 r0 = 0L;
+        while (r0 < rows) {
+            int64 nr = chunk;
+            if (r0 + nr > rows) { nr = rows - r0; }
+            Linear.nLaunches = Linear.nLaunches + 1L;
+            KernelBuffer<int8> sub #= this.packedDev.slice(
+                (uint64) (r0 * rowBytes), (uint64) (nr * rowBytes));
+            this.launchOne(sub, nr, r0);
+            r0 = r0 + nr;
+        }
+        return;
+    }
+
+    /** One dispatch over `nr` rows of `w` starting at output row `r0`.
+     *  Whether it waits is `oneSync`'s business, not this method's. */
+    void launchOne(KernelBuffer<int8> w, int64 nr, int64 r0) {
+        if (this.q8) {
+            if (this.wave) {
+                if (Linear.oneSync) {
+                    QuantKernel.q4kQ8WaveMatVecLaunchNoSync(this.yDev, w,
+                        Linear.stXp, nr, (int64) this.inDim, r0);
+                } else {
+                    QuantKernel.q4kQ8WaveMatVecLaunch(this.yDev, w,
+                        Linear.stXp, nr, (int64) this.inDim, r0);
+                }
+            } else if (this.packed1) {
+                if (Linear.oneSync) {
+                    QuantKernel.q4kQ8PackedMatVecLaunchNoSync(this.yDev, w,
+                        Linear.stXp, nr, (int64) this.inDim, r0);
+                } else {
+                    QuantKernel.q4kQ8PackedMatVecLaunch(this.yDev, w,
+                        Linear.stXp, nr, (int64) this.inDim, r0);
+                }
+            } else if (Linear.oneSync) {
+                QuantKernel.q4kQ8MatVecLaunchNoSync(this.yDev, w, Linear.stXq,
+                    Linear.stXd, Linear.stXbs, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q4kQ8MatVecLaunch(this.yDev, w, Linear.stXq,
+                    Linear.stXd, Linear.stXbs, nr, (int64) this.inDim, r0);
+            }
+        } else if (this.wave6) {
+            if (Linear.oneSync) {
+                QuantKernel.q6kQ8WaveMatVecLaunchNoSync(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q6kQ8WaveMatVecLaunch(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            }
+        } else if (this.wave2) {
+            if (Linear.oneSync) {
+                QuantKernel.q2kQ8WaveMatVecLaunchNoSync(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q2kQ8WaveMatVecLaunch(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            }
+        } else if (this.wave3) {
+            if (Linear.oneSync) {
+                QuantKernel.q3kQ8WaveMatVecLaunchNoSync(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q3kQ8WaveMatVecLaunch(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            }
+        } else if (this.wave5) {
+            if (Linear.oneSync) {
+                QuantKernel.q5kQ8WaveMatVecLaunchNoSync(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q5kQ8WaveMatVecLaunch(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            }
+        } else if (this.wave8) {
+            if (Linear.oneSync) {
+                QuantKernel.q80Q8WaveMatVecLaunchNoSync(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            } else {
+                QuantKernel.q80Q8WaveMatVecLaunch(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0);
+            }
+        } else if (Linear.oneSync) {
+            QuantKernel.matVecLaunchNoSync(this.packedTy, this.yDev, w,
+                Linear.stX, nr, (int64) this.inDim, 0L, r0);
+        } else {
+            QuantKernel.matVecLaunch(this.packedTy, this.yDev, w,
+                Linear.stX, nr, (int64) this.inDim, 0L, r0);
+        }
+        return;
+    }
+
+    /** The one wait a projection owes, when the dispatches skipped
+     *  theirs. 10.12.37: launchRows no longer calls this — the wait
+     *  moved to fetchResult (the READ side), so keep-on-device chains
+     *  are launch-only. */
+    void syncLaunches() {
+        if (!Linear.oneSync) { return; }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+}

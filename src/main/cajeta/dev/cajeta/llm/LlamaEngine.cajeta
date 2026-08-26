@@ -1,0 +1,181 @@
+package dev.cajeta.llm;
+
+import cajeta.lang.String;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.gen.TokenSink;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.LlamaForCausalLM;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.sched.Request;
+import dev.cajeta.llm.sched.Scheduler;
+import dev.cajeta.llm.store.BlockStore;
+import dev.cajeta.llm.store.I64Codec;
+import dev.cajeta.llm.tok.Tokenizer;
+import cajeta.wire.Encoder;
+import cajeta.xpu.Device;
+
+/**
+ * The library facade (spec 11.4/11.7; plan 19.2.2): load a model from
+ * either weight format, submit prompts, stream tokens, read text back —
+ * everything the CLI does, reachable without it. CONCURRENT submissions
+ * batch through the ONE Unit-9 scheduler: the CLI is just one caller of
+ * this API, never a separate single-sequence path (11.7).
+ *
+ * ```cajeta
+ * EngineOptions o #= heap EngineOptions("model.gguf");
+ * LlamaEngine e #= LlamaEngine.load(#o);
+ * SampleParams p #= heap SampleParams(0.7f, 42L);
+ * int32 id = e.submitText("The capital of France is", #p, 32);
+ * e.runAll(4096);
+ * String text #= e.textOf(id);
+ * ```
+ */
+public final class LlamaEngine {
+    EngineOptions opts;
+    LlamaForCausalLM model;
+    Scheduler sched;
+    Tokenizer tok;
+    BlockStore store;
+    Encoder<int64> storeEnc;
+
+    LlamaEngine() {
+        this.opts = null;
+        this.model = null;
+        this.sched = null;
+        this.tok = null;
+        this.store = null;
+        this.storeEnc = null;
+    }
+
+    /** Load per the options; GGUF brings config and tokenizer with it
+     *  (spec 9.2/9.3); safetensors needs `config` and has no tokenizer
+     *  unless one is attached later. */
+    public static #LlamaEngine load(#EngineOptions opts) {
+        LlamaEngine e = heap LlamaEngine();
+        e.opts #= opts;
+        if (!e.opts.device.equals("")) {
+            Device.force(e.opts.device);      // 11.2; absent → dispatcher order
+        }
+        // Prefill weight residency (10.12.16). Validated HERE, loudly: a
+        // typo'd mode that silently fell back to packed would read as
+        // "int8 bought nothing".
+        if (e.opts.prefillWeights.equals("int8")) {
+            Linear.setDeqPrefill(true);
+        } else if (e.opts.prefillWeights.equals("packed")) {
+            Linear.setDeqPrefill(false);
+        } else {
+            throw heap LlamaException("engine: prefillWeights must be "
+                + "\"packed\" or \"int8\", not \""
+                + e.opts.prefillWeights + "\"");
+        }
+        Checkpoint ck #= Checkpoint.open(e.opts.model);
+        ModelConfig cfg = null;
+        if (ck.gguf() != null) {
+            cfg #= ModelConfig.fromGguf(ck.gguf());
+            e.tok #= ck.gguf().tokenizer();
+        } else {
+            String cfgPath = e.opts.config;
+            if (cfgPath.equals("")) {
+                throw heap LlamaException("engine: a safetensors model "
+                    + "needs --config (GGUF carries its own)");
+            }
+            cfg #= ModelConfig.parse(cfgPath);
+        }
+        cfg.blockTokens = e.opts.blockTokens;
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, e.opts.ctx,
+            e.opts.maxSeqs, 0);
+        m.bind(ck, false);
+        ck.close();
+        m.prewarmPrefillWeights();
+        e.model #= m;
+        Scheduler s = heap Scheduler(e.model, e.opts.chunk);
+        e.sched #= s;
+        if (e.tok != null) {
+            e.sched.setTokenizer(e.tok);
+        }
+        if (!e.opts.kvStore.equals("")) {
+            Encoder<int64> enc = heap I64Codec();
+            e.storeEnc #= enc;
+            BlockStore st = heap BlockStore(e.opts.kvStore,
+                e.model.kvCache().blockPayloadBytes(),
+                e.opts.kvStoreSize, e.storeEnc);
+            e.store #= st;
+            e.sched.attachStore(e.store, e.opts.model, "f32", "none");
+        }
+        return #e;
+    }
+
+    /** The scheduler — 11.7's seam, exposed for callers that drive steps
+     *  themselves. Borrow. */
+    public Scheduler scheduler() {
+        return this.sched;
+    }
+
+    public Tokenizer tokenizer() {
+        return this.tok;
+    }
+
+    /** Streaming sink for every request (spec 8.8). Borrow. */
+    public void setSink(TokenSink sink) {
+        this.sched.setSink(sink);
+    }
+
+    /** Submit raw token ids. */
+    public int32 submitTokens(int32[] prompt, int32 promptLen, int32 maxNew,
+            #SampleParams params) {
+        return this.sched.submitSampled(prompt, promptLen, maxNew, #params);
+    }
+
+    /** Submit text through the model's tokenizer (GGUF-loaded engines). */
+    public int32 submitText(String prompt, #SampleParams params,
+            int32 maxNew) {
+        if (this.tok == null) {
+            throw heap LlamaException("engine: no tokenizer - load a GGUF "
+                + "or submit token ids");
+        }
+        // encodePrompt, not encode: a prompt carries whatever the model's
+        // metadata says it does (BOS for Llama-3). Submitting raw ids
+        // bypasses this deliberately — see submitTokens.
+        int32[] ids #= this.tok.encodePrompt(prompt);
+        return this.sched.submitSampled(ids, (int32) ids.count(), maxNew,
+            #params);
+    }
+
+    /** Drive everything to completion (bounded). */
+    public void runAll(int32 maxSteps) {
+        this.sched.runAll(maxSteps);
+    }
+
+    public boolean stepOnce() {
+        return this.sched.stepOnce();
+    }
+
+    public Request request(int32 id) {
+        return this.sched.request(id);
+    }
+
+    /** The generated text of a finished request (needs the tokenizer). */
+    public #String textOf(int32 id) {
+        if (this.tok == null) {
+            throw heap LlamaException("engine: no tokenizer for detok");
+        }
+        Request r = this.sched.request(id);
+        int32 n = r.generatedCount();
+        int32[] ids #= heap int32[n];
+        int32 i = 0;
+        while (i < n) {
+            ids[i] = r.generatedAt(i);
+            i = i + 1;
+        }
+        int8[] bytes #= this.tok.decode(ids, n);
+        String s = heap String(#bytes, (int32) bytes.count());
+        return #s;
+    }
+
+    public void close() {
+        if (this.store != null) {
+            this.store.close();
+        }
+    }
+}

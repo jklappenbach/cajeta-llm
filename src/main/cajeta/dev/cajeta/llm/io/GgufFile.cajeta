@@ -1,0 +1,696 @@
+package dev.cajeta.llm.io;
+
+import cajeta.collection.HashMap;
+import cajeta.io.file.MappedFile;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llm.LlamaException;
+import dev.cajeta.llm.tok.Tokenizer;
+
+/**
+ * The 24-byte GGUF prelude — the fixed-offset region, which is exactly
+ * what `view` is designed for (spec 13.12): declared little-endian wire
+ * order, constant field offsets, zero-copy overlay. The KV stream and
+ * tensor directory that follow are data-dependent (string lengths decide
+ * every offset), so they take the cursor parser below — Views.md's own
+ * line: offsets determined by the data need a parser.
+ */
+@LittleEndian
+view GgufHeader {
+    int32 magic;
+    int32 version;
+    int64 tensorCount;
+    int64 kvCount;
+}
+
+/**
+ * GGUF v3 reader (cajeta-llm plan Unit 16; spec 9.1–9.5, §10 preamble):
+ * mmap the file, parse the metadata KV block and tensor directory, and
+ * serve tensors dequantized to `float32` — the engine's compute dtype.
+ * Storage types F32, F16, BF16 and Q8_0 load (16.1.2); every other ggml
+ * type errors NAMING THE TYPE AND THE TENSOR (9.4) until Unit 18 wires
+ * the k-quant family. Type dispatch is PER TENSOR, never per file (9.5):
+ * a `Q4_K_M` file mixes Q6_K/Q5_K/Q4_K by tensor sensitivity.
+ *
+ * Metadata: scalar values are retained for every key; the arrays the
+ * engine consumes (`tokenizer.ggml.tokens`/`scores`/`token_type`/
+ * `merges`) are materialized, all other arrays are structurally skipped.
+ * `tokenizer()` builds Unit 12's tokenizer from the embedded vocab with
+ * no external file (9.2/16.1.4); `chatTemplate()` hands
+ * `tokenizer.chat_template` to Unit 13's interpreter (7.11/16.1.5);
+ * `ModelConfig.fromGguf` maps the hyperparameter keys (9.3/16.2.2).
+ */
+public final class GgufFile {
+    // ggml type ids (ggml.h) — the four Unit-16 storage types.
+    static final int32 T_F32 = 0;
+    static final int32 T_F16 = 1;
+    static final int32 T_Q8_0 = 8;
+    static final int32 T_BF16 = 30;
+
+    MappedFile map;
+    String path;
+    int64 nTensors;
+    int64 nKv;
+    int64 dataStart;
+    int64 alignment;
+
+    // Scalars: parallel arrays by KV index. kind: 0 int (all int widths +
+    // bool), 1 float (f32/f64), 2 string, 3 skipped-array, 4 kept-array.
+    String[] kKeys;
+    int32[] kKinds;
+    int64[] kInts;
+    float64[] kFloats;
+    String[] kStrs;
+    HashMap<String, int32> kIdx;
+
+    // The retained arrays (dedicated fields — see the class doc).
+    String[] tokTokens;
+    float32[] tokScores;
+    int32[] tokTypes;
+    String[] tokMerges;
+    int32 tokCount;
+    int32 mergeCount;
+
+    // Tensor directory.
+    String[] tNames;
+    int64[][] tShapes;      // TORCH order (reversed ggml ne)
+    int32[] tTypes;
+    int64[] tOffsets;       // relative to dataStart
+    HashMap<String, int32> tIdx;
+
+    int64 pos;              // parse cursor
+
+    public GgufFile(String path) {
+        this.path = "" + path;
+        this.map #= heap MappedFile(path);
+        int64 fileLen = this.map.size();
+        if (fileLen < 24) {
+            throw heap LlamaException("gguf: '" + path + "' is " + fileLen
+                + " bytes - too short for the GGUF header");
+        }
+        // The fixed prelude reads through the view overlay (16.2.1).
+        int8[] hb #= heap int8[24];
+        this.map.read(0, hb, 0, 24);
+        GgufHeader h = GgufHeader(hb);
+        if (h.magic != 0x46554747) {
+            throw heap LlamaException("gguf: '" + path
+                + "' has magic " + h.magic + "; expected GGUF");
+        }
+        if (h.version != 3 && h.version != 2) {
+            throw heap LlamaException("gguf: '" + path + "' is version "
+                + h.version + "; supported: 2, 3");
+        }
+        this.nTensors = h.tensorCount;
+        this.nKv = h.kvCount;
+        this.pos = 24;
+        this.alignment = 32;
+
+        int32 nk = (int32) this.nKv;
+        this.kKeys #= heap String[nk];
+        this.kKinds #= heap int32[nk];
+        this.kInts #= heap int64[nk];
+        this.kFloats #= heap float64[nk];
+        this.kStrs #= heap String[nk];
+        this.kIdx #= heap HashMap<String, int32>();
+        this.tokTokens = null;
+        this.tokScores = null;
+        this.tokTypes = null;
+        this.tokMerges = null;
+        this.tokCount = 0;
+        this.mergeCount = 0;
+        int32 i = 0;
+        while (i < nk) {
+            this.readKv(i);
+            i = i + 1;
+        }
+        // general.alignment overrides the default 32.
+        int32 ai = this.indexOfKey("general.alignment");
+        if (ai >= 0) {
+            if (this.kKinds[ai] == 0) {
+                this.alignment = this.kInts[ai];
+            }
+        }
+
+        int32 nt = (int32) this.nTensors;
+        this.tNames #= heap String[nt];
+        this.tShapes #= heap int64[nt][];
+        this.tTypes #= heap int32[nt];
+        this.tOffsets #= heap int64[nt];
+        this.tIdx #= heap HashMap<String, int32>();
+        i = 0;
+        while (i < nt) {
+            this.readTensorInfo(i);
+            i = i + 1;
+        }
+        int64 a = this.alignment;
+        this.dataStart = ((this.pos + a - 1) / a) * a;
+    }
+
+    public void close() {
+        this.map.close();
+    }
+
+    // ── surface ─────────────────────────────────────────────────────────
+
+    public int64 tensorCount() {
+        return this.nTensors;
+    }
+
+    public int64 kvCount() {
+        return this.nKv;
+    }
+
+    public boolean hasKey(String key) {
+        return this.kIdx.containsKey(key);
+    }
+
+    /** Scalar string value, or null. Borrow of retained storage. */
+    public String metaString(String key) {
+        int32 i = this.indexOfKey(key);
+        if (i < 0 || this.kKinds[i] != 2) {
+            return null;
+        }
+        return this.kStrs[i];
+    }
+
+    public int64 metaInt(String key, int64 dflt) {
+        int32 i = this.indexOfKey(key);
+        if (i < 0 || this.kKinds[i] != 0) {
+            return dflt;
+        }
+        return this.kInts[i];
+    }
+
+    public float64 metaFloat(String key, float64 dflt) {
+        int32 i = this.indexOfKey(key);
+        if (i < 0) {
+            return dflt;
+        }
+        if (this.kKinds[i] == 1) {
+            return this.kFloats[i];
+        }
+        if (this.kKinds[i] == 0) {
+            return (float64) this.kInts[i];
+        }
+        return dflt;
+    }
+
+    public boolean contains(String name) {
+        return this.tIdx.containsKey(name);
+    }
+
+    public int32 tensorIndexOf(String name) {
+        if (!this.tIdx.containsKey(name)) {
+            return -1;
+        }
+        return this.tIdx.get(name);
+    }
+
+    public int64[] shapeOf(int32 idx) {
+        return this.tShapes[idx];
+    }
+
+    public int32 typeOf(int32 idx) {
+        return this.tTypes[idx];
+    }
+
+    /** The embedded tokenizer (9.2/16.1.4) — no external file. */
+    public #Tokenizer tokenizer() {
+        String model = this.metaString("tokenizer.ggml.model");
+        if (model == null || this.tokTokens == null) {
+            throw heap LlamaException("gguf: '" + this.path
+                + "' embeds no tokenizer (tokenizer.ggml.model / tokens)");
+        }
+        String pre = this.metaString("tokenizer.ggml.pre");
+        if (pre == null) {
+            pre = "";
+        }
+        Tokenizer t #= Tokenizer.fromGgml(model, pre, this.tokTokens,
+            this.tokScores, this.tokTypes, this.tokMerges);
+        // The model's own prompt policy. Absent add_bos_token, default to
+        // TRUE when a bos id exists: that is llama.cpp's behaviour and the
+        // Llama-3 configs' own default, and getting it wrong is silent —
+        // the model simply answers differently.
+        int64 bos = this.metaInt("tokenizer.ggml.bos_token_id", -1L);
+        boolean add = this.metaInt("tokenizer.ggml.add_bos_token", 1L) != 0L;
+        t.setBosPolicy(add, (int32) bos);
+        return #t;
+    }
+
+    /** `tokenizer.chat_template`, or null — Unit 13's input (16.1.5). */
+    public String chatTemplate() {
+        return this.metaString("tokenizer.chat_template");
+    }
+
+    /**
+     * Load tensor `name` dequantized to float32 — F32/F16/BF16 widen,
+     * Q8_0 dequantizes per 32-block (spec §10: sub-byte and blocked
+     * formats are STORAGE, arithmetic happens at f32). Anything else is
+     * the 9.4 error, naming type and tensor.
+     */
+    /**
+     * The ggml type of a tensor by NAME, or -1 when absent — the
+     * dispatch key for keeping a quantized weight PACKED rather than
+     * dequantizing it at load (spec §10).
+     */
+    public int32 typeOfName(String name) {
+        int32 i = this.tensorIndexOf(name);
+        if (i < 0) {
+            return -1;
+        }
+        return this.tTypes[i];
+    }
+
+    /**
+     * A tensor's shape by NAME in TORCH order (`[out, in]` for a
+     * projection, `[vocab, dim]` for an embedding), or null when absent —
+     * so a packed bind can verify orientation, not merely byte count.
+     */
+    public int64[] shapeOfName(String name) {
+        int32 i = this.tensorIndexOf(name);
+        if (i < 0) {
+            return null;
+        }
+        return this.tShapes[i];
+    }
+
+    /**
+     * The tensor's bytes EXACTLY as the file holds them — no decode. For
+     * a block-quantized tensor these are the packed blocks the
+     * dequantize-on-the-fly kernels consume directly (`Quant.q8MatVec`),
+     * which is the point: decode is memory-bandwidth bound, so moving 1
+     * byte per weight instead of 4 is the win, and the unpack rides in
+     * registers where the block scale is already hot.
+     */
+    public #int8[] loadPacked(String name) {
+        int32 i = this.tensorIndexOf(name);
+        if (i < 0) {
+            throw heap LlamaException("gguf: no tensor '" + name + "' in '"
+                + this.path + "'");
+        }
+        int32 ty = this.tTypes[i];
+        if (!Quant.supported(ty)) {
+            throw heap LlamaException("gguf: tensor '" + name + "' is "
+                + GgufFile.typeName(ty) + ", not a packed block type");
+        }
+        int64[] shp = this.tShapes[i];
+        int64 n = 1;
+        int32 d = 0;
+        while (d < (int32) shp.count()) {
+            n = n * shp[d];
+            d = d + 1;
+        }
+        int64 be = (int64) Quant.blockElems(ty);
+        if (n % be != 0L) {
+            throw heap LlamaException("gguf: " + GgufFile.typeName(ty)
+                + " tensor '" + name + "' has " + n
+                + " elements - not a " + be + "-block multiple");
+        }
+        int64 bytes = (n / be) * (int64) Quant.blockBytes(ty);
+        int8[] raw #= heap int8[bytes];
+        this.map.read(this.dataStart + this.tOffsets[i], raw, 0, bytes);
+        return #raw;
+    }
+
+    public #Tensor<float32> loadF32(String name) {
+        int32 i = this.tensorIndexOf(name);
+        if (i < 0) {
+            throw heap LlamaException("gguf: no tensor '" + name + "' in '"
+                + this.path + "'");
+        }
+        int32 ty = this.tTypes[i];
+        int64[] shp = this.tShapes[i];
+        int64 n = 1;
+        int32 d = 0;
+        while (d < (int32) shp.count()) {
+            n = n * shp[d];
+            d = d + 1;
+        }
+        int64[] shpCopy #= heap int64[shp.count()];
+        d = 0;
+        while (d < (int32) shp.count()) {
+            shpCopy[d] = shp[d];
+            d = d + 1;
+        }
+        Tensor<float32> t #= Tensor.zeros<float32>(shpCopy);
+        int64 off = this.dataStart + this.tOffsets[i];
+        if (ty == GgufFile.T_F32) {
+            this.map.copyTo(off, t.hostAddress(), n * 4);
+        } else if (ty == GgufFile.T_F16) {
+            int8[] raw #= heap int8[n * 2];
+            this.map.read(off, raw, 0, n * 2);
+            int64 j = 0;
+            while (j < n) {
+                int32 h = ((int32) raw[j * 2] & 255)
+                    | (((int32) raw[j * 2 + 1] & 255) << 8);
+                t.flatSet(j, GgufFile.halfBitsToF32(h));
+                j = j + 1;
+            }
+        } else if (ty == GgufFile.T_BF16) {
+            int8[] raw #= heap int8[n * 2];
+            this.map.read(off, raw, 0, n * 2);
+            int64 j = 0;
+            while (j < n) {
+                int64 hi = ((int64) raw[j * 2] & 255L)
+                    | (((int64) raw[j * 2 + 1] & 255L) << 8);
+                t.flatSet(j, GgufFile.singleBits(hi << 16));
+                j = j + 1;
+            }
+        } else if (Quant.supported(ty)) {
+            // The whole block family routes through Quant (Unit 18):
+            // per-TENSOR dispatch — a Q4_K_M file mixes Q4_K/Q5_K/Q6_K by
+            // tensor sensitivity (spec 9.5).
+            int64 be = (int64) Quant.blockElems(ty);
+            if (n % be != 0L) {
+                throw heap LlamaException("gguf: " + GgufFile.typeName(ty)
+                    + " tensor '" + name + "' has " + n
+                    + " elements - not a " + be + "-block multiple");
+            }
+            int64 blocks = n / be;
+            int64 bb = (int64) Quant.blockBytes(ty);
+            int8[] raw #= heap int8[blocks * bb];
+            this.map.read(off, raw, 0, blocks * bb);
+            float32[] dq #= heap float32[n];
+            Quant.dequantize(ty, raw, 0, blocks, dq, 0);
+            int64 j = 0;
+            while (j < n) {
+                t.flatSet(j, dq[j]);
+                j = j + 1;
+            }
+        } else {
+            throw heap LlamaException("gguf: tensor '" + name
+                + "' has unsupported ggml type " + ty
+                + " (" + GgufFile.typeName(ty) + "); supported: "
+                + "F32, F16, BF16, Q4_0, Q8_0, Q2_K..Q6_K");
+        }
+        return #t;
+    }
+
+    // ── parsing internals ───────────────────────────────────────────────
+
+    int32 indexOfKey(String key) {
+        if (!this.kIdx.containsKey(key)) {
+            return -1;
+        }
+        return this.kIdx.get(key);
+    }
+
+    int64 readU32() {
+        int8[] b #= heap int8[4];
+        this.map.read(this.pos, b, 0, 4);
+        this.pos = this.pos + 4;
+        return ((int64) b[0] & 255L) | (((int64) b[1] & 255L) << 8)
+            | (((int64) b[2] & 255L) << 16) | (((int64) b[3] & 255L) << 24);
+    }
+
+    int64 readU64() {
+        int64 lo = this.readU32();
+        int64 hi = this.readU32();
+        return lo | (hi << 32);
+    }
+
+    #String readStr() {
+        int64 len = this.readU64();
+        if (len < 0 || this.pos + len > this.map.size()) {
+            throw heap LlamaException("gguf: '" + this.path
+                + "' declares a " + len + "-byte string at " + this.pos
+                + " past the file end");
+        }
+        int8[] b #= heap int8[len];
+        this.map.read(this.pos, b, 0, len);
+        this.pos = this.pos + len;
+        String s = heap String(#b, (int32) len);
+        return #s;
+    }
+
+    float64 readF32Val() {
+        int64 bits = this.readU32();
+        return (float64) GgufFile.singleBits(bits);
+    }
+
+    /**
+     * f64 metadata values decode arithmetically too (same isel-abort
+     * avoidance). 52-bit mantissas split into two exact halves.
+     */
+    float64 readF64Val() {
+        int64 bits = this.readU64();
+        int32 sign = (int32) ((bits >> 63) & 1L);
+        int32 exp = (int32) ((bits >> 52) & 2047L);
+        int64 man = bits & 4503599627370495L;
+        float64 mag;
+        float64 frac = ((float64) (man >> 26)) / 67108864.0
+            + ((float64) (man & 67108863L)) / 4503599627370496.0;
+        if (exp == 0) {
+            mag = frac * GgufFile.pow2(-1022);
+        } else if (exp == 2047) {
+            mag = 340000000000000000000000000000000000000.0;
+        } else {
+            mag = (1.0 + frac) * GgufFile.pow2(exp - 1023);
+        }
+        if (sign == 1) {
+            mag = 0.0 - mag;
+        }
+        return mag;
+    }
+
+    /** Scalar value size by GGUF type id; -1 for string/array. */
+    static int64 scalarSize(int32 ty) {
+        if (ty == 0 || ty == 1 || ty == 7) { return 1; }   // u8 i8 bool
+        if (ty == 2 || ty == 3) { return 2; }              // u16 i16
+        if (ty == 4 || ty == 5 || ty == 6) { return 4; }   // u32 i32 f32
+        if (ty == 10 || ty == 11 || ty == 12) { return 8; } // u64 i64 f64
+        return -1;
+    }
+
+    int64 readScalarInt(int32 ty) {
+        int64 sz = GgufFile.scalarSize(ty);
+        int8[] b #= heap int8[8];
+        this.map.read(this.pos, b, 0, sz);
+        this.pos = this.pos + sz;
+        int64 v = 0;
+        int64 j = 0;
+        while (j < sz) {
+            v = v | (((int64) b[j] & 255L) << (j * 8L));
+            j = j + 1;
+        }
+        // Sign-extend the signed widths (i8/i16/i32; i64 is already full).
+        if (ty == 1 && (v & 0x80L) != 0L) { v = v - 256L; }
+        if (ty == 3 && (v & 0x8000L) != 0L) { v = v - 65536L; }
+        if (ty == 5 && (v & 0x80000000L) != 0L) { v = v - 4294967296L; }
+        return v;
+    }
+
+    void readKv(int32 i) {
+        String key #= this.readStr();
+        int32 vt = (int32) this.readU32();
+        this.kKinds[i] = 3;
+        if (vt == 8) {                       // string
+            String sv #= this.readStr();
+            this.kKinds[i] = 2;
+            this.kStrs[i] #= sv;
+        } else if (vt == 6) {                // f32
+            this.kKinds[i] = 1;
+            this.kFloats[i] = this.readF32Val();
+        } else if (vt == 12) {               // f64
+            this.kKinds[i] = 1;
+            this.kFloats[i] = this.readF64Val();
+        } else if (GgufFile.scalarSize(vt) > 0) {
+            this.kKinds[i] = 0;
+            this.kInts[i] = this.readScalarInt(vt);
+        } else if (vt == 9) {                // array
+            this.readArrayValue(i, key);
+        } else {
+            throw heap LlamaException("gguf: '" + this.path
+                + "' key '" + key + "' has unknown value type " + vt);
+        }
+        this.kIdx.put("" + key, i);
+        this.kKeys[i] #= key;
+    }
+
+    void readArrayValue(int32 i, String key) {
+        int32 et = (int32) this.readU32();
+        int64 count = this.readU64();
+        boolean isTokens = key.equals("tokenizer.ggml.tokens");
+        boolean isMerges = key.equals("tokenizer.ggml.merges");
+        boolean isScores = key.equals("tokenizer.ggml.scores");
+        boolean isTypes = key.equals("tokenizer.ggml.token_type");
+        if (et == 8) {                       // string elements
+            if (isTokens || isMerges) {
+                String[] arr #= heap String[(int32) count];
+                int64 j = 0;
+                while (j < count) {
+                    String sv #= this.readStr();
+                    arr[(int32) j] #= sv;
+                    j = j + 1;
+                }
+                this.kKinds[i] = 4;
+                if (isTokens) {
+                    this.tokTokens #= arr;
+                    this.tokCount = (int32) count;
+                } else {
+                    this.tokMerges #= arr;
+                    this.mergeCount = (int32) count;
+                }
+            } else {
+                int64 j = 0;
+                while (j < count) {
+                    int64 len = this.readU64();
+                    this.pos = this.pos + len;
+                    j = j + 1;
+                }
+            }
+        } else if (et == 6 && isScores) {    // f32 scores
+            float32[] sc #= heap float32[(int32) count];
+            int64 j = 0;
+            while (j < count) {
+                sc[(int32) j] = (float32) this.readF32Val();
+                j = j + 1;
+            }
+            this.kKinds[i] = 4;
+            this.tokScores #= sc;
+        } else if (et == 5 && isTypes) {     // i32 token types
+            int32[] tt #= heap int32[(int32) count];
+            int64 j = 0;
+            while (j < count) {
+                tt[(int32) j] = (int32) this.readScalarInt(5);
+                j = j + 1;
+            }
+            this.kKinds[i] = 4;
+            this.tokTypes #= tt;
+        } else {
+            int64 sz = GgufFile.scalarSize(et);
+            if (sz < 0) {
+                throw heap LlamaException("gguf: '" + this.path
+                    + "' key '" + key + "' is an array of type " + et
+                    + " - unsupported");
+            }
+            this.pos = this.pos + sz * count;
+        }
+    }
+
+    void readTensorInfo(int32 i) {
+        String name #= this.readStr();
+        int32 nd = (int32) this.readU32();
+        if (nd < 1 || nd > 4) {
+            throw heap LlamaException("gguf: tensor '" + name + "' has "
+                + nd + " dims; expected 1-4");
+        }
+        int64[] ne #= heap int64[nd];
+        int32 d = 0;
+        while (d < nd) {
+            ne[d] = this.readU64();
+            d = d + 1;
+        }
+        // ggml ne is fastest-first; the engine's torch shapes are the
+        // reverse — identical byte layout, reversed labels.
+        int64[] shp #= heap int64[nd];
+        d = 0;
+        while (d < nd) {
+            shp[d] = ne[nd - 1 - d];
+            d = d + 1;
+        }
+        this.tTypes[i] = (int32) this.readU32();
+        this.tOffsets[i] = this.readU64();
+        this.tIdx.put("" + name, i);
+        this.tNames[i] #= name;
+        this.tShapes[i] #= shp;
+    }
+
+    /**
+     * IEEE 754 half bits → float32 (Q8_0 scales, F16 payloads) —
+     * ARITHMETIC decode, not a bit reinterpretation: `Cajeta.bitsToF32`
+     * aborts AOT emission today (specs/aot-bitcast-f32-isel-abort in the
+     * cajeta repo; the JIT path is fine). Powers of two and the mantissa
+     * quotient are exact in float64, so this loses nothing. Infinities
+     * clamp to ±3.4e38 — GGUF weight payloads carry no infinities, and a
+     * checkpoint that did would be corrupt anyway.
+     */
+    @Device
+    static float32 halfBitsToF32(int32 h) {
+        // Bit-layout rebase, not arithmetic: f16 and f32 share a sign bit and
+        // a normalised mantissa, so the conversion is a shift and an exponent
+        // bias change. The old arithmetic decode existed only because
+        // Cajeta.bitsToF32 aborted AOT emission; that defect is fixed (the
+        // intrinsics coerce their operands now), and pow2()'s repeated-squaring
+        // loop measured 38% of the Q4_K mat-vec.
+        int32 sign = (h >> 15) & 1;
+        int32 exp = (h >> 10) & 31;
+        int32 man = h & 1023;
+        int64 bits;
+        if (exp == 0) {
+            if (man == 0) {
+                bits = (int64) sign << 31;              // +/- zero
+            } else {
+                // Subnormal: normalise so the implicit leading 1 appears, and
+                // pay for the exponent with the shift distance.
+                int32 k = 9;
+                while ((man & (1 << k)) == 0) { k = k - 1; }
+                bits = ((int64) sign << 31)
+                     | ((int64) (k + 103) << 23)
+                     | (((int64) man << (23 - k)) & 8388607L);
+            }
+        } else if (exp == 31) {
+            bits = ((int64) sign << 31) | (255L << 23) | ((int64) man << 13);
+        } else {
+            bits = ((int64) sign << 31)
+                 | ((int64) (exp + 112) << 23)
+                 | ((int64) man << 13);
+        }
+        return Cajeta.bitsToF32(bits);
+    }
+
+    /** 2^e for e in [-149, 127] by repeated squaring at float64 (exact). */
+    static float64 pow2(int32 e) {
+        float64 r = 1.0;
+        int32 n = e;
+        float64 b = 2.0;
+        if (n < 0) {
+            n = 0 - n;
+            b = 0.5;
+        }
+        while (n > 0) {
+            if ((n & 1) == 1) {
+                r = r * b;
+            }
+            b = b * b;
+            n = n >> 1;
+        }
+        return r;
+    }
+
+    /** IEEE 754 single bits → float32, same arithmetic-decode reason.
+     *  Public: the parity instrument reads raw-f32 fixtures through it. */
+    public static float32 singleBits(int64 bits) {
+        int32 sign = (int32) ((bits >> 31) & 1L);
+        int32 exp = (int32) ((bits >> 23) & 255L);
+        int32 man = (int32) (bits & 8388607L);
+        float64 mag;
+        if (exp == 0) {
+            mag = ((float64) man / 8388608.0) * GgufFile.pow2(-126);
+        } else if (exp == 255) {
+            mag = 340000000000000000000000000000000000000.0;
+        } else {
+            mag = (1.0 + (float64) man / 8388608.0) * GgufFile.pow2(exp - 127);
+        }
+        if (sign == 1) {
+            mag = 0.0 - mag;
+        }
+        return (float32) mag;
+    }
+
+    static #String typeName(int32 ty) {
+        if (ty == 2) { return #"q4_0"; }
+        if (ty == 3) { return #"q4_1"; }
+        if (ty == 6) { return #"q5_0"; }
+        if (ty == 7) { return #"q5_1"; }
+        if (ty == 10) { return #"q2_k"; }
+        if (ty == 11) { return #"q3_k"; }
+        if (ty == 12) { return #"q4_k"; }
+        if (ty == 13) { return #"q5_k"; }
+        if (ty == 14) { return #"q6_k"; }
+        if (ty == 16) { return #"iq2_xxs"; }
+        String u = "type_" + ty;
+        return #u;
+    }
+}

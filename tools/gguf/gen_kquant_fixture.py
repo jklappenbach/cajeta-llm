@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cajeta-llama plan Unit 18 — k-quant fixtures from REAL blocks.
+# cajeta-llm plan Unit 18 — k-quant fixtures from REAL blocks.
 #
 # Pulls raw packed blocks of every required type out of the downloaded
 # Llama-3.1-8B GGUFs (Q4_K_M mixes Q4_K/Q5_K/Q6_K by tensor sensitivity —

@@ -1,0 +1,158 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.LlamaForCausalLM;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.tok.Tokenizer;
+import cajeta.math.Tensor;
+
+/**
+ * Greedy-decode the RAW 6-token prompt
+ * `<|begin_of_text|>The capital of France is` (128000 791 6864 315 9822 374).
+ *
+ * CORRECTION 2026-08-21. This file used to claim llama.cpp "answers
+ * ' Paris.'" and treat anything else as a defect. That expectation was WRONG
+ * and cost a day: `llama-completion -p "The capital of France is"` on an
+ * Instruct model applies the CHAT TEMPLATE and evaluates **15** tokens, not
+ * these 6. It was answering a different question.
+ *
+ * The reference for these exact ids is transformers fp32 on CPU:
+ *
+ *   264 ' a'      +16.0104   <- argmax
+ *   12366 ' Paris' +15.9078
+ *   3967 ' known'  +15.0098
+ *   2162 ' home'   +14.8960
+ *   279 ' the'     +14.3193
+ *
+ * So ' a' is CORRECT here, and ' Paris' loses by 0.10 -- the near-tie spec
+ * 13.22's divergence clause exists for.
+ *
+ * Which is why this probe reports LOGITS at the reference ids and not just the
+ * token. The argmax is 264 both with and without the GGUF rope un-permute,
+ * while the logits are ~1.5 off without it and ~0.05 with it: a token-level
+ * check is blind to a defect a logit-level check catches instantly.
+ */
+public class BosProbe {
+    /**
+     * `oneStep` feeds the prompt ONE token at a time through stepSeq(n=1),
+     * which is a different code path from prefill's multi-token chunk: n==1
+     * short-circuits to stepOne and never touches the chunk arena, the
+     * multi-row causal mask, or the "argmax over the LAST consumed row"
+     * selection. Both must agree -- one forward path is the design (spec
+     * 13.14) -- so a divergence localizes the fault to the chunked path.
+     */
+    static void once(LlamaForCausalLM m, Tokenizer t, int32[] ids, int32 n,
+            String label, boolean oneStep) {
+        int32 nxt = 0;
+        if (oneStep) {
+            int32 i = 0;
+            while (i < n) {
+                nxt = m.stepSeq(0, ids, i, 1);
+                i = i + 1;
+            }
+        } else {
+            nxt = m.prefill(ids, n);
+        }
+        // The parity gate (15.1.2) reads m.logits() and computes its OWN
+        // argmax; it never checks the value stepSeq RETURNS. So "cosine 1.0,
+        // top-1 agrees" verifies the forward pass and says nothing about this
+        // return. Print both -- a divergence means the logits are right and
+        // the returned token is not.
+        int32 vocab = m.vocabSize();
+        Tensor<float32> lg = m.logits();
+        int32 fromLogits = 0;
+        float32 best = lg.flatGet(0);
+        int32 vi = 1;
+        while (vi < vocab) {
+            float32 v = lg.flatGet((int64) vi);
+            if (v > best) { best = v; fromLogits = vi; }
+            vi = vi + 1;
+        }
+        System.stdout.println(label + " returned=" + nxt
+            + " argmax(m.logits())=" + fromLogits
+            + (nxt == fromLogits ? " AGREE" : " DIVERGE"));
+        // The argmax alone cannot tell a correct engine from a broken one on a
+        // near-tie. Print the reference's top-5 ids so the LOGITS are
+        // comparable: transformers fp32 on these exact ids gives
+        //   264 ' a' +16.0104 | 12366 ' Paris' +15.9078 | 3967 ' known' +15.0098
+        //   2162 ' home' +14.8960 | 279 ' the' +14.3193
+        int32[] ref #= heap int32[5];
+        ref[0] = 264; ref[1] = 12366; ref[2] = 3967; ref[3] = 2162; ref[4] = 279;
+        int32 ri = 0;
+        while (ri < 5) {
+            System.stdout.println("    ref id=" + ref[ri] + " engine logit="
+                + lg.flatGet((int64) ref[ri]));
+            ri = ri + 1;
+        }
+        int32[] one #= heap int32[1];
+        one[0] = nxt;
+        if (t == null) {
+            System.stdout.println(label + " -> id " + nxt);
+            return;
+        }
+        int8[] b #= t.decode(one, 1);
+        String s #= heap String(#b, (int32) b.count());
+        System.stdout.println(label + " -> id " + nxt + " = '" + s + "'");
+        return;
+    }
+
+    public static void run(String[] args) {
+        String path = args[0];
+        // args[1] == "nopack" runs the SAME checkpoint dequantized, so a
+        // wrong token can be attributed to the packed path or exonerated.
+        if ((int32) args.count() > 1 && args[1].equals("nopack")) {
+            Quant.setPackingEnabled(false);
+            System.stdout.println("(packing DISABLED)");
+        }
+        Checkpoint ck #= Checkpoint.open(path);
+        // A safetensors directory carries no GGUF metadata, so the config
+        // comes from config.json. Running the SAME prompt from both weight
+        // sources is what isolates a GGUF-loading fault from an engine fault:
+        // the safetensors path is the one measured correct against
+        // transformers (plan 15.1.2), so if it answers correctly and the GGUF
+        // does not, the difference is in the GGUF boundary and nowhere else.
+        ModelConfig cfg = null;
+        if (ck.gguf() != null) {
+            cfg #= ModelConfig.fromGguf(ck.gguf());
+        } else {
+            int64 slash = -1L;
+            int64 at = path.indexOfFrom("/", 0L);
+            while (at >= 0L) {
+                slash = at;
+                at = path.indexOfFrom("/", at + 1L);
+            }
+            String dir #= path.substring(0, (int32) (slash < 0L ? 0L : slash));
+            cfg #= ModelConfig.parse(dir + "/config.json");
+        }
+        cfg.blockTokens = 16;
+        // The token ids below are hard-coded, so the tokenizer is only needed
+        // to DECODE the answer. Borrow one from the GGUF when there is one.
+        Tokenizer t = null;
+        if (ck.gguf() != null) {
+            t #= ck.gguf().tokenizer();
+        }
+        LlamaForCausalLM m = heap LlamaForCausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+
+        int32[] withBos #= heap int32[6];
+        withBos[0] = 128000;
+        withBos[1] = 791;
+        withBos[2] = 6864;
+        withBos[3] = 315;
+        withBos[4] = 9822;
+        withBos[5] = 374;
+        boolean oneStep = false;
+        int32 ai = 1;
+        while (ai < (int32) args.count()) {
+            if (args[ai].equals("onestep")) { oneStep = true; }
+            ai = ai + 1;
+        }
+        BosProbe.once(m, t, withBos, 6,
+            oneStep ? "WITH bos [onestep]" : "WITH bos [chunked]", oneStep);
+        return;
+    }
+}

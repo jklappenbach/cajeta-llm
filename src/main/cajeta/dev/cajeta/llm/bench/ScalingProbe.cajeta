@@ -1,0 +1,443 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * threaded-forward-path plan Unit 5 — the Q4_K scaling curve.
+ *
+ * Shape is Llama-3.1-8B's q_proj: [4096, 4096] Q4_K, 9.4 MB of weight per
+ * mat-vec, which is the whole reason this is worth threading — decode is
+ * bandwidth-bound and one core cannot saturate the bus.
+ *
+ * TWO SWEEPS, and the difference between them is the point. A single 9.4 MB
+ * weight fits in this box's 64 MiB L3, so hammering one matrix measures a
+ * CACHE-RESIDENT mat-vec. Real decode reads ~224 distinct projections
+ * totalling ~4.5 GB per token, each exactly once, from DRAM. The `hot`
+ * sweep reuses one weight; the `cold` sweep rotates through {@link #COPIES}
+ * distinct weights whose total exceeds L3, so every launch starts cold.
+ * Reading the hot curve as if it predicted decode would overstate the low
+ * worker counts, which are the ones cache rescues.
+ *
+ * The measurement discipline is the one this project arrived at the hard
+ * way (spec §7.6), and each piece is here because its absence produced a
+ * wrong answer once:
+ *
+ *   * ARMS ALTERNATE. Odd repetitions walk the worker counts backwards.
+ *     A fixed arm order let a decaying background load read as a speedup
+ *     in the Unit 1 spike; the first run of a round is measurably slower
+ *     than the rest regardless of which arm it is.
+ *   * MEDIAN OF 3, not mean: one descheduled sample should not move the
+ *     number.
+ *   * AN UNTOUCHED CONTROL runs in every repetition — the HOST serial
+ *     mat-vec, which the worker cap cannot reach. If the control drifts
+ *     across repetitions the box was not idle and the run is void. This
+ *     is stronger than checking idleness beforehand, because it checks the
+ *     window the measurement actually occupied.
+ *
+ *     The control takes its turn IN THE ROTATION rather than leading every
+ *     round. A control pinned to first position eats the
+ *     first-run-of-a-round penalty every time — measured at +3.7% in the
+ *     Unit 1 spike — which inflates every speedup computed against it.
+ *   * EVERY TIMING CARRIES ITS WORKER COUNT, read back from the runtime
+ *     rather than from what was requested (5.1.1). A number whose worker
+ *     count is assumed is not a data point.
+ */
+public class ScalingProbe {
+
+    static final int32 ROWS = 4096;
+    static final int32 COLS = 4096;
+    static final int32 ITERS = 32;
+    static final int32 CTRL_ITERS = 16;
+    static final int32 REPS = 3;
+
+    /** Distinct weights in the cold sweep. 16 x 9.4 MB = 150 MB, comfortably
+     *  past the 64 MiB L3, so a launch never finds its weight cached. */
+    static final int32 COPIES = 16;
+
+    /**
+     * Fill `p` with `ty` blocks whose f16 SCALES are sane.
+     *
+     * A pseudo-random byte pattern is not enough, and finding that out cost
+     * a whole round of numbers. Every k-quant block carries its scale as an
+     * f16, and arbitrary bytes there decode to NaN or Inf — so the bench was
+     * timing NaN arithmetic on both sides, which is neither the work decode
+     * does nor even reliably the same cost (denormal and NaN handling take
+     * different paths in scalar and vector code). The quantized payload can
+     * stay arbitrary; only the scale fields have to be real numbers.
+     *
+     * Caught by making the bench VERIFY its own output before reporting a
+     * speedup — it printed `nan vs nan`.
+     */
+    static void fillBlocks(int8[] p, int32 ty, int32 salt) {
+        int64 n = (int64) p.count();
+        int64 z = 0;
+        while (z < n) {
+            p[z] = (int8) ((z * 31L + (int64) salt * 7L) % 251L);
+            z = z + 1;
+        }
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 nb = n / bb;
+        int64 b = 0;
+        while (b < nb) {
+            int64 o = b * bb;
+            // f16 values just above 1.0 (0x3C00) and 0.5 (0x3800): normal,
+            // finite, and varying per block so nothing is degenerate.
+            int32 v = (int32) (b % 16L);
+            if (ty == Quant.GG_Q6_K) {
+                p[o + 208L] = (int8) v;
+                p[o + 209L] = (int8) 60;              // 0x3C
+            } else if (ty == Quant.GG_Q8_0) {
+                p[o] = (int8) v;
+                p[o + 1L] = (int8) 60;
+            } else {                                   // Q4_K / Q5_K header
+                p[o] = (int8) v;
+                p[o + 1L] = (int8) 60;                // d    ~ 1.0
+                p[o + 2L] = (int8) v;
+                p[o + 3L] = (int8) 56;                // dmin ~ 0.5  (0x38)
+            }
+            b = b + 1;
+        }
+        return;
+    }
+
+    /** Median of three, without sorting machinery. */
+    static float64 med3(float64 a, float64 b, float64 c) {
+        if (a > b) { float64 t = a; a = b; b = t; }
+        if (b > c) { float64 t = b; b = c; c = t; }
+        if (a > b) { float64 t = a; a = b; b = t; }
+        return b;
+    }
+
+    /** ms per launch at the current worker cap, rotating over `n` weights. */
+    static float64 timeKernel(KernelBuffer<float32> y,
+            ArrayList<KernelBuffer<int8>> ps, int32 n,
+            KernelBuffer<float32> x) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < ScalingProbe.ITERS) {
+            QuantKernel.q4kMatVecLaunch(y, ps.get(k % n), x,
+                (int64) ScalingProbe.ROWS, (int64) ScalingProbe.COLS, 0L, 0L);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) ScalingProbe.ITERS;
+    }
+
+    /** ms per call for the host serial path — the control, and the baseline
+     *  every speedup is measured against. */
+    static float64 timeSerial(ArrayList<int8[]> hs, int32 n, float32[] x,
+            float32[] y) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < ScalingProbe.CTRL_ITERS) {
+            Quant.q4kMatVecInto(hs.get(k % n), (int64) ScalingProbe.ROWS,
+                (int64) ScalingProbe.COLS, x, 0L, y, 0L);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) ScalingProbe.CTRL_ITERS;
+    }
+
+    static void sweep(String label, int32 n, ArrayList<int8[]> hs,
+            ArrayList<KernelBuffer<int8>> ps, KernelBuffer<float32> xb,
+            KernelBuffer<float32> yb, float32[] hx, float32[] hy,
+            float64 mbPerCall) {
+        // Index 6 is the CONTROL: the host serial path, which no cap reaches.
+        int32[] arms #= heap int32[7];
+        arms[0] = 1; arms[1] = 2; arms[2] = 4; arms[3] = 8;
+        arms[4] = 16; arms[5] = 0; arms[6] = -1;
+        int32 nArms = 7;
+        int32 ctrlArm = 6;
+
+        float64[] samples #= heap float64[(int64) nArms * 3L];
+        int32[] workers #= heap int32[nArms];
+
+        // Warm: first touch pays one-time costs (pool spin-up, page faults)
+        // that belong to neither arm.
+        Device.setCpuWorkerCap(0);
+        ScalingProbe.timeKernel(yb, ps, n, xb);
+        ScalingProbe.timeSerial(hs, n, hx, hy);
+
+        int32 rep = 0;
+        while (rep < ScalingProbe.REPS) {
+            int32 k = 0;
+            while (k < nArms) {
+                int32 a = rep % 2 == 0 ? k : nArms - 1 - k;
+                float64 ms = 0.0;
+                if (a == ctrlArm) {
+                    ms = ScalingProbe.timeSerial(hs, n, hx, hy);
+                    workers[a] = 0;
+                } else {
+                    Device.setCpuWorkerCap(arms[a]);
+                    ms = ScalingProbe.timeKernel(yb, ps, n, xb);
+                    workers[a] = Device.lastLaunchWorkers();
+                }
+                samples[(int64) a * 3L + (int64) rep] = ms;
+                k = k + 1;
+            }
+            rep = rep + 1;
+        }
+        Device.setCpuWorkerCap(0);
+
+        int64 cb = (int64) ctrlArm * 3L;
+        float64 c = ScalingProbe.med3(samples[cb], samples[cb + 1L],
+            samples[cb + 2L]);
+        float64 cLo = samples[cb];
+        float64 cHi = samples[cb];
+        int32 r2 = 1;
+        while (r2 < 3) {
+            float64 v = samples[cb + (int64) r2];
+            if (v < cLo) { cLo = v; }
+            if (v > cHi) { cHi = v; }
+            r2 = r2 + 1;
+        }
+        float64 drift = (cHi - cLo) / cLo * 100.0;
+
+        System.stdout.println("");
+        System.stdout.println("== " + label + " ==");
+        System.stdout.println("control (host serial, untouched by the cap): "
+            + c + " ms   spread across reps " + drift + "%");
+        if (drift > 5.0) {
+            System.stdout.println("*** RUN VOID: the control moved " + drift
+                + "% across repetitions, so the box was not idle for the "
+                + "window this measurement occupied. The arm numbers below "
+                + "are not comparable. ***");
+        }
+        System.stdout.println(
+            "workers |    ms    |   GB/s   | vs serial | vs 1 worker");
+        float64 one = ScalingProbe.med3(samples[0], samples[1], samples[2]);
+        int32 a2 = 0;
+        while (a2 < nArms) {
+            float64 m = ScalingProbe.med3(samples[(int64) a2 * 3L],
+                samples[(int64) a2 * 3L + 1L],
+                samples[(int64) a2 * 3L + 2L]);
+            String who = a2 == ctrlArm ? "serial" : "" + workers[a2];
+            System.stdout.println("  " + who + "  |  " + m + "  |  "
+                + (mbPerCall / 1024.0 / (m / 1000.0)) + "  |  " + (c / m)
+                + "x  |  " + (one / m) + "x");
+            a2 = a2 + 1;
+        }
+        return;
+    }
+
+    /**
+     * Plan 6.3.2 — per-format timings, kernel against serial, at full
+     * worker count with the weights cold.
+     *
+     * Q6_K's flat result under `headK6` (`quant-scalar-decode-cost`
+     * 5.1.3) is NOT assumed to repeat: that was a header-decode change on
+     * one core and this is a different mechanism entirely. Each format is
+     * measured, and the arms alternate here too.
+     */
+    static void formats(int32 n, float32[] hx, float32[] hy,
+            KernelBuffer<float32> xb, KernelBuffer<float32> yb) {
+        int32[] tys #= heap int32[4];
+        tys[0] = Quant.GG_Q4_K; tys[1] = Quant.GG_Q5_K;
+        tys[2] = Quant.GG_Q6_K; tys[3] = Quant.GG_Q8_0;
+        System.stdout.println("");
+        System.stdout.println("== per format, cold weights, uncapped ==");
+        System.stdout.println("format | serial ms | k@1 ms | k@32 ms | "
+            + "GB/s@32 | k1 vs serial | scaling");
+        Device.setCpuWorkerCap(0);
+        int32 f = 0;
+        while (f < 4) {
+            int32 ty = tys[f];
+            int64 be = (int64) Quant.blockElems(ty);
+            int64 bb = (int64) Quant.blockBytes(ty);
+            int64 nbytes = (int64) ScalingProbe.ROWS
+                * ((int64) ScalingProbe.COLS / be) * bb;
+            ArrayList<int8[]> hs #= heap ArrayList<int8[]>();
+            ArrayList<KernelBuffer<int8>> ps
+                #= heap ArrayList<KernelBuffer<int8>>();
+            int32 cp = 0;
+            while (cp < n) {
+                int8[] packed #= heap int8[nbytes];
+                ScalingProbe.fillBlocks(packed, ty, cp);
+                KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+                    (uint64) nbytes);
+                pb.upload(packed);
+                hs.add(#packed);
+                ps.add(#pb);
+                cp = cp + 1;
+            }
+            float64[] sv #= heap float64[3];
+            float64[] kv #= heap float64[3];
+            float64[] k1 #= heap float64[3];
+            int32 rep = 0;
+            while (rep < 3) {
+                if (rep % 2 == 0) {
+                    sv[rep] = ScalingProbe.timeSerialTy(ty, hs, n, hx, hy);
+                    Device.setCpuWorkerCap(1);
+                    k1[rep] = ScalingProbe.timeKernelTy(ty, yb, ps, n, xb);
+                    Device.setCpuWorkerCap(0);
+                    kv[rep] = ScalingProbe.timeKernelTy(ty, yb, ps, n, xb);
+                } else {
+                    Device.setCpuWorkerCap(0);
+                    kv[rep] = ScalingProbe.timeKernelTy(ty, yb, ps, n, xb);
+                    Device.setCpuWorkerCap(1);
+                    k1[rep] = ScalingProbe.timeKernelTy(ty, yb, ps, n, xb);
+                    Device.setCpuWorkerCap(0);
+                    sv[rep] = ScalingProbe.timeSerialTy(ty, hs, n, hx, hy);
+                }
+                rep = rep + 1;
+            }
+            Device.setCpuWorkerCap(0);
+            // VERIFY before reporting. A speedup from a kernel that is not
+            // computing the same thing is not a speedup, and the failure
+            // mode here is silent: an unlaunched kernel leaves the output
+            // buffer alone and the timing looks superb.
+            float32[] kout #= heap float32[ScalingProbe.ROWS];
+            QuantKernel.matVecLaunch(ty, yb, ps.get(0), xb,
+                (int64) ScalingProbe.ROWS, (int64) ScalingProbe.COLS, 0L, 0L);
+            yb.download(kout);
+            // Verify against the SAME-ORDER twin. Q4_K's kernel is 4-lane
+            // and its host path 16-lane on purpose (plan 6.3.3), so
+            // comparing against `q4kMatVecInto` reports a 2e-6 relative
+            // difference as a defect. `q4kMatVecIntoLanes4` is the oracle.
+            ScalingProbe.serialRefTy(ty, hs.get(0), hx, hy);
+            int64 bad = -1L;
+            int64 vi = 0;
+            while (vi < (int64) ScalingProbe.ROWS) {
+                float32 kk = kout[vi];
+                float32 ss = hy[vi];
+                // `kk != kk` is the NaN test. A bench whose data decodes to
+                // NaN reports every row as a mismatch AND times the wrong
+                // work, so say so rather than printing a row number.
+                if ((kk != kk || ss != ss) && bad < 0L) { bad = -2L; }
+                else if (kk != ss && bad < 0L) { bad = vi; }
+                vi = vi + 1;
+            }
+            if (bad == -2L) {
+                System.stdout.println(" " + GgufFile.typeName(ty)
+                    + "  *** NaN in the result — the synthetic blocks carry "
+                    + "an invalid f16 scale; the timing below is void");
+            } else if (bad >= 0L) {
+                System.stdout.println(" " + GgufFile.typeName(ty)
+                    + "  *** WRONG at row " + bad + ": kernel " + kout[bad]
+                    + " vs serial " + hy[bad] + " — timing below is void");
+            }
+
+            float64 sm = ScalingProbe.med3(sv[0], sv[1], sv[2]);
+            float64 km = ScalingProbe.med3(kv[0], kv[1], kv[2]);
+            float64 k1m = ScalingProbe.med3(k1[0], k1[1], k1[2]);
+            float64 mbf = (float64) nbytes / 1048576.0;
+            System.stdout.println(" " + GgufFile.typeName(ty) + " | " + sm
+                + " | " + k1m + " | " + km + " | "
+                + (mbf / 1024.0 / (km / 1000.0)) + " | " + (sm / k1m) + "x | "
+                + (k1m / km) + "x");
+            f = f + 1;
+        }
+        return;
+    }
+
+    static float64 timeKernelTy(int32 ty, KernelBuffer<float32> y,
+            ArrayList<KernelBuffer<int8>> ps, int32 n,
+            KernelBuffer<float32> x) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < ScalingProbe.ITERS) {
+            QuantKernel.matVecLaunch(ty, y, ps.get(k % n), x,
+                (int64) ScalingProbe.ROWS, (int64) ScalingProbe.COLS, 0L, 0L);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) ScalingProbe.ITERS;
+    }
+
+    /** The kernel's same-order twin, for VERIFICATION only. */
+    static void serialRefTy(int32 ty, int8[] p, float32[] x, float32[] y) {
+        int64 rows = (int64) ScalingProbe.ROWS;
+        int64 cols = (int64) ScalingProbe.COLS;
+        if (ty == Quant.GG_Q4_K) {
+            Quant.q4kMatVecIntoLanes4(p, rows, cols, x, 0L, y, 0L);
+        } else if (ty == Quant.GG_Q5_K) {
+            Quant.q5kMatVecInto(p, rows, cols, x, 0L, y, 0L);
+        } else if (ty == Quant.GG_Q6_K) {
+            Quant.q6kMatVecInto(p, rows, cols, x, 0L, y, 0L);
+        } else {
+            Quant.q8MatVecInto(p, rows, cols, x, 0L, y, 0L);
+        }
+        return;
+    }
+
+    static float64 timeSerialTy(int32 ty, ArrayList<int8[]> hs, int32 n,
+            float32[] x, float32[] y) {
+        int64 rows = (int64) ScalingProbe.ROWS;
+        int64 cols = (int64) ScalingProbe.COLS;
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < ScalingProbe.CTRL_ITERS) {
+            int8[] p = hs.get(k % n);
+            if (ty == Quant.GG_Q4_K) {
+                Quant.q4kMatVecInto(p, rows, cols, x, 0L, y, 0L);
+            } else if (ty == Quant.GG_Q5_K) {
+                Quant.q5kMatVecInto(p, rows, cols, x, 0L, y, 0L);
+            } else if (ty == Quant.GG_Q6_K) {
+                Quant.q6kMatVecInto(p, rows, cols, x, 0L, y, 0L);
+            } else {
+                Quant.q8MatVecInto(p, rows, cols, x, 0L, y, 0L);
+            }
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) ScalingProbe.CTRL_ITERS;
+    }
+
+    public static void run() {
+        int64 blocksPerRow = (int64) ScalingProbe.COLS / 256L;
+        int64 nbytes = (int64) ScalingProbe.ROWS * blocksPerRow * 144L;
+        float64 mb = (float64) nbytes / 1048576.0;
+
+        float32[] hx #= heap float32[ScalingProbe.COLS];
+        int64 i = 0;
+        while (i < (int64) ScalingProbe.COLS) {
+            hx[i] = (float32) ((i % 11L) - 5L) * 0.375f;
+            i = i + 1;
+        }
+        float32[] hy #= heap float32[ScalingProbe.ROWS];
+
+        ArrayList<int8[]> hs #= heap ArrayList<int8[]>();
+        ArrayList<KernelBuffer<int8>> ps #= heap ArrayList<KernelBuffer<int8>>();
+        int32 cp = 0;
+        while (cp < ScalingProbe.COPIES) {
+            int8[] packed #= heap int8[nbytes];
+            // Distinct per copy, so nothing can be shared or folded — and
+            // with REAL f16 scales, so this is not timing NaN arithmetic.
+            ScalingProbe.fillBlocks(packed, Quant.GG_Q4_K, cp);
+            KernelBuffer<int8> pb #= heap KernelBuffer<int8>((uint64) nbytes);
+            pb.upload(packed);
+            hs.add(#packed);
+            ps.add(#pb);
+            cp = cp + 1;
+        }
+
+        KernelBuffer<float32> xb #= heap KernelBuffer<float32>(
+            (uint64) ScalingProbe.COLS);
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>(
+            (uint64) ScalingProbe.ROWS);
+        xb.upload(hx);
+        yb.upload(hy);
+
+        System.stdout.println("Q4_K [" + ScalingProbe.ROWS + " x "
+            + ScalingProbe.COLS + "] = " + mb + " MB per mat-vec, "
+            + ScalingProbe.ITERS + " launches per sample, median of "
+            + ScalingProbe.REPS + ", arms alternated");
+
+        ScalingProbe.sweep("HOT: one weight, re-read (fits L3)", 1, hs, ps,
+            xb, yb, hx, hy, mb);
+        ScalingProbe.sweep("COLD: " + ScalingProbe.COPIES
+            + " distinct weights in rotation (exceeds L3) - this is the one "
+            + "that predicts decode", ScalingProbe.COPIES, hs, ps, xb, yb,
+            hx, hy, mb);
+        ScalingProbe.formats(4, hx, hy, xb, yb);
+        return;
+    }
+}

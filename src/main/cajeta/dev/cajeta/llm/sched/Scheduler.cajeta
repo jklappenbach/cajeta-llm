@@ -1,0 +1,554 @@
+package dev.cajeta.llm.sched;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import dev.cajeta.llm.LlamaException;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.gen.Sampler;
+import dev.cajeta.llm.gen.TokenSink;
+import dev.cajeta.llm.tok.Tokenizer;
+import dev.cajeta.llm.model.LlamaForCausalLM;
+import dev.cajeta.llm.model.PagedKvCache;
+import dev.cajeta.llm.store.BlockKeys;
+import dev.cajeta.llm.store.BlockStore;
+
+/**
+ * The continuous-batching scheduler (plan Unit 9; spec 6.19–6.25,
+ * 13.14, 13.15): iteration-level batch assembly over one step function.
+ *
+ * Every request advances by consuming its unconsumed tokens in chunks of
+ * at most `chunk` through `LlamaForCausalLM.stepSeq` — a prefilling
+ * request has many unconsumed tokens, a decoding request exactly one, so
+ * DECODE IS THE N=1 CHUNK of the same path (13.14) and long prompts
+ * interleave with in-flight decodes by construction (6.21): each
+ * iteration gives every running request one bounded item.
+ *
+ * Stated policies (6.22, 6.23):
+ * - Admission (6.19): a request is admitted only when free blocks cover
+ *   its whole uncached suffix PLUS one block per unwindowed layer of
+ *   decode headroom — admitting churn is not progress.
+ * - Preemption victim: the YOUNGEST running request (latest
+ *   admission/resume stamp). Older work is never sacrificed for newer,
+ *   which is what bounds every request's wait.
+ * - Resume: preempted requests re-admit FIFO by preemption time and take
+ *   priority over new admissions — combined with youngest-victim, no
+ *   request starves (6.23). With no store (6.32), resume recomputes the
+ *   prefix through the same chunked path; the Unit 11 store swaps in
+ *   behind exactly this seam.
+ */
+public final class Scheduler {
+    LlamaForCausalLM model;   // borrowed; the caller keeps it alive
+    int32 chunk;
+    int32 maxSeqs;
+    ArrayList<Request> reqs;
+    int32[] slotReq;          // request id per slot, -1 free
+    int32 admittedN;
+    int32 preemptedN;
+    int32 resumedN;
+    int32 stamp;
+    int32 steps;
+    // Optional prefix block store (Unit 11; null = disabled, 6.32).
+    BlockStore store;         // borrow; the caller keeps it alive
+    String modelId;
+    String modelDtype;
+    String modelQuant;
+    int8[] blockBuf;          // one payload scratch, allocated at attach
+    int32 adoptedBlocksN;
+    int32 prefillRowsN;       // rows actually computed (11.3.1)
+    // Unit 14 — generation-loop attachments. Requests are stepped one at
+    // a time, so ONE detok window scratch serves the whole batch.
+    TokenSink sink;           // borrow; null = no streaming (8.8)
+    Tokenizer tok;            // borrow; null = stop strings inert (8.7)
+    int32[] tailIds;          // stop-string window scratch (16 ids)
+
+    public Scheduler(LlamaForCausalLM model, int32 chunk) {
+        this.model = model;
+        this.chunk = chunk;
+        this.maxSeqs = model.maxSequences();
+        this.reqs = heap ArrayList<Request>();
+        this.slotReq = heap int32[this.maxSeqs];
+        int32 i = 0;
+        while (i < this.maxSeqs) {
+            this.slotReq[i] = -1;
+            i = i + 1;
+        }
+        this.admittedN = 0;
+        this.preemptedN = 0;
+        this.resumedN = 0;
+        this.stamp = 0;
+        this.steps = 0;
+        this.store = null;
+        this.modelId = null;
+        this.modelDtype = null;
+        this.modelQuant = null;
+        this.blockBuf = null;
+        this.adoptedBlocksN = 0;
+        this.prefillRowsN = 0;
+        this.sink = null;
+        this.tok = null;
+        this.tailIds #= heap int32[16];
+    }
+
+    /** Streaming sink (spec 8.8): every emitted token is delivered within
+     *  the step that produced it, before the next step begins. Borrow. */
+    public void setSink(TokenSink sink) {
+        this.sink = sink;
+    }
+
+    /** Tokenizer for stop-string checks (spec 8.7) — without one, stop
+     *  strings never fire. Borrow. */
+    public void setTokenizer(Tokenizer tok) {
+        this.tok = tok;
+    }
+
+    /**
+     * Attach the prefix block store (spec 6.16–6.18): preempted AND
+     * completed sequences write their full blocks; admission adopts the
+     * longest stored prefix before computing the rest. The identity
+     * strings fold into every key (6.27). Without a store, preemption
+     * falls back to recompute-on-resume with identical output (6.32).
+     * v1 restriction: adoption engages only when every layer is
+     * unwindowed (rings are cheap to recompute and are not stored).
+     */
+    public void attachStore(BlockStore store, String modelId, String dtype,
+            String quant) {
+        this.store = store;
+        this.modelId = "" + modelId;
+        this.modelDtype = "" + dtype;
+        this.modelQuant = "" + quant;
+        this.blockBuf = heap int8[this.model.kvCache().blockPayloadBytes()];
+    }
+
+    public int32 adoptedBlocks() {
+        return this.adoptedBlocksN;
+    }
+
+    /** Prompt/decode rows actually computed by the model (11.3.1). */
+    public int32 prefillRowsExecuted() {
+        return this.prefillRowsN;
+    }
+
+    /** Enqueue a request; returns its id. */
+    public int32 submit(int32[] prompt, int32 promptLen, int32 maxNew) {
+        Request r = heap Request(prompt, promptLen, maxNew);
+        this.reqs.add(#r);
+        return this.reqs.count() - 1;
+    }
+
+    /**
+     * Enqueue a SAMPLED request (Unit 14): its own parameters and its own
+     * RNG stream, so one sequence's seed never perturbs another's
+     * (14.1.8). Temperature 0 reproduces the greedy path through the
+     * sampler.
+     */
+    public int32 submitSampled(int32[] prompt, int32 promptLen, int32 maxNew,
+            #SampleParams params) {
+        Request r = heap Request(prompt, promptLen, maxNew);
+        Sampler smp #= heap Sampler(#params, this.model.vocabSize());
+        r.attachSampler(#smp);
+        this.reqs.add(#r);
+        return this.reqs.count() - 1;
+    }
+
+    public Request request(int32 id) {
+        return this.reqs.get(id);
+    }
+
+    // ── counters (6.25) ─────────────────────────────────────────────────
+
+    public int32 admittedCount() {
+        return this.admittedN;
+    }
+
+    public int32 preemptedCount() {
+        return this.preemptedN;
+    }
+
+    public int32 resumedCount() {
+        return this.resumedN;
+    }
+
+    /** Requests waiting for a slot or for blocks (incl. preempted). */
+    public int32 queuedCount() {
+        int32 n = 0;
+        int32 i = 0;
+        while (i < this.reqs.count()) {
+            int32 st = this.reqs.get(i).state;
+            if (st == Request.WAITING || st == Request.PREEMPTED) {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        return n;
+    }
+
+    public int32 stepCount() {
+        return this.steps;
+    }
+
+    public boolean allDone() {
+        int32 i = 0;
+        while (i < this.reqs.count()) {
+            if (this.reqs.get(i).state != Request.DONE) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    // ── the iteration (6.20) ────────────────────────────────────────────
+
+    /**
+     * One scheduling iteration: admit what fits (resumes first), give
+     * every running request one bounded item, emit tokens for requests
+     * whose newest position was consumed, release completions, and admit
+     * again so a completion's blocks serve a waiter within the SAME step
+     * (6.24). Returns whether unfinished requests remain.
+     */
+    public boolean stepOnce() {
+        this.steps = this.steps + 1;
+        this.admitPhase();
+        PagedKvCache cache = this.model.kvCache();
+        int32 i = 0;
+        while (i < this.reqs.count()) {
+            Request r = this.reqs.get(i);
+            if (r.state == Request.RUNNING) {
+                int32 n = r.totalLen - r.cachedLen;
+                if (n > this.chunk) {
+                    n = this.chunk;
+                }
+                // Per-item headroom: preempt YOUNGER requests until this
+                // item fits; if this request is itself the youngest, it
+                // yields (preempts itself) instead (6.22).
+                while (cache.blocksNeededFor(r.slot, n) > cache.freeBlocks()) {
+                    int32 victim = this.youngestRunning();
+                    if (victim < 0) {
+                        throw heap LlamaException(
+                            "scheduler: no preemptable sequence");
+                    }
+                    this.preempt(victim);
+                    if (victim == i) {
+                        break;
+                    }
+                }
+                if (r.state != Request.RUNNING) {
+                    i = i + 1;
+                    continue;
+                }
+                int32 ret = this.model.stepSeq(r.slot, r.all, r.cachedLen, n);
+                r.cachedLen = r.cachedLen + n;
+                this.prefillRowsN = this.prefillRowsN + n;
+                if (r.cachedLen == r.totalLen) {
+                    // The newest position was consumed: `ret` is the
+                    // model's argmax (interior chunks discard it). A
+                    // sampled request draws from the SAME logits instead
+                    // (they are still pooled from this stepSeq — requests
+                    // advance one at a time), with the penalty history
+                    // being its previously EMITTED tokens (8.5).
+                    int32 tok = ret;
+                    if (r.sampler != null) {
+                        tok = r.sampler.sample(this.model.logits(), r.all,
+                            r.promptLen, r.genCount);
+                    }
+                    r.all[r.totalLen] = tok;
+                    r.totalLen = r.totalLen + 1;
+                    r.genCount = r.genCount + 1;
+                    // 8.8 — deliver before the next step begins.
+                    if (this.sink != null) {
+                        this.sink.onToken(i, tok);
+                    }
+                    // 8.7 — EOS, then stop strings, then the budget.
+                    int32 fin = Request.FINISH_NONE;
+                    if (r.sampler != null) {
+                        fin = this.stopReason(r);
+                    }
+                    if (fin == Request.FINISH_NONE
+                            && r.genCount >= r.maxNew) {
+                        fin = Request.FINISH_BUDGET;
+                    }
+                    if (fin != Request.FINISH_NONE) {
+                        r.finishReason = fin;
+                        // A completed sequence's blocks feed the prompt
+                        // cache before they free (6.16's write, and what
+                        // makes 11.3.1's repeated-prefix win real).
+                        this.saveBlocks(r);
+                        cache.release(r.slot);
+                        this.slotReq[r.slot] = -1;
+                        r.slot = -1;
+                        r.state = Request.DONE;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        // Completions freed blocks: same-step admission (6.24).
+        this.admitPhase();
+        return !this.allDone();
+    }
+
+    /** Drive to completion, with a hard progress cap. */
+    public void runAll(int32 maxSteps) {
+        int32 s = 0;
+        while (s < maxSteps) {
+            if (!this.stepOnce()) {
+                return;
+            }
+            s = s + 1;
+        }
+        throw heap LlamaException("scheduler: not done after " + maxSteps
+            + " steps");
+    }
+
+    // ── internals ───────────────────────────────────────────────────────
+
+    /**
+     * Which halting condition the newest token fired (spec 8.7): a stop
+     * TOKEN is checked directly; stop STRINGS are searched in the decode
+     * of a rolling 16-token window of the generated tail — per-token work
+     * stays bounded (13.10's small constant: one decode buffer and one
+     * candidate String per token), and a stop string spanning more than
+     * 16 tokens is not a stop string.
+     */
+    int32 stopReason(Request r) {
+        SampleParams sp = r.sampler.params();
+        int32 last = r.all[r.totalLen - 1];
+        if (sp.stopTokens != null) {
+            int32 i = 0;
+            while (i < (int32) sp.stopTokens.count()) {
+                if (sp.stopTokens[i] == last) {
+                    return Request.FINISH_EOS;
+                }
+                i = i + 1;
+            }
+        }
+        if (sp.stops != null) {
+            if (this.tok != null) {
+                if (sp.stops.count() > 0) {
+                    int32 w = r.genCount;
+                    if (w > 16) {
+                        w = 16;
+                    }
+                    int32 base = r.totalLen - w;
+                    int32 i = 0;
+                    while (i < w) {
+                        this.tailIds[i] = r.all[base + i];
+                        i = i + 1;
+                    }
+                    int8[] bytes #= this.tok.decode(this.tailIds, w);
+                    int32 bn = (int32) bytes.count();
+                    String txt #= heap String(#bytes, bn);
+                    int32 si = 0;
+                    while (si < sp.stops.count()) {
+                        if (txt.indexOf(sp.stops.get(si)) >= 0L) {
+                            return Request.FINISH_STOP;
+                        }
+                        si = si + 1;
+                    }
+                }
+            }
+        }
+        return Request.FINISH_NONE;
+    }
+
+    void admitPhase() {
+        PagedKvCache cache = this.model.kvCache();
+        while (true) {
+            // Resumes first, FIFO by preemption time; then new waiters,
+            // FIFO by submission (6.23).
+            int32 pick = -1;
+            int32 bestPre = 2147483647;
+            int32 i = 0;
+            while (i < this.reqs.count()) {
+                Request r = this.reqs.get(i);
+                if (r.state == Request.PREEMPTED
+                        && r.preemptStamp < bestPre) {
+                    pick = i;
+                    bestPre = r.preemptStamp;
+                }
+                i = i + 1;
+            }
+            boolean isResume = pick >= 0;
+            if (pick < 0) {
+                i = 0;
+                while (i < this.reqs.count()) {
+                    if (this.reqs.get(i).state == Request.WAITING) {
+                        pick = i;
+                        break;
+                    }
+                    i = i + 1;
+                }
+            }
+            if (pick < 0) {
+                return;
+            }
+            int32 slot = -1;
+            i = 0;
+            while (i < this.maxSeqs) {
+                if (this.slotReq[i] < 0) {
+                    slot = i;
+                    break;
+                }
+                i = i + 1;
+            }
+            if (slot < 0) {
+                return;
+            }
+            Request r = this.reqs.get(pick);
+            // 6.19: the whole uncached suffix plus decode headroom.
+            int32 bt = cache.blocksNeededFor(slot, r.totalLen)
+                + cache.fullLayers();
+            if (bt > cache.freeBlocks()) {
+                return;
+            }
+            this.slotReq[slot] = pick;
+            r.slot = slot;
+            r.cachedLen = 0;
+            r.state = Request.RUNNING;
+            this.stamp = this.stamp + 1;
+            r.stamp = this.stamp;
+            if (isResume) {
+                this.resumedN = this.resumedN + 1;
+            } else {
+                this.admittedN = this.admittedN + 1;
+            }
+            this.adoptPrefix(r);
+        }
+    }
+
+    /**
+     * Longest-prefix adoption (6.17, 6.18, 6.28): walk the request's
+     * block-aligned chain keys until the first miss on ANY layer, then
+     * import that run into the cache — the request's prefill starts at
+     * the uncached suffix. A verification failure during import rolls the
+     * sequence back to empty (corrupt bytes are never adopted, 6.31).
+     */
+    void adoptPrefix(Request r) {
+        if (this.store == null) {
+            return;
+        }
+        PagedKvCache cache = this.model.kvCache();
+        if (cache.fullLayers() != this.model.layerCount()) {
+            return;   // v1: rings are recomputed, not stored
+        }
+        int32 bt = cache.blockTokensN();
+        int32 candidates = r.totalLen / bt;
+        int32 layers = this.model.layerCount();
+        // Probe: the longest run where EVERY layer's key is present.
+        int32 run = 0;
+        boolean stop = false;
+        int32 bi = 0;
+        while (bi < candidates && stop == false) {
+            int32 l = 0;
+            while (l < layers && stop == false) {
+                if (this.store.contains(this.keyFor(r, l, bi)) == false) {
+                    stop = true;
+                }
+                l = l + 1;
+            }
+            if (stop == false) {
+                run = bi + 1;
+            }
+            bi = bi + 1;
+        }
+        // The newest position's LOGITS must be computed, not adopted:
+        // always leave at least one token for the step loop to consume.
+        while (run > 0 && run * bt >= r.totalLen) {
+            run = run - 1;
+        }
+        if (run == 0) {
+            return;
+        }
+        // Import: per block, all layers; any verified-read failure rolls
+        // the whole adoption back (6.31).
+        bi = 0;
+        while (bi < run) {
+            int32 l = 0;
+            while (l < layers) {
+                boolean ok = this.store.get(this.keyFor(r, l, bi),
+                    this.blockBuf);
+                if (ok) {
+                    ok = cache.importBlock(r.slot, l, bi, this.blockBuf);
+                }
+                if (ok == false) {
+                    cache.release(r.slot);
+                    return;
+                }
+                l = l + 1;
+            }
+            this.adoptedBlocksN = this.adoptedBlocksN + 1;
+            bi = bi + 1;
+        }
+        r.cachedLen = run * bt;
+    }
+
+    /** Chain key of block `bi` of layer `l` for request `r` (6.26). */
+    int64 keyFor(Request r, int32 l, int32 bi) {
+        int32 bt = this.model.kvCache().blockTokensN();
+        int64 key = BlockKeys.seed(this.modelId, this.modelDtype,
+            this.modelQuant, l);
+        int32 b = 0;
+        while (b <= bi) {
+            key = BlockKeys.chain(key, r.all, b * bt, bt);
+            b = b + 1;
+        }
+        return key;
+    }
+
+    /** Write `r`'s FULL cached blocks to the store (6.16). */
+    void saveBlocks(Request r) {
+        if (this.store == null) {
+            return;
+        }
+        PagedKvCache cache = this.model.kvCache();
+        if (cache.fullLayers() != this.model.layerCount()) {
+            return;
+        }
+        int32 bt = cache.blockTokensN();
+        int32 nb = r.cachedLen / bt;
+        int32 layers = this.model.layerCount();
+        int32 l = 0;
+        while (l < layers) {
+            int64 key = BlockKeys.seed(this.modelId, this.modelDtype,
+                this.modelQuant, l);
+            int32 bi = 0;
+            while (bi < nb) {
+                key = BlockKeys.chain(key, r.all, bi * bt, bt);
+                cache.exportBlock(r.slot, l, bi, this.blockBuf);
+                this.store.put(key, this.blockBuf);
+                bi = bi + 1;
+            }
+            l = l + 1;
+        }
+    }
+
+    int32 youngestRunning() {
+        int32 best = -1;
+        int32 bestStamp = -1;
+        int32 i = 0;
+        while (i < this.reqs.count()) {
+            Request r = this.reqs.get(i);
+            if (r.state == Request.RUNNING && r.stamp > bestStamp) {
+                best = i;
+                bestStamp = r.stamp;
+            }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    void preempt(int32 id) {
+        Request r = this.reqs.get(id);
+        // With a store attached, eviction is a WRITE, not a discard
+        // (spec 13.16); without one, resume recomputes (6.32).
+        this.saveBlocks(r);
+        this.model.kvCache().release(r.slot);
+        this.slotReq[r.slot] = -1;
+        r.slot = -1;
+        r.cachedLen = 0;
+        r.state = Request.PREEMPTED;
+        this.stamp = this.stamp + 1;
+        r.preemptStamp = this.stamp;
+        this.preemptedN = this.preemptedN + 1;
+    }
+}

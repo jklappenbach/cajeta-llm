@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cajeta-llama Unit 15 support — offline bf16 -> f32 safetensors
+# cajeta-llm Unit 15 support — offline bf16 -> f32 safetensors
 # conversion. The engine's forward path is f32-only today (SafetensorsFile
 # .loadF32 requires stored dtype F32), so the parity run feeds it an f32
 # copy of the reference checkpoint. Sharded output mirrors the input

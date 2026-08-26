@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# cajeta-llama plan 15.1.2/15.1.3 — build and run the ParityRun instrument
-# (dev.cajeta.llama.bench.ParityRun) against the f32-converted reference
+# cajeta-llm plan 15.1.2/15.1.3 — build and run the ParityRun instrument
+# (dev.cajeta.llm.bench.ParityRun) against the f32-converted reference
 # checkpoint and the transformers fp32 fixture. Release + bounded live-set:
 # the shipping configuration (§12.10's compiler-mode axis).
 #
@@ -25,7 +25,7 @@ echo ">> building parity runner (release, bounded live-set)"
 "$CAJETA" --emit=exe --release --live-set=bounded --xpu-backend=cpu \
     --classpath="$CODEC_CJA,$JINJA_CJA" \
     -o "$out/parity" \
-    dev.cajeta.llama.bench.ParityRun.run "$here/src/main/cajeta" "$out" >/dev/null
+    dev.cajeta.llm.bench.ParityRun.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> running (8B f32 on host — expect minutes)"
 cd "$here"

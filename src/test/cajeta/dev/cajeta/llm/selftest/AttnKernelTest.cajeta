@@ -1,0 +1,899 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.model.AttnKernel;
+import dev.cajeta.llm.model.DeviceKv;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.model.PagedKvCache;
+
+/**
+ * threaded-forward-path plan 10.11 — the decode attention tail on the
+ * device: RoPE, the KV append and the attend.
+ *
+ * The bar is a TOLERANCE, not bit-identity, and unlike the Q4_K suite
+ * that is forced rather than chosen: the score is reduced as a 32-lane
+ * tree on the device and as an ascending sequential sum on the host, so
+ * a few ULP of difference is the CORRECT outcome. What is held exactly
+ * is the shape — every head written, every position read, the softmax
+ * normalized — and each of those has a test that FAILS when it is wrong,
+ * not merely one that passes when it is right.
+ *
+ * Every test also asserts the output is non-zero. A kernel that fails to
+ * lower does not fail the build (plan 8.11): the launch finds nothing
+ * registered and the buffer reads back zeros, and two zeros compare
+ * equal. That is how a suite comes to pass while running no kernel.
+ */
+public class AttnKernelTest {
+
+    public AttnKernelTest() { return; }
+
+    static boolean onDevice() {
+        String be #= Device.activeBackend();
+        return !be.equals("cpu") && !be.equals("none");
+    }
+
+    static void assertLive(float32[] v, String what) {
+        int64 i = 0;
+        while (i < (int64) v.count()) {
+            if (v[i] != 0.0f) { return; }
+            i = i + 1;
+        }
+        Assert.fail(what + ": every value is zero, which is what a kernel "
+            + "that never ran produces");
+    }
+
+    /** Mixed signs and magnitudes; a constant fill hides lane misordering
+     *  and an all-positive fill hides sign handling. */
+    static #float32[] spread(int64 n, int32 seed) {
+        float32[] x #= heap float32[n];
+        int64 i = 0;
+        int32 s = seed;
+        while (i < n) {
+            s = s * 1103515245 + 12345;
+            if (s < 0) { s = 0 - s; }
+            int32 m = s % 2000;
+            x[i] = ((float32) m - 1000.0f) / 700.0f;
+            i = i + 1;
+        }
+        return #x;
+    }
+
+    static void assertClose(float32[] want, float32[] got, String what) {
+        int64 i = 0;
+        while (i < (int64) want.count()) {
+            float32 a = want[i];
+            float32 b = got[i];
+            float32 diff = a - b;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.001f + 0.0002f) {
+                Assert.fail(what + " at " + i + ": device " + b
+                    + " vs host " + a
+                    + " - further apart than reassociation explains");
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── RoPE ────────────────────────────────────────────────────────────
+
+    /**
+     * 10.11.1 — the device RoPE rotates every head of a query row exactly
+     * as the host floor does.
+     */
+    @Test
+    public void theDeviceRopeMatchesTheHostRotation() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 nH = 6;
+        int32 hd = 16;
+        int32 half = hd / 2;
+        int32 pos = 37;
+        float32[] t0 #= AttnKernelTest.spread((int64) (nH * hd), 7);
+        float32[] inv #= heap float32[(int64) half];
+        int32 d = 0;
+        while (d < half) {
+            inv[(int64) d] = 1.0f
+                / Math.pow(10000.0f, (float32) (2 * d) / (float32) hd);
+            d = d + 1;
+        }
+        // Host floor, computed here rather than borrowed, so the test does
+        // not pass by comparing a routine against itself.
+        float32[] want #= heap float32[(int64) (nH * hd)];
+        int64 c = 0;
+        while (c < (int64) (nH * hd)) { want[c] = t0[c]; c = c + 1; }
+        int32 h = 0;
+        while (h < nH) {
+            int64 base = (int64) (h * hd);
+            int32 j = 0;
+            while (j < half) {
+                float32 ang = (float32) pos * inv[(int64) j];
+                float32 cs = Math.cos(ang);
+                float32 sn = Math.sin(ang);
+                float32 a = t0[base + (int64) j];
+                float32 b = t0[base + (int64) (j + half)];
+                want[base + (int64) j] = a * cs - b * sn;
+                want[base + (int64) (j + half)] = a * sn + b * cs;
+                j = j + 1;
+            }
+            h = h + 1;
+        }
+
+        float32[] got #= heap float32[(int64) (nH * hd)];
+        c = 0;
+        while (c < (int64) (nH * hd)) { got[c] = t0[c]; c = c + 1; }
+        AttnKernel.ropeDecodeInto(got, inv, nH, hd, pos);
+
+        AttnKernelTest.assertLive(got, "device rope");
+        AttnKernelTest.assertClose(want, got, "rope");
+    }
+
+    /**
+     * 10.11.1 — and it does NOT leave the row unrotated. A kernel that
+     * silently failed to lower would return the buffer it was handed, and
+     * the agreement test above cannot tell that from success unless the
+     * rotation actually moves the values.
+     */
+    @Test
+    public void theDeviceRopeActuallyChangesTheRow() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 nH = 4;
+        int32 hd = 16;
+        float32[] t0 #= AttnKernelTest.spread((int64) (nH * hd), 11);
+        float32[] inv #= heap float32[(int64) (hd / 2)];
+        int32 d = 0;
+        while (d < hd / 2) {
+            inv[(int64) d] = 1.0f
+                / Math.pow(10000.0f, (float32) (2 * d) / (float32) hd);
+            d = d + 1;
+        }
+        float32[] got #= heap float32[(int64) (nH * hd)];
+        int64 c = 0;
+        while (c < (int64) (nH * hd)) { got[c] = t0[c]; c = c + 1; }
+        AttnKernel.ropeDecodeInto(got, inv, nH, hd, 19);
+        int64 moved = 0;
+        c = 0;
+        while (c < (int64) (nH * hd)) {
+            if (got[c] != t0[c]) { moved = moved + 1; }
+            c = c + 1;
+        }
+        // Dimension 0 has invFreq 1.0 and every other dim a smaller angle;
+        // at position 19 none of them is a multiple of 2*pi, so every
+        // element must move.
+        if (moved < (int64) (nH * hd)) {
+            Assert.fail("rope left " + ((int64) (nH * hd) - moved)
+                + " of " + (nH * hd) + " elements untouched");
+        }
+    }
+
+    // ── attend ──────────────────────────────────────────────────────────
+
+    /**
+     * 10.11.3 — the two-phase device attend agrees with the host floor,
+     * at GQA (nH != nKv) and a context deep enough that the softmax has
+     * something to normalize.
+     */
+    @Test
+    public void theDeviceAttendMatchesTheHostFloor() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 nH = 8;
+        int32 nKv = 2;
+        int32 hd = 64;
+        int32 count = 40;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        int64 kvDim = (int64) (nKv * hd);
+        float32[] q #= AttnKernelTest.spread((int64) (nH * hd), 3);
+        float32[] k #= AttnKernelTest.spread((int64) count * kvDim, 5);
+        float32[] v #= AttnKernelTest.spread((int64) count * kvDim, 9);
+
+        float32[] want #= heap float32[(int64) (nH * hd)];
+        AttnKernel.attendDecodeHost(want, q, k, v, nH, nKv, hd, count,
+            scale);
+        float32[] got #= heap float32[(int64) (nH * hd)];
+        AttnKernel.attendDecodeInto(got, q, k, v, nH, nKv, hd, count,
+            scale);
+
+        AttnKernelTest.assertLive(got, "device attend");
+        AttnKernelTest.assertClose(want, got, "attend");
+    }
+
+    /**
+     * 10.11.3 — every head is written, including the last.
+     *
+     * A grid computed as `nH` when it should have been `nH x 128`, or a
+     * head index taken from the wrong divisor, leaves a suffix of the
+     * output at zero. Against smooth data the surviving heads still
+     * agree, so the tolerance test above passes; only counting the
+     * untouched tail catches it.
+     */
+    @Test
+    public void theDeviceAttendWritesEveryHead() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 nH = 12;
+        int32 nKv = 4;
+        int32 hd = 32;
+        int32 count = 7;
+        float32[] q #= AttnKernelTest.spread((int64) (nH * hd), 21);
+        float32[] k #= AttnKernelTest.spread(
+            (int64) count * (int64) (nKv * hd), 23);
+        float32[] v #= AttnKernelTest.spread(
+            (int64) count * (int64) (nKv * hd), 27);
+        float32[] got #= heap float32[(int64) (nH * hd)];
+        AttnKernel.attendDecodeInto(got, q, k, v, nH, nKv, hd, count,
+            1.0f / Math.sqrt((float32) hd));
+        int32 h = 0;
+        while (h < nH) {
+            boolean live = false;
+            int32 d = 0;
+            while (d < hd) {
+                if (got[(int64) (h * hd + d)] != 0.0f) { live = true; }
+                d = d + 1;
+            }
+            if (!live) {
+                Assert.fail("head " + h + " of " + nH
+                    + " is entirely zero - the grid or the head index is "
+                    + "short");
+            }
+            h = h + 1;
+        }
+    }
+
+    /**
+     * 10.11.3 — the attend READS every cached position, not just the
+     * newest.
+     *
+     * The control varies the MECHANISM rather than the data: one V row is
+     * moved, and the answer must move with it. A kernel that attended
+     * only over the last position, or that clamped `count` to one,
+     * produces a self-consistent result on any single input — comparing
+     * against a host floor with the same off-by-one would agree. Making
+     * a position that should be read stop mattering is what distinguishes
+     * them.
+     */
+    @Test
+    public void theDeviceAttendReadsTheWholeContextNotJustTheLastRow() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 nH = 4;
+        int32 nKv = 1;
+        int32 hd = 32;
+        int32 count = 16;
+        int64 kvDim = (int64) (nKv * hd);
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        float32[] q #= AttnKernelTest.spread((int64) (nH * hd), 31);
+        float32[] k #= AttnKernelTest.spread((int64) count * kvDim, 33);
+        float32[] v #= AttnKernelTest.spread((int64) count * kvDim, 35);
+        float32[] base #= heap float32[(int64) (nH * hd)];
+        AttnKernel.attendDecodeInto(base, q, k, v, nH, nKv, hd, count,
+            scale);
+
+        // Perturb the FIRST cached position only.
+        float32[] v2 #= heap float32[(int64) count * kvDim];
+        int64 i = 0;
+        while (i < (int64) count * kvDim) { v2[i] = v[i]; i = i + 1; }
+        int64 j = 0;
+        while (j < kvDim) { v2[j] = v2[j] + 4.0f; j = j + 1; }
+        float32[] moved #= heap float32[(int64) (nH * hd)];
+        AttnKernel.attendDecodeInto(moved, q, k, v2, nH, nKv, hd, count,
+            scale);
+
+        int64 changed = 0;
+        i = 0;
+        while (i < (int64) (nH * hd)) {
+            if (moved[i] != base[i]) { changed = changed + 1; }
+            i = i + 1;
+        }
+        if (changed == 0) {
+            Assert.fail("changing V at position 0 changed nothing - the "
+                + "attend is not reading the whole context");
+        }
+    }
+
+    /**
+     * 10.11.3 — the softmax weights sum to one.
+     *
+     * Fed a V cache whose every row is the constant 1.0, the output must
+     * be 1.0 in every element whatever the scores are, because the
+     * weights are a convex combination. This catches a missing
+     * normalizer, a normalizer summed over the wrong range, and a max
+     * subtraction that did not cancel — none of which a comparison
+     * against a host floor sharing the same mistake would catch.
+     */
+    @Test
+    public void theDeviceAttendNormalizesItsWeights() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 nH = 8;
+        int32 nKv = 2;
+        int32 hd = 64;
+        int32 count = 33;
+        int64 kvDim = (int64) (nKv * hd);
+        float32[] q #= AttnKernelTest.spread((int64) (nH * hd), 41);
+        float32[] k #= AttnKernelTest.spread((int64) count * kvDim, 43);
+        float32[] v #= heap float32[(int64) count * kvDim];
+        int64 i = 0;
+        while (i < (int64) count * kvDim) { v[i] = 1.0f; i = i + 1; }
+        float32[] got #= heap float32[(int64) (nH * hd)];
+        AttnKernel.attendDecodeInto(got, q, k, v, nH, nKv, hd, count,
+            1.0f / Math.sqrt((float32) hd));
+        i = 0;
+        while (i < (int64) (nH * hd)) {
+            float32 e = got[i] - 1.0f;
+            if (e < 0.0f) { e = 0.0f - e; }
+            if (e > 0.0005f) {
+                Assert.fail("with V all ones the attend must return 1.0; "
+                    + "element " + i + " is " + got[i]
+                    + " - the softmax weights do not sum to one");
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── the device/host K/V coherence machinery (10.11.2) ───────────────
+
+    /** hidden 16, 2 heads / 1 kv head -> headDim 8, kvDim 8. */
+    static #ModelConfig kvCfg(int32 layers, int32 window) {
+        String path = "tmp/cajeta_llama_devkv_cfg.json";
+        String extra = "";
+        if (window > 0) {
+            extra = "\"sliding_window\":" + window + ",";
+        }
+        ToyModel.writeConfigX(path, "LlamaForCausalLM", 16, 32, layers,
+            2, 1, 0, 24, 64, true, extra);
+        ModelConfig cfg = ModelConfig.parse(path);
+        cfg.blockTokens = 4;
+        return #cfg;
+    }
+
+    /**
+     * 10.11.2 — `supports` refuses the layouts the flat planes cannot
+     * serve.
+     *
+     * The DOES-NOT-FIRE half of the check, and the half that matters: a
+     * windowed layer indexes K/V through a ring the planes do not have,
+     * so admitting one would not crash, it would attend over the wrong
+     * positions and return a plausible wrong token.
+     */
+    @Test
+    public void deviceKvRefusesWindowedLayers() {
+        ModelConfig plain #= AttnKernelTest.kvCfg(2, 0);
+        if (!DeviceKv.supports(plain)) {
+            Assert.fail("an unwindowed 8-wide-head config must be "
+                + "supported; the predicate never fires");
+        }
+        ModelConfig windowed #= AttnKernelTest.kvCfg(2, 8);
+        if (DeviceKv.supports(windowed)) {
+            Assert.fail("a windowed layer has no ring in the flat device "
+                + "planes and must be refused");
+        }
+    }
+
+    /**
+     * 10.11.2 — seed, append on the device, write back, and the paged
+     * cache holds exactly what the device did.
+     *
+     * This is the whole coherence contract in one test. Its failure mode
+     * is silent: a writeback that lost a position, wrote it at the wrong
+     * offset, or skipped a layer leaves a cache that still answers every
+     * read, just with the wrong bytes. So the values are DISTINCT per
+     * (layer, position, dim) and each is checked, rather than asserting
+     * the row is merely non-zero.
+     */
+    @Test
+    public void deviceKvWritesBackEveryLayerAndPosition() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 layers = 3;
+        ModelConfig cfg #= AttnKernelTest.kvCfg(layers, 0);
+        int32 kvDim = cfg.kvDim();
+        // 32 BLOCKS, not 0: the zero was written against the suite's
+        // vacuously green era (the amdgpu sweep compiled cpu and this
+        // test early-returned) — a zero-block pool fails its FIRST
+        // append, so the test had never run to its own first assert.
+        PagedKvCache cache #= heap PagedKvCache(cfg, 32, 1, 32);
+        DeviceKv dk #= heap DeviceKv(cfg, 32);
+        dk.seed(cache, 0);
+        if (dk.owns()) {
+            Assert.fail("a freshly seeded DeviceKv owns nothing yet");
+        }
+
+        // Append three positions on every layer, with values that encode
+        // exactly where they came from.
+        int32 posCount = 3;
+        KernelBuffer<float32> kb #= heap KernelBuffer<float32>(
+            (uint64) kvDim);
+        KernelBuffer<float32> vb #= heap KernelBuffer<float32>(
+            (uint64) kvDim);
+        float32[] kh #= heap float32[(int64) kvDim];
+        float32[] vh #= heap float32[(int64) kvDim];
+        int32 p = 0;
+        while (p < posCount) {
+            int32 l = 0;
+            while (l < layers) {
+                int32 d = 0;
+                while (d < kvDim) {
+                    kh[(int64) d] = (float32) (1000 * l + 10 * p + d);
+                    vh[(int64) d] = 0.0f - (float32) (1000 * l + 10 * p + d);
+                    d = d + 1;
+                }
+                kb.upload(kh);
+                vb.upload(vh);
+                dk.append(l, kb, vb, p);
+                l = l + 1;
+            }
+            dk.notePosition(p);
+            p = p + 1;
+        }
+        if (!dk.owns()) {
+            Assert.fail("after appending on the device the planes must "
+                + "own rows the cache does not");
+        }
+        if (dk.length() != posCount) {
+            Assert.fail("device length is " + dk.length() + ", expected "
+                + posCount);
+        }
+
+        dk.writeback(cache, 0);
+        if (dk.owns()) {
+            Assert.fail("after a writeback the device owns nothing");
+        }
+        if (cache.lengthOf(0, 0) != posCount) {
+            Assert.fail("cache length is " + cache.lengthOf(0, 0)
+                + " after writeback, expected " + posCount);
+        }
+        int32 l2 = 0;
+        while (l2 < layers) {
+            int32 p2 = 0;
+            while (p2 < posCount) {
+                int32 d2 = 0;
+                while (d2 < kvDim) {
+                    float32 want = (float32) (1000 * l2 + 10 * p2 + d2);
+                    float32 gotK = cache.kAt(0, l2, p2, d2);
+                    float32 gotV = cache.vAt(0, l2, p2, d2);
+                    if (gotK != want) {
+                        Assert.fail("K at layer " + l2 + " position " + p2
+                            + " dim " + d2 + " is " + gotK + ", expected "
+                            + want);
+                    }
+                    if (gotV != 0.0f - want) {
+                        Assert.fail("V at layer " + l2 + " position " + p2
+                            + " dim " + d2 + " is " + gotV + ", expected "
+                            + (0.0f - want));
+                    }
+                    d2 = d2 + 1;
+                }
+                p2 = p2 + 1;
+            }
+            l2 = l2 + 1;
+        }
+    }
+
+    /**
+     * 10.11.2 — seeding carries the cache's EXISTING positions onto the
+     * device, so a decode that follows a prefill attends over the prompt.
+     *
+     * The control varies the mechanism rather than the data: rows are
+     * put in the cache by the host path, then read back through a device
+     * ATTEND whose V is what was seeded. A seed that uploaded nothing —
+     * or uploaded capacity instead of content — leaves zeros, and the
+     * attend over an all-zero V returns zeros whatever the scores are.
+     */
+    @Test
+    public void deviceKvSeedCarriesTheHostRowsOntoTheDevice() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        ModelConfig cfg #= AttnKernelTest.kvCfg(1, 0);
+        int32 kvDim = cfg.kvDim();
+        // 32 blocks, not 0 — same vacuous-green artifact as above.
+        PagedKvCache cache #= heap PagedKvCache(cfg, 32, 1, 32);
+        int32 n = 5;
+        float32[] kh #= heap float32[(int64) kvDim];
+        float32[] vh #= heap float32[(int64) kvDim];
+        int32 p = 0;
+        while (p < n) {
+            int32 d = 0;
+            while (d < kvDim) {
+                kh[(int64) d] = (float32) (10 * p + d) / 8.0f;
+                vh[(int64) d] = (float32) (7 * p + 3 * d) / 5.0f;
+                d = d + 1;
+            }
+            if (!cache.appendRowRaw(0, 0, kh, 0L, vh, 0L, p)) {
+                Assert.fail("host append failed at position " + p);
+            }
+            p = p + 1;
+        }
+
+        DeviceKv dk #= heap DeviceKv(cfg, 32);
+        dk.seed(cache, 0);
+        if (dk.length() != n) {
+            Assert.fail("seed produced length " + dk.length()
+                + ", expected " + n);
+        }
+        // Read the planes straight back. An upload that sent CAPACITY
+        // instead of CONTENT — the 10.1 defect, which cost a day — lands
+        // the right byte count in the right buffer and the wrong values
+        // in it, so the count passing proves nothing on its own.
+        int64 span = (int64) n * (int64) kvDim;
+        float32[] backK #= heap float32[span];
+        float32[] backV #= heap float32[span];
+        dk.kPlane(0).download(backK, span);
+        dk.vPlane(0).download(backV, span);
+        int32 p3 = 0;
+        while (p3 < n) {
+            int32 d3 = 0;
+            while (d3 < kvDim) {
+                int64 at = (int64) p3 * (int64) kvDim + (int64) d3;
+                float32 wantK = (float32) (10 * p3 + d3) / 8.0f;
+                float32 wantV = (float32) (7 * p3 + 3 * d3) / 5.0f;
+                if (backK[at] != wantK) {
+                    Assert.fail("seeded K at position " + p3 + " dim " + d3
+                        + " reads back " + backK[at] + ", expected " + wantK
+                        + " - the seed did not carry the host rows");
+                }
+                if (backV[at] != wantV) {
+                    Assert.fail("seeded V at position " + p3 + " dim " + d3
+                        + " reads back " + backV[at] + ", expected "
+                        + wantV);
+                }
+                d3 = d3 + 1;
+            }
+            p3 = p3 + 1;
+        }
+    }
+
+    // ── prefill attend (10.12.2) ────────────────────────────────────────
+
+    /**
+     * 10.12.2 — the prefill attend agrees with the host floor on every
+     * query row, and each row is CAUSAL: row `r` reads `[0, r]` and
+     * nothing past it.
+     *
+     * Causality is the part that cannot be checked by agreement alone,
+     * because a host floor with the same off-by-one agrees perfectly. So
+     * the second half of this test perturbs a LATER key position and
+     * asserts the earlier rows do not move — a kernel that let row 0 see
+     * position 5 passes every tolerance check and produces fluent,
+     * wrong text.
+     */
+    @Test
+    public void thePrefillAttendIsCausalPerRow() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 rows = 12;
+        int32 nH = 8;
+        int32 nKv = 2;
+        int32 hd = 64;
+        int32 startPos = 0;
+        int32 tMax = startPos + rows;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        float32[] q #= AttnKernelTest.spread(qn, 61);
+        float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 63);
+        float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim, 67);
+
+        float32[] want #= heap float32[qn];
+        AttnKernel.attendPrefillHost(want, q, k, v, rows, nH, nKv, hd,
+            startPos, scale);
+        float32[] got #= heap float32[qn];
+        AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv, hd,
+            startPos, scale);
+        AttnKernelTest.assertLive(got, "prefill attend");
+        AttnKernelTest.assertClose(want, got, "prefill attend");
+
+        // Move the LAST key position. Row `rows-1` must move; every row
+        // before it must not.
+        float32[] v2 #= heap float32[(int64) tMax * kvDim];
+        int64 i = 0;
+        while (i < (int64) tMax * kvDim) { v2[i] = v[i]; i = i + 1; }
+        int64 last = (int64) (tMax - 1) * kvDim;
+        int64 j = 0;
+        while (j < kvDim) { v2[last + j] = v2[last + j] + 5.0f; j = j + 1; }
+        float32[] moved #= heap float32[qn];
+        AttnKernel.attendPrefillInto(moved, q, k, v2, rows, nH, nKv, hd,
+            startPos, scale);
+
+        int64 rowLen = (int64) (nH * hd);
+        int32 r = 0;
+        while (r < rows - 1) {
+            int64 off = (int64) r * rowLen;
+            int64 c = 0;
+            while (c < rowLen) {
+                if (moved[off + c] != got[off + c]) {
+                    Assert.fail("row " + r + " changed when key position "
+                        + (tMax - 1) + " changed - the prefill attend is "
+                        + "NOT causal");
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        int64 lo = (int64) (rows - 1) * rowLen;
+        int64 diff = 0;
+        int64 c2 = 0;
+        while (c2 < rowLen) {
+            if (moved[lo + c2] != got[lo + c2]) { diff = diff + 1; }
+            c2 = c2 + 1;
+        }
+        if (diff == 0) {
+            Assert.fail("the last row did not change when the last key "
+                + "position changed - it is not reading its own position");
+        }
+    }
+
+    // ── flash prefill attend at hd 128 (10.12.43) ───────────────────────
+    //
+    // The hd==128 route is the one the model actually runs, and until
+    // these tests it was UNTESTED here — the v1-shaped tests above use
+    // hd 64/32, which the launch routes AWAY from the v2/flash kernels.
+    // v2 shipped on bench-token equality alone; the flash kernel gets a
+    // real floor.
+
+    /**
+     * 10.12.43 — the fused online-softmax prefill attend agrees with the
+     * host floor at hd 128 (the routed shape), GQA, both at startPos 0
+     * and mid-sequence. The online (m, l) recurrence reorders the exp
+     * sums relative to the host's two-pass softmax, so tolerance is the
+     * bar, exactly as for the reduction trees.
+     */
+    @Test
+    public void theFlashPrefillAttendMatchesTheHostAtHd128() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        AttnKernel.setAttnFlash(true);
+        int32 nH = 8;
+        int32 hd = 128;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        // nKv = 2 is group 4 (the GQA x4 wave kernel); nKv = 4 is group
+        // 2 (the general fused fallback). Both routes get the floor.
+        int32 nKv = 2;
+        while (nKv <= 4) {
+            int32 sp = 0;
+            while (sp <= 10) {
+                int32 rows = 9;
+                int32 tMax = sp + rows;
+                int64 kvDim = (int64) (nKv * hd);
+                int64 qn = (int64) rows * (int64) (nH * hd);
+                float32[] q #= AttnKernelTest.spread(qn, 83 + sp + nKv);
+                float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim,
+                    89);
+                float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim,
+                    97);
+                float32[] want #= heap float32[qn];
+                AttnKernel.attendPrefillHost(want, q, k, v, rows, nH, nKv,
+                    hd, sp, scale);
+                float32[] got #= heap float32[qn];
+                AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv,
+                    hd, sp, scale);
+                AttnKernelTest.assertLive(got, "flash prefill attend nKv"
+                    + nKv + " sp" + sp);
+                AttnKernelTest.assertClose(want, got,
+                    "flash prefill attend nKv" + nKv + " sp" + sp);
+                sp = sp + 10;
+            }
+            nKv = nKv + 2;
+        }
+    }
+
+    /**
+     * 10.12.43 — the flash attend is causal at hd 128: moving the last
+     * key position moves only the last row. A fused kernel that ran its
+     * online loop one position long agrees with nothing here. Runs BOTH
+     * routed shapes: nKv = 1 (nH == 4 * nKv, the GQA x4 wave kernel) and
+     * nKv = 2 (group 2, the general fused fallback).
+     */
+    @Test
+    public void theFlashPrefillAttendIsCausalAtHd128() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        AttnKernel.setAttnFlash(true);
+        int32 nkv = 1;
+        while (nkv <= 2) {
+            AttnKernelTest.causalAtHd128(nkv);
+            nkv = nkv + 1;
+        }
+    }
+
+    static void causalAtHd128(int32 nKv) {
+        int32 rows = 7;
+        int32 nH = 4;
+        int32 hd = 128;
+        int32 tMax = rows;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        float32[] q #= AttnKernelTest.spread(qn, 101);
+        float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 103);
+        float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim, 107);
+        float32[] got #= heap float32[qn];
+        AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv, hd,
+            0, scale);
+        float32[] v2 #= heap float32[(int64) tMax * kvDim];
+        int64 i = 0;
+        while (i < (int64) tMax * kvDim) { v2[i] = v[i]; i = i + 1; }
+        int64 last = (int64) (tMax - 1) * kvDim;
+        int64 j = 0;
+        while (j < kvDim) { v2[last + j] = v2[last + j] + 5.0f; j = j + 1; }
+        float32[] moved #= heap float32[qn];
+        AttnKernel.attendPrefillInto(moved, q, k, v2, rows, nH, nKv, hd,
+            0, scale);
+        int64 rowLen = (int64) (nH * hd);
+        int32 r = 0;
+        while (r < rows - 1) {
+            int64 off = (int64) r * rowLen;
+            int64 c = 0;
+            while (c < rowLen) {
+                if (moved[off + c] != got[off + c]) {
+                    Assert.fail("flash row " + r + " changed when key "
+                        + "position " + (tMax - 1) + " changed - NOT "
+                        + "causal");
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        int64 lo = (int64) (rows - 1) * rowLen;
+        int64 diff = 0;
+        int64 c2 = 0;
+        while (c2 < rowLen) {
+            if (moved[lo + c2] != got[lo + c2]) { diff = diff + 1; }
+            c2 = c2 + 1;
+        }
+        if (diff == 0) {
+            Assert.fail("the last row did not move with the last key "
+                + "position - the flash attend is not reading it");
+        }
+    }
+
+    /**
+     * 10.12.43 — the flash attend's ONLINE normalizer sums to one. The
+     * two-pass softmax's normalizer is a plain sum; the online one is
+     * rebuilt through rescale-by-exp(mOld - mNew) corrections at every
+     * running-max update, and a correction applied to `l` but not to the
+     * accumulator (or vice versa) still produces plausible values on
+     * smooth data. With V all ones the output must be exactly a convex
+     * weight sum: 1.0 everywhere.
+     */
+    @Test
+    public void theFlashPrefillAttendNormalizesItsOnlineWeights() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        AttnKernel.setAttnFlash(true);
+        int32 rows = 8;
+        int32 nH = 4;
+        int32 nKv = 1;
+        int32 hd = 128;
+        int32 tMax = rows;
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        // Scale UP rather than down so the scores swing hard and the
+        // running max updates many times - a rescale bug needs max
+        // updates to fire at all.
+        float32 scale = 2.0f;
+        float32[] q #= AttnKernelTest.spread(qn, 113);
+        float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 127);
+        float32[] v #= heap float32[(int64) tMax * kvDim];
+        int64 i = 0;
+        while (i < (int64) tMax * kvDim) { v[i] = 1.0f; i = i + 1; }
+        float32[] got #= heap float32[qn];
+        AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv, hd,
+            0, scale);
+        i = 0;
+        while (i < qn) {
+            float32 e = got[i] - 1.0f;
+            if (e < 0.0f) { e = 0.0f - e; }
+            if (e > 0.0005f) {
+                Assert.fail("with V all ones the flash attend must return "
+                    + "1.0; element " + i + " is " + got[i]
+                    + " - the online normalizer does not sum to one");
+            }
+            i = i + 1;
+        }
+    }
+
+    /**
+     * 10.12.2 — the prefill attend honours a nonzero `startPos`, so a
+     * second prefill chunk reads the first chunk's positions.
+     */
+    @Test
+    public void thePrefillAttendReadsHistoryBeforeItsChunk() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 rows = 6;
+        int32 nH = 4;
+        int32 nKv = 1;
+        int32 hd = 32;
+        int32 startPos = 10;
+        int32 tMax = startPos + rows;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        float32[] q #= AttnKernelTest.spread(qn, 71);
+        float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 73);
+        float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim, 79);
+        float32[] want #= heap float32[qn];
+        AttnKernel.attendPrefillHost(want, q, k, v, rows, nH, nKv, hd,
+            startPos, scale);
+        float32[] got #= heap float32[qn];
+        AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv, hd,
+            startPos, scale);
+        AttnKernelTest.assertLive(got, "prefill attend at startPos 10");
+        AttnKernelTest.assertClose(want, got, "prefill attend startPos");
+    }
+
+    // ── fused flash decode (2026-08-25 decode attribution) ──────────────
+
+    /**
+     * The FUSED flash decode (GQA x4, hd 128, split-S over positions)
+     * agrees with the host floor at every split shape: one position, fewer
+     * positions than splits, a ragged final chunk, one exact chunk, and a
+     * 512-class context. The counter assertion is the vacuous-green guard:
+     * a routing predicate that quietly fell back to the two-kernel path
+     * would pass every tolerance here while testing nothing.
+     */
+    @Test
+    public void theFlashDecodeGqa4MatchesTheHostFloor() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 nH = 8;
+        int32 nKv = 2;
+        int32 hd = 128;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        int64 kvDim = (int64) (nKv * hd);
+        int32[] counts #= heap int32[5];
+        counts[0] = 1;
+        counts[1] = 3;
+        counts[2] = 16;
+        counts[3] = 100;
+        counts[4] = 513;
+        int64 before = AttnKernel.flashDecodeCalls();
+        int32 ci = 0;
+        while (ci < 5) {
+            int32 count = counts[ci];
+            float32[] q #= AttnKernelTest.spread((int64) (nH * hd), 3 + ci);
+            float32[] k #= AttnKernelTest.spread((int64) count * kvDim,
+                5 + ci);
+            float32[] v #= AttnKernelTest.spread((int64) count * kvDim,
+                9 + ci);
+            float32[] want #= heap float32[(int64) (nH * hd)];
+            AttnKernel.attendDecodeHost(want, q, k, v, nH, nKv, hd, count,
+                scale);
+            float32[] got #= heap float32[(int64) (nH * hd)];
+            AttnKernel.attendDecodeInto(got, q, k, v, nH, nKv, hd, count,
+                scale);
+            AttnKernelTest.assertLive(got, "flash decode count " + count);
+            AttnKernelTest.assertClose(want, got,
+                "flash decode count " + count);
+            ci = ci + 1;
+        }
+        if (AttnKernel.flashDecodeCalls() != before + 5L) {
+            Assert.fail("the GQA4 shape must route to the fused flash "
+                + "decode: " + (AttnKernel.flashDecodeCalls() - before)
+                + " of 5 calls took it");
+        }
+    }
+
+    /**
+     * The two decode attend paths agree with EACH OTHER on the same
+     * buffers — the fused path forced off must land within tolerance of
+     * the fused path on, so an arm comparison (`nofd`) measures the same
+     * arithmetic.
+     */
+    @Test
+    public void theFusedAndTwoKernelDecodesAgree() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        int32 nH = 8;
+        int32 nKv = 2;
+        int32 hd = 128;
+        int32 count = 129;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        int64 kvDim = (int64) (nKv * hd);
+        float32[] q #= AttnKernelTest.spread((int64) (nH * hd), 31);
+        float32[] k #= AttnKernelTest.spread((int64) count * kvDim, 37);
+        float32[] v #= AttnKernelTest.spread((int64) count * kvDim, 41);
+        float32[] fused #= heap float32[(int64) (nH * hd)];
+        AttnKernel.attendDecodeInto(fused, q, k, v, nH, nKv, hd, count,
+            scale);
+        AttnKernel.setFlashDecode(false);
+        float32[] pair #= heap float32[(int64) (nH * hd)];
+        AttnKernel.attendDecodeInto(pair, q, k, v, nH, nKv, hd, count,
+            scale);
+        AttnKernel.setFlashDecode(true);
+        AttnKernelTest.assertLive(fused, "fused decode");
+        AttnKernelTest.assertLive(pair, "two-kernel decode");
+        AttnKernelTest.assertClose(pair, fused, "fused vs two-kernel");
+    }
+}

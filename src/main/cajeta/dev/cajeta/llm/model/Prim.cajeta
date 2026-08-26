@@ -1,0 +1,1078 @@
+package dev.cajeta.llm.model;
+
+import dev.cajeta.llm.io.QuantKernel;
+import cajeta.lang.Math;
+import cajeta.math.Placement;
+import cajeta.math.Tensor;
+import cajeta.xpu.Barrier;
+import cajeta.time.Clock;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.Shared;
+import cajeta.xpu.KernelThread;
+
+/**
+ * Transformer primitives (plan Unit 7; spec §5): XPU kernels plus host
+ * floors, the Ewise op+lowering pattern — ops route on operand placement,
+ * and the in-process CPU backend backs the device path everywhere.
+ *
+ * Attention is ONE primitive for prefill, decode and ragged batches
+ * (spec 6.13): rows carry their absolute positions, so causality is
+ * by-construction (row at position `p` reads cache `[from, p]`) — decode
+ * never builds a mask (5.6) — and a finite window is the same `from`
+ * clamp in prefill and decode (5.9). Scores are never materialized:
+ * the kernel is two streaming passes per (row, head, dim) with f32
+ * running max / sum / accumulator in registers (5.7, 5.8), and the host
+ * floor reuses one preallocated `[maxSeq]` scratch line per row.
+ */
+public final class Prim {
+
+    /**
+     * MEASUREMENT INSTRUMENT, not a feature. Bits select host primitives to
+     * SKIP so a forward pass can be timed with each one removed:
+     * 1 rmsnorm, 2 glu, 4 rope, 8 attend.
+     *
+     * The projections already have such a switch
+     * (`QuantKernel.setSkipMatvecForMeasurement`), and it showed that 56% of
+     * a decode token is NOT the mat-vec — 149 ms of 267. That remainder is
+     * far larger than the arithmetic in these primitives can account for
+     * (64 RMSNorm rows of 4096 elements is under a millisecond), so the
+     * question of WHERE it goes has to be answered by measurement before
+     * anything is optimized. Guessing produced "route the primitives", which
+     * may well be the wrong target.
+     *
+     * Output is garbage whenever any bit is set. Timings taken with it on
+     * describe cost, never correctness.
+     */
+    static int32 skipMask = 0;
+
+    public static void setSkipMaskForMeasurement(int32 m) {
+        Prim.skipMask = m;
+    }
+
+
+    // ── RMSNorm (5.1, 5.12) ─────────────────────────────────────────────
+
+    /**
+     * RMSNorm over rows of `[rows, dim]` (spec 5.1): normalize by
+     * root-mean-square over the last axis, learned scale, NO mean
+     * subtraction. `form` 0 = Llama (`·w`), 1 = Gemma zero-centered
+     * (`·(1+w)`, spec 5.12).
+     */
+    @Kernel
+    public static void rmsnormF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> x, KernelBuffer<float32> w,
+            uint32 rows, uint32 dim, float32 eps, int32 form) {
+        uint32 r = KernelThread.globalIdX();
+        if (r < rows) {
+            float32 ss = 0.0f;
+            uint32 i = 0;
+            while (i < dim) {
+                float32 v = x[r * dim + i];
+                ss = ss + v * v;
+                i = i + 1;
+            }
+            float32 scale = 1.0f / Math.sqrt(ss / (float32) dim + eps);
+            i = 0;
+            while (i < dim) {
+                float32 wi = w[i];
+                if (form == 1) {
+                    wi = 1.0f + wi;
+                }
+                out[r * dim + i] = x[r * dim + i] * scale * wi;
+                i = i + 1;
+            }
+        }
+    }
+
+    /**
+     * Placement-routed RMSNorm op over `[rows, dim]` tensors: all-device →
+     * the kernel; otherwise the host floor. Returns a fresh tensor.
+     */
+    public static #Tensor<float32> rmsnormF32Op(Tensor<float32> x,
+            Tensor<float32> w, float32 eps, int32 form) {
+        Tensor<float32> out = Tensor.zerosLike<float32>(x);
+        int64 dim = x.shapeAt(x.ndim() - 1);
+        int64 rows = x.size() / dim;
+        if (Placement.pair("rmsnorm", "x", x.isOnGpu(), "w", w.isOnGpu())) {
+            out.gpu();
+            uint32 ur = (uint32) rows;
+            KernelStream s = QuantKernel.stream();
+            rmsnormF32.launch(s, grid: [(ur + 63) / 64], block: [64])
+                (out.deviceBuffer(), x.deviceBuffer(), w.deviceBuffer(),
+                 ur, (uint32) dim, eps, form);
+            s.sync();
+        } else {
+            int64 r = 0;
+            while (r < rows) {
+                Prim.rmsnormRowHost(x, r * dim, w, eps, out, r * dim,
+                    (int32) dim, form);
+                r = r + 1;
+            }
+        }
+        return #out;
+    }
+
+    /** Host floor: one row, either norm form, flat offsets; in-place safe. */
+    static void rmsnormRowHost(Tensor<float32> src, int64 srcOff,
+            Tensor<float32> w, float32 eps,
+            Tensor<float32> dst, int64 dstOff, int32 dim, int32 form) {
+        if ((Prim.skipMask & 1) != 0) { return; }
+        // RAW BUFFERS, not `flatGet`/`flatSet` — the same change that took
+        // `PagedKvCache.attendRow` from 105 ms/token to ~2. The accessor,
+        // not the arithmetic, is what these row loops cost.
+        float32[] sb = src.hostBuffer();
+        int64 so = src.hostBase() + srcOff;
+        float32[] wb = w.hostBuffer();
+        int64 wo = w.hostBase();
+        float32[] db = dst.hostBuffer();
+        int64 dof = dst.hostBase() + dstOff;
+        float32 ss = 0.0f;
+        int64 i = 0;
+        while (i < (int64) dim) {
+            float32 v = sb[so + i];
+            ss = ss + v * v;
+            i = i + 1;
+        }
+        float32 scale = 1.0f / Math.sqrt(ss / (float32) dim + eps);
+        i = 0;
+        while (i < (int64) dim) {
+            float32 wi = wb[wo + i];
+            if (form == 1) {
+                wi = 1.0f + wi;
+            }
+            db[dof + i] = sb[so + i] * scale * wi;
+            i = i + 1;
+        }
+        return;
+    }
+
+    // ── Gated MLP activation (5.4) ──────────────────────────────────────
+
+    /**
+     * Fused gate activation × up: `out[i] = act(g[i]) · u[i]`. `act` 0 =
+     * SiLU (SwiGLU), 1 = gelu_pytorch_tanh (GeGLU).
+     */
+    @Kernel
+    public static void gluF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> g, KernelBuffer<float32> u,
+            uint32 n, int32 act) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < n) {
+            float32 x = g[i];
+            float32 a = 0.0f;
+            if (act == 1) {
+                // gelu_pytorch_tanh: 0.5x(1 + tanh(√(2/π)(x + 0.044715x³)))
+                float32 t = 0.7978845608f * (x + 0.044715f * x * x * x);
+                float32 th = 1.0f - 2.0f / (Math.exp(2.0f * t) + 1.0f);
+                a = 0.5f * x * (1.0f + th);
+            } else {
+                a = x / (1.0f + Math.exp(0.0f - x));
+            }
+            out[i] = a * u[i];
+        }
+    }
+
+    /**
+     * 10.12.32: GLU over the FUSED gate|up projection output — row r
+     * of `src` holds gate at [0, inter) and up at [inter, 2*inter).
+     * The result lands in the compact `[rows x inter]` `out`, so the
+     * down projection's pack is unchanged — and the 117 MB/layer
+     * split copy a separate gate/up would need never exists.
+     */
+    @Kernel
+    public static void gluFusedF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> src, uint32 rows, uint32 inter,
+            int32 act) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < rows * inter) {
+            uint32 r = i / inter;
+            uint32 c = i % inter;
+            float32 x = src[r * (2 * inter) + c];
+            float32 a = 0.0f;
+            if (act == 1) {
+                float32 t = 0.7978845608f
+                    * (x + 0.044715f * x * x * x);
+                float32 th = 1.0f - 2.0f / (Math.exp(2.0f * t) + 1.0f);
+                a = 0.5f * x * (1.0f + th);
+            } else {
+                a = x / (1.0f + Math.exp(0.0f - x));
+            }
+            out[i] = a * src[r * (2 * inter) + inter + c];
+        }
+    }
+
+    public static void gluFusedDevice(KernelBuffer<float32> out,
+            KernelBuffer<float32> src, int64 rows, int64 inter,
+            int32 act) {
+        uint32 un = (uint32) (rows * inter);
+        KernelStream s = QuantKernel.stream();
+        int64 t0 = Clock.nanoTime();
+        gluFusedF32.launch(s, grid: [(un + 63) / 64], block: [64])
+            (out, src, (uint32) rows, (uint32) inter, act);
+        Prim.tGlu = Prim.tGlu + (Clock.nanoTime() - t0);
+        Prim.nGlu = Prim.nGlu + 1L;
+        return;
+    }
+
+    /** 10.12.35: copy `n` floats starting at `srcOff` — the last-row
+     *  tail download uses it to bring home 16 KB instead of 8 MB. */
+    @Kernel
+    public static void sliceF32(KernelBuffer<float32> dst,
+            KernelBuffer<float32> src, uint32 n, uint32 srcOff) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < n) { dst[i] = src[srcOff + i]; }
+    }
+
+    public static void sliceF32Device(KernelBuffer<float32> dst,
+            KernelBuffer<float32> src, int64 n, int64 srcOff) {
+        KernelStream s = QuantKernel.stream();
+        sliceF32.launch(s, grid: [(uint32) ((n + 63L) / 64L)],
+            block: [64])
+            (dst, src, (uint32) n, (uint32) srcOff);
+        return;
+    }
+
+    /** 10.12.32: scatter the fused q|k|v batch output into the three
+     *  per-projection buffers — rope, append and attend stay
+     *  untouched. ~12.6 MB per layer at ctx512; the fusion's launch
+     *  and occupancy win pays for it. */
+    @Kernel
+    public static void splitRows3F32(KernelBuffer<float32> aOut,
+            KernelBuffer<float32> bOut, KernelBuffer<float32> cOut,
+            KernelBuffer<float32> src, uint32 rows, uint32 aW,
+            uint32 bW, uint32 cW) {
+        uint32 i = KernelThread.globalIdX();
+        uint32 tot = aW + bW + cW;
+        if (i < rows * tot) {
+            uint32 r = i / tot;
+            uint32 c = i % tot;
+            float32 v = src[i];
+            if (c < aW) { aOut[r * aW + c] = v; }
+            else if (c < aW + bW) { bOut[r * bW + (c - aW)] = v; }
+            else { cOut[r * cW + (c - aW - bW)] = v; }
+        }
+    }
+
+    public static void splitRows3Device(KernelBuffer<float32> aOut,
+            KernelBuffer<float32> bOut, KernelBuffer<float32> cOut,
+            KernelBuffer<float32> src, int64 rows, int64 aW, int64 bW,
+            int64 cW) {
+        uint32 un = (uint32) (rows * (aW + bW + cW));
+        KernelStream s = QuantKernel.stream();
+        splitRows3F32.launch(s, grid: [(un + 63) / 64], block: [64])
+            (aOut, bOut, cOut, src, (uint32) rows, (uint32) aW,
+             (uint32) bW, (uint32) cW);
+        return;
+    }
+
+    /**
+     * RMSNorm over ONE row already on the device (plan 10.2), as a
+     * WORKGROUP-COOPERATIVE reduction.
+     *
+     * `rmsnormF32` gives one ROW to one work item, which is right when
+     * there are many rows and catastrophic when there is one: decode's
+     * single row put a 4096-element dependent-load reduction on a single
+     * lane, twice a layer, and cost 20 ms/token — more than the residency
+     * it was there to enable saved. Here 64 lanes stride the row, reduce
+     * through LDS, and stride it again to write.
+     *
+     * The sum is therefore REGROUPED against the host's sequential one.
+     * Float addition is not associative, so this is a different rounding —
+     * legitimate, and the reason the decode is checked by its token
+     * sequence rather than by bit-identity against the host path.
+     */
+    @Kernel
+    public static void rmsnormRowF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> x, KernelBuffer<float32> w,
+            uint32 dim, float32 eps, int32 form) {
+        // 256 lanes, not 64. A single row's reduction cannot be split
+        // across workgroups without a global barrier, so the ONLY lever on
+        // its parallelism is the workgroup width — and at 64 lanes each one
+        // walked 64 elements of a 4096-wide row, twice a layer.
+        Shared<float32> part = shared float32[256];
+        uint32 lane = KernelThread.x();
+        float32 ss = 0.0f;
+        uint32 i = lane;
+        while (i < dim) {
+            float32 v = x[i];
+            ss = ss + v * v;
+            i = i + 256;
+        }
+        part[lane] = ss;
+        Barrier.workgroup();
+        uint32 s = 128;
+        while (s > 0) {
+            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
+            Barrier.workgroup();
+            s = s / 2;
+        }
+        float32 scale = 1.0f / Math.sqrt(part[0] / (float32) dim + eps);
+        uint32 j = lane;
+        while (j < dim) {
+            float32 wi = w[j];
+            if (form == 1) { wi = 1.0f + wi; }
+            out[j] = x[j] * scale * wi;
+            j = j + 256;
+        }
+    }
+
+    // Where the resident path's time actually goes (plan 10.2). The phase
+    // timers in Linear only see `matvecIntoDevice`, so the resident entry
+    // points are invisible to them — and "the transfers went to zero and
+    // the token got slower" is not a diagnosis.
+    static int64 tNorm;
+    static int64 tAdd;
+    static int64 tGlu;
+    static int64 nNorm;
+    static int64 nAdd;
+    static int64 nGlu;
+
+    public static int64 devNormNs() { return Prim.tNorm; }
+    public static int64 devAddNs()  { return Prim.tAdd; }
+    public static int64 devGluNs()  { return Prim.tGlu; }
+    public static int64 devNormCalls() { return Prim.nNorm; }
+    public static int64 devAddCalls()  { return Prim.nAdd; }
+    public static int64 devGluCalls()  { return Prim.nGlu; }
+    public static void resetDevOpTimers() {
+        Prim.tNorm = 0L; Prim.tAdd = 0L; Prim.tGlu = 0L;
+        Prim.nNorm = 0L; Prim.nAdd = 0L; Prim.nGlu = 0L;
+    }
+
+    public static void rmsnormDevice(KernelBuffer<float32> out,
+            KernelBuffer<float32> x, KernelBuffer<float32> w,
+            int64 dim, float32 eps, int32 form) {
+        int64 t0 = Clock.nanoTime();
+        KernelStream s = QuantKernel.stream();
+        rmsnormRowF32.launch(s, grid: [1], block: [256])
+            (out, x, w, (uint32) dim, eps, form);
+        Prim.tNorm = Prim.tNorm + (Clock.nanoTime() - t0);
+        Prim.nNorm = Prim.nNorm + 1L;
+        // NO SYNC. Everything in a resident layer is enqueued on one
+        // stream and ordered by it; the only thing that must wait is the
+        // download at the end. Syncing here cost a driver round trip per
+        // call, seven times a layer, which is what made the first resident
+        // build SLOWER than the path it replaced (10.3's lesson, on the
+        // ops rather than on the mat-vec).
+        return;
+    }
+
+    /**
+     * Batched {@link #rmsnormF32} over `[rows x dim]` DEVICE buffers —
+     * one row per work item, which is the right shape when there are
+     * many rows (prefill's 512); the workgroup-cooperative
+     * `rmsnormRowF32` behind {@link #rmsnormDevice} is the single-row
+     * (decode) shape. NoSync: stream-ordered like every resident op.
+     */
+    /** One ROW per WORKGROUP, 256-lane cooperative reduction per row —
+     *  the batched shape rocprofv3 demanded: the one-row-per-work-ITEM
+     *  `rmsnormF32` put 512 serial 4096-element reductions on 8
+     *  workgroups and measured 681 us per call, ~8.5x its memory
+     *  floor. */
+    @Kernel
+    public static void rmsnormRowsF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> x, KernelBuffer<float32> w,
+            uint32 dim, float32 eps, int32 form) {
+        Shared<float32> part = shared float32[256];
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 256;
+        uint32 base = row * dim;
+        float32 ss = 0.0f;
+        uint32 i = lane;
+        while (i < dim) {
+            float32 v = x[base + i];
+            ss = ss + v * v;
+            i = i + 256;
+        }
+        part[lane] = ss;
+        Barrier.workgroup();
+        uint32 sred = 128;
+        while (sred > 0) {
+            if (lane < sred) {
+                part[lane] = part[lane] + part[lane + sred];
+            }
+            Barrier.workgroup();
+            sred = sred / 2;
+        }
+        float32 scale = 1.0f
+            / Math.sqrt(part[0] / (float32) dim + eps);
+        uint32 j = lane;
+        while (j < dim) {
+            float32 wi = w[j];
+            if (form == 1) { wi = 1.0f + wi; }
+            out[base + j] = x[base + j] * scale * wi;
+            j = j + 256;
+        }
+    }
+
+    public static void rmsnormBatchDevice(KernelBuffer<float32> out,
+            KernelBuffer<float32> x, KernelBuffer<float32> w,
+            int64 rows, int64 dim, float32 eps, int32 form) {
+        uint32 ur = (uint32) rows;
+        KernelStream s = QuantKernel.stream();
+        int64 t0 = Clock.nanoTime();
+        rmsnormRowsF32.launch(s, grid: [ur], block: [256])
+            (out, x, w, (uint32) dim, eps, form);
+        Prim.tNorm = Prim.tNorm + (Clock.nanoTime() - t0);
+        Prim.nNorm = Prim.nNorm + 1L;
+        return;
+    }
+
+    /** `a += b` elementwise on the device — the residual add. */
+    @Kernel
+    public static void addF32(KernelBuffer<float32> a,
+            KernelBuffer<float32> b, uint32 n) {
+        uint32 i = KernelThread.globalIdX();
+        if (i < n) { a[i] = a[i] + b[i]; }
+    }
+
+    /** {@link #addF32} over a whole row. */
+    public static void addDevice(KernelBuffer<float32> a,
+            KernelBuffer<float32> b, int64 n) {
+        uint32 un = (uint32) n;
+        KernelStream s = QuantKernel.stream();
+        int64 t0 = Clock.nanoTime();
+        addF32.launch(s, grid: [(un + 63) / 64], block: [64])(a, b, un);
+        Prim.tAdd = Prim.tAdd + (Clock.nanoTime() - t0);
+        Prim.nAdd = Prim.nAdd + 1L;
+        return;
+    }
+
+    /**
+     * SwiGLU over buffers ALREADY ON THE DEVICE, in place into `g`
+     * (plan 10.2).
+     *
+     * The same `gluF32` kernel the placement-routed op uses; what is
+     * different is that nothing is uploaded or downloaded around it. In
+     * place is safe because a work item reads `g[i]` and `u[i]` and writes
+     * only `out[i]`.
+     */
+    public static void gluDevice(KernelBuffer<float32> g,
+            KernelBuffer<float32> u, int64 n, int32 act) {
+        uint32 un = (uint32) n;
+        KernelStream s = QuantKernel.stream();
+        int64 t0 = Clock.nanoTime();
+        gluF32.launch(s, grid: [(un + 63) / 64], block: [64])(g, g, u, un, act);
+        Prim.tGlu = Prim.tGlu + (Clock.nanoTime() - t0);
+        Prim.nGlu = Prim.nGlu + 1L;
+        return;
+    }
+
+    /** Placement-routed GLU op over equal-shaped tensors. */
+    public static #Tensor<float32> gluF32Op(Tensor<float32> g,
+            Tensor<float32> u, int32 act) {
+        Tensor<float32> out = Tensor.zerosLike<float32>(g);
+        int64 n = g.size();
+        if (Placement.pair("glu", "g", g.isOnGpu(), "u", u.isOnGpu())) {
+            out.gpu();
+            uint32 un = (uint32) n;
+            KernelStream s = QuantKernel.stream();
+            gluF32.launch(s, grid: [(un + 63) / 64], block: [64])
+                (out.deviceBuffer(), g.deviceBuffer(), u.deviceBuffer(),
+                 un, act);
+            s.sync();
+        } else {
+            Prim.gluRowHost(g, 0, u, 0, out, 0, (int32) n, act);
+        }
+        return #out;
+    }
+
+    /** Host floor: `dst = act(g) · u` over a flat range; in-place safe. */
+    static void gluRowHost(Tensor<float32> g, int64 gOff,
+            Tensor<float32> u, int64 uOff,
+            Tensor<float32> dst, int64 dstOff, int32 n, int32 act) {
+        if ((Prim.skipMask & 2) != 0) { return; }
+        float32[] gb = g.hostBuffer();
+        int64 go = g.hostBase() + gOff;
+        float32[] ub = u.hostBuffer();
+        int64 uo = u.hostBase() + uOff;
+        float32[] db = dst.hostBuffer();
+        int64 dof = dst.hostBase() + dstOff;
+        int64 i = 0;
+        while (i < (int64) n) {
+            float32 x = gb[go + i];
+            float32 a = 0.0f;
+            if (act == 1) {
+                float32 t = 0.7978845608f * (x + 0.044715f * x * x * x);
+                float32 th = 1.0f - 2.0f / (Math.exp(2.0f * t) + 1.0f);
+                a = 0.5f * x * (1.0f + th);
+            } else {
+                a = x / (1.0f + Math.exp(0.0f - x));
+            }
+            db[dof + i] = a * ub[uo + i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    // ── RoPE (5.2) and its scaling variants (5.3) ───────────────────────
+
+    /**
+     * Per-dimension inverse frequencies for `headDim`, theta base, and
+     * the layer's declared scaling (spec 5.3). `type`: 0 none, 1 linear,
+     * 2 ntk/dynamic, 3 yarn, 4 llama3.
+     *
+     * - linear: every frequency divided by `factor` (positions
+     *   effectively interpolated).
+     * - ntk/dynamic: the theta base is rescaled by
+     *   `factor^(dim/(dim-2))`, spreading the interpolation across dims.
+     * - yarn: per-dim ramp between unscaled (high-frequency dims) and
+     *   `/factor` (low-frequency dims); `low`/`high` are beta_slow /
+     *   beta_fast, ramped on `origMax / wavelength`.
+     * - llama3: piecewise by wavelength against `origMax/low` and
+     *   `origMax/high`, with a smooth blend between (Llama 3.1+).
+     */
+    public static #float32[] invFreq(int32 headDim, float32 theta,
+            int32 type, float32 factor, float32 low, float32 high,
+            int32 origMax) {
+        int32 half = headDim / 2;
+        float32[] inv = heap float32[half];
+        float32 base = theta;
+        if (type == 2) {
+            base = theta * Math.pow(factor,
+                (float32) headDim / ((float32) headDim - 2.0f));
+        }
+        int32 d = 0;
+        while (d < half) {
+            float32 f = Math.pow(base,
+                (0.0f - (float32) (2 * d)) / (float32) headDim);
+            if (type == 1) {
+                f = f / factor;
+            } else if (type == 3) {
+                // yarn ramp on r = origMax / wavelength = origMax·f / 2π.
+                float32 r = (float32) origMax * f / 6.2831853f;
+                float32 g = (r - low) / (high - low);
+                if (g < 0.0f) {
+                    g = 0.0f;
+                }
+                if (g > 1.0f) {
+                    g = 1.0f;
+                }
+                f = g * f + (1.0f - g) * (f / factor);
+            } else if (type == 4) {
+                float32 wavelen = 6.2831853f / f;
+                float32 lowWavelen = (float32) origMax / low;
+                float32 highWavelen = (float32) origMax / high;
+                if (wavelen > lowWavelen) {
+                    f = f / factor;
+                } else if (wavelen > highWavelen) {
+                    float32 sm = ((float32) origMax / wavelen - low)
+                        / (high - low);
+                    f = (1.0f - sm) * (f / factor) + sm * f;
+                }
+            }
+            inv[d] = f;
+            d = d + 1;
+        }
+        return #inv;
+    }
+
+    /**
+     * Rotary embedding for one row at absolute position `pos`, HF
+     * split-half convention: pair (d, d+half), angle `pos·invFreq[d]`.
+     * In place. (Spec 5.2: the LAYER's theta base — `invFreq` is
+     * per-layer state.)
+     */
+    static void ropeRowHost(Tensor<float32> t, int64 off, int32 nHeads,
+            int32 headDim, int32 pos, float32[] invFreq) {
+        if ((Prim.skipMask & 4) != 0) { return; }
+        int32 half = headDim / 2;
+        float32[] tb = t.hostBuffer();
+        int64 tbase = t.hostBase() + off;
+        int32 h = 0;
+        while (h < nHeads) {
+            int64 base = tbase + (int64) (h * headDim);
+            int32 d = 0;
+            while (d < half) {
+                float32 ang = (float32) pos * invFreq[d];
+                float32 c = Math.cos(ang);
+                float32 s = Math.sin(ang);
+                float32 a = tb[base + (int64) d];
+                float32 b = tb[base + (int64) (d + half)];
+                tb[base + (int64) d] = a * c - b * s;
+                tb[base + (int64) (d + half)] = a * s + b * c;
+                d = d + 1;
+            }
+            h = h + 1;
+        }
+        return;
+    }
+
+    /** RoPE kernel over `[rows, nHeads·headDim]`, positions per row. */
+    @Kernel
+    public static void ropeF32(KernelBuffer<float32> t,
+            KernelBuffer<float32> invFreq, KernelBuffer<int32> pos,
+            uint32 rows, uint32 nHeads, uint32 headDim) {
+        uint32 id = KernelThread.globalIdX();
+        uint32 half = headDim / 2;
+        uint32 lanes = rows * nHeads * half;
+        if (id < lanes) {
+            uint32 r = id / (nHeads * half);
+            uint32 rem = id % (nHeads * half);
+            uint32 h = rem / half;
+            uint32 d = rem % half;
+            uint32 base = r * (nHeads * headDim) + h * headDim;
+            float32 ang = (float32) pos[r] * invFreq[d];
+            float32 c = Math.cos(ang);
+            float32 s = Math.sin(ang);
+            float32 a = t[base + d];
+            float32 b = t[base + d + half];
+            t[base + d] = a * c - b * s;
+            t[base + d + half] = a * s + b * c;
+        }
+    }
+
+    /**
+     * Batched {@link #ropeF32} over a `[rows x nHeads*headDim]` DEVICE
+     * buffer, positions per row (10.12.7.c). NoSync — stream-ordered
+     * with the append and attend that follow.
+     */
+    public static void ropeBatchDevice(KernelBuffer<float32> t,
+            KernelBuffer<float32> invFreq, KernelBuffer<int32> pos,
+            int64 rows, int32 nHeads, int32 headDim) {
+        uint32 lanes = (uint32) (rows * (int64) nHeads
+            * (int64) (headDim / 2));
+        KernelStream s = QuantKernel.stream();
+        ropeF32.launch(s, grid: [(lanes + 63) / 64], block: [64])
+            (t, invFreq, pos, (uint32) rows, (uint32) nHeads,
+             (uint32) headDim);
+        return;
+    }
+
+    /**
+     * Placement-routed RoPE op over `[rows, nHeads·headDim]`: rotates in
+     * place. `positions` is `[rows]` int32 absolute positions.
+     */
+    public static void ropeF32Op(Tensor<float32> t, Tensor<int32> positions,
+            Tensor<float32> invFreqT, int32 nHeads, int32 headDim) {
+        int64 rows = positions.size();
+        if (Placement.pair("rope", "t", t.isOnGpu(),
+                "positions", positions.isOnGpu())) {
+            uint32 lanes = (uint32) (rows * (int64) nHeads
+                * (int64) (headDim / 2));
+            KernelStream s = QuantKernel.stream();
+            ropeF32.launch(s, grid: [(lanes + 63) / 64], block: [64])
+                (t.deviceBuffer(), invFreqT.deviceBuffer(),
+                 positions.deviceBuffer(), (uint32) rows,
+                 (uint32) nHeads, (uint32) headDim);
+            s.sync();
+        } else {
+            int32 half = headDim / 2;
+            int64 r = 0;
+            while (r < rows) {
+                int32 p = positions.flatGet(r);
+                int64 off = r * (int64) (nHeads * headDim);
+                int32 h = 0;
+                while (h < nHeads) {
+                    int64 base = off + (int64) (h * headDim);
+                    int32 d = 0;
+                    while (d < half) {
+                        float32 ang = (float32) p * invFreqT.flatGet((int64) d);
+                        float32 c = Math.cos(ang);
+                        float32 s = Math.sin(ang);
+                        float32 a = t.flatGet(base + (int64) d);
+                        float32 b = t.flatGet(base + (int64) (d + half));
+                        t.flatSet(base + (int64) d, a * c - b * s);
+                        t.flatSet(base + (int64) (d + half), a * s + b * c);
+                        d = d + 1;
+                    }
+                    h = h + 1;
+                }
+                r = r + 1;
+            }
+        }
+        return;
+    }
+
+    // ── Attention (5.5–5.9, 5.13, 6.13) ─────────────────────────────────
+
+    /**
+     * Host attention for ONE query row at absolute position `p` against a
+     * packed KV region: rows `[kvRowBase + t]` of `[*, nKv·headDim]`
+     * caches, keys `t` in `[from, p]`. GQA shares KV heads across query
+     * groups with no repeat tensor (5.5); `from` carries the window
+     * clamp (5.9); `scale` the declared query scale (5.13); `scores` is
+     * the caller's preallocated scratch line — allocation-free.
+     */
+    static void attendRowHost(Tensor<float32> q, int64 qOff,
+            Tensor<float32> kC, Tensor<float32> vC, int64 kvRowBase,
+            int32 from, int32 p, float32 scale, Tensor<float32> scores,
+            Tensor<float32> outv, int64 outOff,
+            int32 nHeads, int32 nKv, int32 headDim) {
+        if ((Prim.skipMask & 8) != 0) { return; }
+        int32 kvDim = nKv * headDim;
+        int32 group = nHeads / nKv;
+        int32 h = 0;
+        while (h < nHeads) {
+            int32 kvh = h / group;
+            int64 qBase = qOff + (int64) (h * headDim);
+            int64 kvHead = (int64) (kvh * headDim);
+            int32 count = p + 1 - from;
+            int64 t = 0;
+            while (t < (int64) count) {
+                float32 s = 0.0f;
+                int64 kRow = (kvRowBase + (int64) from + t) * (int64) kvDim
+                    + kvHead;
+                int64 d = 0;
+                while (d < (int64) headDim) {
+                    s = s + q.flatGet(qBase + d) * kC.flatGet(kRow + d);
+                    d = d + 1;
+                }
+                scores.flatSet(t, s * scale);
+                t = t + 1;
+            }
+            float32 mx = scores.flatGet(0);
+            t = 1;
+            while (t < (int64) count) {
+                float32 sv = scores.flatGet(t);
+                if (sv > mx) {
+                    mx = sv;
+                }
+                t = t + 1;
+            }
+            float32 sum = 0.0f;
+            t = 0;
+            while (t < (int64) count) {
+                float32 e = Math.exp(scores.flatGet(t) - mx);
+                scores.flatSet(t, e);
+                sum = sum + e;
+                t = t + 1;
+            }
+            float32 rs = 1.0f / sum;
+            int64 d = 0;
+            while (d < (int64) headDim) {
+                float32 acc = 0.0f;
+                t = 0;
+                while (t < (int64) count) {
+                    acc = acc + scores.flatGet(t) * vC.flatGet(
+                        (kvRowBase + (int64) from + t) * (int64) kvDim
+                        + kvHead + d);
+                    t = t + 1;
+                }
+                outv.flatSet(outOff + (int64) (h * headDim) + d, acc * rs);
+                d = d + 1;
+            }
+            h = h + 1;
+        }
+        return;
+    }
+
+    /**
+     * f16-STORAGE attention row with f32 ACCUMULATION throughout
+     * (spec 5.7): scores, softmax and the V reduction all carry f32; only
+     * the loads are f16. Same contract as {@link #attendRowHost}.
+     */
+    static void attendRowHostF16(Tensor<float16> q, int64 qOff,
+            Tensor<float16> kC, Tensor<float16> vC, int64 kvRowBase,
+            int32 from, int32 p, float32 scale, Tensor<float32> scores,
+            Tensor<float32> outv, int64 outOff,
+            int32 nHeads, int32 nKv, int32 headDim) {
+        int32 kvDim = nKv * headDim;
+        int32 group = nHeads / nKv;
+        int32 h = 0;
+        while (h < nHeads) {
+            int32 kvh = h / group;
+            int64 qBase = qOff + (int64) (h * headDim);
+            int64 kvHead = (int64) (kvh * headDim);
+            int32 count = p + 1 - from;
+            int64 t = 0;
+            while (t < (int64) count) {
+                float32 s = 0.0f;
+                int64 kRow = (kvRowBase + (int64) from + t) * (int64) kvDim
+                    + kvHead;
+                int64 d = 0;
+                while (d < (int64) headDim) {
+                    s = s + (float32) q.flatGet(qBase + d)
+                        * (float32) kC.flatGet(kRow + d);
+                    d = d + 1;
+                }
+                scores.flatSet(t, s * scale);
+                t = t + 1;
+            }
+            float32 mx = scores.flatGet(0);
+            t = 1;
+            while (t < (int64) count) {
+                float32 sv = scores.flatGet(t);
+                if (sv > mx) {
+                    mx = sv;
+                }
+                t = t + 1;
+            }
+            float32 sum = 0.0f;
+            t = 0;
+            while (t < (int64) count) {
+                float32 e = Math.exp(scores.flatGet(t) - mx);
+                scores.flatSet(t, e);
+                sum = sum + e;
+                t = t + 1;
+            }
+            float32 rs = 1.0f / sum;
+            int64 d = 0;
+            while (d < (int64) headDim) {
+                float32 acc = 0.0f;
+                t = 0;
+                while (t < (int64) count) {
+                    acc = acc + scores.flatGet(t) * (float32) vC.flatGet(
+                        (kvRowBase + (int64) from + t) * (int64) kvDim
+                        + kvHead + d);
+                    t = t + 1;
+                }
+                outv.flatSet(outOff + (int64) (h * headDim) + d, acc * rs);
+                d = d + 1;
+            }
+            h = h + 1;
+        }
+        return;
+    }
+
+    /**
+     * Ragged-batch attention kernel (spec 6.13): every query row carries
+     * its batch item (`seqOf`) and absolute position (`qPos`); item KV
+     * lives at row base `kvBase[item]` of the PACKED `k`/`v` buffers.
+     * Sequences of different lengths share this one launch with no
+     * padding; causality is by-construction (`t ≤ p`); `window` > 0
+     * clamps `from` in prefill and decode alike (5.9).
+     *
+     * One thread per (row, head, dim): two streaming passes with f32
+     * running max / sum / accumulator in registers — NO score
+     * materialization at any size (5.7, 5.8).
+     */
+    @Kernel
+    public static void attendF32(KernelBuffer<float32> out,
+            KernelBuffer<float32> q, KernelBuffer<float32> k,
+            KernelBuffer<float32> v, KernelBuffer<int32> seqOf,
+            KernelBuffer<int32> qPos, KernelBuffer<int32> kvBase,
+            uint32 totalRows, uint32 nH, uint32 nKv, uint32 hd,
+            int32 window, float32 scale) {
+        uint32 id = KernelThread.globalIdX();
+        uint32 lanes = totalRows * nH * hd;
+        if (id < lanes) {
+            uint32 r = id / (nH * hd);
+            uint32 rem = id % (nH * hd);
+            uint32 h = rem / hd;
+            uint32 d = rem % hd;
+            int32 item = seqOf[r];
+            int32 p = qPos[r];
+            int32 from = 0;
+            if (window > 0 && p + 1 > window) {
+                from = p + 1 - window;
+            }
+            uint32 kvDim = nKv * hd;
+            uint32 kvh = h / (nH / nKv);
+            uint32 qBase = r * (nH * hd) + h * hd;
+            uint32 base = (uint32) kvBase[item];
+            // Pass 1: running max of the scaled scores.
+            float32 mx = 0.0f - 3.0e38f;
+            int32 t = from;
+            while (t <= p) {
+                uint32 kRow = (base + (uint32) t) * kvDim + kvh * hd;
+                float32 s = 0.0f;
+                uint32 dd = 0;
+                while (dd < hd) {
+                    s = s + q[qBase + dd] * k[kRow + dd];
+                    dd = dd + 1;
+                }
+                s = s * scale;
+                if (s > mx) {
+                    mx = s;
+                }
+                t = t + 1;
+            }
+            // Pass 2: normalizer and the weighted V component together.
+            float32 l = 0.0f;
+            float32 acc = 0.0f;
+            t = from;
+            while (t <= p) {
+                uint32 kRow = (base + (uint32) t) * kvDim + kvh * hd;
+                float32 s = 0.0f;
+                uint32 dd = 0;
+                while (dd < hd) {
+                    s = s + q[qBase + dd] * k[kRow + dd];
+                    dd = dd + 1;
+                }
+                float32 e = Math.exp(s * scale - mx);
+                l = l + e;
+                acc = acc + e * v[kRow + d];
+                t = t + 1;
+            }
+            out[qBase + d] = acc / l;
+        }
+    }
+
+    /** {@link #attendF32} at f16 storage — accumulation stays f32 (5.7). */
+    @Kernel
+    public static void attendF16(KernelBuffer<float32> out,
+            KernelBuffer<float16> q, KernelBuffer<float16> k,
+            KernelBuffer<float16> v, KernelBuffer<int32> seqOf,
+            KernelBuffer<int32> qPos, KernelBuffer<int32> kvBase,
+            uint32 totalRows, uint32 nH, uint32 nKv, uint32 hd,
+            int32 window, float32 scale) {
+        uint32 id = KernelThread.globalIdX();
+        uint32 lanes = totalRows * nH * hd;
+        if (id < lanes) {
+            uint32 r = id / (nH * hd);
+            uint32 rem = id % (nH * hd);
+            uint32 h = rem / hd;
+            uint32 d = rem % hd;
+            int32 item = seqOf[r];
+            int32 p = qPos[r];
+            int32 from = 0;
+            if (window > 0 && p + 1 > window) {
+                from = p + 1 - window;
+            }
+            uint32 kvDim = nKv * hd;
+            uint32 kvh = h / (nH / nKv);
+            uint32 qBase = r * (nH * hd) + h * hd;
+            uint32 base = (uint32) kvBase[item];
+            float32 mx = 0.0f - 3.0e38f;
+            int32 t = from;
+            while (t <= p) {
+                uint32 kRow = (base + (uint32) t) * kvDim + kvh * hd;
+                float32 s = 0.0f;
+                uint32 dd = 0;
+                while (dd < hd) {
+                    s = s + (float32) q[qBase + dd] * (float32) k[kRow + dd];
+                    dd = dd + 1;
+                }
+                s = s * scale;
+                if (s > mx) {
+                    mx = s;
+                }
+                t = t + 1;
+            }
+            float32 l = 0.0f;
+            float32 acc = 0.0f;
+            t = from;
+            while (t <= p) {
+                uint32 kRow = (base + (uint32) t) * kvDim + kvh * hd;
+                float32 s = 0.0f;
+                uint32 dd = 0;
+                while (dd < hd) {
+                    s = s + (float32) q[qBase + dd] * (float32) k[kRow + dd];
+                    dd = dd + 1;
+                }
+                float32 e = Math.exp(s * scale - mx);
+                l = l + e;
+                acc = acc + e * (float32) v[kRow + d];
+                t = t + 1;
+            }
+            out[qBase + d] = acc / l;
+        }
+    }
+
+    /**
+     * Placement-routed ragged attention op (spec 6.13). `q` is
+     * `[totalRows, nH·hd]`; `k`/`v` are the packed caches; `seqOf`,
+     * `qPos` are `[totalRows]`; `kvBase` is `[items]` row bases. Returns
+     * `[totalRows, nH·hd]`. All-device → one kernel launch; otherwise the
+     * host floor loops rows over {@link #attendRowHost} with a scratch
+     * line sized to the longest attended span.
+     */
+    public static #Tensor<float32> attendRaggedF32Op(Tensor<float32> q,
+            Tensor<float32> k, Tensor<float32> v, Tensor<int32> seqOf,
+            Tensor<int32> qPos, Tensor<int32> kvBase,
+            int32 nH, int32 nKv, int32 hd, int32 window, float32 scale) {
+        Tensor<float32> out = Tensor.zerosLike<float32>(q);
+        int64 totalRows = seqOf.size();
+        if (Placement.pair("attend", "q", q.isOnGpu(), "k", k.isOnGpu())) {
+            out.gpu();
+            uint32 lanes = (uint32) (totalRows * (int64) nH * (int64) hd);
+            KernelStream s = QuantKernel.stream();
+            attendF32.launch(s, grid: [(lanes + 63) / 64], block: [64])
+                (out.deviceBuffer(), q.deviceBuffer(), k.deviceBuffer(),
+                 v.deviceBuffer(), seqOf.deviceBuffer(), qPos.deviceBuffer(),
+                 kvBase.deviceBuffer(), (uint32) totalRows,
+                 (uint32) nH, (uint32) nKv, (uint32) hd, window, scale);
+            s.sync();
+        } else {
+            // Scratch line sized to the longest attended span.
+            int32 longest = 1;
+            int64 r = 0;
+            while (r < totalRows) {
+                int32 p = qPos.flatGet(r);
+                int32 from = 0;
+                if (window > 0 && p + 1 > window) {
+                    from = p + 1 - window;
+                }
+                if (p + 1 - from > longest) {
+                    longest = p + 1 - from;
+                }
+                r = r + 1;
+            }
+            int64[] ss = heap int64[1];
+            ss[0] = (int64) longest;
+            Tensor<float32> scores = Tensor.zeros<float32>(ss);
+            r = 0;
+            while (r < totalRows) {
+                int32 p = qPos.flatGet(r);
+                int32 from = 0;
+                if (window > 0 && p + 1 > window) {
+                    from = p + 1 - window;
+                }
+                int64 base = (int64) kvBase.flatGet((int64) seqOf.flatGet(r));
+                Prim.attendRowHost(q, r * (int64) (nH * hd), k, v, base,
+                    from, p, scale, scores, out, r * (int64) (nH * hd),
+                    nH, nKv, hd);
+                r = r + 1;
+            }
+        }
+        return #out;
+    }
+
+    /**
+     * {@link #attendRaggedF32Op} at f16 STORAGE: q/k/v are f16, the
+     * result and every accumulation are f32 (spec 5.7). Same routing.
+     */
+    public static #Tensor<float32> attendRaggedF16Op(Tensor<float16> q,
+            Tensor<float16> k, Tensor<float16> v, Tensor<int32> seqOf,
+            Tensor<int32> qPos, Tensor<int32> kvBase,
+            int32 nH, int32 nKv, int32 hd, int32 window, float32 scale) {
+        int64 totalRows = seqOf.size();
+        int64[] os = heap int64[2];
+        os[0] = totalRows;
+        os[1] = (int64) (nH * hd);
+        Tensor<float32> out = Tensor.zeros<float32>(os);
+        if (Placement.pair("attend", "q", q.isOnGpu(), "k", k.isOnGpu())) {
+            out.gpu();
+            uint32 lanes = (uint32) (totalRows * (int64) nH * (int64) hd);
+            KernelStream s = QuantKernel.stream();
+            attendF16.launch(s, grid: [(lanes + 63) / 64], block: [64])
+                (out.deviceBuffer(), q.deviceBuffer(), k.deviceBuffer(),
+                 v.deviceBuffer(), seqOf.deviceBuffer(), qPos.deviceBuffer(),
+                 kvBase.deviceBuffer(), (uint32) totalRows,
+                 (uint32) nH, (uint32) nKv, (uint32) hd, window, scale);
+            s.sync();
+        } else {
+            int32 longest = 1;
+            int64 r = 0;
+            while (r < totalRows) {
+                int32 p = qPos.flatGet(r);
+                int32 from = 0;
+                if (window > 0 && p + 1 > window) {
+                    from = p + 1 - window;
+                }
+                if (p + 1 - from > longest) {
+                    longest = p + 1 - from;
+                }
+                r = r + 1;
+            }
+            int64[] ss = heap int64[1];
+            ss[0] = (int64) longest;
+            Tensor<float32> scores = Tensor.zeros<float32>(ss);
+            r = 0;
+            while (r < totalRows) {
+                int32 p = qPos.flatGet(r);
+                int32 from = 0;
+                if (window > 0 && p + 1 > window) {
+                    from = p + 1 - window;
+                }
+                int64 base = (int64) kvBase.flatGet((int64) seqOf.flatGet(r));
+                Prim.attendRowHostF16(q, r * (int64) (nH * hd), k, v, base,
+                    from, p, scale, scores, out, r * (int64) (nH * hd),
+                    nH, nKv, hd);
+                r = r + 1;
+            }
+        }
+        return #out;
+    }
+}

@@ -1,0 +1,1499 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+
+/**
+ * threaded-forward-path plan 3.1 — the Q4_K mat-vec as an `@Kernel`,
+ * against the serial reference it was lifted from.
+ *
+ * The bar is BIT-IDENTICAL, not a tolerance, and that is a deliberate
+ * choice rather than an optimistic one: each kernel performs the same
+ * float operations in the same order as the serial twin it is compared
+ * against. A tolerance would hide exactly the class of bug these units
+ * can introduce — a row computed twice, a row skipped, a sub-block paired
+ * with the wrong scale — because all of those land close to the right
+ * answer on smooth data.
+ *
+ * Q4_K's twin is `q4kMatVecIntoLanes4`, NOT the `q4kMatVecInto` the host
+ * path uses. The two host forms compute the same thing in different
+ * orders because the two settings want different vector widths (plan
+ * 6.3.3): 16 lanes wins on the host, 4 lanes wins inside a kernel, where
+ * the CPU backend vectorizes across work items. Keeping a same-order twin
+ * is what lets the bar stay hard equality instead of softening to a
+ * tolerance the moment the shapes diverged.
+ *
+ * Every test also asserts the answer is NON-ZERO. A kernel that fails to
+ * lower does not fail the build: the launch finds nothing registered and
+ * every output buffer reads back zero (plan 8.11). Comparing two things
+ * that are both zero is how XpuScheduleTests came to pass while running
+ * no kernel at all, and this suite will not repeat it.
+ */
+public class QuantKernelTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+
+    public QuantKernelTest() { return; }
+
+    /** Fails unless `v` has at least one non-zero entry — the guard against
+     *  a silent no-op launch reading as agreement. */
+    static void assertLive(float32[] v, String what) {
+        int64 i = 0;
+        while (i < (int64) v.count()) {
+            if (v[i] != 0.0f) { return; }
+            i = i + 1;
+        }
+        Assert.fail(what + ": every value is zero, which is what a kernel "
+            + "that never ran produces");
+    }
+
+    /** Mixed signs and magnitudes: an all-positive x hides sign handling in
+     *  the nibble widen, and a constant x hides lane misordering. */
+    static #float32[] activations(int64 n) {
+        float32[] x #= heap float32[n];
+        int64 c = 0;
+        while (c < n) {
+            x[c] = (float32) ((c % 11L) - 5L) * 0.375f;
+            c = c + 1;
+        }
+        return #x;
+    }
+
+    /** `reps` copies of the fixture's blocks, so a test can ask for more
+     *  rows than the 8 blocks on disk. */
+    static #int8[] tiled(int8[] raw, int64 reps) {
+        int64 n = (int64) raw.count();
+        int8[] out #= heap int8[n * reps];
+        int64 r = 0;
+        while (r < reps) {
+            int64 i = 0;
+            while (i < n) { out[r * n + i] = raw[i]; i = i + 1; }
+            r = r + 1;
+        }
+        return #out;
+    }
+
+    /**
+     * 3.1.1 — the kernel agrees with `q4kMatVecIntoLanes4` bit for bit on
+     * the real Q4_K_M bytes.
+     */
+    @Test
+    public void q4kKernelIsBitIdenticalToSerial() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        Quant.q4kMatVecIntoLanes4(raw, rows, cols, x, 0L, want, 0L);
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, x, 0L, got, 0L);
+
+        QuantKernelTest.assertLive(want, "serial reference");
+        QuantKernelTest.assertLive(got, "kernel");
+        int64 r = 0;
+        while (r < rows) {
+            if (got[r] != want[r]) {
+                Assert.fail("row " + r + ": kernel " + got[r]
+                    + " vs serial " + want[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    /**
+     * 6.1.1 — every routed format is bit-identical to its own serial
+     * reference, over the real blocks checked in under kquant/.
+     *
+     * Q6_K is the one that pays: 25.6% of a Q4_K_M file by bytes
+     * (measured on Meta-Llama-3.1-8B-Instruct-Q4_K_M — 74.4% Q4_K, 25.6%
+     * Q6_K, no Q5_K, no Q8_0), and it holds `attn_v` and `output.weight`,
+     * so it runs for every token. With Q4_K routed and Q6_K serial,
+     * Amdahl caps end-to-end at about 3x however well the Q4_K kernel
+     * scales.
+     */
+    static void checkFormat(String name, int32 ty, int64 blockBytes,
+            int64 blockElems) {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + name + ".bin");
+        int64 blocks = (int64) raw.count() / blockBytes;
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * blockElems;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        if (ty == Quant.GG_Q5_K) {
+            Quant.q5kMatVecInto(raw, rows, cols, x, 0L, want, 0L);
+        } else if (ty == Quant.GG_Q6_K) {
+            Quant.q6kMatVecInto(raw, rows, cols, x, 0L, want, 0L);
+        } else {
+            Quant.q8MatVecInto(raw, rows, cols, x, 0L, want, 0L);
+        }
+        QuantKernel.matVecIntoDevice(ty, raw, rows, cols, x, 0L, got, 0L);
+
+        QuantKernelTest.assertLive(want, name + " serial reference");
+        QuantKernelTest.assertLive(got, name + " kernel");
+        int64 r = 0;
+        while (r < rows) {
+            if (got[r] != want[r]) {
+                Assert.fail(name + " row " + r + ": kernel " + got[r]
+                    + " vs serial " + want[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    /**
+     * 6.3.3 — the 4-lane oracle is tied to the SCALAR floor, so it cannot
+     * drift away from what Q4_K means while still agreeing with the kernel.
+     *
+     * Without this, `q4kMatVecIntoLanes4` and `q4kMatVecKernel` could both
+     * be wrong in the same way and 3.1.1 would still pass. A tolerance is
+     * right here and hard equality would be wrong: the scalar floor sums
+     * left to right over 256 elements and the vector form reduces four
+     * lanes, so they cannot agree bit for bit and a test demanding it would
+     * fail on correct code.
+     */
+    @Test
+    public void lanes4OracleAgreesWithTheScalarFloor() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+        float32[] lanes4 #= heap float32[rows];
+        float32[] floor #= heap float32[rows];
+        Quant.q4kMatVecIntoLanes4(raw, rows, cols, x, 0L, lanes4, 0L);
+        Quant.q4kMatVecIntoScalar(raw, rows, cols, x, 0L, floor, 0L);
+        QuantKernelTest.assertLive(lanes4, "lanes4 oracle");
+        int64 r = 0;
+        while (r < rows) {
+            float32 diff = lanes4[r] - floor[r];
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = floor[r] < 0.0f ? 0.0f - floor[r] : floor[r];
+            if (diff > mag * 1.0e-4f + 1.0e-3f) {
+                Assert.fail("row " + r + ": lanes4 " + lanes4[r]
+                    + " vs scalar floor " + floor[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    @Test
+    public void q6kKernelIsBitIdenticalToSerial() {
+        QuantKernelTest.checkFormat("q6_k", Quant.GG_Q6_K, 210L, 256L);
+    }
+
+    @Test
+    public void q5kKernelIsBitIdenticalToSerial() {
+        QuantKernelTest.checkFormat("q5_k", Quant.GG_Q5_K, 176L, 256L);
+    }
+
+    @Test
+    public void q8KernelIsBitIdenticalToSerial() {
+        QuantKernelTest.checkFormat("q8_0", Quant.GG_Q8_0, 34L, 32L);
+    }
+
+    /**
+     * 3.1.2 — 520 rows over a 64-wide block is 9 grid blocks with the last
+     * one 56/64 masked off, and 9 blocks over the CPU backend's workers
+     * divides evenly for no worker count it is likely to pick. A row
+     * computed twice or skipped shows up as a mismatch at that row.
+     */
+    @Test
+    public void q4kKernelCoversEveryRowWhenRowsDoNotFillTheGrid() {
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 rows = 520L;
+        int64 cols = 256L;                       // one block per row
+        int64 blocksOnDisk = (int64) one.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int8[] raw #= QuantKernelTest.tiled(one, (rows + blocksOnDisk - 1L)
+            / blocksOnDisk);
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        Quant.q4kMatVecIntoLanes4(raw, rows, cols, x, 0L, want, 0L);
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, x, 0L, got, 0L);
+
+        QuantKernelTest.assertLive(got, "kernel");
+        int64 r = 0;
+        while (r < rows) {
+            if (got[r] != want[r]) {
+                Assert.fail("row " + r + " of " + rows + ": kernel "
+                    + got[r] + " vs serial " + want[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    /**
+     * 3.1.3 — `kQuantMatVecHonoursOffsets`' guarantee through the kernel:
+     * a non-zero `xOff`/`yOff` reads and writes the same values, shifted.
+     */
+    @Test
+    public void q4kKernelHonoursOffsets() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] flat #= heap float32[rows];
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, x, 0L, flat, 0L);
+
+        float32[] bigX #= heap float32[cols + 8L];
+        int64 c = 0;
+        while (c < cols) { bigX[c + 5L] = x[c]; c = c + 1; }
+        float32[] bigY #= heap float32[rows + 4L];
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, bigX, 5L, bigY, 3L);
+
+        QuantKernelTest.assertLive(flat, "kernel at offset 0");
+        int64 r = 0;
+        while (r < rows) {
+            if (bigY[r + 3L] != flat[r]) {
+                Assert.fail("row " + r + " at offset: " + bigY[r + 3L]
+                    + " vs flat " + flat[r]);
+            }
+            r = r + 1;
+        }
+        // The untouched margins must stay untouched — a yOff the kernel
+        // ignored would still match above while scribbling at index 0.
+        Assert.equals((int64) (bigY[0] * 1000000.0f), 0L);
+        Assert.equals((int64) (bigY[rows + 3L] * 1000000.0f), 0L);
+    }
+
+    /**
+     * 3.1.4 — a single-row grid, the serial-cutover shape: one work item,
+     * one grid block, and the same answer as the full run's row 0.
+     */
+    @Test
+    public void q4kKernelSingleRowGridMatchesTheFullGrid() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] full #= heap float32[rows];
+        QuantKernel.q4kMatVecIntoDevice(raw, rows, cols, x, 0L, full, 0L);
+
+        float32[] one #= heap float32[1];
+        QuantKernel.q4kMatVecIntoDevice(raw, 1L, cols, x, 0L, one, 0L);
+
+        QuantKernelTest.assertLive(one, "single-row kernel");
+        if (one[0] != full[0]) {
+            Assert.fail("single-row grid " + one[0]
+                + " vs full grid row 0 " + full[0]);
+        }
+    }
+
+    /**
+     * The q8_K INTEGER kernel against its host oracle, bit-identical.
+     *
+     * `Quant.q4kMatVecIntoQ8` is the reference here, NOT `q4kMatVecInto`:
+     * the integer route quantizes the activations, so it does not compute
+     * what the f32 route computes and holding it to that would be holding
+     * it to the wrong thing. What must hold exactly is that moving the same
+     * integer arithmetic into a kernel does not perturb it — and on x86 the
+     * kernel now reaches `vpdpbusd` while the oracle may take a different
+     * tier, which is precisely the pair worth pinning, since every tier is
+     * specified to agree bit-for-bit.
+     */
+    @Test
+    public void q4kQ8KernelIsBitIdenticalToItsIntegerOracle() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        int8[] xq #= heap int8[cols];
+        float32[] xd #= heap float32[cols / 256L];
+        int32[] xbs #= heap int32[cols / 16L];
+        Quant.q8kQuantize(x, 0L, cols, xq, xd, xbs);
+
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        Quant.q4kMatVecIntoQ8(raw, rows, cols, xq, xd, xbs, want, 0L);
+        QuantKernel.q4kQ8MatVecIntoDevice(raw, rows, cols, x, 0L, got, 0L);
+
+        QuantKernelTest.assertLive(want, "integer oracle");
+        QuantKernelTest.assertLive(got, "integer kernel");
+        // Bit identity is a NATIVE-tier invariant: there our own LLVM does the
+        // final codegen, so the kernel's scale arithmetic rounds exactly like
+        // the host oracle's. On the shader tier the DRIVER compiles the
+        // SPIR-V and may contract mul+add differently — measured 2026-08-25 as
+        // a sub-1e-6-relative (ULP-level) difference on RADV. Hold bit
+        // identity where it is promised; hold a 1e-5 relative bar elsewhere.
+        String be #= Device.activeBackend();
+        boolean bitExact = !be.equals("vulkan");
+        int64 r = 0;
+        while (r < rows) {
+            if (bitExact) {
+                if (got[r] != want[r]) {
+                    Assert.fail("row " + r + ": kernel " + got[r]
+                        + " vs integer oracle " + want[r]);
+                }
+            } else {
+                float32 a = want[r];
+                float32 b = got[r];
+                float32 diff = a - b;
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = a < 0.0f ? 0.0f - a : a;
+                if (diff > mag * 0.00001f + 0.0000001f) {
+                    Assert.fail("row " + r + ": kernel " + got[r]
+                        + " vs integer oracle " + want[r]
+                        + " - beyond driver-contraction ULPs");
+                }
+            }
+            r = r + 1;
+        }
+    }
+
+    /**
+     * And it must NOT equal the f32 route — the does-not-fire half.
+     *
+     * The integer route's whole premise is that quantizing the activations
+     * is an approximation worth 1.47x. If these two agreed exactly, either
+     * the quantization is not happening or the test above is comparing
+     * something to itself; both are failures that a bit-identity check
+     * alone reads as success.
+     */
+    @Test
+    public void theIntegerRouteIsCloseToButNotEqualToTheF32Route() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] f32 #= heap float32[rows];
+        float32[] q8 #= heap float32[rows];
+        Quant.q4kMatVecInto(raw, rows, cols, x, 0L, f32, 0L);
+        QuantKernel.q4kQ8MatVecIntoDevice(raw, rows, cols, x, 0L, q8, 0L);
+
+        QuantKernelTest.assertLive(f32, "f32 route");
+        QuantKernelTest.assertLive(q8, "integer route");
+        boolean anyDiffer = false;
+        int64 r = 0;
+        while (r < rows) {
+            if (q8[r] != f32[r]) { anyDiffer = true; }
+            // Close, though: a 1% band on the magnitude catches a route that
+            // is not merely re-rounded but wrong.
+            float32 d = q8[r] - f32[r];
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 m = f32[r] < 0.0f ? 0.0f - f32[r] : f32[r];
+            if (d > 0.01f * m + 0.001f) {
+                Assert.fail("row " + r + ": integer " + q8[r]
+                    + " is not close to f32 " + f32[r]);
+            }
+            r = r + 1;
+        }
+        if (!anyDiffer) {
+            Assert.fail("the integer route matched the f32 route EXACTLY, "
+                + "so the activation quantization did not happen");
+        }
+    }
+
+    /**
+     * 10.1.1 — the PACKED activation buffer is bit-identical to the three
+     * separate buffers, through the same kernel body.
+     *
+     * The whole claim of 10.1 is that folding q8_K's sixteen group sums
+     * into eight sub-block sums and rebuilding the scale from its own bytes
+     * changes the TRANSFER shape and nothing else. A tolerance would not
+     * establish that; only equality does.
+     */
+    @Test
+    public void thePackedActivationBufferIsBitIdenticalToTheThreeBufferForm() {
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        QuantKernel.q4kQ8MatVecIntoDevice(raw, rows, cols, x, 0L, want, 0L);
+        QuantKernel.q4kQ8PackedMatVecIntoDevice(raw, rows, cols, x, 0L,
+            got, 0L);
+
+        QuantKernelTest.assertLive(want, "three-buffer q8 kernel");
+        QuantKernelTest.assertLive(got, "packed q8 kernel");
+        int64 r = 0;
+        while (r < rows) {
+            if (got[r] != want[r]) {
+                Assert.fail("row " + r + ": packed " + got[r]
+                    + " vs three-buffer " + want[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    /**
+     * 10.1.2 — the pack ROUND-TRIPS.
+     *
+     * A result comparison can hide a layout slip: a stride or offset that
+     * is wrong in both the writer and the reader agrees with itself. This
+     * asserts the bytes directly against `q8kQuantize`'s output, which is
+     * the independently-tested definition of q8_K form.
+     */
+    @Test
+    public void theQ8PackRoundTripsQuantsScaleAndSubBlockSums() {
+        int64 cols = 512L;
+        float32[] x #= QuantKernelTest.activations(cols);
+        int8[] xq #= heap int8[cols];
+        float32[] xd #= heap float32[cols / 256L];
+        int32[] xbs #= heap int32[cols / 16L];
+        Quant.q8kQuantize(x, 0L, cols, xq, xd, xbs);
+
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, 0L, cols, xp);
+
+        if (Quant.q8kPackedBytes(cols) != 640L) {
+            Assert.fail("packed size " + Quant.q8kPackedBytes(cols)
+                + " - expected 2 blocks x 320 bytes");
+        }
+        int64 b = 0;
+        while (b < cols / 256L) {
+            int64 e = 0;
+            while (e < 256L) {
+                if (xp[b * 320L + e] != xq[b * 256L + e]) {
+                    Assert.fail("block " + b + " quant " + e + ": packed "
+                        + xp[b * 320L + e] + " vs " + xq[b * 256L + e]);
+                }
+                e = e + 1L;
+            }
+            if (Quant.q8kPackedScale(xp, b) != xd[b]) {
+                Assert.fail("block " + b + " scale: packed "
+                    + Quant.q8kPackedScale(xp, b) + " vs " + xd[b]);
+            }
+            int64 sb = 0;
+            while (sb < 8L) {
+                int32 want = xbs[b * 16L + sb * 2L]
+                    + xbs[b * 16L + sb * 2L + 1L];
+                if (Quant.q8kPackedSum(xp, b, sb) != want) {
+                    Assert.fail("block " + b + " sub-block " + sb + ": packed "
+                        + Quant.q8kPackedSum(xp, b, sb) + " vs " + want);
+                }
+                sb = sb + 1L;
+            }
+            b = b + 1L;
+        }
+    }
+
+    /**
+     * 10.1.3 — the scale survives the byte round-trip EXACTLY, at
+     * magnitudes where a narrower carrier would not.
+     *
+     * The block stores the scale's IEEE-754 bits rather than an f16,
+     * which is only worth the four bytes if the recovered value is the
+     * f32 itself. These magnitudes are chosen so an f16 carrier would
+     * visibly fail: the mantissa bits below f16's eleven, and a value
+     * beyond f16's range entirely.
+     */
+    @Test
+    public void thePackedScaleIsTheExactF32NotANarrowedOne() {
+        int64 cols = 256L;
+        float32[] x #= heap float32[cols];
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        float32[] amax #= heap float32[4];
+        amax[0] = 1.0f;
+        amax[1] = 127.0f * 1.0000305f;
+        amax[2] = 0.00001f;
+        amax[3] = 100000.0f;
+        int64 t = 0;
+        while (t < 4L) {
+            int64 i = 0;
+            while (i < cols) { x[i] = 0.0f; i = i + 1L; }
+            x[0] = amax[t];
+            Quant.q8kPack(x, 0L, cols, xp);
+            float32 want = amax[t] / 127.0f;
+            if (Quant.q8kPackedScale(xp, 0L) != want) {
+                Assert.fail("amax " + amax[t] + ": scale read back "
+                    + Quant.q8kPackedScale(xp, 0L) + " vs " + want);
+            }
+            t = t + 1L;
+        }
+    }
+
+
+    /**
+     * 11.1 — the wave-cooperative kernel agrees with the one-item-per-row
+     * kernel on the same bytes.
+     *
+     * NOT bit-identical, and it must not be: the sum over a row is
+     * regrouped. One item per row adds block 0's contribution, then block
+     * 1's, in order; one wave per row has each lane add its own subset and
+     * then reduces the 32 partials as a tree. Float addition is not
+     * associative, so a difference of a few ULP is the CORRECT outcome and
+     * an exact match would mean the decomposition did not change.
+     */
+    /**
+     * 10.12.45.C — the Q2_K wave mat-vec agrees with the host
+     * block-direct mat-vec. The device kernel reads q8_K-QUANTIZED
+     * activations (the integer route's approximation) while the host
+     * floor reads f32, so the bar absorbs quantization (~0.03%
+     * measured for the Q4 route) — far below what any scale/min/shift
+     * indexing slip produces, which is order-100% garbage.
+     */
+    @Test
+    public void theQ2WaveKernelAgreesWithTheHostMatVec() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        // Tiled x16: the raw fixture is 4 blocks per row and the V2
+        // kernel flies 8 blocks per wave, so untiled it would test a
+        // single loop iteration with half the lanes idle.
+        QuantKernelTest.checkWaveVsHostTiled("q2_k", Quant.GG_Q2_K, 16L);
+    }
+
+    /** 10.12.45.C — the Q3_K twin; tiled x16 for the same reason as
+     *  Q2's (the V2 kernels fly 8 blocks per wave). */
+    @Test
+    public void theQ3WaveKernelAgreesWithTheHostMatVec() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        QuantKernelTest.checkWaveVsHostTiled("q3_k", Quant.GG_Q3_K, 16L);
+    }
+
+    /** 10.12.39 — the Q5_K wave twin: the Q4 kernel plus the qh high
+     *  bit. Tiled x16 so each row carries 64 blocks and the wave's
+     *  8-blocks-in-flight loop runs 8 iterations, not one. */
+    @Test
+    public void theQ5WaveKernelAgreesWithTheHostMatVec() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        QuantKernelTest.checkWaveVsHostTiled("q5_k", Quant.GG_Q5_K, 16L);
+    }
+
+    /** 10.12.39 — the Q8_0 wave kernel: one lane per 32-element block,
+     *  signed x signed dotAccum. Tiled x64 (the fixture is 8 blocks =
+     *  one wave-iteration of 32 lanes at an eighth occupancy); at 256
+     *  blocks per row the lane loop runs 8 iterations. */
+    @Test
+    public void theQ8WaveKernelAgreesWithTheHostMatVec() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        QuantKernelTest.checkWaveVsHostTiled("q8_0", Quant.GG_Q8_0, 64L);
+    }
+
+    static void checkWaveVsHost(String name, int32 ty) {
+        QuantKernelTest.checkWaveVsHostTiled(name, ty, 1L);
+    }
+
+    static void checkWaveVsHostTiled(String name, int32 ty, int64 reps) {
+        int8[] raw0 #= File.readAllBytes(QuantKernelTest.DIR + name
+            + ".bin");
+        int8[] raw #= QuantKernelTest.tiled(raw0, reps);
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(ty);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * (int64) Quant.blockElems(ty);
+        float32[] x #= QuantKernelTest.activations(cols);
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        if (ty == Quant.GG_Q2_K) {
+            Quant.q2kMatVec(raw, rows, cols, x, want);
+            QuantKernel.q2kQ8WaveMatVecIntoDevice(raw, rows, cols, x, 0L,
+                got, 0L);
+        } else if (ty == Quant.GG_Q5_K) {
+            Quant.q5kMatVec(raw, rows, cols, x, want);
+            QuantKernel.q5kQ8WaveMatVecIntoDevice(raw, rows, cols, x, 0L,
+                got, 0L);
+        } else if (ty == Quant.GG_Q8_0) {
+            Quant.q8MatVec(raw, rows, cols, x, want);
+            QuantKernel.q80Q8WaveMatVecIntoDevice(raw, rows, cols, x, 0L,
+                got, 0L);
+        } else {
+            Quant.q3kMatVec(raw, rows, cols, x, want);
+            QuantKernel.q3kQ8WaveMatVecIntoDevice(raw, rows, cols, x, 0L,
+                got, 0L);
+        }
+        QuantKernelTest.assertLive(want, name + " host mat-vec");
+        QuantKernelTest.assertLive(got, name + " wave kernel");
+        int64 r = 0;
+        while (r < rows) {
+            float32 a = want[r];
+            float32 b = got[r];
+            float32 diff = a - b;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.005f + 0.01f) {
+                Assert.fail(name + " row " + r + ": wave " + b
+                    + " vs host " + a
+                    + " - beyond the q8_K quantization budget");
+            }
+            r = r + 1;
+        }
+    }
+
+    @Test
+    public void theWaveKernelAgreesWithTheItemPerRowKernel() {
+        // The wave-cooperative kernel is a DEVICE kernel: it depends on a
+        // workgroup of 32 threads sharing an LDS array across a barrier,
+        // and on the CPU backend that shape returns exactly 0.0 on every
+        // row (plan 11.5). It is routed only on device backends, so it is
+        // asserted only there — skipping it silently everywhere would be
+        // the same as not having the test.
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] raw #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rows = 2L;
+        int64 cols = (blocks / rows) * 256L;
+        float32[] x #= QuantKernelTest.activations(cols);
+
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        QuantKernel.q4kQ8PackedMatVecIntoDevice(raw, rows, cols, x, 0L,
+            want, 0L);
+        QuantKernel.q4kQ8WaveMatVecIntoDevice(raw, rows, cols, x, 0L,
+            got, 0L);
+
+        QuantKernelTest.assertLive(want, "item-per-row kernel");
+        QuantKernelTest.assertLive(got, "wave-cooperative kernel");
+        int64 r = 0;
+        while (r < rows) {
+            float32 a = want[r];
+            float32 b = got[r];
+            float32 diff = a - b;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.0001f + 0.0001f) {
+                Assert.fail("row " + r + ": wave " + b + " vs item " + a
+                    + " - further apart than reassociation explains");
+            }
+            r = r + 1;
+        }
+    }
+
+    /**
+     * 11.1, the does-NOT-fire half: every row must be written.
+     *
+     * Only lane 0 of each wave stores, and the row index is derived from
+     * the global id rather than handed in — two places a decomposition
+     * change silently drops or doubles rows. A row count that is not a
+     * multiple of anything convenient is the case that catches it.
+     */
+    @Test
+    public void theWaveKernelWritesEveryRowIncludingARaggedTail() {
+        // The wave-cooperative kernel is a DEVICE kernel: it depends on a
+        // workgroup of 32 threads sharing an LDS array across a barrier,
+        // and on the CPU backend that shape returns exactly 0.0 on every
+        // row (plan 11.5). It is routed only on device backends, so it is
+        // asserted only there — skipping it silently everywhere would be
+        // the same as not having the test.
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 rows = 173L;                       // deliberately ragged
+        int64 cols = 256L;                       // one block per row
+        int64 bb = (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int8[] raw #= heap int8[rows * bb];
+        int64 blocksOnDisk = (int64) one.count() / bb;
+        int64 r = 0;
+        while (r < rows) {
+            int64 src = (r % blocksOnDisk) * bb;
+            int64 k = 0;
+            while (k < bb) { raw[r * bb + k] = one[src + k]; k = k + 1; }
+            r = r + 1;
+        }
+        float32[] x #= QuantKernelTest.activations(cols);
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        QuantKernel.q4kQ8PackedMatVecIntoDevice(raw, rows, cols, x, 0L,
+            want, 0L);
+        QuantKernel.q4kQ8WaveMatVecIntoDevice(raw, rows, cols, x, 0L,
+            got, 0L);
+        r = 0;
+        while (r < rows) {
+            float32 a = want[r];
+            float32 b = got[r];
+            float32 diff = a - b;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.0001f + 0.0001f) {
+                Assert.fail("row " + r + " of " + rows + ": wave " + b
+                    + " vs item " + a);
+            }
+            r = r + 1;
+        }
+    }
+
+
+    /**
+     * 10.2 — the DEVICE packer is byte-for-byte the host packer.
+     *
+     * These two are interchangeable by design: the host one runs when the
+     * activation arrives from the host, the device one when it is already
+     * resident. "Close" is not good enough — a device path that quantized
+     * slightly differently would be a second quantization that nothing
+     * compares against, and every downstream bit-identity test would still
+     * pass because they all read whichever buffer they were given.
+     */
+    @Test
+    public void theDeviceActivationPackerMatchesTheHostOneByteForByte() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int64 n = 1024L;
+        float32[] x #= QuantKernelTest.activations(n);
+        // A block of exact zeros, because the packer guards a reciprocal
+        // there and a divergence would be invisible in ordinary data.
+        int64 z = 0;
+        while (z < 256L) { x[512L + z] = 0.0f; z = z + 1L; }
+
+        int8[] want #= heap int8[Quant.q8kPackedBytes(n)];
+        int8[] got #= heap int8[Quant.q8kPackedBytes(n)];
+        Quant.q8kPack(x, 0L, n, want);
+        QuantKernel.q8kPackIntoDevice(x, n, got);
+
+        int64 nb = n / 256L;
+        int64 b = 0;
+        while (b < nb) {
+            int64 e = 0;
+            while (e < 292L) {          // the payload; pad is never read
+                int64 o = b * 320L + e;
+                if (got[o] != want[o]) {
+                    Assert.fail("block " + b + " byte " + e + ": device "
+                        + got[o] + " vs host " + want[o]);
+                }
+                e = e + 1L;
+            }
+            b = b + 1L;
+        }
+    }
+
+
+    /**
+     * 10.12.14 — the MATRIX-CORE Q4_K GEMM agrees with the shipped
+     * one-token-per-lane batch kernel on the same bytes.
+     *
+     * Not bit-identical and it must not be: `dotAccum` sums a 32-element
+     * group per call and the wave reduces the block serially, while WMMA
+     * accumulates a 16x16x16 tile in the matrix-core register file. The
+     * regrouping is the whole point of the change.
+     *
+     * What IS held exactly is the shape. Every row of the output must be
+     * live: a tiling that got `tilesN` or the tile origin wrong leaves a
+     * whole 16-wide stripe at zero, and against smooth data the surviving
+     * stripes still agree to tolerance.
+     */
+    @Test
+    public void theWmmaKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        // 2026-08-25, second pass: the "shader-tier miscompile" was the NATIVE
+        // OpCooperativeMatrixMulAddKHR path multiplying signed int8 as
+        // UNSIGNED — the emitter passed no signedness operands literal
+        // (VkTileProbe: -1 read as 255). Fixed by threading the sign mask
+        // from the cajeta type args through the seam; the vulkan tier now
+        // runs these pair tests like every other backend.
+        // The fixture holds 8 blocks and a 16x16 tile needs 16 rows, so
+        // as committed this computed `cols = (8/16)*256 = 0` — a
+        // zero-column GEMM whose all-zero output tripped assertLive the
+        // FIRST time the suite was actually compiled for amdgpu
+        // (2026-08-24; the earlier "green" sweep set CAJETA_XPU_BACKEND,
+        // which run-tests.sh does not read, so every device test
+        // early-returned against a cpu-compiled binary). Tile the
+        // fixture to 32 blocks: 16 rows x 2 blocks, and the b loop
+        // actually iterates.
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 outDim = 16L;
+        int64 cols = (blocks / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareInto(raw, x, rows, outDim, cols, want, got);
+
+        QuantKernelTest.assertLive(want, "batch kernel");
+        QuantKernelTest.assertLive(got, "WMMA kernel");
+        int64 t = 0;
+        while (t < rows) {
+            boolean live = false;
+            int64 i = 0;
+            while (i < outDim) {
+                if (got[t * outDim + i] != 0.0f) { live = true; }
+                i = i + 1;
+            }
+            if (!live) {
+                Assert.fail("token row " + t + " of " + rows
+                    + " is entirely zero - the tiling is short");
+            }
+            t = t + 1;
+        }
+        int64 n = rows * outDim;
+        int64 k = 0;
+        while (k < n) {
+            float32 a = want[k];
+            float32 b2 = got[k];
+            float32 diff = a - b2;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.002f + 0.002f) {
+                Assert.fail("element " + k + " (token " + (k / outDim)
+                    + ", row " + (k % outDim) + "): wmma " + b2
+                    + " vs batch " + a
+                    + " - further apart than reassociation explains");
+            }
+            k = k + 1;
+        }
+    }
+
+    /**
+     * 10.12.23 — the Q6_K MATRIX-CORE GEMM agrees with the shipped
+     * Q6_K batch kernel on the same bytes. Not bit-identical and it
+     * must not be (the two accumulate in different orders — the same
+     * reassociation slack as the Q4_K pair), but every 16-wide output
+     * stripe must be live, so a tiling slip cannot hide.
+     *
+     * The kernels also differ in SIGN HANDLING, deliberately: the
+     * batch kernel keeps q unsigned (0..63) and corrects with
+     * -32*asum because its dotAccum is uint8 x int8; the WMMA twin
+     * widens the signed value q-32 directly (matrix cores multiply
+     * signed int8), so no correction pass exists to get wrong. This
+     * test is what holds the two reconstructions together.
+     */
+    @Test
+    public void theQ6kWmmaKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        // 2026-08-25, second pass: the "shader-tier miscompile" was the NATIVE
+        // OpCooperativeMatrixMulAddKHR path multiplying signed int8 as
+        // UNSIGNED — the emitter passed no signedness operands literal
+        // (VkTileProbe: -1 read as 255). Fixed by threading the sign mask
+        // from the cajeta type args through the seam; the vulkan tier now
+        // runs these pair tests like every other backend.
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q6_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 blocks = (int64) raw.count()
+            / (int64) Quant.blockBytes(Quant.GG_Q6_K);
+        int64 outDim = 16L;
+        int64 cols = (blocks / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareQ6Into(raw, x, rows, outDim, cols, want, got);
+
+        QuantKernelTest.assertLive(want, "q6 batch kernel");
+        QuantKernelTest.assertLive(got, "q6 WMMA kernel");
+        int64 t = 0;
+        while (t < rows) {
+            boolean live = false;
+            int64 i = 0;
+            while (i < outDim) {
+                if (got[t * outDim + i] != 0.0f) { live = true; }
+                i = i + 1;
+            }
+            if (!live) {
+                Assert.fail("token row " + t + " of " + rows
+                    + " is entirely zero - the tiling is short");
+            }
+            t = t + 1;
+        }
+        int64 n = rows * outDim;
+        int64 k = 0;
+        while (k < n) {
+            float32 a = want[k];
+            float32 b2 = got[k];
+            float32 diff = a - b2;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.002f + 0.002f) {
+                Assert.fail("element " + k + " (token " + (k / outDim)
+                    + ", row " + (k % outDim) + "): q6 wmma " + b2
+                    + " vs batch " + a
+                    + " - further apart than reassociation explains");
+            }
+            k = k + 1;
+        }
+    }
+
+    /** Shared tolerance check for the epilogue kernels: liveness per
+     *  16-wide stripe, then reassociation-tolerance agreement. */
+    static void assertEpiAgreement(float32[] want, float32[] got,
+            int64 rows, int64 outDim, String what) {
+        QuantKernelTest.assertLive(want, "batch kernel");
+        QuantKernelTest.assertLive(got, what);
+        int64 t = 0;
+        while (t < rows) {
+            boolean live = false;
+            int64 i = 0;
+            while (i < outDim) {
+                if (got[t * outDim + i] != 0.0f) { live = true; }
+                i = i + 1;
+            }
+            if (!live) {
+                Assert.fail(what + ": token row " + t + " of " + rows
+                    + " is entirely zero - the tiling is short");
+            }
+            t = t + 1;
+        }
+        int64 n = rows * outDim;
+        int64 k = 0;
+        while (k < n) {
+            float32 a = want[k];
+            float32 b2 = got[k];
+            float32 diff = a - b2;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.002f + 0.002f) {
+                Assert.fail(what + " element " + k + " (token "
+                    + (k / outDim) + ", row " + (k % outDim) + "): "
+                    + b2 + " vs batch " + a
+                    + " - further apart than reassociation explains");
+            }
+            k = k + 1;
+        }
+    }
+
+    /**
+     * Epilogue plan U3 — the Q4_K register-epilogue kernels (staged and
+     * deq B feeds) agree with the batch kernel. Tolerance oracle: the
+     * epi kernels pre-fold d*sc and run dmin as rank-1 float
+     * accumulates, so the association moves by design; the verbs' own
+     * bit-exactness is pinned at the compiler level.
+     */
+    @Test
+    public void theEpiQ4kKernelsAgreeWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 outDim = 16L;
+        int64 cols = (((int64) raw.count() / 144L) / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] want #= heap float32[rows * outDim];
+        float32[] gotStaged #= heap float32[rows * outDim];
+        float32[] gotDeq #= heap float32[rows * outDim];
+        WmmaKernel.compareEpiInto(raw, x, rows, outDim, cols, want,
+            gotStaged, gotDeq);
+        // The two epi kernels share every line of math and differ only
+        // in the B feed — EXACT agreement between them splits any
+        // failure into feed vs shared-arithmetic before the tolerance
+        // checks run.
+        int64 nsd = rows * outDim;
+        int64 ksd = 0;
+        while (ksd < nsd) {
+            if (gotStaged[ksd] != gotDeq[ksd]) {
+                Assert.fail("epi staged vs deq diverge at element " + ksd
+                    + " (token " + (ksd / outDim) + ", row "
+                    + (ksd % outDim) + "): staged " + gotStaged[ksd]
+                    + " vs deq " + gotDeq[ksd]
+                    + " - the B FEED differs, not the shared math");
+            }
+            ksd = ksd + 1;
+        }
+        QuantKernelTest.assertEpiAgreement(want, gotDeq, rows, outDim,
+            "epi deq Q4_K");
+        QuantKernelTest.assertEpiAgreement(want, gotStaged, rows, outDim,
+            "epi staged Q4_K");
+    }
+
+    /**
+     * 10.12.21 — the register-tiled T=2 deq kernel (two token-tiles per
+     * wave sharing every B fragment) agrees with the batch kernel, on a
+     * 32-row problem so BOTH token tiles of a workgroup are exercised.
+     * A T2 kernel that read the second tile's activations or scales
+     * from the first tile's state would pass 16-row shapes and corrupt
+     * every real prefill.
+     */
+    @Test
+    public void theT2DeqKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 outDim = 16L;
+        int64 cols = (((int64) raw.count() / 144L) / outDim) * 256L;
+        int64 rows = 32L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareT2Into(raw, x, rows, outDim, cols, want, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "T2 deq Q4_K");
+    }
+
+    /**
+     * 10.12.21 second iteration — the N=4 output-tiled deq kernel (one
+     * wave, FOUR output tiles, A fragments loaded once and reused
+     * across all four) agrees with the batch kernel. outDim = 64 so a
+     * workgroup's full output span is exercised: a kernel that reused
+     * the wrong tile's scales or wrote a stripe at the wrong offset
+     * passes narrower shapes and corrupts every real projection.
+     */
+    @Test
+    public void theN4DeqKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        // 2026-08-25, second pass: the "shader-tier miscompile" was the NATIVE
+        // OpCooperativeMatrixMulAddKHR path multiplying signed int8 as
+        // UNSIGNED — the emitter passed no signedness operands literal
+        // (VkTileProbe: -1 read as 255). Fixed by threading the sign mask
+        // from the cajeta type args through the seam; the vulkan tier now
+        // runs these pair tests like every other backend.
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 16L);
+        int64 outDim = 64L;
+        int64 cols = (((int64) raw.count() / 144L) / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareN4Into(raw, x, rows, outDim, cols, want, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "N4 deq Q4_K");
+    }
+
+    /**
+     * 10.12.21 FINAL — the multi-wave deq kernel (8 waves per
+     * workgroup, register epilogue via the dual verb, per-lane header
+     * registers, barrier-free K-loop) agrees with the batch kernel.
+     * outDim = 128 so every wave slot of a workgroup computes a
+     * distinct tile: a kernel that mapped wave ids to tiles wrongly
+     * passes narrower shapes and corrupts every real projection.
+     */
+    @Test
+    public void theMwDeqKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 32L);
+        int64 outDim = 128L;
+        int64 cols = (((int64) raw.count() / 144L) / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareMwInto(raw, x, rows, outDim, cols, want, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "Mw deq Q4_K");
+    }
+
+    /**
+     * 10.12.21 token blocking — the Mw4 kernel (FOUR token-tiles per
+     * workgroup sharing every weight fragment) agrees with the batch
+     * kernel. rows = 64 AND outDim = 128 so one workgroup's full
+     * 64x128 span is exercised: every wave slot times every token
+     * tile. A kernel that crossed a tile's activations with another
+     * tile's token scales, or drifted a shared rg (the Mw lesson),
+     * fails here at the first wrong (tile, wave) pair.
+     */
+    @Test
+    public void theMw4DeqKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 32L);
+        int64 outDim = 128L;
+        int64 cols = (((int64) raw.count() / 144L) / outDim) * 256L;
+        int64 rows = 64L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareMw4Into(raw, x, rows, outDim, cols, want, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "Mw4 deq Q4_K");
+    }
+
+    /**
+     * 10.12.28 — the T=8 deq kernel (EIGHT token-tiles per workgroup,
+     * both weight halves register-resident, accumulators and rg
+     * arrays reused across the two 4-tile chunks) agrees with the
+     * batch kernel. rows = 128 x outDim = 128: the full workgroup
+     * span — every wave slot times every token tile, BOTH chunks. A
+     * chunk-reuse bug (stale mc, rg rewritten early, wrong facc
+     * pairing) shows up in tiles 4-7 of the first token block.
+     */
+    @Test
+    public void theMw8DeqKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 32L);
+        int64 outDim = 128L;
+        int64 cols = (((int64) raw.count() / 144L) / outDim) * 256L;
+        int64 rows = 128L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareMw8Into(raw, x, rows, outDim, cols, want, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "Mw8 deq Q4_K");
+    }
+
+    /**
+     * 10.12.27 — the Q6_K token-blocked deq kernel (one-time signed
+     * widen + four token-tiles per workgroup) agrees with the batch
+     * kernel. rows = 64 x outDim = 128: the full workgroup span, every
+     * wave slot times every token tile, same rationale as the Q4 Mw4
+     * test. The widen has no separate oracle — any addressing slip in
+     * it breaks this agreement.
+     */
+    @Test
+    public void theQ6Mw4DeqKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q6_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 32L);
+        int64 outDim = 128L;
+        int64 cols = (((int64) raw.count() / 210L) / outDim) * 256L;
+        int64 rows = 64L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareQ6Mw4Into(raw, x, rows, outDim, cols, want,
+            got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "Q6 Mw4 deq");
+    }
+
+    /**
+     * 10.12.39 — the Q6_K T=8 twin (the Q4 Mw8 retile ported: cf
+     * pre-folded to LDS at block staging, eight token tiles per weight
+     * fragment) agrees with the batch kernel. rows = 128 x outDim =
+     * 128: every wave slot times every token tile, BOTH chunks — a
+     * stale-mc / wrong-facc pairing bug lands in tiles 4-7 of the
+     * first token block, same rationale as the Q4 Mw8 test.
+     */
+    @Test
+    public void theQ6Mw8DeqKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q6_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 32L);
+        int64 outDim = 128L;
+        int64 cols = (((int64) raw.count() / 210L) / outDim) * 256L;
+        int64 rows = 128L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareQ6Mw8Into(raw, x, rows, outDim, cols, want,
+            got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "Q6 Mw8 deq");
+    }
+
+    /**
+     * 10.12.45.D — the Q8_0 T=8 deq GEMM agrees with the host mat-vec
+     * on every (token, output) cell. Q8_0's widen is a pure tile-major
+     * re-layout (the values are already int8) and the drain is a single
+     * per-32-block scale, so any disagreement is addressing, not
+     * arithmetic. rows = 128 x outDim = 128: both chunks, every wave
+     * slot.
+     */
+    @Test
+    public void theQ8Mw8DeqKernelAgreesWithTheHostMatVec() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        // The Mw deq GEMMs use the NATIVE-only scaledAccumInto{,2}S verbs, so
+        // shader-tier backends skip them at build ("kernels skipped: 7" —
+        // measured 2026-08-25); the launch is a loud no-op and the output
+        // stays zero. Assert only where the kernel exists.
+        if (be.equals("vulkan")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q8_0.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 128L);
+        int64 outDim = 128L;
+        int64 cols = (((int64) raw.count() / 34L) / outDim) * 32L;
+        int64 rows = 128L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        // The GEMM reads q8_K-quantized activations; the oracle must
+        // share that quantization or the 0.002 bar measures the pack,
+        // not the kernel.
+        float32[] xr #= QuantKernelTest.q8kRoundTrip(x, rows, cols);
+        float32[] want #= heap float32[rows * outDim];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q8MatVecInto(raw, outDim, cols, xr, r * cols, want,
+                r * outDim);
+            r = r + 1;
+        }
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareQ80Mw8Into(raw, x, rows, outDim, cols, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "Q8_0 Mw8 deq");
+    }
+
+    /**
+     * 10.12.45.D — the Q3_K T=8 deq GEMM (the Q6 Mw8 shape: signed
+     * values with the -4 baked into the widen, signed six-bit scale
+     * prefold) agrees with the host mat-vec.
+     */
+    @Test
+    public void theQ3Mw8DeqKernelAgreesWithTheHostMatVec() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        // The Mw deq GEMMs use the NATIVE-only scaledAccumInto{,2}S verbs, so
+        // shader-tier backends skip them at build ("kernels skipped: 7" —
+        // measured 2026-08-25); the launch is a loud no-op and the output
+        // stays zero. Assert only where the kernel exists.
+        if (be.equals("vulkan")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q3_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 32L);
+        int64 outDim = 128L;
+        int64 cols = (((int64) raw.count() / 110L) / outDim) * 256L;
+        int64 rows = 128L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] xr #= QuantKernelTest.q8kRoundTrip(x, rows, cols);
+        float32[] want #= heap float32[rows * outDim];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q3kMatVecInto(raw, outDim, cols, xr, r * cols, want,
+                r * outDim);
+            r = r + 1;
+        }
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareQ3Mw8Into(raw, x, rows, outDim, cols, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "Q3_K Mw8 deq");
+    }
+
+    /**
+     * 10.12.45.D — the Q2_K T=8 deq GEMM: the two-factor drain with
+     * the min term closed by PER-16 activation sums computed at block
+     * staging (llama.cpp's bsums, materialized in LDS). The min half
+     * has no other oracle — a wrong rg16 produces plausible smooth
+     * output, so this test is the whole gate for it.
+     */
+    @Test
+    public void theQ2Mw8DeqKernelAgreesWithTheHostMatVec() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        // The Mw deq GEMMs use the NATIVE-only scaledAccumInto{,2}S verbs, so
+        // shader-tier backends skip them at build ("kernels skipped: 7" —
+        // measured 2026-08-25); the launch is a loud no-op and the output
+        // stays zero. Assert only where the kernel exists.
+        if (be.equals("vulkan")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q2_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 32L);
+        int64 outDim = 128L;
+        int64 cols = (((int64) raw.count() / 84L) / outDim) * 256L;
+        int64 rows = 128L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] xr #= QuantKernelTest.q8kRoundTrip(x, rows, cols);
+        float32[] want #= heap float32[rows * outDim];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q2kMatVecInto(raw, outDim, cols, xr, r * cols, want,
+                r * outDim);
+            r = r + 1;
+        }
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareQ2Mw8Into(raw, x, rows, outDim, cols, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "Q2_K Mw8 deq");
+    }
+
+    /** Quantize to the q8_K pack and reconstruct f32 — the activation
+     *  the integer GEMMs actually see. */
+    static #float32[] q8kRoundTrip(float32[] x, int64 rows, int64 cols) {
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int8[] xp #= heap int8[pb];
+        float32[] xr #= heap float32[rows * cols];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q8kPack(x, r * cols, cols, xp, 0L);
+            int64 b = 0;
+            while (b < cols / 256L) {
+                int64 xb = b * 320L;
+                float32 d8 = Cajeta.bitsToF32(((int32) xp[xb + 288L] & 255)
+                    | (((int32) xp[xb + 289L] & 255) << 8)
+                    | (((int32) xp[xb + 290L] & 255) << 16)
+                    | (((int32) xp[xb + 291L] & 255) << 24));
+                int64 e = 0;
+                while (e < 256) {
+                    xr[r * cols + b * 256L + e] =
+                        (float32) xp[xb + e] * d8;
+                    e = e + 1;
+                }
+                b = b + 1;
+            }
+            r = r + 1;
+        }
+        return #xr;
+    }
+
+    /**
+     * 10.12.45.D — the Q5_K T=8 deq GEMM agrees with the host mat-vec.
+     * The GEMM kernel IS the Q4 Mw8 kernel (identical 16-byte header at
+     * identical offsets; only the block stride differs), so this test
+     * pins the q5 widen and the blockBytes parameterization.
+     */
+    @Test
+    public void theQ5Mw8DeqKernelAgreesWithTheHostMatVec() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        // The Mw deq GEMMs use the NATIVE-only scaledAccumInto{,2}S verbs, so
+        // shader-tier backends skip them at build ("kernels skipped: 7" —
+        // measured 2026-08-25); the launch is a loud no-op and the output
+        // stays zero. Assert only where the kernel exists.
+        if (be.equals("vulkan")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q5_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 32L);
+        int64 outDim = 128L;
+        int64 cols = (((int64) raw.count() / 176L) / outDim) * 256L;
+        int64 rows = 128L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] xr #= QuantKernelTest.q8kRoundTrip(x, rows, cols);
+        float32[] want #= heap float32[rows * outDim];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q5kMatVecInto(raw, outDim, cols, xr, r * cols, want,
+                r * outDim);
+            r = r + 1;
+        }
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareQ5Mw8Into(raw, x, rows, outDim, cols, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "Q5_K Mw8 deq");
+    }
+
+    /** Epilogue plan U3 — the Q6_K register-epilogue kernel vs batch. */
+    @Test
+    public void theEpiQ6kKernelAgreesWithTheBatchKernel() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q6_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 outDim = 16L;
+        int64 cols = (((int64) raw.count() / 210L) / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareQ6EpiInto(raw, x, rows, outDim, cols, want, got);
+        QuantKernelTest.assertEpiAgreement(want, got, rows, outDim,
+            "epi Q6_K");
+    }
+
+    /**
+     * 10.12.16 — the one-time widen kernel writes exactly the nibbles
+     * the packed blocks hold, at the TILE-MAJOR addressing the deq GEMM
+     * reads: tile `(i/16, k/16)` is a contiguous 256-byte `[k%16][i%16]`
+     * run (the flat `[outDim x cols]` layout was measured 52% slower —
+     * see the widen kernel's comment).
+     *
+     * The oracle is HOST code written straight from the Q4_K layout
+     * (byte `t` of the 32 at 16+32g holds element 64g+t in its low
+     * nibble and 64g+32+t in its high one) — independent of the kernel's
+     * index math, so an addressing slip in either shows as disagreement.
+     */
+    @Test
+    public void theWidenKernelMatchesHostNibbleExtraction() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 outDim = 16L;
+        int64 bpr = ((int64) raw.count() / 144L) / outDim;
+        int64 cols = bpr * 256L;
+        int8[] got #= heap int8[outDim * cols];
+        WmmaKernel.widenInto(raw, outDim, cols, got);
+
+        boolean live = false;
+        int64 ii = 0;
+        while (ii < outDim) {
+            int64 b = 0;
+            while (b < bpr) {
+                int64 byteIdx = 0;
+                while (byteIdx < 128L) {
+                    int32 rb = (int32) raw[ii * bpr * 144L + b * 144L
+                        + 16L + byteIdx] & 255;
+                    int64 g = byteIdx / 32L;
+                    int64 t = byteIdx % 32L;
+                    int64 kLo = b * 256L + 64L * g + t;
+                    int64 kHi = kLo + 32L;
+                    int32 lo = rb & 15;
+                    int32 hi = (rb >> 4) & 15;
+                    int64 tilesK = bpr * 16L;
+                    int64 tI = ii / 16L;
+                    int64 iIn = ii % 16L;
+                    int32 gotLo = (int32) got[
+                        (tI * tilesK + kLo / 16L) * 256L
+                        + iIn * 16L + (kLo % 16L)];
+                    int32 gotHi = (int32) got[
+                        (tI * tilesK + kHi / 16L) * 256L
+                        + iIn * 16L + (kHi % 16L)];
+                    if (gotLo != lo || gotHi != hi) {
+                        Assert.fail("row " + ii + " block " + b + " byte "
+                            + byteIdx + ": device widen " + gotLo + "/"
+                            + gotHi + " vs host " + lo + "/" + hi);
+                    }
+                    if (lo != 0 || hi != 0) { live = true; }
+                    byteIdx = byteIdx + 1;
+                }
+                b = b + 1;
+            }
+            ii = ii + 1;
+        }
+        if (!live) {
+            Assert.fail("every nibble in the fixture is zero - "
+                + "agreement proved nothing");
+        }
+    }
+
+    /**
+     * 10.12.16 — the deq WMMA kernel (B fed straight from the widened
+     * global int8 copy, layout=1) agrees with the staged WMMA kernel
+     * EXACTLY, not to tolerance: the accumulation order is identical and
+     * the only change is where the B bytes come from. A tolerance here
+     * would let a subtly wrong column-major stride hide behind
+     * reassociation slack.
+     *
+     * This test is also the SPIKE for int8 + layout=1 + global
+     * `mb.load` — a combination no compiler test pins (the layout=1
+     * coverage is all f16 from LDS).
+     */
+    @Test
+    public void theDeqWmmaKernelMatchesTheStagedWmmaKernelExactly() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] raw #= QuantKernelTest.tiled(one, 4L);
+        int64 outDim = 16L;
+        int64 cols = (((int64) raw.count() / 144L) / outDim) * 256L;
+        int64 rows = 16L;
+        float32[] x #= QuantKernelTest.activations(rows * cols);
+
+        float32[] want #= heap float32[rows * outDim];
+        float32[] got #= heap float32[rows * outDim];
+        WmmaKernel.compareDeqInto(raw, x, rows, outDim, cols, want, got);
+
+        QuantKernelTest.assertLive(want, "staged WMMA kernel");
+        QuantKernelTest.assertLive(got, "deq WMMA kernel");
+        int64 n = rows * outDim;
+        int64 k = 0;
+        while (k < n) {
+            if (want[k] != got[k]) {
+                Assert.fail("element " + k + " (token " + (k / outDim)
+                    + ", row " + (k % outDim) + "): deq " + got[k]
+                    + " vs staged " + want[k]
+                    + " - the B feed changed the VALUE, not just the path");
+            }
+            k = k + 1;
+        }
+    }
+}

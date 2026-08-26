@@ -1,0 +1,430 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.codec.json.Json;
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonReader;
+import cajeta.codec.json.JsonToken;
+import cajeta.codec.json.JsonValue;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llm.LlamaException;
+import dev.cajeta.llm.chat.ChatTemplate;
+
+/**
+ * cajeta-llm plan Unit 13 TDD — the chat-template interpreter (spec
+ * 7.11–7.14). The gate is byte-for-byte equality with
+ * `transformers.apply_chat_template` across the four target families
+ * and a tool-call template; the rest pin dialect behaviour.
+ */
+public class ChatTest {
+
+    public ChatTest() { return; }
+
+    static final String DIR = "src/test/fixtures/tpl/";
+    static final String FIX = "src/test/fixtures/tpl/expected-prompts.json";
+    // The instant frozen when the fixtures were generated (13.1.8):
+    // 2026-08-14 00:00 UTC — strftime_now('%d %b %Y') = "14 Aug 2026".
+    static final int64 NOW = 1786665600;
+
+    static final String SIMPLE =
+        "[{\"role\": \"user\", \"content\": \"What is the capital of France?\"}]";
+    static final String MULTI =
+        "[{\"role\": \"system\", \"content\": \"You are a terse assistant.\"},"
+        + "{\"role\": \"user\", \"content\": \"Hello!\"},"
+        + "{\"role\": \"assistant\", \"content\": \"Hi.\"},"
+        + "{\"role\": \"user\", \"content\": \"Name two colors.\"}]";
+    static final String NOSYS =
+        "[{\"role\": \"user\", \"content\": \"First question?\"},"
+        + "{\"role\": \"assistant\", \"content\": \"First answer.\"},"
+        + "{\"role\": \"user\", \"content\": \"Second question?\"}]";
+    static final String TOOLCONV =
+        "[{\"role\": \"system\", \"content\": \"You may call tools.\"},"
+        + "{\"role\": \"user\", \"content\": \"Weather in Paris?\"}]";
+    static final String TOOLS =
+        "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\","
+        + "\"description\": \"Get the current weather in a location.\","
+        + "\"parameters\": {\"type\": \"object\", \"properties\": {"
+        + "\"location\": {\"type\": \"string\", \"description\":"
+        + " \"City name, e.g. Paris\"},"
+        + "\"unit\": {\"type\": \"string\", \"enum\": [\"celsius\","
+        + " \"fahrenheit\"]}}, \"required\": [\"location\"]}}}]";
+
+    static #ChatTemplate load(String tag) {
+        int8[] raw = File.readAllBytes(ChatTest.DIR + tag + ".jinja");
+        int32 n = (int32) raw.count();
+        if (n <= 0) {
+            throw heap LlamaException("missing fixture: " + tag);
+        }
+        String text = heap String(#raw, n);
+        // The fixtures were produced with these tokens in scope.
+        String bos = "<s>";
+        String eos = "</s>";
+        if (tag.equals("llama3")) {
+            bos = "<|begin_of_text|>";
+            eos = "<|eot_id|>";
+        } else if (tag.equals("qwen25") || tag.equals("qwen3coder")) {
+            bos = "";
+            eos = "<|im_end|>";
+        }
+        ChatTemplate t = ChatTemplate.fromString(text, tag, bos, eos);
+        t.setNowEpochSeconds(ChatTest.NOW);
+        return #t;
+    }
+
+    /**
+     * The reference rendering for (family, case), or null.
+     *
+     * STREAMED with `JsonReader.currentDecodedString`, not `Json.parse` +
+     * `asString()`. The parsed tree hands back escapes VERBATIM — the
+     * stdlib says so outright ("escapes verbatim because the reader's
+     * currentBytes() does too") — so `asString()` on a fixture entry
+     * yields a literal backslash-n where the reference has a NEWLINE.
+     * Every byte-exact comparison in this file then failed against an
+     * expectation that had never been decoded, which read as six engine
+     * bugs and was one bug in the harness. Same trap, same fix, as
+     * `ChatTemplate.fromTokenizerConfig` (spec 13.7).
+     */
+    static #String expected(String tag, String caseName) {
+        int8[] raw = File.readAllBytes(ChatTest.FIX);
+        JsonReader r = heap JsonReader(raw, (int64) raw.count());
+        // {"cases": {"<tag>": {"<caseName>": "<text>"}}}
+        if (!ChatTest.enterKey(r, "cases")) { return null; }
+        if (!ChatTest.enterKey(r, tag)) { return null; }
+        if (!ChatTest.enterKey(r, caseName)) { return null; }
+        // enterKey leaves the reader ON THE KEY; the value is the next
+        // token. A family that lacks this case is a legitimate skip.
+        if (r.next() != JsonToken.STRING) {
+            return null;
+        }
+        return #r.currentDecodedString();
+    }
+
+    /**
+     * Scan the object `r` is about to enter for the key `want`. Returns
+     * true with the reader positioned on that KEY (caller advances to the
+     * value), false when the key is absent — the "family lacks this case"
+     * path that `assertCase` treats as a skip.
+     */
+    static boolean enterKey(JsonReader r, String want) {
+        if (r.next() != JsonToken.START_OBJECT) {
+            return false;
+        }
+        boolean found = false;
+        while (!found) {
+            int32 t = r.next();
+            if (t == JsonToken.END_OBJECT || t == JsonToken.END) {
+                return false;
+            }
+            if (t != JsonToken.KEY) {
+                continue;
+            }
+            if (r.currentDecodedString().equals(want)) {
+                found = true;
+            } else {
+                ChatTest.skipValue(r, r.next());
+            }
+        }
+        return found;
+    }
+
+    /** Skip a composite value; scalars need no work. */
+    static void skipValue(JsonReader r, int32 opened) {
+        if (opened != JsonToken.START_OBJECT
+                && opened != JsonToken.START_ARRAY) {
+            return;
+        }
+        int32 depth = 1;
+        while (depth > 0) {
+            int32 e = r.next();
+            if (e == JsonToken.START_OBJECT || e == JsonToken.START_ARRAY) {
+                depth = depth + 1;
+            } else if (e == JsonToken.END_OBJECT
+                    || e == JsonToken.END_ARRAY) {
+                depth = depth - 1;
+            } else if (e == JsonToken.END) {
+                return;
+            }
+        }
+    }
+
+    static void assertCase(String tag, String caseName, String msgs,
+            String tools, boolean addGen) {
+        String want = ChatTest.expected(tag, caseName);
+        if (want == null) {
+            return;                       // family lacks this case
+        }
+        ChatTemplate t = ChatTest.load(tag);
+        String got = t.renderJson(msgs, tools, addGen);
+        Assert.equals(want, got);
+    }
+
+    static void assertFamily(String tag) {
+        ChatTest.assertCase(tag, "simple", ChatTest.SIMPLE, null, false);
+        ChatTest.assertCase(tag, "multi", ChatTest.MULTI, null, false);
+        ChatTest.assertCase(tag, "nosys", ChatTest.NOSYS, null, false);
+        ChatTest.assertCase(tag, "simple_gen", ChatTest.SIMPLE, null, true);
+        ChatTest.assertCase(tag, "multi_gen", ChatTest.MULTI, null, true);
+    }
+
+    // ── 13.1.9 / 7.14 — byte-exact across the target families ───────────
+
+    @Test
+    public void llama3MatchesTransformers() {
+        ChatTest.assertFamily("llama3");
+    }
+
+    @Test
+    public void qwenMatchesTransformers() {
+        ChatTest.assertFamily("qwen25");
+    }
+
+    @Test
+    public void llama2FamilyMatchesTransformers() {
+        ChatTest.assertFamily("tinyllama");
+        ChatTest.assertFamily("mistral");
+    }
+
+    // ── 13.1.10 — the tool-call template (the case that retired the
+    //             hand-written table, spec 13.18) ────────────────────────
+
+    @Test
+    public void toolCallTemplateMatchesIncludingTools() {
+        ChatTest.assertCase("qwen3coder", "tools", ChatTest.TOOLCONV,
+            ChatTest.TOOLS, true);
+        ChatTest.assertCase("llama3", "tools", ChatTest.TOOLCONV,
+            ChatTest.TOOLS, true);
+        ChatTest.assertCase("qwen25", "tools", ChatTest.TOOLCONV,
+            ChatTest.TOOLS, true);
+    }
+
+    // ── 13.1.13 — multi-turn with a system message ──────────────────────
+
+    @Test
+    public void multiTurnWithSystemMatchesReference() {
+        ChatTest.assertCase("qwen25", "multi", ChatTest.MULTI, null, false);
+        ChatTest.assertCase("llama3", "multi", ChatTest.MULTI, null, false);
+        ChatTest.assertCase("qwen3coder", "multi", ChatTest.MULTI, null,
+            false);
+    }
+
+    // ── 13.1.2 — control constructs and whitespace control ──────────────
+
+    static #String render(String tpl, String msgs) {
+        ChatTemplate t = ChatTemplate.fromString(tpl, "inline", "<s>",
+            "</s>");
+        t.setNowEpochSeconds(ChatTest.NOW);
+        return #t.renderJson(msgs, null, false);
+    }
+
+    @Test
+    public void controlConstructsRender() {
+        // for + if/elif/else + set + {{ }}
+        String tpl = "{% set greeting = 'hi' %}"
+            + "{% for m in messages %}"
+            + "{% if m.role == 'user' %}U:{{ m.content }}"
+            + "{% elif m.role == 'system' %}S:{{ m.content }}"
+            + "{% else %}A:{{ m.content }}{% endif %}|"
+            + "{% endfor %}{{ greeting }}";
+        Assert.equals("S:sys|U:one|A:two|hi",
+            ChatTest.render(tpl, "[{\"role\":\"system\",\"content\":\"sys\"},"
+                + "{\"role\":\"user\",\"content\":\"one\"},"
+                + "{\"role\":\"assistant\",\"content\":\"two\"}]"));
+        // Whitespace control: `-%}` eats following whitespace, `{%-`
+        // eats preceding; trim_blocks eats ONE newline after a tag.
+        //
+        // Both expectations below were hand-computed and both were WRONG;
+        // the engine was right. Re-derived by running the templates through
+        // ImmutableSandboxedEnvironment(trim_blocks=True,
+        // lstrip_blocks=True) — the same environment transformers uses —
+        // rather than by reasoning about trim_blocks a third time.
+        String ws = "A\n{% if true %}\nB\n{% endif %}\nC";
+        // trim_blocks eats the newline after BOTH `%}`s, so no blank line
+        // survives: was asserted "A\nB\n\nC".
+        Assert.equals("A\nB\nC", ChatTest.render(ws, "[]"));
+        String ws2 = "A\n{%- if true -%}\n   B\n{%- endif %}\nC";
+        // `{%- endif %}` strips the whitespace BEFORE it (including B's
+        // trailing newline) and trim_blocks eats the one after it, so C
+        // joins directly: was asserted "AB\nC".
+        Assert.equals("ABC", ChatTest.render(ws2, "[]"));
+        // Comments vanish.
+        Assert.equals("XY", ChatTest.render("X{# a comment #}Y", "[]"));
+    }
+
+    // ── 13.1.3 — filters ────────────────────────────────────────────────
+
+    @Test
+    public void filtersMatchJinjaSemantics() {
+        Assert.equals("hi", ChatTest.render("{{ '  hi  ' | trim }}", "[]"));
+        Assert.equals("3", ChatTest.render("{{ [1,2,3] | length }}", "[]"));
+        Assert.equals("a-b", ChatTest.render(
+            "{{ ['a','b'] | join('-') }}", "[]"));
+        Assert.equals("HI", ChatTest.render("{{ 'hi' | upper }}", "[]"));
+        Assert.equals("hi", ChatTest.render("{{ 'HI' | lower }}", "[]"));
+        Assert.equals("xoxo", ChatTest.render(
+            "{{ 'xaxa' | replace('a','o') }}", "[]"));
+        Assert.equals("fallback", ChatTest.render(
+            "{{ missing | default('fallback') }}", "[]"));
+        Assert.equals("7", ChatTest.render("{{ '7' | int }}", "[]"));
+        Assert.equals("42", ChatTest.render("{{ 42 | string }}", "[]"));
+        // tojson: compact separators, escaped control bytes.
+        Assert.equals("{\"a\": 1, \"b\": [true, null]}", ChatTest.render(
+            "{{ {'a': 1, 'b': [true, none]} | tojson }}", "[]"));
+        Assert.equals("\"x\\ny\"", ChatTest.render(
+            "{{ 'x\\ny' | tojson }}", "[]"));
+    }
+
+    // ── 13.1.4 — tests ──────────────────────────────────────────────────
+
+    @Test
+    public void testsMatchJinjaSemantics() {
+        Assert.equals("yes", ChatTest.render(
+            "{% if messages is defined %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("no", ChatTest.render(
+            "{% if nope is defined %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if nope is not defined %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if none is none %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if 'x' is string %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if {'a':1} is mapping %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("no", ChatTest.render(
+            "{% if 'x' is mapping %}yes{% else %}no{% endif %}", "[]"));
+        Assert.equals("yes", ChatTest.render(
+            "{% if [1] is iterable %}yes{% else %}no{% endif %}", "[]"));
+    }
+
+    // ── 13.1.5 — .items(), .get(), indexing, slicing, `~` ───────────────
+
+    @Test
+    public void accessorsAndConcatMatchJinja() {
+        Assert.equals("a=1,b=2,", ChatTest.render(
+            "{% for k, v in {'a':1,'b':2}.items() %}{{ k }}={{ v }},"
+            + "{% endfor %}", "[]"));
+        Assert.equals("1", ChatTest.render(
+            "{{ {'a':1}.get('a') }}", "[]"));
+        Assert.equals("zz", ChatTest.render(
+            "{{ {'a':1}.get('b', 'zz') }}", "[]"));
+        Assert.equals("2", ChatTest.render("{{ [1,2,3][1] }}", "[]"));
+        Assert.equals("3", ChatTest.render("{{ [1,2,3][-1] }}", "[]"));
+        Assert.equals("bc", ChatTest.render("{{ 'abcd'[1:3] }}", "[]"));
+        Assert.equals("2", ChatTest.render(
+            "{{ [1,2,3][1:] | length }}", "[]"));
+        Assert.equals("ab", ChatTest.render("{{ 'a' ~ 'b' }}", "[]"));
+        Assert.equals("x1", ChatTest.render("{{ 'x' ~ 1 }}", "[]"));
+        // loop variables, including the previtem/nextitem the real
+        // templates branch on.
+        // idx0: first, not last, nextitem 'b'  -> "0:a>b|"
+        // idx1: not first, not last, next 'c'  -> "1:b>c|"
+        // idx2: not first, last, no nextitem   -> "2:b<|"
+        Assert.equals("0:a>b|1:b>c|2:b<|", ChatTest.render(
+            "{% for x in ['a','b','c'] %}{{ loop.index0 }}:"
+            + "{% if loop.first %}a{% else %}b{% endif %}"
+            + "{% if loop.last %}<{% else %}>{% endif %}"
+            + "{% if loop.nextitem is defined %}{{ loop.nextitem }}"
+            + "{% endif %}|{% endfor %}", "[]"));
+    }
+
+    // ── 13.1.6 — macros ─────────────────────────────────────────────────
+
+    @Test
+    public void macrosRender() {
+        Assert.equals("[a][b]", ChatTest.render(
+            "{% macro wrap(x) %}[{{ x }}]{% endmacro %}"
+            + "{{ wrap('a') }}{{ wrap('b') }}", "[]"));
+        Assert.equals("[a:1]", ChatTest.render(
+            "{% macro wrap(x, y=1) %}[{{ x }}:{{ y }}]{% endmacro %}"
+            + "{{ wrap('a') }}", "[]"));
+        Assert.equals("[a:9]", ChatTest.render(
+            "{% macro wrap(x, y=1) %}[{{ x }}:{{ y }}]{% endmacro %}"
+            + "{{ wrap('a', y=9) }}", "[]"));
+    }
+
+    // ── 13.1.7 / 13.1.11 — loud failures ────────────────────────────────
+
+    @Test
+    public void raiseExceptionAndUnsupportedConstructsError() {
+        boolean threw = false;
+        try {
+            String s = ChatTest.render(
+                "{% if true %}{{ raise_exception('boom town') }}{% endif %}",
+                "[]");
+            Assert.isTrue(s.byteLength() < 0);      // unreachable
+        } catch (LlamaException ex) {
+            threw = true;
+            Assert.isTrue(ex.getMessage().contains("boom town"));
+        }
+        Assert.isTrue(threw);
+        // An unsupported construct names the construct AND the line.
+        threw = false;
+        try {
+            // {% with %} joined the supported set when rendering moved
+            // to dev.cajeta.jinja; {% do %} stays outside it.
+            String s2 = ChatTest.render("line1\n{% do thing %}",
+                "[]");
+            Assert.isTrue(s2.byteLength() < 0);     // unreachable
+        } catch (LlamaException ex2) {
+            threw = true;
+            Assert.isTrue(ex2.getMessage().contains("do"));
+            Assert.isTrue(ex2.getMessage().contains("line 2"));
+        }
+        Assert.isTrue(threw);
+        // An unsupported filter is named too.
+        threw = false;
+        try {
+            String s3 = ChatTest.render("{{ 'x' | frobnicate }}", "[]");
+            Assert.isTrue(s3.byteLength() < 0);     // unreachable
+        } catch (LlamaException ex3) {
+            threw = true;
+            Assert.isTrue(ex3.getMessage().contains("frobnicate"));
+        }
+        Assert.isTrue(threw);
+    }
+
+    // ── 13.1.8 — the clock is injectable ────────────────────────────────
+
+    @Test
+    public void strftimeNowUsesInjectedClock() {
+        ChatTemplate t = ChatTemplate.fromString(
+            "today={{ strftime_now('%d %b %Y') }}", "clock", "", "");
+        t.setNowEpochSeconds((int64) 1930262400);   // 2031-03-03 UTC
+        Assert.equals("today=03 Mar 2031", t.renderJson("[]", null, false));
+        t.setNowEpochSeconds((int64) 1964649600);   // 2032-04-04 UTC
+        Assert.equals("today=04 Apr 2032", t.renderJson("[]", null, false));
+    }
+
+    // ── 13.1.12 / 7.13 — pre-rendered prompts bypass the template ───────
+
+    @Test
+    public void preRenderedPromptBypassesTemplate() {
+        String raw = "<|custom|>already rendered<|end|>";
+        Assert.equals(raw, ChatTemplate.renderPre(raw));
+    }
+
+    // ── 13.1.1 — the template comes from the model's own config ─────────
+
+    @Test
+    public void templateReadFromTokenizerConfigAndGgufAgree() {
+        // The SAME template reached two ways — parsed out of the model's
+        // real `tokenizer_config.json` (HF), and handed over as raw text
+        // (the GGUF `tokenizer.chat_template` shape) — must render
+        // identically and match the reference (7.11).
+        ChatTemplate fromCfg = ChatTemplate.fromTokenizerConfig(
+            ChatTest.DIR + "qwen25-tokenizer_config.json");
+        fromCfg.setNowEpochSeconds(ChatTest.NOW);
+        Assert.equals("<|im_end|>", fromCfg.eos());
+
+        int8[] tplRaw = File.readAllBytes(ChatTest.DIR + "qwen25.jinja");
+        String tplText = heap String(#tplRaw, (int32) tplRaw.count());
+        ChatTemplate fromGguf = ChatTemplate.fromString(tplText, "gguf",
+            "", "<|im_end|>");
+        fromGguf.setNowEpochSeconds(ChatTest.NOW);
+
+        String a = fromCfg.renderJson(ChatTest.MULTI, null, true);
+        String b = fromGguf.renderJson(ChatTest.MULTI, null, true);
+        Assert.equals(a, b);
+        Assert.equals(ChatTest.expected("qwen25", "multi_gen"), a);
+    }
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build + run the cajeta-llama unit tests.
+# Build + run the cajeta-llm unit tests.
 #
 # The suite lives under src/test/cajeta and is driven by cajeta-unit's reflective
 # @Test discovery (dev.cajeta.unit.Runner). It compiles ONLY the test sources into
@@ -148,7 +148,7 @@ echo ">> dev.cajeta.jinja: $jinja_cja"
 echo ">> building llama library .cja"
 "$CAJETA" --emit=cja -o "$out/llama.cja" \
     --classpath="$codec_cja,$jinja_cja" \
-    dev.cajeta.llama.Llama.run "$here/src/main/cajeta" "$out" >/dev/null
+    dev.cajeta.llm.Llama.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> building + running the test binary"
 # XPU_BACKEND (default cpu): the engine's device paths (device-resident weight
@@ -168,7 +168,7 @@ echo ">> building + running the test binary"
 "$CAJETA" --emit=exe --profile=test --xpu-backend="${XPU_BACKEND:-cpu}" \
     --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja" \
     -o "$out/llamatests" \
-    dev.cajeta.llama.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
+    dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
 "$out/llamatests"
 
@@ -180,6 +180,6 @@ echo ">> building + running the test binary under --release --live-set=bounded"
     --xpu-backend="${XPU_BACKEND:-cpu}" \
     --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja" \
     -o "$out/llamatests-release" \
-    dev.cajeta.llama.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
+    dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
 "$out/llamatests-release"

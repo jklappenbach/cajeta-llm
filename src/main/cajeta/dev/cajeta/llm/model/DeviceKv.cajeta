@@ -1,0 +1,415 @@
+package dev.cajeta.llm.model;
+
+import cajeta.math.Tensor;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.LlamaException;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * Device-resident K/V for ONE decoding sequence, plus the scratch the
+ * decode attend needs (plan 10.11.2).
+ *
+ * Layout is deliberately NOT the paged pool's. Each layer gets flat
+ * `[cap x kvDim]` K and V planes, so position `t` is at `t·kvDim` and a
+ * kernel needs no block table, no ring modulo and no copy-on-write. The
+ * paging in {@link PagedKvCache} exists to pack MANY sequences into a
+ * fixed pool; a single decoding sequence has nothing to pack against,
+ * and the indirection would cost a table upload per layer per token plus
+ * a dependent load per position inside the hottest loop there is.
+ *
+ * The price is that the two copies can disagree, and the rule that keeps
+ * them honest is explicit rather than clever: while `owns()` is true the
+ * DEVICE planes are authoritative for positions `[hostLen, len)`, the
+ * host cache's length has already been advanced to match, and the host
+ * bytes for that range are stale. Anything that wants to read the host
+ * cache calls {@link #writeback} first. `LlamaForCausalLM` does exactly
+ * that whenever a token takes the non-resident path.
+ */
+public final class DeviceKv {
+    KernelBuffer<float32>[] kDev;
+    KernelBuffer<float32>[] vDev;
+    /** Per-layer RoPE frequencies. Per LAYER, not per model: `theta` and
+     *  the scaling are layer state (spec §5 preamble), and sharing one
+     *  buffer would be right for Llama and silently wrong elsewhere. */
+    KernelBuffer<float32>[] invDev;
+    /** `[nH x cap]` scores scratch, reused by every layer. */
+    KernelBuffer<float32> scores;
+    /** `[nH x headDim]` attention output, consumed by `o_proj` in place. */
+    KernelBuffer<float32> aoDev;
+    /** Host staging for seeding and writeback: `[cap x kvDim]`, one plane
+     *  at a time. */
+    float32[] stageK;
+    float32[] stageV;
+
+    int32 cap;
+    int32 kvDim;
+    int32 layers;
+    int32 nH;
+    int32 nKv;
+    int32 hd;
+    /** Positions present in the device planes. */
+    int32 len;
+    /** Positions the HOST cache holds real bytes for. `len - hostLen` is
+     *  what a writeback owes. */
+    int32 hostLen;
+    /** Which sequence the planes hold; -1 when they hold nothing. */
+    int32 seq;
+
+    /**
+     * Can this configuration take the device attend at all?
+     *
+     * `headDim <= 128` is the combine kernel's workgroup width — one lane
+     * per output dimension. A windowed layer needs ring indexing the flat
+     * planes do not have. Both are checked rather than assumed, because
+     * the failure of either is a silently wrong answer.
+     */
+    public static boolean supports(ModelConfig cfg) {
+        if (cfg.headDim > 128) { return false; }
+        if (cfg.headDim % 2 != 0) { return false; }
+        if (cfg.numHeads % cfg.numKvHeads != 0) { return false; }
+        int32 l = 0;
+        while (l < cfg.numLayers) {
+            if (cfg.windowForLayer(l) > 0) { return false; }
+            l = l + 1;
+        }
+        return true;
+    }
+
+    public DeviceKv(ModelConfig cfg, int32 cap) {
+        this.cap = cap;
+        this.kvDim = cfg.kvDim();
+        this.layers = cfg.numLayers;
+        this.nH = cfg.numHeads;
+        this.nKv = cfg.numKvHeads;
+        this.hd = cfg.headDim;
+        this.len = 0;
+        this.hostLen = 0;
+        this.seq = 0 - 1;
+        int64 plane = (int64) cap * (int64) this.kvDim;
+        this.kDev #= heap KernelBuffer<float32>[(int64) this.layers];
+        this.vDev #= heap KernelBuffer<float32>[(int64) this.layers];
+        this.invDev #= heap KernelBuffer<float32>[(int64) this.layers];
+        int32 l = 0;
+        while (l < this.layers) {
+            this.kDev[(int64) l] #= heap KernelBuffer<float32>(
+                (uint64) plane);
+            this.vDev[(int64) l] #= heap KernelBuffer<float32>(
+                (uint64) plane);
+            l = l + 1;
+        }
+        this.scores #= heap KernelBuffer<float32>(
+            (uint64) ((int64) this.nH * (int64) cap));
+        this.aoDev #= heap KernelBuffer<float32>(
+            (uint64) ((int64) this.nH * (int64) this.hd));
+        this.stageK #= heap float32[plane];
+        this.stageV #= heap float32[plane];
+    }
+
+    /** Upload each layer's RoPE frequencies once. */
+    public void bindRope(LlamaModel model) {
+        int32 l = 0;
+        while (l < this.layers) {
+            Attention a = model.layerArr[l].selfAttn;
+            int64 n = (int64) a.ropeInv.count();
+            this.invDev[(int64) l] #= heap KernelBuffer<float32>((uint64) n);
+            this.invDev[(int64) l].upload(a.ropeInv);
+            l = l + 1;
+        }
+        return;
+    }
+
+    /** True when the device planes hold positions the host cache does
+     *  not. */
+    public boolean owns() {
+        return this.seq >= 0 && this.len > this.hostLen;
+    }
+
+    /**
+     * Make the device planes hold exactly what `cache` holds for `seq`.
+     * Called on the transition into device-resident decode — after
+     * prefill, or after any token that took the host path.
+     */
+    public void seed(PagedKvCache cache, int32 seq) {
+        int32 want = cache.lengthOf(seq, 0);
+        if (want > this.cap) {
+            throw heap LlamaException("device kv: context " + want
+                + " exceeds the allocated capacity " + this.cap);
+        }
+        int32 l = 0;
+        while (l < this.layers) {
+            int32 n = cache.lengthOf(seq, l);
+            if (n > 0) {
+                cache.copyRowsTo(seq, l, 0, n, this.stageK, this.stageV);
+                this.kDev[(int64) l].upload(this.stageK,
+                    (int64) n * (int64) this.kvDim);
+                this.vDev[(int64) l].upload(this.stageV,
+                    (int64) n * (int64) this.kvDim);
+            }
+            l = l + 1;
+        }
+        this.seq = seq;
+        this.len = want;
+        this.hostLen = want;
+        return;
+    }
+
+    /** True when the planes already hold `cache`'s state for `seq`. */
+    public boolean isCurrentFor(PagedKvCache cache, int32 seq) {
+        return this.seq == seq && this.hostLen == cache.lengthOf(seq, 0)
+            && this.len >= this.hostLen;
+    }
+
+    /**
+     * Copy the device-only positions back into the paged cache, so the
+     * host path can run again. The reverse of {@link #seed}, and the only
+     * thing that makes device authority safe.
+     */
+    public void writeback(PagedKvCache cache, int32 seq) {
+        if (!this.owns()) { return; }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int32 l = 0;
+        while (l < this.layers) {
+            int64 n = (int64) this.len * (int64) this.kvDim;
+            this.kDev[(int64) l].download(this.stageK, n);
+            this.vDev[(int64) l].download(this.stageV, n);
+            int32 t = this.hostLen;
+            while (t < this.len) {
+                int64 off = (int64) t * (int64) this.kvDim;
+                if (!cache.appendRowRaw(seq, l, this.stageK, off,
+                        this.stageV, off, t)) {
+                    throw heap LlamaException("kv writeback: pool "
+                        + "exhausted at layer " + l + " position " + t);
+                }
+                t = t + 1;
+            }
+            l = l + 1;
+        }
+        this.hostLen = this.len;
+        return;
+    }
+
+    // ── the per-layer decode tail ───────────────────────────────────────
+
+    /** Rotate q and k in place at absolute position `p`. */
+    public void rope(int32 li, KernelBuffer<float32> q, KernelBuffer<float32> k,
+            int32 p) {
+        if ((AttnKernel.skipForMeasurement() & 1) != 0) { return; }
+        AttnKernel.ropeDecodeLaunchNoSync(q, this.invDev[(int64) li],
+            this.nH, this.hd, p);
+        AttnKernel.ropeDecodeLaunchNoSync(k, this.invDev[(int64) li],
+            this.nKv, this.hd, p);
+        return;
+    }
+
+    /** Append the rotated K row and the V row at position `p`. */
+    public void append(int32 li, KernelBuffer<float32> k, KernelBuffer<float32> v,
+            int32 p) {
+        if (p >= this.cap) {
+            throw heap LlamaException("device kv: position " + p
+                + " exceeds the allocated capacity " + this.cap);
+        }
+        if ((AttnKernel.skipForMeasurement() & 2) != 0) { return; }
+        AttnKernel.kvAppendLaunchNoSync(this.kDev[(int64) li],
+            this.vDev[(int64) li], k, v, this.kvDim, p);
+        return;
+    }
+
+    /** Attend over positions `[0, p]`, leaving the result in
+     *  {@link #out}. */
+    public void attend(int32 li, KernelBuffer<float32> q, int32 p, float32 scale) {
+        AttnKernel.attendDecodeLaunchNoSync(this.aoDev, this.scores, q,
+            this.kDev[(int64) li], this.vDev[(int64) li], this.nH,
+            this.nKv, this.hd, p + 1, 0, this.cap, scale);
+        return;
+    }
+
+    /** The attention output buffer — a BORROW, valid until the next
+     *  attend overwrites it. */
+    public KernelBuffer<float32> out() { return this.aoDev; }
+
+    // ── prefill (plan 10.12.2) ──────────────────────────────────────────
+
+    KernelBuffer<float32> preK;
+    KernelBuffer<float32> preV;
+    KernelBuffer<float32> preQ;
+    KernelBuffer<float32> preOut;
+    KernelBuffer<float32> preScores;
+    float32[] preOutH;
+    float32[] preQH;
+    float32[] preKH;
+    float32[] preVH;
+    int32 preRows;
+
+    /** Copy `n` elements from a tensor's window into a flat array. */
+    static void gather(Tensor<float32> t, int64 n, float32[] out) {
+        float32[] hb = t.hostBuffer();
+        int64 base = t.hostBase();
+        int64 i = 0;
+        while (i < n) {
+            out[i] = hb[base + i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    void ensurePrefill(int32 rows) {
+        if (this.preRows >= rows) { return; }
+        int64 kvn = (int64) rows * (int64) this.kvDim;
+        int64 qn = (int64) rows * (int64) (this.nH * this.hd);
+        this.preK #= heap KernelBuffer<float32>((uint64) kvn);
+        this.preV #= heap KernelBuffer<float32>((uint64) kvn);
+        this.preQ #= heap KernelBuffer<float32>((uint64) qn);
+        this.preOut #= heap KernelBuffer<float32>((uint64) qn);
+        this.preOutH #= heap float32[qn];
+        this.preQH #= heap float32[qn];
+        this.preKH #= heap float32[kvn];
+        this.preVH #= heap float32[kvn];
+        this.preScores #= heap KernelBuffer<float32>(
+            (uint64) ((int64) rows * (int64) this.nH * (int64) this.cap));
+        this.preRows = rows;
+        return;
+    }
+
+    /**
+     * The RESIDENT prefill attention (10.12.7.c): `q`, `k` and `v` are
+     * DEVICE buffers the batched projections left in their `yBatch`,
+     * already roped — no gathers, no uploads, no output download. The
+     * return is a VIEW of `preOut` (interior state, plain return),
+     * valid until the next prefill call; the caller packs the o
+     * projection's input straight from it. NOSYNC (10.12.30): nothing
+     * here is read by the host — the o pack consumes `preOut` on the
+     * device, and the cache-authority k/v download is DEFERRED to one
+     * post-loop pass reading the persistent planes — so the layer
+     * loop never round-trips. A caller that must read k/v right after
+     * (mid-sequence prefill) syncs on its own.
+     */
+    public KernelBuffer<float32> prefillAttendResident(int32 li,
+            KernelBuffer<float32> q, KernelBuffer<float32> k,
+            KernelBuffer<float32> v, int32 rows, int32 startPos,
+            float32 scale) {
+        this.ensurePrefill(rows);
+        AttnKernel.kvAppendRangeLaunchNoSync(this.kDev[(int64) li],
+            this.vDev[(int64) li], k, v, this.kvDim, startPos, rows);
+        AttnKernel.attendPrefillLaunchNoSync(this.preOut, this.preScores,
+            q, this.kDev[(int64) li], this.vDev[(int64) li], rows,
+            this.nH, this.nKv, this.hd, startPos, this.cap, scale);
+        return this.preOut;
+    }
+
+    /** The layer's persistent K plane — a view, for the deferred
+     *  cache-authority download (10.12.30). */
+    public KernelBuffer<float32> kPlane(int32 li) {
+        return this.kDev[(int64) li];
+    }
+
+    /** The layer's persistent V plane — a view (10.12.30). */
+    public KernelBuffer<float32> vPlane(int32 li) {
+        return this.vDev[(int64) li];
+    }
+
+    /**
+     * The whole prefill attention for one layer: place `rows` K/V rows
+     * into the planes, then attend for all `rows` query rows at once.
+     *
+     * `q`, `k` and `v` are the host `[rows x ...]` tensors the batched
+     * projections just filled, and `ao` receives the result. Everything
+     * between is one upload, three launches and one download — where the
+     * host floor is O(n^2) scalar work and measured 16.5 s of a 23.6 s
+     * prefill at 512 tokens.
+     */
+    public void prefillAttend(int32 li, Tensor<float32> q, Tensor<float32> k,
+            Tensor<float32> v, Tensor<float32> ao, int32 rows,
+            int32 startPos, float32 scale) {
+        this.ensurePrefill(rows);
+        int64 kvn = (int64) rows * (int64) this.kvDim;
+        int64 qn = (int64) rows * (int64) (this.nH * this.hd);
+        // THROUGH A STAGING COPY, because `upload(host, count)` starts at
+        // index 0 of the ARRAY and these tensors are arena slices with a
+        // nonzero `hostBase`. Uploading `q.hostBuffer()` directly sends
+        // whatever the arena put at the front — a plausible, wrong
+        // answer: it decoded 13 1129 1129 1129 instead of 198 14196.
+        DeviceKv.gather(k, kvn, this.preKH);
+        DeviceKv.gather(v, kvn, this.preVH);
+        DeviceKv.gather(q, qn, this.preQH);
+        this.preK.upload(this.preKH, kvn);
+        this.preV.upload(this.preVH, kvn);
+        this.preQ.upload(this.preQH, qn);
+        AttnKernel.kvAppendRangeLaunchNoSync(this.kDev[(int64) li],
+            this.vDev[(int64) li], this.preK, this.preV, this.kvDim,
+            startPos, rows);
+        AttnKernel.attendPrefillLaunch(this.preOut, this.preScores,
+            this.preQ, this.kDev[(int64) li], this.vDev[(int64) li],
+            rows, this.nH, this.nKv, this.hd, startPos, this.cap, scale);
+        this.preOut.download(this.preOutH, qn);
+        float32[] ob = ao.hostBuffer();
+        int64 obase = ao.hostBase();
+        int64 i = 0;
+        while (i < qn) {
+            ob[obase + i] = this.preOutH[i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** The planes already hold `len` positions for `seq`, written
+     *  directly rather than seeded — what a batched prefill leaves
+     *  behind. Both copies agree, so nothing is owed. */
+    public void adopt(int32 seq, int32 len) {
+        this.seq = seq;
+        this.len = len;
+        this.hostLen = len;
+        return;
+    }
+
+    /**
+     * Adopt with the host cache BEHIND (10.12.38 lazy authority): the
+     * planes hold `[0, len)` but the paged cache only `[0, hostLen)`.
+     * `owns()` is then true, and every host-path consumer already calls
+     * {@link #writeback} (via `syncKvToHost`) before reading K/V bytes,
+     * so the catch-up is paid ON DEMAND instead of on the prefill clock.
+     * The profiler measured the eager pass at ~36 ms — 4 ms of plane
+     * downloads and ~32 ms of per-row host appends — none of which the
+     * resident decode path ever reads.
+     */
+    public void adoptLazy(int32 seq, int32 len, int32 hostLen) {
+        this.seq = seq;
+        this.len = len;
+        this.hostLen = hostLen;
+        return;
+    }
+
+    /** A layer's K plane — a BORROW of interior state, for tests and
+     *  diagnostics. */
+    public KernelBuffer<float32> kPlane(int32 li) {
+        return this.kDev[(int64) li];
+    }
+
+    public KernelBuffer<float32> vPlane(int32 li) {
+        return this.vDev[(int64) li];
+    }
+
+    /**
+     * Record that position `p` was appended on the device for every
+     * layer.
+     *
+     * The host cache is deliberately left BEHIND rather than advanced:
+     * its length and its bytes stay consistent with each other, and
+     * {@link #writeback} catches it up in one pass. Advancing the length
+     * without the bytes was the first shape and it is strictly worse —
+     * any reader that trusted the length would get zeros, and there is no
+     * way to make that fail loudly.
+     *
+     * What it defers is the pool draw. Blocks for these positions are
+     * taken at writeback, not now, so a pool that fills in the meantime
+     * turns a silent overwrite into a loud failure there.
+     */
+    public void notePosition(int32 p) {
+        this.len = p + 1;
+        return;
+    }
+
+    /** Positions held, device planes included. */
+    public int32 length() { return this.len; }
+}

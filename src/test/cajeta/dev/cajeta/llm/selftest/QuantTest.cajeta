@@ -1,0 +1,490 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.Quant;
+import cajeta.io.file.File;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.lang.System;
+
+/**
+ * cajeta-llm plan Unit 18 TDD (18.1.2–18.1.7, 18.1.11, 18.3.1) — the
+ * ggml block-format decoders against REAL blocks: fixtures are raw packed
+ * bytes pulled from the published Llama-3.1-8B builds (Q4_K/Q6_K from the
+ * Q4_K_M file — the spec-9.5 mix a single recipe actually ships —, Q5_K
+ * from Q5_K_M, Q2_K/Q3_K from their builds, Q8_0 from Q8_0; Q4_0 from
+ * gguf-py's reference quantizer), each paired with gguf-py's reference
+ * dequantization. The comparison is BIT-EXACT f32 equality: both sides
+ * compute d·q−m in float32 from the same bytes, so any deviation is a
+ * layout bug, not rounding.
+ */
+public class QuantTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+
+    public QuantTest() { return; }
+
+    static void checkFormat(String name, int32 ty) {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + name + ".bin");
+        int8[] refBytes #= File.readAllBytes(QuantTest.DIR + name + ".f32");
+        int32 bb = Quant.blockBytes(ty);
+        int32 be = Quant.blockElems(ty);
+        int64 blocks = (int64) raw.count() / (int64) bb;
+        Assert.isTrue(blocks > 0L);
+        Assert.equals((int64) refBytes.count(),
+            blocks * (int64) be * 4L);
+        float32[] out #= heap float32[blocks * (int64) be];
+        Quant.dequantize(ty, raw, 0, blocks, out, 0);
+        int64 n = blocks * (int64) be;
+        int64 i = 0;
+        while (i < n) {
+            int64 b0 = (int64) refBytes[i * 4L] & 255L;
+            int64 b1 = (int64) refBytes[i * 4L + 1L] & 255L;
+            int64 b2 = (int64) refBytes[i * 4L + 2L] & 255L;
+            int64 b3 = (int64) refBytes[i * 4L + 3L] & 255L;
+            float32 want = GgufFile.singleBits(
+                b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            if (out[i] != want) {
+                Assert.fail(name + " element " + i + ": got " + out[i]
+                    + " want " + want);
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── 18.1.2 / 18.3.1 — Q4_0 and Q8_0 ────────────────────────────────
+
+    @Test
+    public void q40MatchesReferenceExactly() {
+        QuantTest.checkFormat("q4_0", Quant.GG_Q4_0);
+    }
+
+    @Test
+    public void q80MatchesReferenceExactly() {
+        QuantTest.checkFormat("q8_0", Quant.GG_Q8_0);
+    }
+
+    // ── 18.1.3 — Q4_K: 256 super-block, 6-bit packed scales/mins ───────
+
+    @Test
+    public void q4kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q4_k", Quant.GG_Q4_K);
+    }
+
+    // ── 18.1.4 — Q2_K: 16×16, 4-bit scales and mins ────────────────────
+
+    @Test
+    public void q2kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q2_k", Quant.GG_Q2_K);
+    }
+
+    // ── 18.1.5 — Q3_K / Q5_K / Q6_K, incl. byte-spanning extraction ────
+
+    @Test
+    public void q3kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q3_k", Quant.GG_Q3_K);
+    }
+
+    @Test
+    public void q5kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q5_k", Quant.GG_Q5_K);
+    }
+
+    @Test
+    public void q6kMatchesReferenceExactly() {
+        QuantTest.checkFormat("q6_k", Quant.GG_Q6_K);
+    }
+
+    // ── 18.1.7 — scalar and vectorized unpack agree (Unit 17's path) ───
+
+    @Test
+    public void vectorizedQ40AgreesWithScalar() {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q4_0.bin");
+        int64 blocks = (int64) raw.count() / 18L;
+        float32[] a #= heap float32[blocks * 32L];
+        float32[] b #= heap float32[blocks * 32L];
+        int64 blk = 0;
+        while (blk < blocks) {
+            Quant.q40Block(raw, blk * 18L, a, blk * 32L);
+            Quant.q40BlockVec(raw, blk * 18L, b, blk * 32L);
+            blk = blk + 1;
+        }
+        int64 i = 0;
+        while (i < blocks * 32L) {
+            if (a[i] != b[i]) {
+                Assert.fail("lane " + i + ": scalar " + a[i]
+                    + " vs vector " + b[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── 18.1.11 — unsupported type errors naming the type ──────────────
+
+    @Test
+    public void unsupportedTypeErrors() {
+        Assert.isFalse(Quant.supported(16));   // IQ2_XXS
+        Assert.equals(-1L, (int64) Quant.blockBytes(16));
+    }
+
+    // ── 18.1.1 — Q8_0 mat-vec without a dequantized weight tensor ──────
+
+    @Test
+    public void q8MatVecMatchesDequantizedReference() {
+        // Build a 4×64 packed Q8_0 weight from the real fixture blocks
+        // (8 blocks = exactly 4 rows × 2 blocks), a fixed activation, and
+        // compare against dequantize-then-multiply.
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q8_0.bin");
+        Assert.equals(272L, (int64) raw.count());   // 8 blocks × 34
+        int64 rows = 4;
+        int64 cols = 64;
+        float32[] x #= heap float32[cols];
+        int64 i = 0;
+        while (i < cols) {
+            x[i] = (float32) ((i * 7L % 13L) - 6L) * 0.25f;
+            i = i + 1;
+        }
+        float32[] y #= heap float32[rows];
+        Quant.q8MatVec(raw, rows, cols, x, y);
+
+        float32[] w #= heap float32[rows * cols];
+        Quant.dequantize(Quant.GG_Q8_0, raw, 0, 8, w, 0);
+        int64 r = 0;
+        while (r < rows) {
+            float32 acc = 0.0f;
+            int64 c = 0;
+            while (c < cols) {
+                acc = acc + w[r * cols + c] * x[c];
+                c = c + 1;
+            }
+            // Same accumulation ORDER by construction (block-major), so
+            // the comparison is exact, not a tolerance.
+            float32 diff = y[r] - acc;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            if (diff > 0.0001f) {
+                Assert.fail("row " + r + ": " + y[r] + " vs " + acc);
+            }
+            r = r + 1;
+        }
+    }
+
+    // ── K-quant block-direct mat-vec (the bandwidth path) ──────────────
+
+    /** Shared check: a block-direct mat-vec over REAL llama.cpp-quantized
+     *  bytes agrees with dequantize-then-multiply. Non-exact by
+     *  construction — the block form factors the sum differently — so the
+     *  bar is a tight relative tolerance, not equality. */
+    static void checkMatVec(String name, int32 ty, int32 rows) {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + name + ".bin");
+        int32 be = Quant.blockElems(ty);
+        int64 blocks = (int64) raw.count() / (int64) Quant.blockBytes(ty);
+        int64 n = blocks * (int64) be;
+        int64 cols = n / (int64) rows;
+
+        // Reference: dequantize the whole thing, then a plain row-major matvec.
+        float32[] w #= heap float32[n];
+        Quant.dequantize(ty, raw, 0, blocks, w, 0);
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) {
+            x[c] = (float32) ((c % 13L) - 6L) * 0.125f;
+            c = c + 1;
+        }
+        float32[] want #= heap float32[rows];
+        int64 r = 0;
+        while (r < (int64) rows) {
+            float32 acc = 0.0f;
+            c = 0;
+            while (c < cols) {
+                acc = acc + w[r * cols + c] * x[c];
+                c = c + 1;
+            }
+            want[r] = acc;
+            r = r + 1;
+        }
+
+        float32[] got #= heap float32[rows];
+        if (ty == Quant.GG_Q4_K) {
+            Quant.q4kMatVec(raw, (int64) rows, cols, x, got);
+        } else if (ty == Quant.GG_Q5_K) {
+            Quant.q5kMatVec(raw, (int64) rows, cols, x, got);
+        } else if (ty == Quant.GG_Q2_K) {
+            Quant.q2kMatVec(raw, (int64) rows, cols, x, got);
+        } else if (ty == Quant.GG_Q3_K) {
+            Quant.q3kMatVec(raw, (int64) rows, cols, x, got);
+        } else {
+            Quant.q6kMatVec(raw, (int64) rows, cols, x, got);
+        }
+
+        r = 0;
+        while (r < (int64) rows) {
+            float64 a = (float64) want[r];
+            float64 b = (float64) got[r];
+            float64 diff = a - b;
+            if (diff < 0.0) { diff = 0.0 - diff; }
+            float64 mag = a < 0.0 ? 0.0 - a : a;
+            if (mag < 1.0) { mag = 1.0; }
+            if (diff / mag > 1.0e-5) {
+                Assert.fail(name + " row " + r + ": got " + got[r]
+                    + " want " + want[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    @Test
+    public void q4kMatVecMatchesDequantizedReference() {
+        QuantTest.checkMatVec("q4_k", Quant.GG_Q4_K, 2);
+    }
+
+    @Test
+    public void q5kMatVecMatchesDequantizedReference() {
+        QuantTest.checkMatVec("q5_k", Quant.GG_Q5_K, 2);
+    }
+
+    @Test
+    public void q6kMatVecMatchesDequantizedReference() {
+        QuantTest.checkMatVec("q6_k", Quant.GG_Q6_K, 2);
+    }
+
+    /**
+     * 10.12.45.A — the Q2_K block-direct mat-vec agrees with
+     * dequantize-then-matvec. The oracle's `Quant.dequantize` is pinned
+     * bit-exact against gguf-py fixtures (checkFormat above), and the
+     * harness activations vary per position, so a 16-element sub-block
+     * indexed off by one cannot cancel.
+     */
+    @Test
+    public void q2kMatVecMatchesDequantizedReference() {
+        QuantTest.checkMatVec("q2_k", Quant.GG_Q2_K, 2);
+    }
+
+    /** 10.12.45.A — the Q3_K twin of the test above. */
+    @Test
+    public void q3kMatVecMatchesDequantizedReference() {
+        QuantTest.checkMatVec("q3_k", Quant.GG_Q3_K, 2);
+    }
+
+    /**
+     * 15.1.16 — the vectorized Q4_K mat-vec agrees with the scalar floor on
+     * REAL Q4_K_M bytes from the published 8B.
+     *
+     * Not bit-exact by construction and deliberately not asserted as such:
+     * the vector form accumulates in 4 lanes and sums them at the end, so the
+     * float addition ORDER differs from the scalar left-to-right sum. The bar
+     * is a relative difference at the rounding floor. Asserting bit-equality
+     * here would fail for a correct kernel and teach the next person to loosen
+     * a real check.
+     */
+    @Test
+    public void q4kSimdMatVecAgreesWithScalarFloor() {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count() / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 n = blocks * 256L;
+        int64 rows = 2L;
+        int64 cols = n / rows;
+
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        // Mixed signs and magnitudes: an all-positive x hides sign handling in
+        // the nibble widen, and a constant x hides lane misordering entirely.
+        while (c < cols) {
+            x[c] = (float32) ((c % 11L) - 5L) * 0.375f;
+            c = c + 1;
+        }
+        float32[] simd #= heap float32[rows];
+        float32[] ref #= heap float32[rows];
+        Quant.q4kMatVecInto(raw, rows, cols, x, 0L, simd, 0L);
+        Quant.q4kMatVecIntoScalar(raw, rows, cols, x, 0L, ref, 0L);
+
+        int64 r = 0;
+        while (r < rows) {
+            float32 a = simd[r];
+            float32 b = ref[r];
+            float32 diff = a - b;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = b < 0.0f ? 0.0f - b : b;
+            float32 tol = mag * 1.0e-4f + 1.0e-3f;
+            if (diff > tol) {
+                Assert.fail("row " + r + ": simd " + a + " vs scalar " + b
+                    + " differ by " + diff + " (tol " + tol + ")");
+            }
+            r = r + 1;
+        }
+    }
+
+    /**
+     * simd-fused-integer-madd 3.1.2 / 3.1.3 — the q8_K integer kernel against
+     * the scalar floor.
+     *
+     * This one agrees to a TOLERANCE and cannot agree exactly, unlike every
+     * other kernel in this file: `dotAccum` needs int8 on both sides, so the
+     * activations are quantized to 127 steps of their block's peak and that
+     * error is real, not rounding. The test therefore MEASURES the worst
+     * relative error and reports it, rather than asserting a bound somebody
+     * guessed — a tolerance nobody measured is a tolerance nobody chose.
+     *
+     * The bound: q8_K's step is amax/127, so a single product carries up to
+     * half a step of activation error, and over 256 elements the errors are
+     * signed and largely cancel. Against a row magnitude this lands near 1e-3
+     * relative. The assertion is deliberately loose (2e-2) because its job is
+     * to catch a LAYOUT bug — a swapped sub-block or a misread bsum moves the
+     * answer by whole percent, not by quantization noise — while the printed
+     * number is what tells a human whether the accuracy is acceptable.
+     */
+    @Test
+    public void q4kQ8IntegerKernelAgreesWithScalarFloorToTolerance() {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count() / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 n = blocks * 256L;
+        int64 rows = 2L;
+        int64 cols = n / rows;
+
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) {
+            x[c] = (float32) ((c % 11L) - 5L) * 0.375f;
+            c = c + 1;
+        }
+        float32[] q8 #= heap float32[rows];
+        float32[] ref #= heap float32[rows];
+        Quant.q4kMatVecQ8(raw, rows, cols, x, q8);
+        Quant.q4kMatVecIntoScalar(raw, rows, cols, x, 0L, ref, 0L);
+
+        float32 worst = 0.0f;
+        int64 r = 0;
+        while (r < rows) {
+            float32 a = q8[r];
+            float32 b = ref[r];
+            float32 diff = a - b;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = b < 0.0f ? 0.0f - b : b;
+            float32 rel = diff / (mag + 1.0e-6f);
+            if (rel > worst) { worst = rel; }
+            r = r + 1;
+        }
+        System.stdout.println("q8_K integer kernel: worst relative error "
+            + worst);
+        if (worst > 2.0e-2f) {
+            Assert.fail("q8_K kernel diverges from the scalar floor by "
+                + worst + " relative — that is a layout bug, not "
+                + "quantization noise");
+        }
+    }
+
+    /** 15.1.16 — Q6_K vectorized kernel vs its scalar floor. */
+    @Test
+    public void q6kSimdMatVecAgreesWithScalarFloor() {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q6_k.bin");
+        int64 blocks = (int64) raw.count() / (int64) Quant.blockBytes(Quant.GG_Q6_K);
+        int64 n = blocks * 256L;
+        int64 rows = 2L;
+        int64 cols = n / rows;
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) { x[c] = (float32) ((c % 11L) - 5L) * 0.375f; c = c + 1; }
+        float32[] simd #= heap float32[rows];
+        float32[] ref #= heap float32[rows];
+        Quant.q6kMatVecInto(raw, rows, cols, x, 0L, simd, 0L);
+        Quant.q6kMatVecIntoScalar(raw, rows, cols, x, 0L, ref, 0L);
+        int64 r = 0;
+        while (r < rows) {
+            float32 diff = simd[r] - ref[r];
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = ref[r] < 0.0f ? 0.0f - ref[r] : ref[r];
+            if (diff > mag * 1.0e-4f + 1.0e-3f) {
+                Assert.fail("row " + r + ": simd " + simd[r] + " vs scalar "
+                    + ref[r] + " differ by " + diff);
+            }
+            r = r + 1;
+        }
+    }
+
+    /** 15.1.16 — Q5_K vectorized kernel vs its scalar floor. */
+    @Test
+    public void q5kSimdMatVecAgreesWithScalarFloor() {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q5_k.bin");
+        int64 blocks = (int64) raw.count() / (int64) Quant.blockBytes(Quant.GG_Q5_K);
+        int64 n = blocks * 256L;
+        int64 rows = 2L;
+        int64 cols = n / rows;
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) { x[c] = (float32) ((c % 11L) - 5L) * 0.375f; c = c + 1; }
+        float32[] simd #= heap float32[rows];
+        float32[] ref #= heap float32[rows];
+        Quant.q5kMatVecInto(raw, rows, cols, x, 0L, simd, 0L);
+        Quant.q5kMatVecIntoScalar(raw, rows, cols, x, 0L, ref, 0L);
+        int64 r = 0;
+        while (r < rows) {
+            float32 diff = simd[r] - ref[r];
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = ref[r] < 0.0f ? 0.0f - ref[r] : ref[r];
+            if (diff > mag * 1.0e-4f + 1.0e-3f) {
+                Assert.fail("row " + r + ": simd " + simd[r] + " vs scalar "
+                    + ref[r] + " differ by " + diff);
+            }
+            r = r + 1;
+        }
+    }
+
+    /** 15.1.16 — Q8_0 vectorized kernel vs its scalar floor. */
+    @Test
+    public void q8SimdMatVecAgreesWithScalarFloor() {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q8_0.bin");
+        int64 blocks = (int64) raw.count() / (int64) Quant.blockBytes(Quant.GG_Q8_0);
+        int64 n = blocks * 32L;
+        int64 rows = 2L;
+        int64 cols = n / rows;
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) { x[c] = (float32) ((c % 11L) - 5L) * 0.375f; c = c + 1; }
+        float32[] simd #= heap float32[rows];
+        float32[] ref #= heap float32[rows];
+        Quant.q8MatVecInto(raw, rows, cols, x, 0L, simd, 0L);
+        Quant.q8MatVecIntoScalar(raw, rows, cols, x, 0L, ref, 0L);
+        int64 r = 0;
+        while (r < rows) {
+            float32 diff = simd[r] - ref[r];
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = ref[r] < 0.0f ? 0.0f - ref[r] : ref[r];
+            if (diff > mag * 1.0e-4f + 1.0e-3f) {
+                Assert.fail("row " + r + ": simd " + simd[r] + " vs scalar "
+                    + ref[r] + " differ by " + diff);
+            }
+            r = r + 1;
+        }
+    }
+
+    /** Offsets: the forward path multiplies windows of larger arena
+     *  buffers, so the -Into forms must honour xOff/yOff. */
+    @Test
+    public void kQuantMatVecHonoursOffsets() {
+        int8[] raw #= File.readAllBytes(QuantTest.DIR + "q4_k.bin");
+        int64 blocks = (int64) raw.count() / (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 n = blocks * 256L;
+        int64 rows = 2L;
+        int64 cols = n / rows;
+
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) { x[c] = (float32) ((c % 7L) - 3L) * 0.25f; c = c + 1; }
+        float32[] flat #= heap float32[rows];
+        Quant.q4kMatVec(raw, rows, cols, x, flat);
+
+        // Same data, shifted inside bigger buffers.
+        float32[] bigX #= heap float32[cols + 8L];
+        c = 0;
+        while (c < cols) { bigX[c + 5L] = x[c]; c = c + 1; }
+        float32[] bigY #= heap float32[rows + 4L];
+        Quant.q4kMatVecInto(raw, rows, cols, bigX, 5L, bigY, 3L);
+
+        int64 r = 0;
+        while (r < rows) {
+            Assert.equals((int64) (flat[r] * 1000000.0f),
+                (int64) (bigY[r + 3L] * 1000000.0f));
+            r = r + 1;
+        }
+    }
+}

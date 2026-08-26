@@ -1,0 +1,282 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelThread;
+import dev.cajeta.llm.io.Quant;
+
+/**
+ * Does MISALIGNMENT cost bandwidth on this part? (plan 10.6)
+ *
+ * The per-shape launch buckets say Q6_K weights run at 92-106 GB/s where
+ * Q4_K weights of the same shape and the same grid run at 147-168 — in the
+ * f32 kernel AND in the integer one, so it is not the arithmetic. The
+ * difference between the two formats that is not arithmetic is the BLOCK
+ * STRIDE. Q4_K blocks are 144 bytes = 9x16, so every block starts
+ * 16-byte-aligned and every `vload<16>` is aligned. Q6_K blocks are 210
+ * bytes; 210 mod 16 = 2, so a block start is aligned only every eighth
+ * block and seven of eight weight loads straddle a boundary.
+ *
+ * This is a hypothesis until it is measured, so it is measured the way 9.6
+ * measured the interleave: ONE variable. Both arms stream the same buffer
+ * with the same grid, the same number of 16-byte loads, and the same XOR
+ * per load — the only difference is a 2-byte skew on the base address.
+ *
+ * XOR because it cannot overflow (cajeta traps on signed overflow) and
+ * cannot be folded away: the accumulator depends on every load.
+ */
+public class AlignProbe {
+    // Past this part's 32 MB MALL, so what is measured is DRAM, which is
+    // what a decode sees — every weight it touches is cold.
+    static final int32 ROWS = 65536;
+    static final int32 CHUNK = 5120;      // 9.1's launch optimum
+    static final int32 GROUP = 64;
+
+    /**
+     * Read a row with 16-byte loads starting `skew` bytes into it.
+     *
+     * `skew` is a kernel PARAMETER, not a constant, so both arms run the
+     * identical instruction sequence and no arm can be specialized away.
+     */
+    @Kernel
+    public static void skewReadKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, uint32 rows, int64 rowBytes,
+            int64 skew) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 base = (int64) gi * rowBytes + skew;
+            Vector<int8,16> acc = packed.vload<16>(base)
+                ^ packed.vload<16>(base);
+            int64 o = 0;
+            // One load short of the row, so the skewed arm cannot read past
+            // the buffer — both arms therefore issue the SAME count.
+            while (o < rowBytes - 16L) {
+                acc = acc ^ packed.vload<16>(base + o);
+                o = o + 16L;
+            }
+            y[(int64) gi] = (float32) acc[0];
+        }
+    }
+
+    /**
+     * The same read with FOUR independent accumulators.
+     *
+     * `skewReadKernel` chains every load into one accumulator, so a lane
+     * has at most one XOR's worth of work to overlap the next load with.
+     * That measures how fast a lane can chase a dependent chain, which is
+     * not the same question as how fast the memory can go — and it is the
+     * number 10.4 has been treating as the machine's ceiling. Four
+     * independent chains let four loads be in flight per lane.
+     *
+     * If this reads meaningfully more than the single-accumulator form,
+     * 162 GB/s was a property of the PROBE.
+     */
+    @Kernel
+    public static void wideReadKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, uint32 rows, int64 rowBytes) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 base = (int64) gi * rowBytes;
+            Vector<int8,16> z = packed.vload<16>(base)
+                ^ packed.vload<16>(base);
+            Vector<int8,16> a0 = z;
+            Vector<int8,16> a1 = z;
+            Vector<int8,16> a2 = z;
+            Vector<int8,16> a3 = z;
+            int64 o = 0;
+            while (o + 64L <= rowBytes) {
+                a0 = a0 ^ packed.vload<16>(base + o);
+                a1 = a1 ^ packed.vload<16>(base + o + 16L);
+                a2 = a2 ^ packed.vload<16>(base + o + 32L);
+                a3 = a3 ^ packed.vload<16>(base + o + 48L);
+                o = o + 64L;
+            }
+            Vector<int8,16> acc = (a0 ^ a1) ^ (a2 ^ a3);
+            y[(int64) gi] = (float32) acc[0];
+        }
+    }
+
+    /**
+     * FULLY COALESCED: consecutive lanes read consecutive 16-byte chunks.
+     *
+     * Both other kernels here give one ROW to one work item, so a wave's 32
+     * lanes read 32 addresses `rowBytes` apart. This one walks the buffer
+     * flat — lane l of a wave reads chunk `base + 16l` — which is the shape
+     * a wave-cooperative mat-vec produces.
+     *
+     * The same bytes and the same load width as the others; only WHICH lane
+     * reads WHICH chunk moves. If this reads meaningfully more than 170
+     * GB/s then the ceiling belongs to the decomposition rather than to the
+     * machine, and llama.cpp's 184 is reachable.
+     */
+    @Kernel
+    public static void flatReadKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, uint32 items, int64 perItem) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < items) {
+            // Chunk index strides by the whole grid, so at every step the
+            // grid's lanes are reading one contiguous run.
+            int64 stride = (int64) items * 16L;
+            int64 o = (int64) gi * 16L;
+            Vector<int8,16> acc = packed.vload<16>(o) ^ packed.vload<16>(o);
+            int64 k = 0;
+            while (k < perItem) {
+                acc = acc ^ packed.vload<16>(o + k * stride);
+                k = k + 1;
+            }
+            y[(int64) gi] = (float32) acc[0];
+        }
+    }
+
+    static float64 timeFlat(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            int64 nbytes, int64 items) {
+        int64 perItem = nbytes / (items * 16L);
+        int64 t0 = Clock.nanoTime();
+        int32 r = 0;
+        while (r < 4) {
+            uint32 ui = (uint32) items;
+            uint32 blk = (uint32) AlignProbe.GROUP;
+            KernelStream s #= KernelStream.current();
+            flatReadKernel.launch(s, grid: [(ui + blk - 1) / blk],
+                block: [blk])(y, p, ui, perItem);
+            s.sync();
+            r = r + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0 / 4.0;
+    }
+
+    static void passWide(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            int64 rows, int64 rowBytes) {
+        int64 r0 = 0L;
+        while (r0 < rows) {
+            int64 nr = (int64) AlignProbe.CHUNK;
+            if (r0 + nr > rows) { nr = rows - r0; }
+            KernelBuffer<int8> sub #= p.slice((uint64) (r0 * rowBytes),
+                (uint64) (nr * rowBytes));
+            KernelBuffer<float32> ys #= y.slice((uint64) r0, (uint64) nr);
+            uint32 ur = (uint32) nr;
+            uint32 blk = (uint32) AlignProbe.GROUP;
+            KernelStream s #= KernelStream.current();
+            wideReadKernel.launch(s, grid: [(ur + blk - 1) / blk],
+                block: [blk])(ys, sub, ur, rowBytes);
+            s.sync();
+            r0 = r0 + nr;
+        }
+        return;
+    }
+
+    static float64 timeWide(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            int64 rows, int64 rowBytes) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 4) {
+            AlignProbe.passWide(y, p, rows, rowBytes);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0 / 4.0;
+    }
+
+    static void pass(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            int64 rows, int64 rowBytes, int64 skew) {
+        int64 r0 = 0L;
+        while (r0 < rows) {
+            int64 nr = (int64) AlignProbe.CHUNK;
+            if (r0 + nr > rows) { nr = rows - r0; }
+            KernelBuffer<int8> sub #= p.slice((uint64) (r0 * rowBytes),
+                (uint64) (nr * rowBytes));
+            KernelBuffer<float32> ys #= y.slice((uint64) r0, (uint64) nr);
+            uint32 ur = (uint32) nr;
+            uint32 blk = (uint32) AlignProbe.GROUP;
+            KernelStream s #= KernelStream.current();
+            skewReadKernel.launch(s, grid: [(ur + blk - 1) / blk],
+                block: [blk])(ys, sub, ur, rowBytes, skew);
+            s.sync();
+            r0 = r0 + nr;
+        }
+        return;
+    }
+
+    static float64 time(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            int64 rows, int64 rowBytes, int64 skew) {
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 4) {
+            AlignProbe.pass(y, p, rows, rowBytes, skew);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0 / 4.0;
+    }
+
+    public static void run() {
+        // The Q6_K row shape from the engine's biggest Q6_K weight: 16
+        // blocks of 210 bytes = 3360 bytes, itself 16-aligned, so the row
+        // BASE is aligned and only the skew moves.
+        int64 rowBytes = 3360L;
+        int64 rows = (int64) AlignProbe.ROWS;
+        int64 nbytes = rows * rowBytes;
+        System.stdout.println("rows " + rows + "  rowBytes " + rowBytes
+            + "  " + ((float64) nbytes / 1048576.0) + " MB");
+
+        int8[] packed #= heap int8[nbytes];
+        int64 i = 0;
+        while (i < nbytes) {
+            packed[i] = (int8) ((i % 251L) - 125L);
+            i = i + 1;
+        }
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>((uint64) nbytes);
+        pb.upload(packed);
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+
+        // Warm-up, discarded: the first dispatch of a session pays driver
+        // init, which would land inside whichever arm ran first.
+        AlignProbe.time(yb, pb, rows, rowBytes, 0L);
+
+        float64 mb = (float64) (nbytes) / 1048576.0;
+        int32 r = 0;
+        while (r < 3) {
+            // ALTERNATING arm order: a decaying background load otherwise
+            // reads as a difference between the arms (ab-timing memory).
+            int64 first = 0L;
+            int64 second = 2L;
+            if (r % 2 == 1) { first = 2L; second = 0L; }
+            float64 a = AlignProbe.time(yb, pb, rows, rowBytes, first);
+            float64 b = AlignProbe.time(yb, pb, rows, rowBytes, second);
+            System.stdout.println("  round " + r
+                + "  skew " + first + ": " + a + " ms ("
+                + (mb / a * 1000.0 / 1024.0) + " GB/s)"
+                + "   skew " + second + ": " + b + " ms ("
+                + (mb / b * 1000.0 / 1024.0) + " GB/s)");
+            r = r + 1;
+        }
+        // Does the single-accumulator chain understate the machine?
+        AlignProbe.timeWide(yb, pb, rows, rowBytes);
+        int32 w = 0;
+        while (w < 3) {
+            float64 one = AlignProbe.time(yb, pb, rows, rowBytes, 0L);
+            float64 four = AlignProbe.timeWide(yb, pb, rows, rowBytes);
+            System.stdout.println("  mlp round " + w
+                + "  1 accumulator: " + (mb / one * 1000.0 / 1024.0)
+                + " GB/s   4 accumulators: "
+                + (mb / four * 1000.0 / 1024.0) + " GB/s");
+            w = w + 1;
+        }
+        // The coalesced arm. `items` is sized so the grid is large enough to
+        // fill the machine and each lane still does many loads.
+        int64 items = 262144L;
+        AlignProbe.timeFlat(yb, pb, nbytes, items);
+        int32 f = 0;
+        while (f < 3) {
+            float64 strided = AlignProbe.timeWide(yb, pb, rows, rowBytes);
+            float64 flat = AlignProbe.timeFlat(yb, pb, nbytes, items);
+            System.stdout.println("  pattern round " + f
+                + "  one-row-per-item: " + (mb / strided * 1000.0 / 1024.0)
+                + " GB/s   coalesced: "
+                + (mb / flat * 1000.0 / 1024.0) + " GB/s");
+            f = f + 1;
+        }
+        return;
+    }
+}

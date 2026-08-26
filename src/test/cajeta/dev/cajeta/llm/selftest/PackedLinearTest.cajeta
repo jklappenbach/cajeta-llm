@@ -1,0 +1,188 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.Linear;
+
+/**
+ * Quantized weights stay PACKED on the forward path (spec §10, plan
+ * 18.1.1's shape put to work): a Q8_0 projection is consumed block-wise
+ * against f32 activations — `d · Σ q·x`, one scale per 32 — instead of
+ * being dequantized into an f32 weight tensor at load.
+ *
+ * The point is bytes moved, not arithmetic: decode is memory-bandwidth
+ * bound, so a Q8_0 weight read at 1 byte/element instead of 4 is the
+ * whole game. These tests pin BOTH halves of the contract — that the
+ * packed path is taken when the checkpoint tensor is Q8_0, and that it
+ * is NOT taken for an F32 tensor (a silently-never-packed wiring would
+ * otherwise read as a clean run).
+ */
+public class PackedLinearTest {
+
+    public PackedLinearTest() { return; }
+
+    static final String TOY = "src/test/fixtures/gguf/toy.gguf";
+
+    // toy.gguf stores layer 0's ffn_down as Q8_0 and everything else F32
+    // (tools/gguf/gen_fixture.py).
+    static final String Q8_NAME = "model.layers.0.mlp.down_proj.weight";
+    static final String F32_NAME = "model.layers.1.mlp.down_proj.weight";
+
+    @Test
+    public void q8TensorBindsPacked() {
+        Checkpoint ck #= Checkpoint.open(PackedLinearTest.TOY);
+        Assert.equals((int64) Quant.GG_Q8_0,
+            (int64) ck.packedTypeOf(PackedLinearTest.Q8_NAME));
+        ck.close();
+    }
+
+    // The negative half: an F32 tensor must NOT report as packed, or the
+    // dispatch below would be untested in one direction.
+    @Test
+    public void f32TensorDoesNotBindPacked() {
+        Checkpoint ck #= Checkpoint.open(PackedLinearTest.TOY);
+        Assert.isTrue(ck.packedTypeOf(PackedLinearTest.F32_NAME) < 0);
+        ck.close();
+    }
+
+    /**
+     * The load-bearing numeric claim: consuming the packed blocks gives
+     * the same answer as dequantizing first. Same weights, same input,
+     * two paths — compared elementwise against the dequantized f32
+     * reference the engine used before.
+     */
+    @Test
+    public void packedMatvecMatchesDequantizedReference() {
+        Checkpoint ck #= Checkpoint.open(PackedLinearTest.TOY);
+
+        // Reference: dequantize to f32 and run the plain matvec.
+        Tensor<float32> w #= ck.loadF32(PackedLinearTest.Q8_NAME);
+        int32 outDim = (int32) w.shapeAt(0);      // [out, in] as stored
+        int32 inDim = (int32) w.shapeAt(1);
+
+        float32[] x #= heap float32[inDim];
+        int32 i = 0;
+        while (i < inDim) {
+            x[i] = (float32) ((i % 11) - 5) * 0.125f;
+            i = i + 1;
+        }
+        float32[] want #= heap float32[outDim];
+        int32 o = 0;
+        while (o < outDim) {
+            float32 acc = 0.0f;
+            i = 0;
+            while (i < inDim) {
+                acc = acc + w.get2((int64) o, (int64) i) * x[i];
+                i = i + 1;
+            }
+            want[o] = acc;
+            o = o + 1;
+        }
+
+        // Packed: the bytes exactly as the file holds them.
+        int8[] packed #= ck.loadPacked(PackedLinearTest.Q8_NAME);
+        float32[] got #= heap float32[outDim];
+        Quant.q8MatVec(packed, (int64) outDim, (int64) inDim, x, got);
+
+        o = 0;
+        while (o < outDim) {
+            float64 diff = (float64) want[o] - (float64) got[o];
+            if (diff < 0.0) { diff = 0.0 - diff; }
+            Assert.isTrue(diff < 1.0e-4);
+            o = o + 1;
+        }
+        ck.close();
+    }
+
+    /** A Linear bound from a Q8_0 tensor keeps the packed weight and
+     *  routes matvecInto through it. */
+    @Test
+    public void linearRoutesThroughPackedWeight() {
+        Checkpoint ck #= Checkpoint.open(PackedLinearTest.TOY);
+        Tensor<float32> w #= ck.loadF32(PackedLinearTest.Q8_NAME);
+        int32 outDim = (int32) w.shapeAt(0);
+        int32 inDim = (int32) w.shapeAt(1);
+
+        Linear lin #= heap Linear(inDim, outDim);
+        lin.bind(ck, PackedLinearTest.Q8_NAME, false);
+        Assert.isTrue(lin.isPacked());
+
+        Linear ref #= heap Linear(inDim, outDim);
+        ref.bind(ck, PackedLinearTest.F32_NAME, false);
+        Assert.isFalse(ref.isPacked());     // the check does NOT fire here
+
+        // Numeric: packed Linear agrees with the dequantized reference.
+        int64[] shp #= heap int64[1];
+        shp[0] = (int64) inDim;
+        Tensor<float32> src #= Tensor.zeros<float32>(shp);
+        int32 i = 0;
+        while (i < inDim) {
+            src.flatSet((int64) i, (float32) ((i % 7) - 3) * 0.25f);
+            i = i + 1;
+        }
+        int64[] oshp #= heap int64[1];
+        oshp[0] = (int64) outDim;
+        Tensor<float32> dst #= Tensor.zeros<float32>(oshp);
+        lin.matvecInto(src, 0, dst, 0);
+
+        int32 o = 0;
+        while (o < outDim) {
+            float32 acc = 0.0f;
+            i = 0;
+            while (i < inDim) {
+                acc = acc + w.get2((int64) o, (int64) i) * src.flatGet((int64) i);
+                i = i + 1;
+            }
+            float64 diff = (float64) acc - (float64) dst.flatGet((int64) o);
+            if (diff < 0.0) { diff = 0.0 - diff; }
+            Assert.isTrue(diff < 1.0e-4);
+            o = o + 1;
+        }
+        ck.close();
+    }
+
+    // ── orientation: the check the byte count CANNOT do ─────────────────
+
+    /**
+     * A transposed bind must be REFUSED. The byte count cannot catch it:
+     * toy.gguf's Q8_0 ffn_down is [out=64, in=32] = 64 rows x 1 block x 34
+     * = 2176 bytes, and the swapped [out=32, in=64] is 32 x 2 x 34 = 2176
+     * — identical. Only the shape distinguishes them, which is exactly
+     * what the f32 path always checked and the packed path did not.
+     */
+    @Test
+    public void transposedPackedBindIsRefused() {
+        Checkpoint ck #= Checkpoint.open(PackedLinearTest.TOY);
+        Tensor<float32> w #= ck.loadF32(PackedLinearTest.Q8_NAME);
+        int32 outDim = (int32) w.shapeAt(0);
+        int32 inDim = (int32) w.shapeAt(1);
+
+        // Same byte count, wrong orientation.
+        Linear swapped #= heap Linear(outDim, inDim);
+        boolean threw = false;
+        try {
+            swapped.bind(ck, PackedLinearTest.Q8_NAME, false);
+        } catch (Throwable e) {
+            threw = true;
+        }
+        Assert.isTrue(threw);
+        ck.close();
+    }
+
+    /** …and the correctly-oriented bind still succeeds — a check that
+     *  refuses everything is no check at all. */
+    @Test
+    public void correctlyOrientedPackedBindSucceeds() {
+        Checkpoint ck #= Checkpoint.open(PackedLinearTest.TOY);
+        Tensor<float32> w #= ck.loadF32(PackedLinearTest.Q8_NAME);
+        Linear ok #= heap Linear((int32) w.shapeAt(1), (int32) w.shapeAt(0));
+        ok.bind(ck, PackedLinearTest.Q8_NAME, false);
+        Assert.isTrue(ok.isPacked());
+        ck.close();
+    }
+}

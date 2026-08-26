@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# cajeta-llama plan 15.1.4 — kernel-level two-backend agreement on REAL
+# cajeta-llm plan 15.1.4 — kernel-level two-backend agreement on REAL
 # silicon (spec 12.3/13.21). Unit 7.3.1 bounded the device paths to the
 # in-process CPU backend and deferred hardware runs to the Unit 15 gate,
 # "which runs on real silicon by definition"; this is that harness.
 #
-# It builds dev.cajeta.llama.bench.GpuParity with the GPU backend ONLY —
+# It builds dev.cajeta.llm.bench.GpuParity with the GPU backend ONLY —
 # no `cpu` in --xpu-backend — so a device launch cannot quietly fall back
 # to a CPU kernel. A run that reports `result onGpu: yes` therefore proves
 # the GEMM executed on the device, which a green portable suite does not:
@@ -35,7 +35,7 @@ CAJETA_OWNED_BIND=warn CAJETA_CAPTURED_BORROW=warn \
 "$CAJETA" --emit=exe --xpu-backend="$XPU" \
     --classpath="$CODEC_CJA,$JINJA_CJA" \
     -o "$out/gpuparity" \
-    dev.cajeta.llama.bench.GpuParity.run "$here/src/main/cajeta" "$out" >/dev/null
+    dev.cajeta.llm.bench.GpuParity.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> running on device"
 cd "$here"

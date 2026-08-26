@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# cajeta-llama plan 15.2.2 — parity-fixture generation from the pinned
+# cajeta-llm plan 15.2.2 — parity-fixture generation from the pinned
 # reference (spec 13.21): Hugging Face transformers at fp32 ON CPU, so the
 # reference contributes no noise of its own. Run under the pinned venv:
 #

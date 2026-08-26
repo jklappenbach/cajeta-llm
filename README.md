@@ -1,7 +1,7 @@
-# cajeta-llama
+# cajeta-llm
 
 A decoder-only LLM inference engine for the cajeta ecosystem
-(`dev.cajeta.llama`): load Llama-family open weights from Hugging Face
+(`dev.cajeta.llm`): load Llama-family open weights from Hugging Face
 safetensors and GGUF, run KV-cached incremental decode on any XPU backend,
 sample, detokenize.
 
@@ -10,8 +10,8 @@ cajeta's `@Native` marshals no C structs or callbacks, so the engine is
 written against `cajeta.math.Tensor` + `cajeta.xpu` end to end.
 
 Design and plan live in the cajeta workspace:
-`specs/cajeta-llama-spec.md` (requirements + decisions) and
-`agents/cajeta-llama-plan.md` (19 units, dependency-ordered). Units 1–4, 10
+`specs/cajeta-llm-spec.md` (requirements + decisions) and
+`agents/cajeta-llm-plan.md` (19 units, dependency-ordered). Units 1–4, 10
 and 17 are stdlib work in the `cajeta` repo; this repo is the engine
 (Units 5–16, 18–19).
 
@@ -36,7 +36,7 @@ measured baseline first.
 ## Building
 
 ```
-cajeta build        # emits build/archive/dev.cajeta.llama-<version>.cja
+cajeta build        # emits build/archive/dev.cajeta.llm-<version>.cja
 ./run-tests.sh      # cajeta-unit suite (CAJETA=<compiler> to override)
 ```
 
