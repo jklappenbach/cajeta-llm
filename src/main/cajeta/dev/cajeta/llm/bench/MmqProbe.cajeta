@@ -291,10 +291,44 @@ public final class MmqProbe {
         s.sync();
         float64 msB = (float64) (Clock.nanoTime() - t0) / 1000000.0
             / (float64) iters;
+        // The Q6 coop twin, correctness + rate (128-multiple dims only).
+        float64 msQ = 0.0;
+        if (rows % 128L == 0L && outDim % 128L == 0L) {
+            KernelBuffer<float16> xhD #= heap KernelBuffer<float16>(
+                (uint64) (rows * cols));
+            f32ToF16Kernel.launch(s,
+                grid: [(uint32) ((rows * cols + 63L) / 64L)], block: [64])
+                (xhD, xfD, (uint32) (rows * cols));
+            QuantKernel.q6kF16CoopLaunchNoSync(yB, padW, xhD, rows,
+                outDim, cols);
+            s.sync();
+            yB.download(g);
+            i = 0;
+            int64 cbad = 0;
+            while (i < rows * outDim) {
+                float32 diff = a[i] - g[i];
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = a[i] < 0.0f ? 0.0f - a[i] : a[i];
+                if (diff > mag * 0.02f + 0.05f) { cbad = cbad + 1; }
+                i = i + 1;
+            }
+            t0 = Clock.nanoTime();
+            it = 0;
+            while (it < iters) {
+                QuantKernel.q6kF16CoopLaunchNoSync(yB, padW, xhD, rows,
+                    outDim, cols);
+                it = it + 1;
+            }
+            s.sync();
+            msQ = (float64) (Clock.nanoTime() - t0) / 1000000.0
+                / (float64) iters;
+            System.stdout.println("  q6coop bad(2%+0.05): " + cbad);
+        }
         float64 tmacs = (float64) (rows * outDim * cols) / 1.0e12;
         System.stdout.println("  q6batch " + msA + " ms ("
             + (tmacs / (msA / 1000.0)) + " TMAC/s)   q6mmq " + msB
-            + " ms (" + (tmacs / (msB / 1000.0)) + " TMAC/s)");
+            + " ms (" + (tmacs / (msB / 1000.0)) + " TMAC/s)   q6coop "
+            + msQ + " ms (" + (tmacs / (msQ / 1000.0)) + " TMAC/s)");
         return bad;
     }
 
@@ -811,6 +845,30 @@ public final class MmqProbe {
         s.sync();
         float64 msC = (float64) (Clock.nanoTime() - t0) / 1000000.0
             / (float64) iters;
+        // SERIAL COLD rate: sync per launch, alternating two weight
+        // buffers so every launch reads cold — the engine's dependency-
+        // chained, stream-of-different-layers reality. (Sustained-load
+        // clock sag and residency pressure were both probed and REFUTED
+        // 2026-08-25; the engine's remaining 2x over these numbers was
+        // FIRST-TOUCH page commit — see PackedResident's warm arm.)
+        KernelBuffer<int8> wD2 #= heap KernelBuffer<int8>(
+            (uint64) (outDim * rowBytes));
+        wD2.upload(raw);
+        KernelBuffer<int32> wW2 #= wD2.wordView();
+        t0 = Clock.nanoTime();
+        it = 0;
+        while (it < iters) {
+            KernelBuffer<int32> wPick = wW;
+            if (it % 2 == 1) { wPick = wW2; }
+            q4kF16CoopV1Kernel.launch(s, grid: [(uint32) nWg],
+                block: [128])
+                (yB, wPick, xhD, (uint32) rows, (uint32) outDim,
+                 (uint32) nRt, cols / 256L);
+            s.sync();
+            it = it + 1;
+        }
+        float64 msS = (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) iters;
         t0 = Clock.nanoTime();
         it = 0;
         while (it < iters) {
@@ -823,8 +881,9 @@ public final class MmqProbe {
             / (float64) iters;
         float64 tmacs = (float64) (rows * outDim * cols) / 1.0e12;
         System.stdout.println("  coopV1 " + msC + " ms ("
-            + (tmacs / (msC / 1000.0)) + " TMAC/s)   mmq " + msM
-            + " ms (" + (tmacs / (msM / 1000.0)) + " TMAC/s)");
+            + (tmacs / (msC / 1000.0)) + " TMAC/s)   serialCold " + msS
+            + " ms (" + (tmacs / (msS / 1000.0)) + " TMAC/s)   mmq "
+            + msM + " ms (" + (tmacs / (msM / 1000.0)) + " TMAC/s)");
         return bad;
     }
 

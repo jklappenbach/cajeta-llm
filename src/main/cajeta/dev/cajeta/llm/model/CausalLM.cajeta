@@ -158,6 +158,21 @@ public final class CausalLM extends InfModule {
     }
 
     /** The cache — observable occupancy for tests and the scheduler. */
+    /**
+     * Reset sequence `seq` to empty WITHOUT freeing anything — the
+     * warmup seam (first-touch attribution, 2026-08-25: every fresh
+     * device buffer pays GPU page-commit inside the first prefill,
+     * measured as the whole 2x gap between the engine's GEMMs and the
+     * probe's). A warmup prefill + resetSeq leaves every buffer
+     * allocated AND touched, so the next prefill runs at steady state.
+     */
+    public void resetSeq(int32 seq) {
+        this.cache.release(seq);
+        if (this.dkv != null) { this.dkv.reset(); }
+        this.pos = 0;
+        return;
+    }
+
     /** The vocabulary width, for a caller inspecting logits. */
     public int32 vocabSize() { return this.cfg.vocabSize; }
 
@@ -695,6 +710,23 @@ public final class CausalLM extends InfModule {
     static int64 pfPrimNs;
     static int64 pfRopeNs;
     static int64 pfAttendNs;
+    static int64 pfGemmNs;
+    static int64 pfStageNs;
+    static int64 pfGQkvNs;
+    static int64 pfGONs;
+    static int64 pfGMlpNs;
+    static int64 pfGDownNs;
+    // Attribution arm (bench "pfsync"): every pfMark drains the stream
+    // first, so the buckets hold GPU time by phase instead of enqueue
+    // time. Off (the default), pfMark is a plain timestamp and the
+    // launch-only loop is untouched — the instrument must not perturb
+    // its control.
+    static boolean pfSyncOn;
+    public static void setPfSync(boolean on) { CausalLM.pfSyncOn = on; }
+    static int64 pfMark() {
+        if (CausalLM.pfSyncOn) { QuantKernel.stream().sync(); }
+        return Clock.nanoTime();
+    }
     static int64 pfHeadNs;
     static int64 pfTailHsNs;
     static int64 pfLogitsNs;
@@ -703,12 +735,24 @@ public final class CausalLM extends InfModule {
     public static int64 prefillLogitsNs() { return CausalLM.pfLogitsNs; }
 
     public static int64 prefillPrimNs()   { return CausalLM.pfPrimNs; }
+    public static int64 prefillGemmNs()   { return CausalLM.pfGemmNs; }
+    public static int64 prefillGQkvNs()   { return CausalLM.pfGQkvNs; }
+    public static int64 prefillGONs()     { return CausalLM.pfGONs; }
+    public static int64 prefillGMlpNs()   { return CausalLM.pfGMlpNs; }
+    public static int64 prefillGDownNs()  { return CausalLM.pfGDownNs; }
+    public static int64 prefillStageNs()  { return CausalLM.pfStageNs; }
     public static int64 prefillRopeNs()   { return CausalLM.pfRopeNs; }
     public static int64 prefillAttendNs() { return CausalLM.pfAttendNs; }
     public static void resetPrefillTimers() {
         CausalLM.pfPrimNs = 0L;
         CausalLM.pfRopeNs = 0L;
         CausalLM.pfAttendNs = 0L;
+        CausalLM.pfGemmNs = 0L;
+        CausalLM.pfStageNs = 0L;
+        CausalLM.pfGQkvNs = 0L;
+        CausalLM.pfGONs = 0L;
+        CausalLM.pfGMlpNs = 0L;
+        CausalLM.pfGDownNs = 0L;
         return;
     }
 
@@ -929,12 +973,17 @@ public final class CausalLM extends InfModule {
 
             // ── attention sublayer ──────────────────────────────────────
             if (res) {
+                int64 tm0 = CausalLM.pfMark();
                 Prim.rmsnormBatchDevice(this.pfXnDev, this.pfHsDev,
                     d.inputLayernorm.deviceWeight(), (int64) rows,
                     (int64) h, d.inputLayernorm.eps, d.normForm);
+                int64 tm1 = CausalLM.pfMark();
+                CausalLM.pfPrimNs = CausalLM.pfPrimNs + (tm1 - tm0);
                 this.stageTag = this.stageTag + 1L;
                 Linear.stageBatchFromDevice(this.pfXnDev, rows, h,
                     this.stageTag);
+                CausalLM.pfStageNs = CausalLM.pfStageNs
+                    + (CausalLM.pfMark() - tm1);
             } else {
                 int64 tp0 = Clock.nanoTime();
                 int32 r0 = 0;
@@ -959,18 +1008,21 @@ public final class CausalLM extends InfModule {
             if (resAttn) {
                 // 10.12.32: one fused q|k|v launch when the route
                 // applies; the scatter leaves rope/append untouched.
+                int64 tg0 = CausalLM.pfMark();
                 if (!a.qProj.fusedQkvBatchKeep(a.kProj, a.vProj,
                         rows)) {
                     a.qProj.matmulBatchKeep(rows);
                     a.kProj.matmulBatchKeep(rows);
                     a.vProj.matmulBatchKeep(rows);
                 }
-                int64 tr0 = Clock.nanoTime();
+                int64 tr0 = CausalLM.pfMark();
+                CausalLM.pfGemmNs = CausalLM.pfGemmNs + (tr0 - tg0);
+                CausalLM.pfGQkvNs = CausalLM.pfGQkvNs + (tr0 - tg0);
                 Prim.ropeBatchDevice(a.qProj.yBatch, a.deviceRopeInv(),
                     this.pfPosDev, (int64) rows, nH, hd);
                 Prim.ropeBatchDevice(a.kProj.yBatch, a.deviceRopeInv(),
                     this.pfPosDev, (int64) rows, nKv, hd);
-                int64 ta0 = Clock.nanoTime();
+                int64 ta0 = CausalLM.pfMark();
                 CausalLM.pfRopeNs = CausalLM.pfRopeNs
                     + (ta0 - tr0);
                 KernelBuffer<float32> aoDev = this.dkv
@@ -1003,11 +1055,14 @@ public final class CausalLM extends InfModule {
                         r = r + 1;
                     }
                 }
+                int64 taEnd = CausalLM.pfMark();
                 CausalLM.pfAttendNs = CausalLM.pfAttendNs
-                    + (Clock.nanoTime() - ta0);
+                    + (taEnd - ta0);
                 this.stageTag = this.stageTag + 1L;
                 Linear.stageBatchFromDevice(aoDev, rows, qd,
                     this.stageTag);
+                CausalLM.pfStageNs = CausalLM.pfStageNs
+                    + (CausalLM.pfMark() - taEnd);
             } else {
             a.qProj.matmulInto(rows, q, 0L);
             a.kProj.matmulInto(rows, k, 0L);
@@ -1073,15 +1128,23 @@ public final class CausalLM extends InfModule {
             if (res) {
                 // o_proj's output joins the resident hs; the second
                 // norm reads it there.
+                int64 tg1 = CausalLM.pfMark();
                 a.oProj.matmulBatchKeep(rows);
+                int64 tn2 = CausalLM.pfMark();
+                CausalLM.pfGemmNs = CausalLM.pfGemmNs + (tn2 - tg1);
+                CausalLM.pfGONs = CausalLM.pfGONs + (tn2 - tg1);
                 Prim.addDevice(this.pfHsDev, a.oProj.yBatch, nHs);
                 Prim.rmsnormBatchDevice(this.pfXnDev, this.pfHsDev,
                     d.postAttentionLayernorm.deviceWeight(),
                     (int64) rows, (int64) h,
                     d.postAttentionLayernorm.eps, d.normForm);
+                int64 ts2 = CausalLM.pfMark();
+                CausalLM.pfPrimNs = CausalLM.pfPrimNs + (ts2 - tn2);
                 this.stageTag = this.stageTag + 1L;
                 Linear.stageBatchFromDevice(this.pfXnDev, rows, h,
                     this.stageTag);
+                CausalLM.pfStageNs = CausalLM.pfStageNs
+                    + (CausalLM.pfMark() - ts2);
             } else {
                 a.oProj.matmulInto(rows, proj, 0L);
                 int64 tp1 = Clock.nanoTime();
@@ -1120,28 +1183,48 @@ public final class CausalLM extends InfModule {
                 // reads the concatenated rows in place and writes the
                 // compact [rows x inter] result, so the split copy a
                 // separate gate/up would need never exists.
+                int64 tg2 = CausalLM.pfMark();
                 if (d.mlp.gateProj.fusedPairBatchKeep(d.mlp.upProj,
                         rows)) {
                     d.mlp.gateProj.ensureBatchOut(rows);
+                    int64 tu0 = CausalLM.pfMark();
+                    CausalLM.pfGemmNs = CausalLM.pfGemmNs + (tu0 - tg2);
+                    CausalLM.pfGMlpNs = CausalLM.pfGMlpNs + (tu0 - tg2);
                     Prim.gluFusedDevice(d.mlp.gateProj.yBatch,
                         d.mlp.gateProj.fusedYBatch, (int64) rows,
                         (int64) inter, d.activation);
+                    int64 tu1 = CausalLM.pfMark();
+                    CausalLM.pfPrimNs = CausalLM.pfPrimNs + (tu1 - tu0);
                 } else {
                     d.mlp.gateProj.matmulBatchKeep(rows);
                     d.mlp.upProj.matmulBatchKeep(rows);
+                    int64 tu0 = CausalLM.pfMark();
+                    CausalLM.pfGemmNs = CausalLM.pfGemmNs + (tu0 - tg2);
+                    CausalLM.pfGMlpNs = CausalLM.pfGMlpNs + (tu0 - tg2);
                     Prim.gluDevice(d.mlp.gateProj.yBatch,
                         d.mlp.upProj.yBatch,
                         (int64) rows * (int64) inter, d.activation);
+                    int64 tu1 = CausalLM.pfMark();
+                    CausalLM.pfPrimNs = CausalLM.pfPrimNs + (tu1 - tu0);
                 }
+                int64 ts3 = CausalLM.pfMark();
                 this.stageTag = this.stageTag + 1L;
                 Linear.stageBatchFromDevice(d.mlp.gateProj.yBatch,
                     rows, inter, this.stageTag);
+                int64 ts4 = CausalLM.pfMark();
+                CausalLM.pfStageNs = CausalLM.pfStageNs + (ts4 - ts3);
                 // With hs resident (.b) the down projection joins it on
                 // the device; devicePackOn == res here, so both arms of
                 // the residual agree on where hs lives.
                 d.mlp.downProj.matmulBatchKeep(rows);
+                int64 ta2 = CausalLM.pfMark();
+                CausalLM.pfGemmNs = CausalLM.pfGemmNs + (ta2 - ts4);
+                CausalLM.pfGDownNs = CausalLM.pfGDownNs + (ta2 - ts4);
+
                 Prim.addDevice(this.pfHsDev, d.mlp.downProj.yBatch,
                     nHs);
+                CausalLM.pfPrimNs = CausalLM.pfPrimNs
+                    + (CausalLM.pfMark() - ta2);
             } else {
                 d.mlp.gateProj.matmulInto(rows, gate, 0L);
                 d.mlp.upProj.matmulInto(rows, up, 0L);
