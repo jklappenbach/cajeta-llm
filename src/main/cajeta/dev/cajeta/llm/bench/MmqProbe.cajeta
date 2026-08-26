@@ -1032,12 +1032,21 @@ public final class MmqProbe {
         // Correctness of the SHIPPED pair against the host reference.
         if (rows % 256L == 0L) {
             int32 which = 0;
-            while (which < 2) {
+            while (which < 4) {
                 if (which == 0) {
                     QuantKernel.q4kF16CoopN256Launch(yB, wW, xhD, rows,
                         outDim, cols);
-                } else {
+                }
+                if (which == 1) {
                     QuantKernel.q4kF16CoopN256GLaunch(yB, wW, xhD, rows,
+                        outDim, cols);
+                }
+                if (which == 2) {
+                    QuantKernel.q4kF16CoopX1Launch(yB, wW, xhD, rows,
+                        outDim, cols);
+                }
+                if (which == 3) {
+                    QuantKernel.q4kF16CoopX3Launch(yB, wW, xhD, rows,
                         outDim, cols);
                 }
                 s.sync();
@@ -1070,28 +1079,30 @@ public final class MmqProbe {
         // to spend LDS and threads on.
         if (rows % 256L == 0L) {
             int64 nWg9 = (outDim / 128L) * (rows / 256L);
-            float64[] best #= heap float64[3];
-            best[0] = 1.0e18; best[1] = 1.0e18; best[2] = 1.0e18;
+            float64[] best #= heap float64[4];
+            best[0] = 1.0e18; best[1] = 1.0e18;
+            best[2] = 1.0e18; best[3] = 1.0e18;
             int32 rnd = 0;
             while (rnd < 7) {
                 int32 v = 0;
-                while (v < 3) {
+                while (v < 4) {
                     t0 = Clock.nanoTime();
                     it = 0;
                     while (it < iters) {
                         if (v == 0) {
-                            q4kF16CoopV7Kernel.launch(s,
-                                grid: [(uint32) nWg], block: [128])
-                                (yB, wW, xhD, (uint32) rows,
-                                 (uint32) outDim, (uint32) nRt,
-                                 cols / 256L);
-                        }
-                        if (v == 1) {
                             QuantKernel.q4kF16CoopN256Launch(yB, wW,
                                 xhD, rows, outDim, cols);
                         }
-                        if (v == 2) {
+                        if (v == 1) {
                             QuantKernel.q4kF16CoopN256GLaunch(yB, wW,
+                                xhD, rows, outDim, cols);
+                        }
+                        if (v == 2) {
+                            QuantKernel.q4kF16CoopX1Launch(yB, wW,
+                                xhD, rows, outDim, cols);
+                        }
+                        if (v == 3) {
+                            QuantKernel.q4kF16CoopX3Launch(yB, wW,
                                 xhD, rows, outDim, cols);
                         }
                         it = it + 1;
@@ -1104,10 +1115,12 @@ public final class MmqProbe {
                 }
                 rnd = rnd + 1;
             }
-            System.stdout.println("  AB min ms:  V7 " + best[0] + " ("
-                + (tmacs / (best[0] / 1000.0)) + ")  N256 " + best[1]
-                + " (" + (tmacs / (best[1] / 1000.0)) + ")  N256G "
-                + best[2] + " (" + (tmacs / (best[2] / 1000.0)) + ")");
+            System.stdout.println("  AB min ms:  N256 " + best[0]
+                + " (" + (tmacs / (best[0] / 1000.0)) + ")  N256G "
+                + best[1] + " (" + (tmacs / (best[1] / 1000.0))
+                + ")  X1 " + best[2] + " ("
+                + (tmacs / (best[2] / 1000.0)) + ")  X3 " + best[3]
+                + " (" + (tmacs / (best[3] / 1000.0)) + ")");
         }
         return bad + v7bad;
     }
@@ -1242,9 +1255,39 @@ public final class MmqProbe {
 
 
 
+    // ── REGISTER-PRESSURE ARC (2026-08-26). The whole staging ledger
+    // below was chasing the wrong wall. RADV_DEBUG=shaderstats on the
+    // SHIPPED kernel: VGPRs 256, Spilled VGPRs 74, Scratch 9472 — and
+    // RADV_DEBUG=asm put 68 scratch_store + 76 scratch_load INSIDE the
+    // k-loop against 64 wmma. Sixteen f32 accumulators per warp (128
+    // VGPRs) plus eight live fragments do not fit, so every iteration
+    // evicted accumulator state to VRAM and hauled it back.
+    //   Eight accumulators (X1 64x32 warp tile, X3 32x64) → VGPRs 192,
+    //   Spilled 0, Scratch 0, subgroups/SIMD 5 → 8. Measured min-of-7:
+    //     4096^2     8.55 → 13.53   (llama.cpp-Vulkan 9.30)
+    //     ffn_down   7.35 → 12.58   (llama.cpp 8.62)
+    //     gate/up    8.96 → 14.85   (llama.cpp 10.63)
+    //   End to end, steady state: prefill(512) 530 → 355 ms, tokens
+    //   identical (llama.cpp-Vulkan 429 ms on the same box/file).
+    // REFUTED on the way, both measured against N256G and both DEAD:
+    //   N256GV  the 32 scalar 2-byte LDS stores replaced by four
+    //           16-byte vector stores (llama.cpp writes f16vec2 and
+    //           never issues a 2-byte LDS write): 8.54 vs 8.54 and
+    //           8.97 vs 8.97 — EXACTLY zero. 32 ds_writes are noise
+    //           next to 144 scratch ops.
+    //   N256GW  the same, plus the duplicate global read removed (kb is
+    //           even, so gq and gq+1 share one quant dword-run and the
+    //           two k-halves were loading it twice): 8.30 and 8.51 —
+    //           2.8-5% SLOWER. A-side global traffic is not the wall
+    //           either.
+    // The lesson worth keeping: three staging redesigns in a row read as
+    // flat because the instrument was wall-clock. One RADV_DEBUG=asm
+    // dump named the cause in a single line.
+    //
     // ── Staging-arc ledger (2026-08-25) — refuted variants kept as
     // prose so they are not retried. Baseline V1 5.2-5.4 TMAC/s,
-    // no-load CEIL 10.4-11.0 (the kernel is DRAM-BANDWIDTH-bound):
+    // no-load CEIL 10.4-11.0 (believed DRAM-bandwidth-bound; it was
+    // scratch traffic):
     //   V2  thread-spread staging (llama.cpp's LOAD_VEC mapping):
     //       3.1-3.8 — 8x redundant header loads/ALU cost more than
     //       the cross-lane scatter ever did.
