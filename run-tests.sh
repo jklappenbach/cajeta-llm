@@ -148,7 +148,7 @@ echo ">> dev.cajeta.jinja: $jinja_cja"
 echo ">> building llama library .cja"
 "$CAJETA" --emit=cja -o "$out/llama.cja" \
     --classpath="$codec_cja,$jinja_cja" \
-    dev.cajeta.llm.Llama.run "$here/src/main/cajeta" "$out" >/dev/null
+    dev.cajeta.llm.Llm.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> building + running the test binary"
 # XPU_BACKEND (default cpu): the engine's device paths (device-resident weight
