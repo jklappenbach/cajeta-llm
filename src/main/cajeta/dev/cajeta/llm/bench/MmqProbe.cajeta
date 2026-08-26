@@ -549,8 +549,381 @@ public final class MmqProbe {
         return bad;
     }
 
+    /**
+     * Stage 6 — the v1 f16-coopmat GEMM, llama.cpp's mul_mm large config
+     * verbatim (their 0.43 s prefill shape on this GPU): BM=128 weight
+     * rows x BN=128 tokens per workgroup of 128 threads (4 wave32
+     * subgroups), BK=32 k-slice per stage. Each subgroup owns a 64x64
+     * quadrant = 4x4 fragments of 16x16x16 f16 mma with f32 accumulate.
+     * Q4_K is dequantized to f16 AT STAGING with scales folded (one
+     * thread per weight row, one scale group per BK step — their
+     * trade: the 16-byte header re-read per step stays in L1). B loads
+     * col-major from Shared and the accumulators store col-major
+     * straight into y's [tokens x outDim] layout — both verified by
+     * stage 5, so there is NO transpose anywhere. All dims must be
+     * multiples of 128 (tokens padded by the caller; every weight shape
+     * in the 8B is already a multiple: 1024/4096/14336/128256).
+     */
+    @Kernel
+    public static void q4kF16CoopV1Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 40];
+        Shared<float16> sb = shared float16[128 * 40];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 128;
+        uint32 to = wg % nRowTiles;       // weight-row tile
+        uint32 tt = wg / nRowTiles;       // token tile
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 2;            // weight quadrant
+        uint32 warpC = sg / 2;            // token quadrant
+        int64 rowWords = blocksPerRow * 36L;
+        int64 kBlocks = blocksPerRow * 8L;
+        int64 cols = kBlocks * 32L;
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a02; a02.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a03; a03.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a12; a12.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a13; a13.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a20; a20.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a21; a21.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a22; a22.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a23; a23.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a30; a30.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a31; a31.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a32; a32.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a33; a33.splat(0.0f);
+        int64 kb = 0;
+        while (kb < kBlocks) {
+            int64 blk = kb >> 3;
+            int32 gq = (int32) (kb & 7L);
+            // A: thread `lane` dequantizes weight row (to*128+lane)'s
+            // 32-wide k-slice (scale group gq of superblock blk).
+            int64 ro = ((int64) (to * 128 + lane)) * rowWords
+                + blk * 36L;
+            Vector<int32,4> hw = packed.vload<4>(ro);
+            int32 h0 = hw[0];
+            float32 d = GgufFile.halfBitsToF32(h0 & 65535);
+            float32 dmin = GgufFile.halfBitsToF32((h0 >> 16) & 65535);
+            int32 hA = hw[1];
+            int32 hB = hw[2];
+            int32 hC = hw[3];
+            int32 sRaw = 0;
+            int32 mRaw = 0;
+            if (gq < 4) {
+                sRaw = (hA >> (8 * gq)) & 63;
+                mRaw = (hB >> (8 * gq)) & 63;
+            } else {
+                int32 j = gq - 4;
+                int32 kk = (hC >> (8 * j)) & 255;
+                int32 dd = (hA >> (8 * j)) & 255;
+                int32 mm = (hB >> (8 * j)) & 255;
+                sRaw = (kk & 15) | ((dd >> 2) & 48);
+                mRaw = (kk >> 4) | ((mm >> 2) & 48);
+            }
+            float32 sc = d * (float32) sRaw;
+            float32 mn = dmin * (float32) mRaw;
+            int32 rg = gq >> 1;
+            int32 nib = (gq & 1) * 4;
+            Vector<int32,8> qw = packed.vload<8>(ro + 4L
+                + (int64) (rg * 8));
+            int64 sBase = (int64) lane * 40L;
+            int32 e = 0;
+            while (e < 8) {
+                int32 w = qw[e];
+                int32 bi = 0;
+                while (bi < 4) {
+                    int32 by = (w >> (8 * bi)) & 255;
+                    int32 q = (by >> nib) & 15;
+                    sa[sBase + (int64) (4 * e + bi)] = (float16)
+                        (sc * (float32) q - mn);
+                    bi = bi + 1;
+                }
+                e = e + 1;
+            }
+            // B: thread `lane` copies token row (tt*128+lane)'s 32-wide
+            // k-slice of the f16 activations.
+            int64 xBase = ((int64) (tt * 128 + lane)) * cols + kb * 32L;
+            int32 jj = 0;
+            while (jj < 32) {
+                sb[sBase + (int64) jj] = xh[xBase + (int64) jj];
+                jj = jj + 1;
+            }
+            Barrier.workgroup();
+            // Two 16-deep mma steps over the staged 32-slice.
+            int32 ks = 0;
+            while (ks < 2) {
+                uint32 ko = (uint32) (16 * ks);
+                uint32 ab = (warpR * 64) * 40 + ko;
+                uint32 bb2 = (warpC * 64) * 40 + ko;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                CooperativeMatrix<float16,16,16,0> t2;
+                CooperativeMatrix<float16,16,16,0> t3;
+                t0.load(sa, ab, 0, 40);
+                t1.load(sa, ab + 640, 0, 40);
+                t2.load(sa, ab + 1280, 0, 40);
+                t3.load(sa, ab + 1920, 0, 40);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                CooperativeMatrix<float16,16,16,1> u2;
+                CooperativeMatrix<float16,16,16,1> u3;
+                u0.load(sb, bb2, 1, 40);
+                u1.load(sb, bb2 + 640, 1, 40);
+                u2.load(sb, bb2 + 1280, 1, 40);
+                u3.load(sb, bb2 + 1920, 1, 40);
+                a00.mma(t0, u0); a01.mma(t0, u1);
+                a02.mma(t0, u2); a03.mma(t0, u3);
+                a10.mma(t1, u0); a11.mma(t1, u1);
+                a12.mma(t1, u2); a13.mma(t1, u3);
+                a20.mma(t2, u0); a21.mma(t2, u1);
+                a22.mma(t2, u2); a23.mma(t2, u3);
+                a30.mma(t3, u0); a31.mma(t3, u1);
+                a32.mma(t3, u2); a33.mma(t3, u3);
+                ks = ks + 1;
+            }
+            Barrier.workgroup();
+            kb = kb + 1;
+        }
+        // Col-major store: fragment (r=weight, c=token) lands at
+        // y[tokBase + c][rowBase + r] — y's native layout, no staging.
+        uint32 rb = to * 128 + warpR * 64;
+        uint32 cb = tt * 128 + warpC * 64;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a02.store(y, (cb + 32) * outDim + rb, 1, outDim);
+        a03.store(y, (cb + 48) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+        a12.store(y, (cb + 32) * outDim + rb + 16, 1, outDim);
+        a13.store(y, (cb + 48) * outDim + rb + 16, 1, outDim);
+        a20.store(y, cb * outDim + rb + 32, 1, outDim);
+        a21.store(y, (cb + 16) * outDim + rb + 32, 1, outDim);
+        a22.store(y, (cb + 32) * outDim + rb + 32, 1, outDim);
+        a23.store(y, (cb + 48) * outDim + rb + 32, 1, outDim);
+        a30.store(y, cb * outDim + rb + 48, 1, outDim);
+        a31.store(y, (cb + 16) * outDim + rb + 48, 1, outDim);
+        a32.store(y, (cb + 32) * outDim + rb + 48, 1, outDim);
+        a33.store(y, (cb + 48) * outDim + rb + 48, 1, outDim);
+    }
+
+    /** Stage 6 driver: exactness stats vs the dp4a batch reference and
+     *  wall-clock vs the mmq kernel, natural (untransposed) layouts. */
+    static int64 checkCoopV1(int64 rows, int64 outDim, int64 cols) {
+        int8[] fix #= File.readAllBytes(
+            "src/test/fixtures/gguf/kquant/q4_k.bin");
+        int64 bb = (int64) Quant.blockBytes(Quant.GG_Q4_K);
+        int64 rowBytes = (cols / 256L) * bb;
+        int8[] raw #= heap int8[outDim * rowBytes];
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int64 blocks = outDim * (cols / 256L);
+        int64 b = 0;
+        while (b < blocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        float32[] x #= heap float32[rows * cols];
+        int64 i = 0;
+        while (i < rows * cols) {
+            x[i] = (float32) ((i * 31L + 7L) % 61L - 30L) * 0.03125f;
+            i = i + 1;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>(
+            (uint64) (outDim * rowBytes));
+        KernelBuffer<float32> xfD #= heap KernelBuffer<float32>(
+            (uint64) (rows * cols));
+        KernelBuffer<int8> xpD #= heap KernelBuffer<int8>(
+            (uint64) (rows * Quant.q8kPackedBytes(cols)));
+        KernelBuffer<float16> xhD #= heap KernelBuffer<float16>(
+            (uint64) (rows * cols));
+        KernelBuffer<float32> yA #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        KernelBuffer<float32> yB #= heap KernelBuffer<float32>(
+            (uint64) (rows * outDim));
+        wD.upload(raw);
+        xfD.upload(x);
+        QuantKernel.q8kPackLaunch(xpD, xfD, rows * cols);
+        KernelStream s = QuantKernel.stream();
+        f32ToF16Kernel.launch(s,
+            grid: [(uint32) ((rows * cols + 63L) / 64L)], block: [64])
+            (xhD, xfD, (uint32) (rows * cols));
+        s.sync();
+
+        KernelBuffer<int32> wW #= wD.wordView();
+        KernelBuffer<int32> xpW #= xpD.wordView();
+        QuantKernel.q4kQ8BatchMatMulLaunchNoSync(yA, wD, xpD, rows,
+            outDim, cols);
+        s.sync();
+        int64 nRt = outDim / 128L;
+        int64 nWg = nRt * (rows / 128L);
+        q4kF16CoopV1Kernel.launch(s, grid: [(uint32) nWg], block: [128])
+            (yB, wW, xhD, (uint32) rows, (uint32) outDim, (uint32) nRt,
+             cols / 256L);
+        s.sync();
+
+        float32[] a #= heap float32[rows * outDim];
+        float32[] g #= heap float32[rows * outDim];
+        yA.download(a);
+        yB.download(g);
+        int64 bad = 0;
+        float64 worst = 0.0;
+        i = 0;
+        while (i < rows * outDim) {
+            float32 diff = a[i] - g[i];
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a[i] < 0.0f ? 0.0f - a[i] : a[i];
+            float64 rel = (float64) diff / ((float64) mag + 1.0);
+            if (rel > worst) { worst = rel; }
+            if (diff > mag * 0.02f + 0.05f) {
+                if (bad < 5L) {
+                    System.stdout.println("  coopV1[" + (i / outDim) + ","
+                        + (i % outDim) + "]: got " + g[i] + " want "
+                        + a[i]);
+                }
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        System.stdout.println("  coopV1 worstRel(+1): " + worst);
+
+        int32 iters = 5;
+        int64 t0 = Clock.nanoTime();
+        int32 it = 0;
+        while (it < iters) {
+            q4kF16CoopV1Kernel.launch(s, grid: [(uint32) nWg],
+                block: [128])
+                (yB, wW, xhD, (uint32) rows, (uint32) outDim,
+                 (uint32) nRt, cols / 256L);
+            it = it + 1;
+        }
+        s.sync();
+        float64 msC = (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) iters;
+        t0 = Clock.nanoTime();
+        it = 0;
+        while (it < iters) {
+            QuantKernel.q4kQ8MmqLaunchNoSync(yB, wW, xpW, rows, outDim,
+                cols);
+            it = it + 1;
+        }
+        s.sync();
+        float64 msM = (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) iters;
+        float64 tmacs = (float64) (rows * outDim * cols) / 1.0e12;
+        System.stdout.println("  coopV1 " + msC + " ms ("
+            + (tmacs / (msC / 1000.0)) + " TMAC/s)   mmq " + msM
+            + " ms (" + (tmacs / (msM / 1000.0)) + " TMAC/s)");
+        return bad;
+    }
+
+    /**
+     * Stage 5 — coopmat layout=1 (column-major) SEMANTICS, the two
+     * operations v0 sidestepped and llama.cpp's mul_mm depends on: a
+     * col-major B load (from a buffer AND from Shared) and a col-major
+     * accumulator store. Each check computes I x f(M) with integer-valued
+     * f16s, so the expected result is EXACTLY M^T — any mis-lowering is a
+     * hard mismatch, never a tolerance call.
+     */
+    @Kernel
+    public static void coopLayoutProbeKernel(KernelBuffer<float32> y0,
+            KernelBuffer<float32> y1, KernelBuffer<float32> y2,
+            KernelBuffer<float16> m) {
+        Shared<float16> si = shared float16[256];
+        Shared<float16> sm = shared float16[256];
+        uint32 lane = KernelThread.x();
+        uint32 idx = lane;
+        while (idx < 256) {
+            float16 v = (float16) 0.0f;
+            if (idx / 16 == idx % 16) {
+                v = (float16) 1.0f;
+            }
+            si[(int64) idx] = v;
+            sm[(int64) idx] = m[(int64) idx];
+            idx = idx + 32;
+        }
+        Barrier.workgroup();
+        CooperativeMatrix<float16,16,16,0> ta;
+        ta.load(si, 0, 0, 16);
+        // (a) col-major B load from a BUFFER: B = M^T, y0 = I x M^T.
+        CooperativeMatrix<float16,16,16,1> tb0;
+        tb0.load(m, 0, 1, 16);
+        CooperativeMatrix<float32,16,16,2> a0;
+        a0.splat(0.0f);
+        a0.mma(ta, tb0);
+        a0.store(y0, 0, 0, 16);
+        // (b) col-major B load from SHARED: same expectation.
+        CooperativeMatrix<float16,16,16,1> tb1;
+        tb1.load(sm, 0, 1, 16);
+        CooperativeMatrix<float32,16,16,2> a1;
+        a1.splat(0.0f);
+        a1.mma(ta, tb1);
+        a1.store(y1, 0, 0, 16);
+        // (c) col-major STORE: y2 = M stored col-major, read back = M^T.
+        CooperativeMatrix<float16,16,16,1> tb2;
+        tb2.load(m, 0, 0, 16);
+        CooperativeMatrix<float32,16,16,2> a2;
+        a2.splat(0.0f);
+        a2.mma(ta, tb2);
+        a2.store(y2, 0, 1, 16);
+    }
+
+    static int64 checkCoopLayout() {
+        KernelStream s #= QuantKernel.stream();
+        float32[] mh #= heap float32[256];
+        int64 i = 0;
+        while (i < 256L) {
+            mh[i] = (float32) i;
+            i = i + 1;
+        }
+        KernelBuffer<float32> mf #= heap KernelBuffer<float32>(
+            (uint64) 256);
+        mf.upload(mh);
+        KernelBuffer<float16> m #= heap KernelBuffer<float16>(
+            (uint64) 256);
+        f32ToF16Kernel.launch(s, grid: [1], block: [256])(m, mf, 256);
+        KernelBuffer<float32> y0 #= heap KernelBuffer<float32>(
+            (uint64) 256);
+        KernelBuffer<float32> y1 #= heap KernelBuffer<float32>(
+            (uint64) 256);
+        KernelBuffer<float32> y2 #= heap KernelBuffer<float32>(
+            (uint64) 256);
+        coopLayoutProbeKernel.launch(s, grid: [1], block: [32])(
+            y0, y1, y2, m);
+        s.sync();
+        float32[] h0 #= heap float32[256];
+        float32[] h1 #= heap float32[256];
+        float32[] h2 #= heap float32[256];
+        y0.download(h0);
+        y1.download(h1);
+        y2.download(h2);
+        int64 bad = 0;
+        int64 r = 0;
+        while (r < 16L) {
+            int64 c = 0;
+            while (c < 16L) {
+                float32 want = mh[c * 16L + r];
+                if (h0[r * 16L + c] != want) { bad = bad + 1L; }
+                if (h1[r * 16L + c] != want) { bad = bad + 2L; }
+                if (h2[r * 16L + c] != want) { bad = bad + 4L; }
+                c = c + 1L;
+            }
+            r = r + 1L;
+        }
+        return bad;
+    }
+
     public static int32 run() {
         System.stdout.println("backend: " + Device.activeBackend());
+        int64 b0 = MmqProbe.checkCoopLayout();
+        System.stdout.println("stage5 coop layout=1 (bufLoad+1/shLoad+2/"
+            + "store+4 per element): " + b0 + " (0 = all three verified)");
         int64 b1 = MmqProbe.checkLdsDot();
         System.stdout.println("stage1 lds vload/vstore/barrier/dotAccum: "
             + b1 + "/64 wrong");
@@ -567,6 +940,13 @@ public final class MmqProbe {
         int64 b5 = MmqProbe.checkCoopF16(512L, 4096L, 4096L);
         System.stdout.println("stage4 coopF16@512x4096x4096: " + b5
             + "/2097152 outside 2%+0.05");
-        return (b1 + b2 + b3 + b4 + b5) == 0L ? 0 : 1;
+        MmqProbe.checkCoopV1(128L, 128L, 256L);
+        int64 b6 = MmqProbe.checkCoopV1(512L, 4096L, 4096L);
+        System.stdout.println("stage6 coopV1@512x4096x4096: " + b6
+            + "/2097152 outside 2%+0.05");
+        int64 b7 = MmqProbe.checkCoopV1(512L, 4096L, 14336L);
+        System.stdout.println("stage6b coopV1@512x4096x14336: " + b7
+            + "/2097152 outside 2%+0.05");
+        return (b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7) == 0L ? 0 : 1;
     }
 }
