@@ -717,6 +717,16 @@ public final class Linear extends InfModule {
         if (QuantKernel.skipMatvecForMeasurement()) {
             return;
         }
+        // Every route below the coop pair reads the int8 activations, so
+        // this is where the lazy pack comes due — one predicate covering
+        // the whole else-if chain rather than a call in each arm.
+        boolean coopHere = Linear.coopOn && Linear.backendIsVulkan()
+            && Linear.btXhSrc != null
+            && (this.packedTy == Quant.GG_Q4_K
+                || this.packedTy == Quant.GG_Q6_K)
+            && (int64) this.inDim % 256L == 0L
+            && (int64) this.outDim % 128L == 0L;
+        if (!coopHere) { Linear.ensureBtXp(); }
         if (this.packedTy >= 0) {
             float32[] sb = src.hostBuffer();
             float32[] db = dst.hostBuffer();
@@ -1011,6 +1021,11 @@ public final class Linear extends InfModule {
     static int64 btXhCap;
     static boolean btXhDone;
     static KernelBuffer<float32> btXhSrc;
+    // The int8 pack is LAZY for the same reason the f16 copy is: on the
+    // coop route nothing ever reads it, and packing rows x inDim floats
+    // per stage is a full pass over the activations. Measured 2026-08-26.
+    static boolean btXpDone;
+    static int64 btXpN;
     static int8[] btXph;
     static int32 btCap;      // rows the stage is sized for
     static int32 btDim;      // inDim the stage is sized for
@@ -1292,6 +1307,7 @@ public final class Linear extends InfModule {
             QuantKernel.q8kPackLaunch(Linear.btXp, Linear.btXf, span);
             Linear.btXhSrc #= Linear.btXf;
             Linear.btXhDone = false;
+            Linear.btXpDone = true;
             int64 t2 = Clock.nanoTime();
             Linear.btPackNs = Linear.btPackNs + (t1 - t0);
             Linear.btUploadNs = Linear.btUploadNs + (t2 - t1);
@@ -1305,6 +1321,7 @@ public final class Linear extends InfModule {
             }
             int64 t1 = Clock.nanoTime();
             Linear.btXp.upload(Linear.btXph, (int64) rows * pb);
+            Linear.btXpDone = true;
             int64 t2 = Clock.nanoTime();
             Linear.btPackNs = Linear.btPackNs + (t1 - t0);
             Linear.btUploadNs = Linear.btUploadNs + (t2 - t1);
@@ -1524,6 +1541,25 @@ public final class Linear extends InfModule {
         Linear.ensureKernelAvail();
         this.ensureDevice();
         this.ensureBatchOut(rows);
+        // The `nomatvec` arm reaches the BATCHED path too (2026-08-26):
+        // with the projections off, a prefill times everything that is
+        // NOT a GEMM — norms, rope, attend, glu, the activation
+        // conversions and every launch — which is the only way to know
+        // how much of the wall clock a faster GEMM cannot touch.
+        // Garbage output by construction.
+        if (QuantKernel.skipMatvecForMeasurement()) {
+            return;
+        }
+        // Every route below the coop pair reads the int8 activations, so
+        // this is where the lazy pack comes due — one predicate covering
+        // the whole else-if chain rather than a call in each arm.
+        boolean coopHere = Linear.coopOn && Linear.backendIsVulkan()
+            && Linear.btXhSrc != null
+            && (this.packedTy == Quant.GG_Q4_K
+                || this.packedTy == Quant.GG_Q6_K)
+            && (int64) this.inDim % 256L == 0L
+            && (int64) this.outDim % 128L == 0L;
+        if (!coopHere) { Linear.ensureBtXp(); }
         int64 t0 = Clock.nanoTime();
         // MATRIX CORES when the shape tiles and the format has a kernel
         // (plan 10.12.14). Only Q4_K has one, so a Q4_K_M checkpoint runs
@@ -1837,15 +1873,26 @@ public final class Linear extends InfModule {
                 && Linear.btN == n) {
             return;
         }
-        int64 t0 = Clock.nanoTime();
-        QuantKernel.q8kPackLaunchNoSync(Linear.btXp, src,
-            (int64) rows * (int64) n);
         Linear.btXhSrc #= src;
         Linear.btXhDone = false;
-        Linear.btPackNs = Linear.btPackNs + (Clock.nanoTime() - t0);
+        Linear.btXpDone = false;
+        Linear.btXpN = (int64) rows * (int64) n;
         Linear.btTag = tag;
         Linear.btRows = rows;
         Linear.btN = n;
+        return;
+    }
+
+    /** Pack the staged activations to q8_K, if a consumer that reads
+     *  them is actually about to run. The source is the same device
+     *  buffer `btXhSrc` the f16 copy uses. */
+    static void ensureBtXp() {
+        if (Linear.btXpDone || Linear.btXhSrc == null) { return; }
+        int64 t0 = Clock.nanoTime();
+        QuantKernel.q8kPackLaunchNoSync(Linear.btXp, Linear.btXhSrc,
+            Linear.btXpN);
+        Linear.btXpDone = true;
+        Linear.btPackNs = Linear.btPackNs + (Clock.nanoTime() - t0);
         return;
     }
 
@@ -1951,6 +1998,7 @@ public final class Linear extends InfModule {
      *  the shape fits — launch ONE Mw8 GEMM over the concatenated
      *  outDim and account it as one deq call. */
     void fusedLaunch(int32 rows) {
+        Linear.ensureBtXp();
         this.ensureFusedY(rows);
         int64 t0 = Clock.nanoTime();
         WmmaKernel.q4kWmmaDeqMw8Launch(this.fusedYBatch,
