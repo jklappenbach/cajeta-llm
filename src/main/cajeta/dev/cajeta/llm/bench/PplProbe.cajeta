@@ -1,0 +1,96 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import cajeta.time.Clock;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.tok.Tokenizer;
+
+/**
+ * Teacher-forced perplexity for the quantized GEMM routes (spec 12.15):
+ * prefill `PRE` corpus tokens through the route under test, then decode
+ * the next `EVAL` corpus tokens teacher-forced, accumulating NLL from
+ * the FULL logits row at every step. Prefill numerics propagate through
+ * the KV cache into every decode logit, so an A/B of this number
+ * between arms measures a route's real effect on model quality — the
+ * standard for f16-accumulating kernels, where token identity is
+ * explicitly NOT asserted (near-ties may legitimately tip).
+ *
+ *   pplprobe <model.gguf> <text-file> [nocoop] [nommq]
+ */
+public final class PplProbe {
+
+    public static int32 run(String[] args) {
+        if ((int32) args.count() < 2) {
+            System.stdout.println(
+                "usage: pplprobe <model.gguf> <text> [nocoop] [nommq]");
+            return 2;
+        }
+        int32 ai = 2;
+        while (ai < (int32) args.count()) {
+            if (args[ai].equals("nocoop")) { Linear.setCoop(false); }
+            if (args[ai].equals("nommq")) { Linear.setMmq(false); }
+            ai = ai + 1;
+        }
+        int32 pre = 512;
+        int32 eval = 256;
+
+        int8[] raw #= File.readAllBytes(args[1]);
+        int32 rawN = (int32) raw.count();
+        Checkpoint ck #= Checkpoint.open(args[0]);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        Tokenizer tok #= ck.gguf().tokenizer();
+        int32[] ids #= tok.encodeBytes(raw, rawN);
+        int32 n = (int32) ids.count();
+        if (n < pre + eval + 1) {
+            System.stdout.println("pplprobe: corpus has " + n
+                + " tokens; need " + (pre + eval + 1));
+            return 2;
+        }
+        System.stdout.println("corpus tokens: " + n + "  (prefill " + pre
+            + ", eval " + eval + ")");
+
+        CausalLM m = heap CausalLM(#cfg, pre + eval + 8, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        m.prewarmPrefillWeights();
+
+        int64 t0 = Clock.nanoTime();
+        m.prefill(ids, pre);
+        System.stdout.println("prefill ms: "
+            + ((float64) (Clock.nanoTime() - t0) / 1000000.0));
+
+        int32 vocab = m.vocabSize();
+        float32[] row #= heap float32[vocab];
+        Perplexity ppl = heap Perplexity();
+        int32[] one #= heap int32[1];
+        t0 = Clock.nanoTime();
+        int32 i = 0;
+        while (i < eval) {
+            // The logits row currently held predicts position pre+i.
+            Tensor<float32> lg = m.logits();
+            float32[] lb = lg.hostBuffer();
+            int64 lbase = lg.hostBase();
+            int32 c = 0;
+            while (c < vocab) {
+                row[c] = lb[lbase + (int64) c];
+                c = c + 1;
+            }
+            ppl.add(row, vocab, ids[pre + i]);
+            // Teacher-force the TRUE corpus token.
+            one[0] = ids[pre + i];
+            m.stepSeq(0, one, 0, 1);
+            i = i + 1;
+        }
+        System.stdout.println("eval ms: "
+            + ((float64) (Clock.nanoTime() - t0) / 1000000.0));
+        System.stdout.println("positions: " + ppl.positions()
+            + "  meanNll: " + ppl.meanNll() + "  ppl: " + ppl.ppl());
+        return 0;
+    }
+}
