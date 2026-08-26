@@ -1001,6 +1001,16 @@ public final class Linear extends InfModule {
     static KernelBuffer<int8> btXp;
     static KernelBuffer<int32> btXpW;   // dword view, refreshed with btXp
     static boolean mmqOn = true;        // vulkan Q4_K batch -> mmq kernel
+    static boolean coopOn = true;       // vulkan Q4_K batch -> f16 coopmat
+    // f16 twin of the staged batch activations, converted LAZILY on the
+    // first coop consumer of a staging (the pack above serves the dp4a
+    // kernels). btXhSrc is a deliberate non-owning alias of the staged
+    // f32 device source (ownership §3); the host-pack path leaves it
+    // null and the coop route then falls through to mmq.
+    static KernelBuffer<float16> btXh;
+    static int64 btXhCap;
+    static boolean btXhDone;
+    static KernelBuffer<float32> btXhSrc;
     static int8[] btXph;
     static int32 btCap;      // rows the stage is sized for
     static int32 btDim;      // inDim the stage is sized for
@@ -1090,6 +1100,7 @@ public final class Linear extends InfModule {
     public static void setWmma(boolean on) { Linear.wmmaOn = on; }
 
     public static void setMmq(boolean on) { Linear.mmqOn = on; }
+    public static void setCoop(boolean on) { Linear.coopOn = on; }
 
     void ensurePackedW() {
         if (this.packedW == null) {
@@ -1206,6 +1217,24 @@ public final class Linear extends InfModule {
         return;
     }
 
+    /** The f16 activation twin for the coop GEMM, converted once per
+     *  staging. `padRows` is the 128-padded token count; pad rows stay
+     *  garbage, and only pad OUTPUT rows depend on them. */
+    static void ensureBtXh(int64 padRows) {
+        int64 need = padRows * (int64) Linear.btN;
+        if (Linear.btXh == null || Linear.btXhCap < need) {
+            Linear.btXh #= heap KernelBuffer<float16>((uint64) need);
+            Linear.btXhCap = need;
+            Linear.btXhDone = false;
+        }
+        if (!Linear.btXhDone) {
+            QuantKernel.f32ToF16LaunchNoSync(Linear.btXh, Linear.btXhSrc,
+                (int64) Linear.btRows * (int64) Linear.btN);
+            Linear.btXhDone = true;
+        }
+        return;
+    }
+
     /**
      * Quantize `rows` activations and upload them ONCE, for the
      * projections that follow.
@@ -1257,6 +1286,8 @@ public final class Linear extends InfModule {
             int64 t1 = Clock.nanoTime();
             Linear.btXf.upload(fh, span);
             QuantKernel.q8kPackLaunch(Linear.btXp, Linear.btXf, span);
+            Linear.btXhSrc #= Linear.btXf;
+            Linear.btXhDone = false;
             int64 t2 = Clock.nanoTime();
             Linear.btPackNs = Linear.btPackNs + (t1 - t0);
             Linear.btUploadNs = Linear.btUploadNs + (t2 - t1);
@@ -1273,6 +1304,8 @@ public final class Linear extends InfModule {
             int64 t2 = Clock.nanoTime();
             Linear.btPackNs = Linear.btPackNs + (t1 - t0);
             Linear.btUploadNs = Linear.btUploadNs + (t2 - t1);
+            Linear.btXhSrc = null;
+            Linear.btXhDone = false;
         }
         Linear.btTag = tag;
         Linear.btRows = rows;
@@ -1695,6 +1728,23 @@ public final class Linear extends InfModule {
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
+        } else if (Linear.coopOn && this.packedTy == Quant.GG_Q4_K
+                && Linear.backendIsVulkan() && Linear.btXhSrc != null
+                && (int64) this.inDim % 256L == 0L
+                && (int64) this.outDim % 128L == 0L) {
+            // The f16 COOPMAT GEMM (matrix cores; llama.cpp's 0.43 s
+            // architecture): 2.3x the mmq kernel measured (5.4 vs 2.3
+            // TMAC/s). f16 accumulation is llama.cpp's own trade —
+            // validated by PERPLEXITY, never token identity.
+            this.sayRoute(8192, "coop q4");
+            this.ensurePackedW();
+            int64 padRows = ((int64) rows + 127L) / 128L * 128L;
+            this.ensureBatchOut((int32) padRows);
+            Linear.ensureBtXh(padRows);
+            QuantKernel.q4kF16CoopLaunchNoSync(this.yBatch, this.packedW,
+                Linear.btXh, padRows, (int64) this.outDim,
+                (int64) this.inDim);
+            QuantKernel.stream().sync();
         } else if (Linear.mmqOn && this.packedTy == Quant.GG_Q4_K
                 && Linear.backendIsVulkan()) {
             // The LDS-tiled dp4a GEMM (q4kQ8MmqKernel): reads dwords only,
@@ -1757,6 +1807,8 @@ public final class Linear extends InfModule {
         int64 t0 = Clock.nanoTime();
         QuantKernel.q8kPackLaunchNoSync(Linear.btXp, src,
             (int64) rows * (int64) n);
+        Linear.btXhSrc #= src;
+        Linear.btXhDone = false;
         Linear.btPackNs = Linear.btPackNs + (Clock.nanoTime() - t0);
         Linear.btTag = tag;
         Linear.btRows = rows;
