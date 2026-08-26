@@ -1,0 +1,278 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * The batched (prefill) coop GEMM, for EVERY quantization the engine
+ * supports — not just the Q4_K/Q6_K pair it shipped with.
+ *
+ * The compute half of that kernel is format-blind: it multiplies f16
+ * tiles out of LDS, so a new format is a staging body plus, where ggml's
+ * block stride is not a multiple of four, a one-time device repack. That
+ * is exactly the shape of bug this suite exists to catch — a scale paired
+ * with the wrong sub-block, a nibble taken from the wrong half, a repack
+ * that shifts the payload by the wrong number of bytes. All of those land
+ * order-100% wrong, which is why a 1% relative bar is enough and a
+ * tolerance is not hiding anything.
+ *
+ * Every arm also asserts the result is NON-ZERO. A kernel that fails to
+ * lower does not fail the build — the launch finds nothing registered and
+ * the output buffer reads back zeros — and comparing two zeros is how a
+ * device suite comes to pass while running no device code at all.
+ */
+public class CoopQuantGemmTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+    static final int64 ROWS = 128L;      // tokens: one BM/BN tile
+    static final int64 OUT = 128L;       // output rows: one row tile
+    static final int64 COLS = 256L;      // K: one 256-block per row
+
+    public CoopQuantGemmTest() { return; }
+
+    /** True when this backend actually lowers the coop kernels. Guarding
+     *  on ONE of them is safe because they share every construct. */
+    static boolean coopHere() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return false; }
+        return Device.kernelAvailable("q4kF16CoopX3Kernel");
+    }
+
+    /**
+     * Run the coop GEMM for `ty` over weights tiled from that format's
+     * fixture blocks, and compare against dequantize-then-multiply on the
+     * host.
+     */
+    static void checkFormat(int32 ty, String fixture) {
+        if (!CoopQuantGemmTest.coopHere()) {
+            System.stdout.println("  (skipped: backend "
+                + Device.activeBackend() + " has no coop kernel)");
+            return;
+        }
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be = (int64) Quant.blockElems(ty);
+        int64 blocksPerRow = CoopQuantGemmTest.COLS / be;
+        int64 nBlocks = CoopQuantGemmTest.OUT * blocksPerRow;
+
+        int8[] fix #= File.readAllBytes(CoopQuantGemmTest.DIR + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        Assert.isTrue(fixBlocks > 0L);
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+
+        // Mixed signs and magnitudes: an all-positive x hides sign
+        // handling in the widen, a constant x hides lane misordering.
+        float32[] x #= heap float32[CoopQuantGemmTest.ROWS
+            * CoopQuantGemmTest.COLS];
+        int64 i = 0;
+        while (i < CoopQuantGemmTest.ROWS * CoopQuantGemmTest.COLS) {
+            x[i] = (float32) ((i * 31L + 7L) % 61L - 30L) * 0.0625f;
+            i = i + 1;
+        }
+
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>(
+            (uint64) (nBlocks * bb));
+        wD.upload(raw);
+        KernelBuffer<float32> xfD #= heap KernelBuffer<float32>(
+            (uint64) (CoopQuantGemmTest.ROWS * CoopQuantGemmTest.COLS));
+        xfD.upload(x);
+        KernelBuffer<float16> xhD #= heap KernelBuffer<float16>(
+            (uint64) (CoopQuantGemmTest.ROWS * CoopQuantGemmTest.COLS));
+        QuantKernel.f32ToF16LaunchNoSync(xhD, xfD,
+            CoopQuantGemmTest.ROWS * CoopQuantGemmTest.COLS);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>(
+            (uint64) (CoopQuantGemmTest.ROWS * CoopQuantGemmTest.OUT));
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+
+        // The same two-step Linear.ensureCoopW performs: repack when the
+        // ggml block stride is not dword-addressable, then take the word
+        // view the kernel indexes.
+        int64 dw = (int64) QuantKernel.coopBlockWords(ty);
+        KernelBuffer<int8> padD #= heap KernelBuffer<int8>(
+            (uint64) (nBlocks * dw * 4L));
+        if (QuantKernel.coopNeedsRepack(ty)) {
+            if (ty == Quant.GG_Q3_K || ty == Quant.GG_Q6_K) {
+                QuantKernel.blockPadLaunch(padD, wD, nBlocks, (int32) bb,
+                    (int32) (dw * 4L));
+            } else {
+                QuantKernel.blockRepack2Launch(padD, wD, nBlocks,
+                    (int32) bb, (int32) (dw * 4L));
+            }
+        }
+        KernelBuffer<int32> wW #= QuantKernel.coopNeedsRepack(ty)
+            ? padD.wordView() : wD.wordView();
+
+        QuantKernel.coopBatchLaunchNoSync(ty, yD, wW, xhD,
+            CoopQuantGemmTest.ROWS, CoopQuantGemmTest.OUT,
+            CoopQuantGemmTest.COLS);
+        s.sync();
+        float32[] got #= heap float32[CoopQuantGemmTest.ROWS
+            * CoopQuantGemmTest.OUT];
+        yD.download(got);
+
+        float32[] w #= heap float32[nBlocks * be];
+        Quant.dequantize(ty, raw, 0L, nBlocks, w, 0L);
+
+        boolean live = false;
+        int64 worstAt = -1L;
+        float64 worst = 0.0;
+        float32 worstGot = 0.0f;
+        float32 worstWant = 0.0f;
+        int64 t = 0;
+        while (t < CoopQuantGemmTest.ROWS) {
+            int64 o = 0;
+            while (o < CoopQuantGemmTest.OUT) {
+                float32 acc = 0.0f;
+                int64 k = 0;
+                while (k < CoopQuantGemmTest.COLS) {
+                    acc = acc + w[o * CoopQuantGemmTest.COLS + k]
+                        * x[t * CoopQuantGemmTest.COLS + k];
+                    k = k + 1;
+                }
+                float32 g = got[t * CoopQuantGemmTest.OUT + o];
+                if (g != 0.0f) { live = true; }
+                float32 diff = acc - g;
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = acc < 0.0f ? 0.0f - acc : acc;
+                float64 rel = (float64) diff
+                    / ((float64) mag * 0.01 + 0.01);
+                if (rel > worst) {
+                    worst = rel;
+                    worstAt = t * CoopQuantGemmTest.OUT + o;
+                    worstGot = g;
+                    worstWant = acc;
+                }
+                o = o + 1;
+            }
+            t = t + 1;
+        }
+        // The f16 staging rounds the weights, so the bar is 1% relative
+        // plus an absolute floor — three orders of magnitude above the
+        // rounding and three below any indexing slip.
+        if (worst > 1.0) {
+            Assert.fail("coop GEMM ty=" + ty + " at ["
+                + (worstAt / CoopQuantGemmTest.OUT) + ","
+                + (worstAt % CoopQuantGemmTest.OUT) + "]: kernel "
+                + worstGot + " vs host dequant-and-multiply " + worstWant);
+        }
+        if (!live) {
+            Assert.fail("coop GEMM ty=" + ty + ": every output is zero, "
+                + "which is what a kernel that never ran produces");
+        }
+    }
+
+    @Test
+    public void coopGemmQ4KMatchesHost() {
+        CoopQuantGemmTest.checkFormat(Quant.GG_Q4_K, "q4_k.bin");
+    }
+
+    @Test
+    public void coopGemmQ6KMatchesHost() {
+        CoopQuantGemmTest.checkFormat(Quant.GG_Q6_K, "q6_k.bin");
+    }
+
+    @Test
+    public void coopGemmQ5KMatchesHost() {
+        CoopQuantGemmTest.checkFormat(Quant.GG_Q5_K, "q5_k.bin");
+    }
+
+    @Test
+    public void coopGemmQ3KMatchesHost() {
+        CoopQuantGemmTest.checkFormat(Quant.GG_Q3_K, "q3_k.bin");
+    }
+
+    @Test
+    public void coopGemmQ2KMatchesHost() {
+        CoopQuantGemmTest.checkFormat(Quant.GG_Q2_K, "q2_k.bin");
+    }
+
+    @Test
+    public void coopGemmQ80MatchesHost() {
+        CoopQuantGemmTest.checkFormat(Quant.GG_Q8_0, "q8_0.bin");
+    }
+
+    @Test
+    public void coopGemmQ50MatchesHost() {
+        CoopQuantGemmTest.checkFormat(Quant.GG_Q5_0, "q5_0.bin");
+    }
+
+    @Test
+    public void coopGemmQ40MatchesHost() {
+        CoopQuantGemmTest.checkFormat(Quant.GG_Q4_0, "q4_0.bin");
+    }
+
+    /**
+     * The invariant that ties the three moving parts together: a format
+     * needs a device repack EXACTLY when ggml's block stride is not a
+     * multiple of four, and the device stride is never smaller than the
+     * ggml one. A wrong `coopBlockWords` entry silently shifts every
+     * block of a tensor, so it is checked as arithmetic here rather than
+     * left to whichever format happens to be in the model under test.
+     */
+    @Test
+    public void deviceBlockStridesAgreeWithGgmls() {
+        int32[] tys #= heap int32[8];
+        tys[0] = Quant.GG_Q4_0;
+        tys[1] = Quant.GG_Q5_0;
+        tys[2] = Quant.GG_Q8_0;
+        tys[3] = Quant.GG_Q2_K;
+        tys[4] = Quant.GG_Q3_K;
+        tys[5] = Quant.GG_Q4_K;
+        tys[6] = Quant.GG_Q5_K;
+        tys[7] = Quant.GG_Q6_K;
+        int32 i = 0;
+        while (i < 8) {
+            int32 ty = tys[i];
+            Assert.isTrue(QuantKernel.coopSupports(ty));
+            int32 gg = Quant.blockBytes(ty);
+            int32 devBytes = QuantKernel.coopBlockWords(ty) * 4;
+            Assert.isTrue(devBytes >= gg);
+            Assert.isTrue(devBytes - gg < 4);
+            boolean aligned = gg % 4 == 0;
+            // Aligned formats are read in place; the rest are repacked.
+            Assert.equals(!aligned, QuantKernel.coopNeedsRepack(ty));
+            i = i + 1;
+        }
+    }
+
+    /**
+     * The half that asserts the check does NOT fire: an unsupported type
+     * must be reported, never routed through another format's decoder.
+     * F16 (ggml type 1) is a real type the engine does not pack.
+     */
+    @Test
+    public void anUnsupportedTypeIsRefusedNotDecoded() {
+        Assert.isFalse(QuantKernel.coopSupports(1));
+        Assert.equals(0, QuantKernel.coopBlockWords(1));
+        if (!CoopQuantGemmTest.coopHere()) { return; }
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) 16);
+        KernelBuffer<int32> w #= heap KernelBuffer<int32>((uint64) 16);
+        KernelBuffer<float16> x #= heap KernelBuffer<float16>((uint64) 16);
+        boolean threw = false;
+        try {
+            QuantKernel.coopBatchLaunchNoSync(1, y, w, x, 128L, 128L,
+                256L);
+        } catch (Throwable e) {
+            threw = true;
+            String m #= e.getMessage();
+            Assert.isTrue(m.contains("1"));
+        }
+        Assert.isTrue(threw);
+    }
+}

@@ -56,6 +56,12 @@ public final class Linear extends InfModule {
     // decode mat-vecs read.
     KernelBuffer<int8> q6PadDev;
     KernelBuffer<int32> q6PadW;
+    // The coop GEMM's dword view of this weight. Q4_K/Q2_K/Q5_K are
+    // dword-addressable as ggml stores them and this is just a view;
+    // Q4_0/Q5_0/Q8_0/Q3_K/Q6_K need a one-time device repack first
+    // (QuantKernel.coopNeedsRepack), and `coopDev` owns that copy.
+    KernelBuffer<int8> coopDev;
+    KernelBuffer<int32> coopW;
     // The widened int8 prefill copy (10.12.16), built ONCE on the first
     // int8-routed matmulInto and only under that policy — a Linear that
     // never prefills under "int8" never pays the ~2x bytes. Decode never
@@ -616,6 +622,8 @@ public final class Linear extends InfModule {
         this.packedW = null;
         this.q6PadW = null;
         this.q6PadDev = null;
+        this.coopW = null;
+        this.coopDev = null;
         this.deqDev = null;
         this.yDev = null;
         this.yScratch = null;
@@ -765,8 +773,7 @@ public final class Linear extends InfModule {
         // the whole else-if chain rather than a call in each arm.
         boolean coopHere = Linear.coopOn && Linear.backendIsVulkan()
             && Linear.btXhSrc != null
-            && (this.packedTy == Quant.GG_Q4_K
-                || this.packedTy == Quant.GG_Q6_K)
+            && QuantKernel.coopSupports(this.packedTy)
             && (int64) this.inDim % 256L == 0L
             && (int64) this.outDim % 128L == 0L;
         if (!coopHere) { Linear.ensureBtXp(); }
@@ -1183,6 +1190,56 @@ public final class Linear extends InfModule {
             this.q6PadW #= this.q6PadDev.wordView();
         }
     }
+    /**
+     * The dword view the coop GEMM reads, materializing the one-time
+     * repack when the format needs one. Q6_K rides the existing 212-byte
+     * pad rather than keeping a second copy of the same tensor.
+     */
+    void ensureCoopW() {
+        if (this.coopW != null) { return; }
+        int32 ty = this.packedTy;
+        if (!QuantKernel.coopNeedsRepack(ty)) {
+            this.coopW #= this.packedDev.wordView();
+            return;
+        }
+        if (ty == Quant.GG_Q6_K) {
+            this.ensureQ6Pad();
+            this.coopW #= this.q6PadDev.wordView();
+            return;
+        }
+        int64 nBlocks = (int64) this.outDim
+            * ((int64) this.inDim / (int64) Quant.blockElems(ty));
+        int32 sb = Quant.blockBytes(ty);
+        int32 db = QuantKernel.coopBlockWords(ty) * 4;
+        this.coopDev #= heap KernelBuffer<int8>(
+            (uint64) (nBlocks * (int64) db));
+        if (ty == Quant.GG_Q3_K) {
+            // Stride-only pad: Q3_K's hmask/qs/scales/d already sit on
+            // dword boundaries, the 110-byte block stride does not.
+            QuantKernel.blockPadLaunch(this.coopDev, this.packedDev,
+                nBlocks, sb, db);
+        } else {
+            // Q4_0/Q5_0/Q8_0: f16 scale, then the payload moved from
+            // byte 2 to byte 4 so it is dword-addressable.
+            QuantKernel.blockRepack2Launch(this.coopDev, this.packedDev,
+                nBlocks, sb, db);
+        }
+        this.coopW #= this.coopDev.wordView();
+        return;
+    }
+
+    /** One route bit per coop weight type, so each prints once. */
+    static int32 coopRouteBit(int32 ty) {
+        if (ty == Quant.GG_Q4_K) { return 8192; }
+        if (ty == Quant.GG_Q6_K) { return 16384; }
+        if (ty == Quant.GG_Q5_K) { return 32768; }
+        if (ty == Quant.GG_Q8_0) { return 65536; }
+        if (ty == Quant.GG_Q5_0) { return 131072; }
+        if (ty == Quant.GG_Q4_0) { return 262144; }
+        if (ty == Quant.GG_Q3_K) { return 524288; }
+        return 1048576;
+    }
+
     public static void setWmma6(boolean on) { Linear.wmma6On = on; }
     public static void setEpi(boolean on) { Linear.epiOn = on; }
     public static void setQ4Epi(boolean on) { Linear.q4EpiOn = on; }
@@ -1495,17 +1552,29 @@ public final class Linear extends InfModule {
      *  there through the dotAccum GEMM instead (matmulBatchKeep gates
      *  useWmma6 off), which requires that kernel to be registered. */
     boolean isBatchRouted() {
-        if (this.packedTy < 0 || !QuantKernel.hasBatchKernel(this.packedTy)
-                || !QuantKernel.routingEnabled() || !Linear.waveMv()
-                || !Linear.wmmaBackend()) {
+        if (this.packedTy < 0 || !QuantKernel.routingEnabled()
+                || !Linear.waveMv() || !Linear.wmmaBackend()) {
             return false;
         }
         if (Linear.backendIsVulkan()) {
             Linear.ensureKernelAvail();
+            // The coop GEMM covers every supported quantization as of
+            // 2026-08-26, so on vulkan the batched path is open to all of
+            // them at the shapes its tile divides -- ABOVE the
+            // hasBatchKernel gate, which asks about the int8 mmq batch
+            // kernels the native path uses and which still exist only for
+            // Q4_K/Q6_K. Below the tile's shape the announced per-row
+            // path still takes it.
+            if (Linear.coopOn && QuantKernel.coopSupports(this.packedTy)
+                    && (int64) this.inDim % 256L == 0L
+                    && (int64) this.outDim % 128L == 0L) {
+                return true;
+            }
+            if (!QuantKernel.hasBatchKernel(this.packedTy)) { return false; }
             if (this.packedTy == Quant.GG_Q6_K) { return Linear.avQ6Batch; }
             return this.packedTy == Quant.GG_Q4_K;
         }
-        return true;
+        return QuantKernel.hasBatchKernel(this.packedTy);
     }
 
     /**
@@ -1604,8 +1673,7 @@ public final class Linear extends InfModule {
         // the whole else-if chain rather than a call in each arm.
         boolean coopHere = Linear.coopOn && Linear.backendIsVulkan()
             && Linear.btXhSrc != null
-            && (this.packedTy == Quant.GG_Q4_K
-                || this.packedTy == Quant.GG_Q6_K)
+            && QuantKernel.coopSupports(this.packedTy)
             && (int64) this.inDim % 256L == 0L
             && (int64) this.outDim % 128L == 0L;
         if (!coopHere) { Linear.ensureBtXp(); }
@@ -1817,16 +1885,19 @@ public final class Linear extends InfModule {
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
-        } else if (Linear.coopOn && this.packedTy == Quant.GG_Q4_K
-                && Linear.backendIsVulkan() && Linear.btXhSrc != null
+        } else if (Linear.coopOn && Linear.backendIsVulkan()
+                && Linear.btXhSrc != null
+                && QuantKernel.coopSupports(this.packedTy)
                 && (int64) this.inDim % 256L == 0L
                 && (int64) this.outDim % 128L == 0L) {
-            // The f16 COOPMAT GEMM (matrix cores; llama.cpp's 0.43 s
-            // architecture): 2.3x the mmq kernel measured (5.4 vs 2.3
-            // TMAC/s). f16 accumulation is llama.cpp's own trade —
-            // validated by PERPLEXITY, never token identity.
-            this.sayRoute(8192, "coop q4");
-            this.ensurePackedW();
+            // The f16 COOPMAT GEMM (matrix cores; llama.cpp's own
+            // architecture), now for EVERY quantization the engine
+            // supports: the compute half is format-blind, so each type
+            // is a staging body plus, where the ggml block stride is not
+            // a multiple of four, a one-time device repack.
+            this.sayRoute(Linear.coopRouteBit(this.packedTy),
+                "coop ty=" + this.packedTy);
+            this.ensureCoopW();
             // 128, always: the BN=256 kernels the 256 pad existed for
             // were retired 2026-08-26 (they spilled 74 VGPRs), and the
             // X1/X3 pair tiles at 128, so a 256 pad now only buys dead
@@ -1840,8 +1911,8 @@ public final class Linear extends InfModule {
             // independent GEMMs. Reallocation points drain the stream
             // (ensureBtXh / ensureBatchStage) before freeing a buffer an
             // in-flight GEMM may still read.
-            QuantKernel.q4kF16CoopAutoLaunchNoSync(this.yBatch,
-                this.packedW, Linear.btXh, padRows, (int64) this.outDim,
+            QuantKernel.coopBatchLaunchNoSync(this.packedTy, this.yBatch,
+                this.coopW, Linear.btXh, padRows, (int64) this.outDim,
                 (int64) this.inDim);
         } else if (Linear.mmqOn && this.packedTy == Quant.GG_Q4_K
                 && Linear.backendIsVulkan()) {
@@ -1853,22 +1924,6 @@ public final class Linear extends InfModule {
                 Linear.btXpW, (int64) rows, (int64) this.outDim,
                 (int64) this.inDim);
             QuantKernel.stream().sync();
-        } else if (Linear.coopOn && this.packedTy == Quant.GG_Q6_K
-                && Linear.backendIsVulkan() && Linear.btXhSrc != null
-                && (int64) this.inDim % 256L == 0L
-                && (int64) this.outDim % 128L == 0L) {
-            this.sayRoute(16384, "coop q6");
-            this.ensureQ6Pad();
-            // 128, always: the BN=256 kernels the 256 pad existed for
-            // were retired 2026-08-26 (they spilled 74 VGPRs), and the
-            // X1/X3 pair tiles at 128, so a 256 pad now only buys dead
-            // rows.
-            int64 padRows = ((int64) rows + 127L) / 128L * 128L;
-            this.ensureBatchOut((int32) padRows);
-            Linear.ensureBtXh(padRows);
-            QuantKernel.q6kF16CoopAutoLaunchNoSync(this.yBatch,
-                this.q6PadW, Linear.btXh, padRows, (int64) this.outDim,
-                (int64) this.inDim);
         } else if (Linear.mmqOn && this.packedTy == Quant.GG_Q6_K
                 && Linear.backendIsVulkan()) {
             this.sayRoute(4096, "mmq q6");
