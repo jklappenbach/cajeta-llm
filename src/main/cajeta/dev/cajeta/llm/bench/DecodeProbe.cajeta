@@ -186,6 +186,91 @@ public class DecodeProbe {
         return;
     }
 
+    /**
+     * The 72B ffn_down shape [8192 x 29568] — inDim % 256 == 128, so the
+     * q8_K wave route cannot serve it. arm0 = the one-item-per-row f32
+     * kernel (what decode ran before 2026-08-26), arm1 = the f32-WAVE
+     * kernel. Cold pool past MALL, interleaved min-of-5, like shape().
+     */
+    static void shapeF32(String name, int32 ty, int64 rows, int64 cols) {
+        int64 wbytes = DecodeProbe.tensorBytes(ty, rows, cols);
+        float64 mb = (float64) wbytes / 1048576.0;
+        float32[] hx #= heap float32[cols];
+        int64 i = 0;
+        while (i < cols) {
+            hx[i] = 0.02f * (float32) ((i % 11L) - 5L);
+            i = i + 1;
+        }
+        KernelBuffer<float32> xd #= heap KernelBuffer<float32>(
+            (uint64) cols);
+        xd.upload(hx);
+        int64 copies = 100663296L / wbytes + 1L;
+        if (copies > 16L) { copies = 16L; }
+        int8[] big #= heap int8[copies * wbytes];
+        ScalingProbe.fillBlocks(big, ty, 5);
+        KernelBuffer<int8> pool #= heap KernelBuffer<int8>(
+            (uint64) (copies * wbytes));
+        pool.upload(big);
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) rows);
+        KernelStream s = QuantKernel.stream();
+        KernelBuffer<int8>[] arms #= heap KernelBuffer<int8>[copies];
+        int64 k = 0;
+        while (k < copies) {
+            arms[k] #= pool.slice((uint64) (k * wbytes), (uint64) wbytes);
+            k = k + 1;
+        }
+        DecodeProbe.launchF32(ty, 0, y, arms[0], xd, rows, cols);
+        s.sync();
+        float64 b0 = 1.0e18;
+        float64 b1 = 1.0e18;
+        int32 rnd = 0;
+        while (rnd < 5) {
+            int32 v = 0;
+            while (v < 2) {
+                int64 t0 = Clock.nanoTime();
+                k = 0;
+                while (k < copies) {
+                    DecodeProbe.launchF32(ty, v, y, arms[k], xd, rows,
+                        cols);
+                    k = k + 1;
+                }
+                s.sync();
+                float64 ms = (float64) (Clock.nanoTime() - t0)
+                    / 1000000.0 / (float64) copies;
+                if (v == 0 && ms < b0) { b0 = ms; }
+                if (v == 1 && ms < b1) { b1 = ms; }
+                v = v + 1;
+            }
+            rnd = rnd + 1;
+        }
+        System.stdout.println("  " + name + "  " + mb + " MB    one-item "
+            + (b0 * 1000.0) + " us (" + (mb / b0 * 1000.0 / 1024.0)
+            + " GB/s)    f32-wave " + (b1 * 1000.0) + " us ("
+            + (mb / b1 * 1000.0 / 1024.0) + " GB/s)");
+        return;
+    }
+
+    static void launchF32(int32 ty, int32 arm, KernelBuffer<float32> y,
+            KernelBuffer<int8> w, KernelBuffer<float32> x, int64 rows,
+            int64 cols) {
+        if (arm == 0) {
+            QuantKernel.matVecLaunchNoSync(ty, y, w, x, rows, cols, 0L, 0L);
+            return;
+        }
+        if (ty == Quant.GG_Q8_0) {
+            QuantKernel.q80F32WaveMatVecLaunchNoSync(y, w, x, rows, cols,
+                0L, 0L);
+        } else if (ty == Quant.GG_Q5_0) {
+            QuantKernel.q50F32WaveMatVecLaunchNoSync(y, w, x, rows, cols,
+                0L, 0L);
+        } else {
+            QuantKernel.q40F32WaveMatVecLaunchNoSync(y, w, x, rows, cols,
+                0L, 0L);
+        }
+        return;
+    }
+
+
     public static int32 run() {
         System.stdout.println("backend: " + Device.activeBackend());
         System.stdout.println("decode mat-vec shapes (Llama-3.1-8B "
@@ -204,6 +289,12 @@ public class DecodeProbe {
             4096L, 14336L, 16, 1);
         DecodeProbe.shape("q6_K 128256x4096 lm head  ", Quant.GG_Q6_K,
             128256L, 4096L, 1, 1);
+        System.stdout.println("72B ffn_down shape (inDim % 256 = 128, "
+            + "q8_K wave route unavailable):");
+        DecodeProbe.shapeF32("q8_0  8192x29568 ffn_down ", Quant.GG_Q8_0,
+            8192L, 29568L);
+        DecodeProbe.shapeF32("q5_0  8192x29568 ffn_down ", Quant.GG_Q5_0,
+            8192L, 29568L);
         return 0;
     }
 }
