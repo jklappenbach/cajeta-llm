@@ -9,6 +9,19 @@ llama.cpp supplies the architecture reference; none of its code is reused —
 cajeta's `@Native` marshals no C structs or callbacks, so the engine is
 written against `cajeta.math.Tensor` + `cajeta.xpu` end to end.
 
+## Related projects
+
+- **[cabra](../cajeta-cabra)** (`dev.cajeta.cabra`) — the resident-model
+  serving harness: loads a model once through this engine's public API,
+  receives prompts, streams responses, and stops each one on the model's
+  end-of-generation set (`LlmEngine.eogTokens`). In the reference
+  ecosystem's terms, `dev.cajeta.llm` is the llama.cpp role, cabra the
+  llama-server role, and olla the distribution half of the ollama role.
+  cabra deliberately consumes only this library's public surface — it is
+  the engine's first real embedder, so an API gap shows up there first.
+- **olla** — the package registry; distributes this library (and, once
+  application install lands, cabra itself).
+
 Design and plan live in the cajeta workspace:
 `specs/cajeta-llm-spec.md` (requirements + decisions) and
 `agents/cajeta-llm-plan.md` (19 units, dependency-ordered). Units 1–4, 10
