@@ -7220,13 +7220,167 @@ public final class QuantKernel {
             || ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0;
     }
 
+    // ── Q4_0 / Q5_0 f32-activation kernels (2026-08-26) ────────────────
+    //
+    // The wave (q8_K-integer) twins above cover these formats only when
+    // inDim % 256 == 0, because the packed activation layout is a 256-
+    // element superblock. Qwen2.5-VL-72B's ffn_down is [8192, 29568] and
+    // 29568 % 256 = 128, so HALF that model's Q5_0/Q8_0 traffic can never
+    // take the integer route — these f32 kernels are the device path that
+    // shape actually runs. One row per work item, like the q8/q5k f32
+    // family they sit beside.
+
+    /**
+     * `y[yOff + i] = W[i]·x` for one row per work item, W packed Q4_0.
+     * Nibble unpack vectorized 16 wide; -8 folds per lane.
+     */
+    @Kernel
+    public static void q40MatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 18L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 18L;
+                float32 dv = QuantKernel.f16AtDev(packed, ro);
+                Vector<int8,16> q = packed.vload<16>(ro + 2L);
+                Vector<int8,16> lo = (q & 15) - 8;
+                Vector<int8,16> hi = ((q >> 4) & 15) - 8;
+                int64 xo = xOff + b * 32L;
+                Vector<int16,8> l0 = lo.widenLo();
+                Vector<int16,8> l1 = lo.widenHi();
+                Vector<int16,8> h0 = hi.widenLo();
+                Vector<int16,8> h1 = hi.widenHi();
+                Vector<float32,4> p = l0.widenLo().toF32() * x.vload<4>(xo);
+                p = p + l0.widenHi().toF32() * x.vload<4>(xo + 4L);
+                p = p + l1.widenLo().toF32() * x.vload<4>(xo + 8L);
+                p = p + l1.widenHi().toF32() * x.vload<4>(xo + 12L);
+                p = p + h0.widenLo().toF32() * x.vload<4>(xo + 16L);
+                p = p + h0.widenHi().toF32() * x.vload<4>(xo + 20L);
+                p = p + h1.widenLo().toF32() * x.vload<4>(xo + 24L);
+                p = p + h1.widenHi().toF32() * x.vload<4>(xo + 28L);
+                acc = acc + dv * (p[0] + p[1] + p[2] + p[3]);
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
+    public static void q40MatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s = QuantKernel.stream();
+        q40MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, x, ur, cols / 32L, xOff, yOff);
+        return;
+    }
+
+    public static void q40MatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        QuantKernel.q40MatVecLaunchNoSync(y, packed, x, rows, cols, xOff,
+            yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
+    /**
+     * `y[yOff + i] = W[i]·x` for one row per work item, W packed Q5_0.
+     *
+     * The low nibbles run the vectorized Q4_0 path with a -16 fold; the
+     * 5th bit is element j reading bit j (or j+16) of ONE u32 — a
+     * different shift per vector lane, which the vector ops cannot
+     * express — so its contribution rides a 32-term scalar fold over the
+     * activations, +16*x[j] per set bit, multiplied by the bit rather
+     * than branched on (same trick as the wave twin).
+     */
+    @Kernel
+    public static void q50MatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 22L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 22L;
+                float32 dv = QuantKernel.f16AtDev(packed, ro);
+                Vector<int8,4> qhb = packed.vload<4>(ro + 2L);
+                int32 qh = ((int32) qhb[0] & 255)
+                    | (((int32) qhb[1] & 255) << 8)
+                    | (((int32) qhb[2] & 255) << 16)
+                    | (((int32) qhb[3] & 255) << 24);
+                Vector<int8,16> q = packed.vload<16>(ro + 6L);
+                Vector<int8,16> lo = (q & 15) - 16;
+                Vector<int8,16> hi = ((q >> 4) & 15) - 16;
+                int64 xo = xOff + b * 32L;
+                Vector<int16,8> l0 = lo.widenLo();
+                Vector<int16,8> l1 = lo.widenHi();
+                Vector<int16,8> h0 = hi.widenLo();
+                Vector<int16,8> h1 = hi.widenHi();
+                Vector<float32,4> p = l0.widenLo().toF32() * x.vload<4>(xo);
+                p = p + l0.widenHi().toF32() * x.vload<4>(xo + 4L);
+                p = p + l1.widenLo().toF32() * x.vload<4>(xo + 8L);
+                p = p + l1.widenHi().toF32() * x.vload<4>(xo + 12L);
+                p = p + h0.widenLo().toF32() * x.vload<4>(xo + 16L);
+                p = p + h0.widenHi().toF32() * x.vload<4>(xo + 20L);
+                p = p + h1.widenLo().toF32() * x.vload<4>(xo + 24L);
+                p = p + h1.widenHi().toF32() * x.vload<4>(xo + 28L);
+                float32 dot = p[0] + p[1] + p[2] + p[3];
+                float32 hs = 0.0f;
+                int32 j = 0;
+                while (j < 16) {
+                    hs = hs + (float32) ((qh >> j) & 1)
+                        * x[xo + (int64) j];
+                    hs = hs + (float32) ((qh >> (j + 16)) & 1)
+                        * x[xo + (int64) (j + 16)];
+                    j = j + 1;
+                }
+                acc = acc + dv * (dot + 16.0f * hs);
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
+    public static void q50MatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s = QuantKernel.stream();
+        q50MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, x, ur, cols / 32L, xOff, yOff);
+        return;
+    }
+
+    public static void q50MatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        QuantKernel.q50MatVecLaunchNoSync(y, packed, x, rows, cols, xOff,
+            yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
     /** The subset of {@link #hasKernel} with an F32-activation kernel
      *  (the matVecLaunch dispatch). Q2_K/Q3_K have ONLY the wave
      *  integer route (10.12.45.C), so a caller that cannot take the
      *  q8_K approximation has no device path for them. */
     public static boolean hasF32Kernel(int32 ty) {
         return ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
-            || ty == Quant.GG_Q6_K || ty == Quant.GG_Q8_0;
+            || ty == Quant.GG_Q6_K || ty == Quant.GG_Q8_0
+            || ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0;
     }
 
     /** Launch the kernel for `ty` over device-resident buffers. */
@@ -7258,6 +7412,12 @@ public final class QuantKernel {
         } else if (ty == Quant.GG_Q8_0) {
             QuantKernel.q8MatVecLaunchNoSync(y, packed, x, rows, cols,
                 xOff, yOff);
+        } else if (ty == Quant.GG_Q4_0) {
+            QuantKernel.q40MatVecLaunchNoSync(y, packed, x, rows, cols,
+                xOff, yOff);
+        } else if (ty == Quant.GG_Q5_0) {
+            QuantKernel.q50MatVecLaunchNoSync(y, packed, x, rows, cols,
+                xOff, yOff);
         } else {
             // 10.12.45: this used to be a bare `else` into the Q8_0
             // kernel. Now that Q2_K/Q3_K BIND packed with no device
@@ -7280,6 +7440,10 @@ public final class QuantKernel {
             QuantKernel.q6kMatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else if (ty == Quant.GG_Q8_0) {
             QuantKernel.q8MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
+        } else if (ty == Quant.GG_Q4_0) {
+            QuantKernel.q40MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
+        } else if (ty == Quant.GG_Q5_0) {
+            QuantKernel.q50MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else {
             // Same guard as the NoSync twin (10.12.45).
             throw heap LlmException("matVecLaunch: no device mat-vec "
