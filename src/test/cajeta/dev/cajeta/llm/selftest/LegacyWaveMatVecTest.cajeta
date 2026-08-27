@@ -1,0 +1,226 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import cajeta.lang.Cajeta;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * The DEVICE mat-vec for Q4_0 and Q5_0 — the last two supported formats
+ * that had no device kernel at all. They ingested and (since c4e9f51)
+ * prefilled, then decoded on the host per-row path, which is what stood
+ * between Qwen2.5-VL-72B-Q4_K_L and generating on a device: half its
+ * `ffn_down` tensors are Q5_0.
+ *
+ * Q5_0 is the one worth a test rather than a glance. Its 5th bit is a
+ * per-element bit of a single u32, which does NOT vectorize the way
+ * Q5_K's does, so the kernel folds it into the activation sum instead:
+ * `sum (lo + 16*hb - 16)*a == sum lo*a + 16*sum hb*a - 16*sum a`. Get
+ * the bit order wrong — j versus j+16, or the shift by 12 the reference
+ * uses to land bit j+16 on position 4 — and half of every block is
+ * silently off by 16, which still produces fluent-looking numbers.
+ *
+ * The bar is the q8_K quantization budget (0.5% + 0.01), the same one
+ * QuantKernelTest holds the other wave kernels to: the device path
+ * quantizes activations to q8_K and the host reference does not, so
+ * exact equality would mean the integer route was not taken. Both arms
+ * are asserted NON-ZERO first — a kernel that fails to lower reads back
+ * zeros, and two zeros compare equal.
+ */
+public class LegacyWaveMatVecTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+    static final int64 ROWS = 64L;
+    static final int64 COLS = 4096L;
+
+    public LegacyWaveMatVecTest() { return; }
+
+    static void checkFormat(int32 ty, String fixture) {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be2 = (int64) Quant.blockElems(ty);
+        int64 blocksPerRow = LegacyWaveMatVecTest.COLS / be2;
+        int64 nBlocks = LegacyWaveMatVecTest.ROWS * blocksPerRow;
+
+        int8[] fix #= File.readAllBytes(LegacyWaveMatVecTest.DIR + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        Assert.isTrue(fixBlocks > 0L);
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+
+        float32[] x #= heap float32[LegacyWaveMatVecTest.COLS];
+        int64 i = 0;
+        while (i < LegacyWaveMatVecTest.COLS) {
+            // Mixed signs and magnitudes: an all-positive x hides sign
+            // handling, a constant x hides element misordering.
+            x[i] = 0.03125f * (float32) ((i * 31L + 7L) % 61L - 30L);
+            i = i + 1;
+        }
+
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(
+            LegacyWaveMatVecTest.COLS)];
+        Quant.q8kPack(x, 0L, LegacyWaveMatVecTest.COLS, xp);
+
+        // Reference: dequantize the weights, and multiply by the SAME
+        // q8_K-rounded activations the kernel sees. Comparing against
+        // the unrounded x conflates the kernel with the activation
+        // quantization, and that confound is worth several percent —
+        // which is exactly the size of the thing being judged. With it
+        // removed the only difference left is summation order, so the
+        // bar can be 1e-4 instead of a quantization budget.
+        float32[] xq #= heap float32[LegacyWaveMatVecTest.COLS];
+        int64 k2 = 0;
+        while (k2 < LegacyWaveMatVecTest.COLS) {
+            int64 ab = k2 / 256L;
+            int64 base = ab * 320L;
+            int32 sb = ((int32) xp[base + 288L] & 255)
+                | (((int32) xp[base + 289L] & 255) << 8)
+                | (((int32) xp[base + 290L] & 255) << 16)
+                | (((int32) xp[base + 291L] & 255) << 24);
+            float32 sc = Cajeta.bitsToF32(sb);
+            xq[k2] = sc * (float32) ((int32) xp[base + (k2 % 256L)]);
+            k2 = k2 + 1;
+        }
+
+        float32[] w #= heap float32[nBlocks * be2];
+        Quant.dequantize(ty, raw, 0L, nBlocks, w, 0L);
+        float32[] want #= heap float32[LegacyWaveMatVecTest.ROWS];
+        int64 r = 0;
+        while (r < LegacyWaveMatVecTest.ROWS) {
+            float32 acc = 0.0f;
+            int64 k = 0;
+            while (k < LegacyWaveMatVecTest.COLS) {
+                acc = acc + w[r * LegacyWaveMatVecTest.COLS + k] * xq[k];
+                k = k + 1;
+            }
+            want[r] = acc;
+            r = r + 1;
+        }
+
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>(
+            (uint64) xp.count());
+        xpb.upload(xp);
+        KernelBuffer<int8> wb #= heap KernelBuffer<int8>(
+            (uint64) raw.count());
+        wb.upload(raw);
+        KernelBuffer<float32> yd #= heap KernelBuffer<float32>(
+            (uint64) LegacyWaveMatVecTest.ROWS);
+        if (ty == Quant.GG_Q4_0) {
+            QuantKernel.q40Q8WaveMatVecLaunch(yd, wb, xpb,
+                LegacyWaveMatVecTest.ROWS, LegacyWaveMatVecTest.COLS, 0L);
+        } else if (ty == Quant.GG_Q5_0) {
+            QuantKernel.q50Q8WaveMatVecLaunch(yd, wb, xpb,
+                LegacyWaveMatVecTest.ROWS, LegacyWaveMatVecTest.COLS, 0L);
+        } else {
+            QuantKernel.q80Q8WaveMatVecLaunch(yd, wb, xpb,
+                LegacyWaveMatVecTest.ROWS, LegacyWaveMatVecTest.COLS, 0L);
+        }
+        float32[] got #= heap float32[LegacyWaveMatVecTest.ROWS];
+        yd.download(got);
+
+        LegacyWaveMatVecTest.assertLive(want, "host reference ty=" + ty);
+        LegacyWaveMatVecTest.assertLive(got, "wave kernel ty=" + ty);
+        // Report the worst before failing on it: every row of this
+        // fixture is the same tiled data, so one number characterizes the
+        // arm, and the magnitude matters — the reference is a heavily
+        // cancelled sum of 4096 terms, where a small absolute error is a
+        // large relative one.
+        r = 0;
+        float64 worstAbs = 0.0;
+        float64 worstRel = 0.0;
+        int64 bad = 0;
+        while (r < LegacyWaveMatVecTest.ROWS) {
+            float32 a = want[r];
+            float32 g = got[r];
+            float32 diff = a - g;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if ((float64) diff > worstAbs) { worstAbs = (float64) diff; }
+            float64 rel = (float64) diff / ((float64) mag + 0.000001);
+            if (rel > worstRel) { worstRel = rel; }
+            if (diff > mag * 0.0001f + 0.0005f) { bad = bad + 1; }
+            r = r + 1;
+        }
+        System.stdout.println("  ty=" + ty + " |want[0]|=" + want[0]
+            + " got[0]=" + got[0] + " worstAbs=" + worstAbs
+            + " worstRel=" + worstRel + " outside=" + bad + "/"
+            + LegacyWaveMatVecTest.ROWS);
+        if (bad > 0L) {
+            Assert.fail("ty=" + ty + ": " + bad + " rows beyond the q8_K "
+                + "bar, worst abs " + worstAbs + " rel " + worstRel);
+        }
+    }
+
+    static void assertLive(float32[] v, String what) {
+        int64 i = 0;
+        while (i < (int64) v.count()) {
+            if (v[i] != 0.0f) { return; }
+            i = i + 1;
+        }
+        Assert.fail(what + ": every value is zero, which is what a kernel "
+            + "that never ran produces");
+    }
+
+    @Test
+    public void q40WaveMatVecMatchesHost() {
+        LegacyWaveMatVecTest.checkFormat(Quant.GG_Q4_0, "q4_0.bin");
+    }
+
+    @Test
+    public void q50WaveMatVecMatchesHost() {
+        LegacyWaveMatVecTest.checkFormat(Quant.GG_Q5_0, "q5_0.bin");
+    }
+
+    /**
+     * CONTROL. Q8_0's wave kernel has shipped and been trusted for
+     * weeks, so running it through this exact harness separates "the new
+     * kernel is wrong" from "this harness/tolerance is wrong". Vary the
+     * format, hold everything else fixed.
+     */
+    @Test
+    public void q80WaveMatVecMatchesHostControl() {
+        LegacyWaveMatVecTest.checkFormat(Quant.GG_Q8_0, "q8_0.bin");
+    }
+
+    /**
+     * The half that asserts the gap is CLOSED: every supported format now
+     * has a device mat-vec. This is the predicate `deviceLaunchable`
+     * consults, so a format missing here decodes on the host per-row path
+     * — which is a correctness-preserving fallback and therefore silent.
+     */
+    @Test
+    public void everySupportedFormatHasADeviceMatVec() {
+        int32[] tys #= heap int32[8];
+        tys[0] = Quant.GG_Q4_0;
+        tys[1] = Quant.GG_Q5_0;
+        tys[2] = Quant.GG_Q8_0;
+        tys[3] = Quant.GG_Q2_K;
+        tys[4] = Quant.GG_Q3_K;
+        tys[5] = Quant.GG_Q4_K;
+        tys[6] = Quant.GG_Q5_K;
+        tys[7] = Quant.GG_Q6_K;
+        int32 i = 0;
+        while (i < 8) {
+            Assert.isTrue(Quant.supported(tys[i]));
+            Assert.isTrue(QuantKernel.hasKernel(tys[i]));
+            i = i + 1;
+        }
+        // And an unsupported one is still refused rather than decoded
+        // through another format's unpacker (F16 is ggml type 1).
+        Assert.isFalse(QuantKernel.hasKernel(1));
+    }
+}
