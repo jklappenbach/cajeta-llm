@@ -5705,7 +5705,6 @@ public final class QuantKernel {
     public static void q4kQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
-        Shared<float32> part = shared float32[32];
         uint32 lane = KernelThread.x();
         uint32 row = KernelThread.globalIdX() / 32;
         int64 rowBytes = blocksPerRow * 144L;
@@ -5802,16 +5801,23 @@ public final class QuantKernel {
         // 88.5 GB/s at 1024 rows, 128.5 against 127.9 at 14336. So the
         // reduction is not what this kernel spends its time on, and the
         // correct-and-simple form is kept until something says otherwise.
-        part[lane] = acc;
-        Barrier.workgroup();
-        uint32 s = 16;
-        while (s > 0) {
-            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
-            Barrier.workgroup();
-            s = s / 2;
-        }
+        // 2026-08-26: ONE subgroup reduction, not a five-barrier LDS
+        // tree. The workgroup IS one wave, so the tree moved through
+        // memory what the hardware reduces across lanes — cheap when the
+        // k-loop is long, and it is not: at K=4096 a wave runs TWO
+        // iterations and then pays the whole tail. Measured on the two
+        // formats that carry 95% of this model's decode traffic, cold
+        // pool, interleaved min-of-5, GiB/s:
+        //   q4_K 14336x4096  180.9 -> 193.8      q4_K 4096x14336 171.6 -> 177.2
+        //   q4_K  4096x4096  155.2 -> 157.1      q4_K 1024x4096  129.4 -> 131.4
+        //   q6_K  4096x14336 136.5 -> 137.5      q6_K 1024x4096  124.8 -> 127.5
+        //   q6_K 128256x4096 158.7 -> 161.0
+        // A hand-written shuffle butterfly was tried in 2026-08 and was
+        // both wrong and exactly as fast — but at half this kernel's
+        // current rate, where the tail was half the share it is now.
+        float32 tot = Wave.reduceSumF32(acc);
         if (lane == 0 && row < rows) {
-            y[yOff + (int64) row] = part[0];
+            y[yOff + (int64) row] = tot;
         }
     }
 
@@ -5838,98 +5844,115 @@ public final class QuantKernel {
     }
 
 
+
+
+
     /**
-     * WAVE-COOPERATIVE Q6_K x q8_K (plan 11.2).
+     * Q6_K wave mat-vec, ZERO-REDUNDANCY lane mapping.
      *
-     * The Q4_K twin's decomposition applied to Q6_K's shape: one workgroup
-     * of 32 threads per output row, and here SIXTEEN lanes to a block
-     * rather than four, because Q6_K's natural unit is its 16-element
-     * sub-block — one per lane, two blocks in flight per wave.
+     * The shipped twin gives each lane one CONTIGUOUS 16-element
+     * sub-block, and Q6_K's packing punishes that: the two nibbles of a
+     * `ql` byte belong to elements 64 apart and the four crumbs of a `qh`
+     * byte to elements 32 apart, so a lane reading 16 contiguous elements
+     * uses half of each ql byte and a quarter of each qh byte. Sixteen
+     * lanes therefore request 512 bytes per superblock half for 192
+     * unique ones -- 2.67x. Measured, that kernel reads 136 GiB/s where
+     * our Q4_K reads 180 and llama.cpp's Q6_K reads 191.
      *
-     * Q6_K quants are `(lo | hi<<4) - 32`, i.e. signed after the bias. The
-     * bias is NOT applied per element: dotAccum's fast tier is unsigned x
-     * signed, so the raw 0..63 value goes in and the bias leaves as
-     * `-32 * (sum of this lane's activations)`. That sum is taken the way
-     * llama.cpp takes it — a dot against all-ones — rather than read from a
-     * precomputed table, which is what frees the lane granularity.
-     *
-     * 10.5 measured a one-item-per-row Q6_K integer kernel as SLOWER than
-     * the f32 body it would replace, and 10.6 showed the format was not
-     * misaligned but ALU-bound. Neither says anything about this: 11.0's
-     * probe puts one-item-per-row's ceiling at ~162-170 GB/s and a
-     * coalesced pattern's at ~208, so the decomposition is the variable
-     * both of those held fixed.
-     *
-     * Every intermediate stays inside int32: a quant caps at 63 and an
-     * activation quant at 127, so a 16-element dot caps at 128016, the
-     * bias term at 65024, and a signed 8-bit scale takes the pair to about
-     * 24.5M — two orders inside int32, which matters because cajeta TRAPS
-     * on signed overflow rather than wrapping.
+     * llama.cpp's mul_mat_vec_q6_k.comp has no such waste because its
+     * thread owns four groups of four elements THIRTY-TWO APART, which is
+     * exactly the stride that makes one qh byte's four crumbs and one ql
+     * byte's two nibbles all belong to it. Same idea at 16 wide: a lane
+     * owns {16a+j, 32+16a+j, 64+16a+j, 96+16a+j} for j = 0..15, so its
+     * two ql loads are fully spent on both nibbles and its one qh load on
+     * all four crumbs. 48 bytes requested, 48 unique, 64 elements
+     * covered -- and the trip count drops 4x because a lane now does what
+     * four lanes used to.
      */
     @Kernel
     public static void q6kQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
-        Shared<float32> part = shared float32[32];
         uint32 lane = KernelThread.x();
         uint32 row = KernelThread.globalIdX() / 32;
         int64 rowBytes = blocksPerRow * 210L;
         float32 acc = 0.0f;
         if (row < rows) {
             int64 i = (int64) row;
-            int32 sb = (int32) (lane % 16);
-            int64 b = (int64) (lane / 16);
+            int32 m = (int32) (lane % 4);
+            int32 g = m / 2;               // which 128-element half
+            int32 a = m - g * 2;           // which 16-lane slice of it
+            int64 b = (int64) (lane / 4);  // 8 blocks in flight
             Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
             while (b < blocksPerRow) {
                 int64 ro = i * rowBytes + b * 210L;
                 float32 d = QuantKernel.f16AtDev(packed, ro + 208L);
                 int64 xb = b * 320L;
-
-                // The serial kernel's sub-block index maths, unchanged —
-                // one iteration of its `sb` loop is one lane here.
-                int32 g = sb / 8;
-                int32 r0 = sb * 16 - g * 128;
-                int32 sl = r0 / 64;
-                int32 l64 = r0 - sl * 64;
-                int32 shi = r0 / 32;
-                int32 l32 = r0 - shi * 32;
-                Vector<int8,16> qlv = packed.vload<16>(
-                    ro + (int64) (64 * g + l64));
-                Vector<int8,16> qhv = packed.vload<16>(
-                    ro + (int64) (128 + 32 * g + l32));
-                Vector<int8,16> lo = qlv & 15;
-                if (sl == 1) { lo = (qlv >> 4) & 15; }
-                Vector<int8,16> hi = (qhv >> (2 * shi)) & 3;
-                Vector<uint8,16> qu = (lo | (hi << 4)).asUnsigned();
-                Vector<int8,16> a = xp.vload<16>(xb + (int64) (sb * 16));
-                Vector<uint8,16> ones = (qu ^ qu) | 1;
-
-                Vector<int32,4> dv = qu.dotAccum(a, z4);
-                Vector<int32,4> sv = ones.dotAccum(a, z4);
-                int32 dot = dv[0] + dv[1] + dv[2] + dv[3];
-                int32 asum = sv[0] + sv[1] + sv[2] + sv[3];
-                int32 sc = (int32) packed[ro + (int64) (192 + sb)];
-
                 Vector<int8,4> dvs = xp.vload<4>(xb + 288L);
                 float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
                     | (((int32) dvs[1] & 255) << 8)
                     | (((int32) dvs[2] & 255) << 16)
                     | (((int32) dvs[3] & 255) << 24));
-
-                acc = acc + d * xs * (float32) (sc * (dot - 32 * asum));
-                b = b + 2L;
+                Vector<int8,16> qlA = packed.vload<16>(
+                    ro + (int64) (64 * g + 16 * a));
+                Vector<int8,16> qlB = packed.vload<16>(
+                    ro + (int64) (64 * g + 32 + 16 * a));
+                Vector<int8,16> qh16 = packed.vload<16>(
+                    ro + (int64) (128 + 32 * g + 16 * a));
+                Vector<int8,16> lo_0 = (qlA >> 0) & 15;
+                Vector<int8,16> hi_0 = (qh16 >> 0) & 3;
+                Vector<uint8,16> qu_0 = (lo_0 | (hi_0 << 4)).asUnsigned();
+                Vector<int8,16> a_0 = xp.vload<16>(xb + (int64) (16 * (8 * g + a)));
+                Vector<uint8,16> on_0 = (qu_0 ^ qu_0) | 1;
+                Vector<int32,4> dv_0 = qu_0.dotAccum(a_0, z4);
+                Vector<int32,4> sv_0 = on_0.dotAccum(a_0, z4);
+                int32 dot_0 = dv_0[0] + dv_0[1] + dv_0[2] + dv_0[3];
+                int32 as_0 = sv_0[0] + sv_0[1] + sv_0[2] + sv_0[3];
+                int32 sc_0 = (int32) packed[ro + (int64) (192 + (8 * g + a))];
+                acc = acc + d * xs
+                    * (float32) (sc_0 * (dot_0 - 32 * as_0));
+                Vector<int8,16> lo_1 = (qlB >> 0) & 15;
+                Vector<int8,16> hi_1 = (qh16 >> 2) & 3;
+                Vector<uint8,16> qu_1 = (lo_1 | (hi_1 << 4)).asUnsigned();
+                Vector<int8,16> a_1 = xp.vload<16>(xb + (int64) (16 * (8 * g + 2 + a)));
+                Vector<uint8,16> on_1 = (qu_1 ^ qu_1) | 1;
+                Vector<int32,4> dv_1 = qu_1.dotAccum(a_1, z4);
+                Vector<int32,4> sv_1 = on_1.dotAccum(a_1, z4);
+                int32 dot_1 = dv_1[0] + dv_1[1] + dv_1[2] + dv_1[3];
+                int32 as_1 = sv_1[0] + sv_1[1] + sv_1[2] + sv_1[3];
+                int32 sc_1 = (int32) packed[ro + (int64) (192 + (8 * g + 2 + a))];
+                acc = acc + d * xs
+                    * (float32) (sc_1 * (dot_1 - 32 * as_1));
+                Vector<int8,16> lo_2 = (qlA >> 4) & 15;
+                Vector<int8,16> hi_2 = (qh16 >> 4) & 3;
+                Vector<uint8,16> qu_2 = (lo_2 | (hi_2 << 4)).asUnsigned();
+                Vector<int8,16> a_2 = xp.vload<16>(xb + (int64) (16 * (8 * g + 4 + a)));
+                Vector<uint8,16> on_2 = (qu_2 ^ qu_2) | 1;
+                Vector<int32,4> dv_2 = qu_2.dotAccum(a_2, z4);
+                Vector<int32,4> sv_2 = on_2.dotAccum(a_2, z4);
+                int32 dot_2 = dv_2[0] + dv_2[1] + dv_2[2] + dv_2[3];
+                int32 as_2 = sv_2[0] + sv_2[1] + sv_2[2] + sv_2[3];
+                int32 sc_2 = (int32) packed[ro + (int64) (192 + (8 * g + 4 + a))];
+                acc = acc + d * xs
+                    * (float32) (sc_2 * (dot_2 - 32 * as_2));
+                Vector<int8,16> lo_3 = (qlB >> 4) & 15;
+                Vector<int8,16> hi_3 = (qh16 >> 6) & 3;
+                Vector<uint8,16> qu_3 = (lo_3 | (hi_3 << 4)).asUnsigned();
+                Vector<int8,16> a_3 = xp.vload<16>(xb + (int64) (16 * (8 * g + 6 + a)));
+                Vector<uint8,16> on_3 = (qu_3 ^ qu_3) | 1;
+                Vector<int32,4> dv_3 = qu_3.dotAccum(a_3, z4);
+                Vector<int32,4> sv_3 = on_3.dotAccum(a_3, z4);
+                int32 dot_3 = dv_3[0] + dv_3[1] + dv_3[2] + dv_3[3];
+                int32 as_3 = sv_3[0] + sv_3[1] + sv_3[2] + sv_3[3];
+                int32 sc_3 = (int32) packed[ro + (int64) (192 + (8 * g + 6 + a))];
+                acc = acc + d * xs
+                    * (float32) (sc_3 * (dot_3 - 32 * as_3));
+                b = b + 8L;
             }
         }
-        part[lane] = acc;
-        Barrier.workgroup();
-        uint32 s = 16;
-        while (s > 0) {
-            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
-            Barrier.workgroup();
-            s = s / 2;
-        }
+        float32 tot = Wave.reduceSumF32(acc);
         if (lane == 0 && row < rows) {
-            y[yOff + (int64) row] = part[0];
+            y[yOff + (int64) row] = tot;
         }
     }
 
@@ -5972,7 +5995,6 @@ public final class QuantKernel {
     public static void q2kQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
-        Shared<float32> part = shared float32[32];
         uint32 lane = KernelThread.x();
         uint32 row = KernelThread.globalIdX() / 32;
         int64 rowBytes = blocksPerRow * 84L;
@@ -6040,16 +6062,23 @@ public final class QuantKernel {
                 b = b + 8L;
             }
         }
-        part[lane] = acc;
-        Barrier.workgroup();
-        uint32 s = 16;
-        while (s > 0) {
-            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
-            Barrier.workgroup();
-            s = s / 2;
-        }
+        // 2026-08-26: ONE subgroup reduction, not a five-barrier LDS
+        // tree. The workgroup IS one wave, so the tree moved through
+        // memory what the hardware reduces across lanes — cheap when the
+        // k-loop is long, and it is not: at K=4096 a wave runs TWO
+        // iterations and then pays the whole tail. Measured on the two
+        // formats that carry 95% of this model's decode traffic, cold
+        // pool, interleaved min-of-5, GiB/s:
+        //   q4_K 14336x4096  180.9 -> 193.8      q4_K 4096x14336 171.6 -> 177.2
+        //   q4_K  4096x4096  155.2 -> 157.1      q4_K 1024x4096  129.4 -> 131.4
+        //   q6_K  4096x14336 136.5 -> 137.5      q6_K 1024x4096  124.8 -> 127.5
+        //   q6_K 128256x4096 158.7 -> 161.0
+        // A hand-written shuffle butterfly was tried in 2026-08 and was
+        // both wrong and exactly as fast — but at half this kernel's
+        // current rate, where the tail was half the share it is now.
+        float32 tot = Wave.reduceSumF32(acc);
         if (lane == 0 && row < rows) {
-            y[yOff + (int64) row] = part[0];
+            y[yOff + (int64) row] = tot;
         }
     }
 
@@ -6107,7 +6136,6 @@ public final class QuantKernel {
     public static void q3kQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
-        Shared<float32> part = shared float32[32];
         uint32 lane = KernelThread.x();
         uint32 row = KernelThread.globalIdX() / 32;
         int64 rowBytes = blocksPerRow * 110L;
@@ -6210,16 +6238,23 @@ public final class QuantKernel {
                 b = b + 8L;
             }
         }
-        part[lane] = acc;
-        Barrier.workgroup();
-        uint32 s = 16;
-        while (s > 0) {
-            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
-            Barrier.workgroup();
-            s = s / 2;
-        }
+        // 2026-08-26: ONE subgroup reduction, not a five-barrier LDS
+        // tree. The workgroup IS one wave, so the tree moved through
+        // memory what the hardware reduces across lanes — cheap when the
+        // k-loop is long, and it is not: at K=4096 a wave runs TWO
+        // iterations and then pays the whole tail. Measured on the two
+        // formats that carry 95% of this model's decode traffic, cold
+        // pool, interleaved min-of-5, GiB/s:
+        //   q4_K 14336x4096  180.9 -> 193.8      q4_K 4096x14336 171.6 -> 177.2
+        //   q4_K  4096x4096  155.2 -> 157.1      q4_K 1024x4096  129.4 -> 131.4
+        //   q6_K  4096x14336 136.5 -> 137.5      q6_K 1024x4096  124.8 -> 127.5
+        //   q6_K 128256x4096 158.7 -> 161.0
+        // A hand-written shuffle butterfly was tried in 2026-08 and was
+        // both wrong and exactly as fast — but at half this kernel's
+        // current rate, where the tail was half the share it is now.
+        float32 tot = Wave.reduceSumF32(acc);
         if (lane == 0 && row < rows) {
-            y[yOff + (int64) row] = part[0];
+            y[yOff + (int64) row] = tot;
         }
     }
 
@@ -6279,7 +6314,6 @@ public final class QuantKernel {
     public static void q5kQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
-        Shared<float32> part = shared float32[32];
         uint32 lane = KernelThread.x();
         uint32 row = KernelThread.globalIdX() / 32;
         int64 rowBytes = blocksPerRow * 176L;
@@ -6356,16 +6390,23 @@ public final class QuantKernel {
                 b = b + 8L;
             }
         }
-        part[lane] = acc;
-        Barrier.workgroup();
-        uint32 s = 16;
-        while (s > 0) {
-            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
-            Barrier.workgroup();
-            s = s / 2;
-        }
+        // 2026-08-26: ONE subgroup reduction, not a five-barrier LDS
+        // tree. The workgroup IS one wave, so the tree moved through
+        // memory what the hardware reduces across lanes — cheap when the
+        // k-loop is long, and it is not: at K=4096 a wave runs TWO
+        // iterations and then pays the whole tail. Measured on the two
+        // formats that carry 95% of this model's decode traffic, cold
+        // pool, interleaved min-of-5, GiB/s:
+        //   q4_K 14336x4096  180.9 -> 193.8      q4_K 4096x14336 171.6 -> 177.2
+        //   q4_K  4096x4096  155.2 -> 157.1      q4_K 1024x4096  129.4 -> 131.4
+        //   q6_K  4096x14336 136.5 -> 137.5      q6_K 1024x4096  124.8 -> 127.5
+        //   q6_K 128256x4096 158.7 -> 161.0
+        // A hand-written shuffle butterfly was tried in 2026-08 and was
+        // both wrong and exactly as fast — but at half this kernel's
+        // current rate, where the tail was half the share it is now.
+        float32 tot = Wave.reduceSumF32(acc);
         if (lane == 0 && row < rows) {
-            y[yOff + (int64) row] = part[0];
+            y[yOff + (int64) row] = tot;
         }
     }
 
@@ -6421,7 +6462,6 @@ public final class QuantKernel {
     public static void q80Q8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
-        Shared<float32> part = shared float32[32];
         uint32 lane = KernelThread.x();
         uint32 row = KernelThread.globalIdX() / 32;
         int64 rowBytes = blocksPerRow * 34L;
@@ -6454,16 +6494,23 @@ public final class QuantKernel {
                 wb = wb + 32L;
             }
         }
-        part[lane] = acc;
-        Barrier.workgroup();
-        uint32 s = 16;
-        while (s > 0) {
-            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
-            Barrier.workgroup();
-            s = s / 2;
-        }
+        // 2026-08-26: ONE subgroup reduction, not a five-barrier LDS
+        // tree. The workgroup IS one wave, so the tree moved through
+        // memory what the hardware reduces across lanes — cheap when the
+        // k-loop is long, and it is not: at K=4096 a wave runs TWO
+        // iterations and then pays the whole tail. Measured on the two
+        // formats that carry 95% of this model's decode traffic, cold
+        // pool, interleaved min-of-5, GiB/s:
+        //   q4_K 14336x4096  180.9 -> 193.8      q4_K 4096x14336 171.6 -> 177.2
+        //   q4_K  4096x4096  155.2 -> 157.1      q4_K 1024x4096  129.4 -> 131.4
+        //   q6_K  4096x14336 136.5 -> 137.5      q6_K 1024x4096  124.8 -> 127.5
+        //   q6_K 128256x4096 158.7 -> 161.0
+        // A hand-written shuffle butterfly was tried in 2026-08 and was
+        // both wrong and exactly as fast — but at half this kernel's
+        // current rate, where the tail was half the share it is now.
+        float32 tot = Wave.reduceSumF32(acc);
         if (lane == 0 && row < rows) {
-            y[yOff + (int64) row] = part[0];
+            y[yOff + (int64) row] = tot;
         }
     }
 

@@ -1,0 +1,209 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * What decode's mat-vecs actually cost, per SHAPE, in the dispatch the
+ * engine really uses — the decode counterpart of MmqProbe.
+ *
+ * The target is llama.cpp-Vulkan's own per-op table for one token at
+ * depth 512 (GGML_VK_PERF_LOGGER, 2026-08-26, 25.14 ms total of which
+ * 22.17 ms is quantized mat-vec at ~208 GB/s average):
+ *
+ *   q4_K 14336x4096  x64   152.5 us   216.6 GB/s     gate/up
+ *   q4_K  4096x14336 x16   157.6      209.6          ffn_down
+ *   q6_K  4096x14336 x16   234.5      205.4          ffn_down
+ *   q4_K  4096x4096  x64    46.5      203            q, o
+ *   q6_K 128256x4096 x1   2258.2      190.7          lm head
+ *   q4_K  1024x4096  x48    12.4      189.9          k, v
+ *   q6_K  1024x4096  x16    19.2      179.0          attn_v
+ *
+ * TWO arms, because the earlier WaveProbe conflated them: `stream`
+ * launches back to back and syncs ONCE, which is what the engine's
+ * decode does (every projection is NoSync and the token ends with one
+ * sync); `serial` syncs after every launch. The difference is the
+ * per-dispatch cost, and at the 1024-row shapes it is most of the
+ * reading — WaveProbe's syncing loop reported 52 GB/s for a shape that
+ * is nowhere near that slow.
+ *
+ * COLD weights: a repeat loop over one tensor measures the 32 MB MALL,
+ * not DRAM — a decode touches ~100 different weights per token and every
+ * one is cold. So the pool is sized past MALL and the arms cycle it.
+ */
+public class DecodeProbe {
+
+    /** Weight bytes for `rows x cols` of `ty`. */
+    static int64 tensorBytes(int32 ty, int64 rows, int64 cols) {
+        return rows * (cols / (int64) Quant.blockElems(ty))
+            * (int64) Quant.blockBytes(ty);
+    }
+
+    static void launch(int32 ty, int32 arm, KernelBuffer<float32> y,
+            KernelBuffer<int8> w, KernelBuffer<int8> xp, int64 rows,
+            int64 cols) {
+        if (ty == Quant.GG_Q4_K) {
+            QuantKernel.q4kQ8WaveMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
+        } else if (ty == Quant.GG_Q6_K) {
+            QuantKernel.q6kQ8WaveMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
+        } else if (ty == Quant.GG_Q5_K) {
+            QuantKernel.q5kQ8WaveMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
+        } else if (ty == Quant.GG_Q8_0) {
+            QuantKernel.q80Q8WaveMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
+        } else if (ty == Quant.GG_Q2_K) {
+            QuantKernel.q2kQ8WaveMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
+        } else {
+            QuantKernel.q3kQ8WaveMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
+        }
+        return;
+    }
+
+    static void shape(String name, int32 ty, int64 rows, int64 cols,
+            int32 perToken, int32 nArms) {
+        int64 wbytes = DecodeProbe.tensorBytes(ty, rows, cols);
+        float64 mb = (float64) wbytes / 1048576.0;
+
+        float32[] hx #= heap float32[cols];
+        int64 i = 0;
+        while (i < cols) {
+            hx[i] = 0.02f * (float32) ((i % 11L) - 5L);
+            i = i + 1;
+        }
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(hx, 0L, cols, xp);
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>(
+            (uint64) xp.count());
+        xpb.upload(xp);
+
+        // Past MALL (32 MB) so every launch reads cold, but bounded so a
+        // 430 MB lm head does not allocate gigabytes.
+        int64 copies = 100663296L / wbytes + 1L;
+        if (copies > 16L) { copies = 16L; }
+        int64 poolBytes = copies * wbytes;
+        int8[] big #= heap int8[poolBytes];
+        ScalingProbe.fillBlocks(big, ty, 5);
+        KernelBuffer<int8> pool #= heap KernelBuffer<int8>(
+            (uint64) poolBytes);
+        pool.upload(big);
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) rows);
+        KernelStream s = QuantKernel.stream();
+
+        // Hoist the slices: a `#=` allocation inside the timed loop is
+        // host work charged to the kernel.
+        KernelBuffer<int8>[] arms #= heap KernelBuffer<int8>[copies];
+        int64 k = 0;
+        while (k < copies) {
+            arms[k] #= pool.slice((uint64) (k * wbytes), (uint64) wbytes);
+            k = k + 1;
+        }
+
+        // Correctness of every alternative arm against the shipped one,
+        // on EVERY row: a decomposition where only lane 0 stores can drop
+        // or double rows and a spot check at row 0 would not see it. The
+        // bar is a tolerance, not equality — the row sum is regrouped, and
+        // float addition is not associative.
+        float32[] ref #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        DecodeProbe.launch(ty, 0, y, arms[0], xpb, rows, cols);
+        s.sync();
+        y.download(ref);
+        int32 arm = 1;
+        while (arm < nArms) {
+            DecodeProbe.launch(ty, arm, y, arms[0], xpb, rows, cols);
+            s.sync();
+            y.download(got);
+            int64 bad = 0;
+            int64 r = 0;
+            boolean live = false;
+            while (r < rows) {
+                float32 a = ref[r];
+                float32 b2 = got[r];
+                if (b2 != 0.0f) { live = true; }
+                float32 diff = a - b2;
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = a < 0.0f ? 0.0f - a : a;
+                if (diff > mag * 0.0002f + 0.001f) { bad = bad + 1; }
+                r = r + 1;
+            }
+            if (bad > 0L || !live) {
+                System.stdout.println("  " + name + " ARM " + arm
+                    + " WRONG: " + bad + "/" + rows + " rows, live=" + live);
+            }
+            arm = arm + 1;
+        }
+
+        float64[] best #= heap float64[8];
+        int32 z = 0;
+        while (z < 8) { best[z] = 1.0e18; z = z + 1; }
+        float64 bestSerial = 1.0e18;
+        int32 rnd = 0;
+        while (rnd < 5) {
+            int32 v = 0;
+            while (v < nArms) {
+                int64 t0 = Clock.nanoTime();
+                k = 0;
+                while (k < copies) {
+                    DecodeProbe.launch(ty, v, y, arms[k], xpb, rows, cols);
+                    k = k + 1;
+                }
+                s.sync();
+                float64 ms = (float64) (Clock.nanoTime() - t0)
+                    / 1000000.0 / (float64) copies;
+                if (ms < best[v]) { best[v] = ms; }
+                v = v + 1;
+            }
+            // The serial arm (sync per launch) only for the shipped
+            // kernel — it measures the dispatch cost, not the tile.
+            int64 t1 = Clock.nanoTime();
+            k = 0;
+            while (k < copies) {
+                DecodeProbe.launch(ty, 0, y, arms[k], xpb, rows, cols);
+                s.sync();
+                k = k + 1;
+            }
+            float64 ms2 = (float64) (Clock.nanoTime() - t1)
+                / 1000000.0 / (float64) copies;
+            if (ms2 < bestSerial) { bestSerial = ms2; }
+            rnd = rnd + 1;
+        }
+        String line #= "  " + name + "  " + mb + " MB x" + perToken + "/tok ";
+        int32 v2 = 0;
+        while (v2 < nArms) {
+            line #= line + "   arm" + v2 + " " + (best[v2] * 1000.0)
+                + " us (" + (mb / best[v2] * 1000.0 / 1024.0) + " GB/s)";
+            v2 = v2 + 1;
+        }
+        line #= line + "   [serial " + (bestSerial * 1000.0)
+            + " us, per-dispatch " + ((bestSerial - best[0]) * 1000.0)
+            + " us]";
+        System.stdout.println(line);
+        return;
+    }
+
+    public static int32 run() {
+        System.stdout.println("backend: " + Device.activeBackend());
+        System.stdout.println("decode mat-vec shapes (Llama-3.1-8B "
+            + "Q4_K_M), llama.cpp-Vulkan target in the class comment:");
+        DecodeProbe.shape("q4_K  1024x4096  k,v      ", Quant.GG_Q4_K,
+            1024L, 4096L, 48, 1);
+        DecodeProbe.shape("q6_K  1024x4096  attn_v   ", Quant.GG_Q6_K,
+            1024L, 4096L, 16, 1);
+        DecodeProbe.shape("q4_K  4096x4096  q,o      ", Quant.GG_Q4_K,
+            4096L, 4096L, 64, 1);
+        DecodeProbe.shape("q4_K 14336x4096  gate/up  ", Quant.GG_Q4_K,
+            14336L, 4096L, 64, 1);
+        DecodeProbe.shape("q4_K  4096x14336 ffn_down ", Quant.GG_Q4_K,
+            4096L, 14336L, 16, 1);
+        DecodeProbe.shape("q6_K  4096x14336 ffn_down ", Quant.GG_Q6_K,
+            4096L, 14336L, 16, 1);
+        DecodeProbe.shape("q6_K 128256x4096 lm head  ", Quant.GG_Q6_K,
+            128256L, 4096L, 1, 1);
+        return 0;
+    }
+}
