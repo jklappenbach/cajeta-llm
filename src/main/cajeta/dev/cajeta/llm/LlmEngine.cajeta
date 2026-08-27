@@ -36,6 +36,12 @@ public final class LlmEngine {
     CausalLM model;
     Scheduler sched;
     Tokenizer tok;
+    // End-of-generation ids for THIS model: the GGUF's eos/eot/eom
+    // metadata unioned with the vocab scan (Tokenizer.eogIds). Applied
+    // as the DEFAULT stop set on every submit whose params carry none —
+    // an engine whose default is "never stop" replayed the same answer
+    // for 10000 tokens on the 72B (2026-08-26).
+    int32[] eog;
     BlockStore store;
     Encoder<int64> storeEnc;
 
@@ -74,6 +80,13 @@ public final class LlmEngine {
         if (ck.gguf() != null) {
             cfg #= ModelConfig.fromGguf(ck.gguf());
             e.tok #= ck.gguf().tokenizer();
+            int64 me = ck.gguf().metaInt("tokenizer.ggml.eos_token_id",
+                0L - 1L);
+            int64 mt = ck.gguf().metaInt("tokenizer.ggml.eot_token_id",
+                0L - 1L);
+            int64 mm = ck.gguf().metaInt("tokenizer.ggml.eom_token_id",
+                0L - 1L);
+            e.eog #= LlmEngine.unionEog(e.tok, me, mt, mm);
         } else {
             String cfgPath = e.opts.config;
             if (cfgPath.equals("")) {
@@ -140,8 +153,101 @@ public final class LlmEngine {
     }
 
     /** Submit raw token ids. */
+    /** The eos/eot metadata ids unioned with the vocab's known EOG
+     *  texts, deduplicated. Static so a test can exercise it without a
+     *  45 GB load. */
+    static #int32[] unionEog(Tokenizer tok, int64 me, int64 mt, int64 mm) {
+        int32[] scan = null;
+        if (tok != null) {
+            scan #= tok.eogIds();
+        }
+        int32 cap = 3;
+        if (scan != null) {
+            cap = cap + (int32) scan.count();
+        }
+        int32[] tmp #= heap int32[cap];
+        int32 n = 0;
+        int64[] meta #= heap int64[3];
+        meta[0] = me;
+        meta[1] = mt;
+        meta[2] = mm;
+        int32 i = 0;
+        while (i < cap) {
+            int32 cand = 0 - 1;
+            if (i < 3) {
+                if (meta[i] >= 0L) {
+                    cand = (int32) meta[i];
+                }
+            } else {
+                cand = scan[i - 3];
+            }
+            if (cand >= 0) {
+                boolean dup = false;
+                int32 j = 0;
+                while (j < n) {
+                    if (tmp[j] == cand) {
+                        dup = true;
+                    }
+                    j = j + 1;
+                }
+                if (!dup) {
+                    tmp[n] = cand;
+                    n = n + 1;
+                }
+            }
+            i = i + 1;
+        }
+        int32[] out #= heap int32[n];
+        i = 0;
+        while (i < n) {
+            out[i] = tmp[i];
+            i = i + 1;
+        }
+        return #out;
+    }
+
+    /** This model's end-of-generation ids (View: interior borrow). */
+    public int32[] eogTokens() {
+        return this.eog;
+    }
+
+    public boolean isEog(int32 t) {
+        if (this.eog == null) {
+            return false;
+        }
+        int32 i = 0;
+        while (i < (int32) this.eog.count()) {
+            if (this.eog[i] == t) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /** Fill in the model's EOG set as the stop tokens when the caller
+     *  set none. Explicit stopTokens are the caller's business and are
+     *  never touched. */
+    void defaultStops(SampleParams p) {
+        if (p.stopTokens != null) {
+            return;
+        }
+        if (this.eog == null || (int32) this.eog.count() == 0) {
+            return;
+        }
+        int32 n = (int32) this.eog.count();
+        int32[] st #= heap int32[n];
+        int32 i = 0;
+        while (i < n) {
+            st[i] = this.eog[i];
+            i = i + 1;
+        }
+        p.stopTokens #= st;
+    }
+
     public int32 submitTokens(int32[] prompt, int32 promptLen, int32 maxNew,
             #SampleParams params) {
+        this.defaultStops(params);
         return this.sched.submitSampled(prompt, promptLen, maxNew, #params);
     }
 
@@ -156,6 +262,7 @@ public final class LlmEngine {
         // metadata says it does (BOS for Llama-3). Submitting raw ids
         // bypasses this deliberately — see submitTokens.
         int32[] ids #= this.tok.encodePrompt(prompt);
+        this.defaultStops(params);
         return this.sched.submitSampled(ids, (int32) ids.count(), maxNew,
             #params);
     }
