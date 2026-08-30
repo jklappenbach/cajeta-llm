@@ -218,9 +218,39 @@ if [[ ! -f "$jinja_cja" ]]; then
 fi
 echo ">> dev.cajeta.jinja: $jinja_cja"
 
+# dev.cajeta.logging — the CLI's diagnostics backend (Julian, 2026-08-30).
+# Same three-step resolution as codec/jinja: sibling checkout, then store,
+# then a sha256-verified Olla fetch.
+LOGGING_VER="$(sed -n 's/.*"dev\.cajeta\.logging"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$here/cajeta.json" | head -1)"
+LOGGING_REPO="${LOGGING_REPO:-$here/../cajeta-logging}"
+logging_cja=""
+if [[ -d "$LOGGING_REPO" ]]; then
+    echo ">> building dev.cajeta.logging from checkout ($LOGGING_REPO)"
+    ( cd "$LOGGING_REPO" && "$CAJETA" build >/dev/null )
+    logging_cja="$(cajeta_artifact_path "$LOGGING_REPO" dev.cajeta.logging 2>/dev/null)"
+fi
+if [[ -z "$logging_cja" ]]; then
+    logging_cja="$OLLA_HOME/dev.cajeta.logging/$LOGGING_VER/dev.cajeta.logging-$LOGGING_VER.cja"
+fi
+if [[ ! -f "$logging_cja" ]]; then
+    logging_cja="$here/build/.unit-cache/dev.cajeta.logging-$LOGGING_VER.cja"
+    if [[ ! -f "$logging_cja" ]]; then
+        echo ">> fetching dev.cajeta.logging $LOGGING_VER from $OLLA_URL"
+        meta="$(curl -fsS "$OLLA_URL/v2/resolve?name=dev.cajeta.logging&version=$LOGGING_VER")"
+        sha="$(printf '%s' "$meta" | sed -n 's/.*"sha256":"sha256:\([0-9a-f]*\)".*/\1/p')"
+        [[ -n "$sha" ]] || { echo "/v2/resolve gave no sha256 for logging" >&2; exit 1; }
+        mkdir -p "$(dirname "$logging_cja")"
+        curl -fsS -o "$logging_cja" "$OLLA_URL/v2/blob/$sha"
+        got="$(sha256_of "$logging_cja")"
+        [[ "$got" == "$sha" ]] || { rm -f "$logging_cja"; echo "sha256 mismatch fetching logging" >&2; exit 1; }
+    fi
+fi
+echo ">> dev.cajeta.logging: $logging_cja"
+
 echo ">> building llama library .cja"
 "$CAJETA" --emit=cja -o "$out/llama.cja" \
-    --classpath="$codec_cja,$jinja_cja" \
+    --classpath="$codec_cja,$jinja_cja,$logging_cja" \
     dev.cajeta.llm.Llm.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> building + running the test binary"
@@ -239,7 +269,7 @@ echo ">> building + running the test binary"
 # it is the accumulator of f16/bf16 WMMA) now demotes to the portable tile as
 # a GROUP and lowers, rather than being skipped. Fixed in cajeta 2026-08-21.
 "$CAJETA" --emit=exe --profile=test --xpu-backend="${XPU_BACKEND:-cpu}" \
-    --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja" \
+    --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja,$logging_cja" \
     -o "$out/llamatests" \
     dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
@@ -251,7 +281,7 @@ echo ">> building + running the test binary under --release --live-set=bounded"
 # codegen with the bounded live-set discipline — not only the test profile.
 "$CAJETA" --emit=exe --profile=test --release --live-set=bounded \
     --xpu-backend="${XPU_BACKEND:-cpu}" \
-    --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja" \
+    --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja,$logging_cja" \
     -o "$out/llamatests-release" \
     dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 

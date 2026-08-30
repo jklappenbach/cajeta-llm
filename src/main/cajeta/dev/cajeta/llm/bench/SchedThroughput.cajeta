@@ -1,0 +1,202 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.time.Clock;
+import dev.cajeta.llm.EngineOptions;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.sched.Request;
+import dev.cajeta.llm.sched.Scheduler;
+
+/**
+ * Scheduler-driven throughput (plan 15.2.7), so spec 12.8 and 12.9 can be
+ * measured in the shapes they actually name.
+ *
+ * Every 8B throughput number this project holds came from `CausalLM`
+ * directly — one unbounded prefill pass, one sequence decoding. Neither
+ * gate is about that path:
+ *
+ *   12.9 wants prefill "at the chunk size the scheduler actually uses
+ *        (13.14), NOT as an unbounded single pass". That chunk is 128
+ *        (`EngineOptions.chunk`), so 512 prompt tokens are FOUR chunked
+ *        passes with the KV cache growing between them — 4x the launches
+ *        over smaller GEMMs, a strictly harder shape than one 512 pass.
+ *   12.8 wants "batch 1 AND a representative batched shape", because
+ *        13.13 makes batch 1 one operating point rather than the only
+ *        one that runs.
+ *
+ * PHASE SEPARATION. 6.20 lets a step mix prefill chunks and decode
+ * tokens, so a step is not inherently one or the other. This bench
+ * submits every request at once with equal prompts, which makes the
+ * phases contiguous, and it does not INFER the boundary — it reads
+ * `Scheduler.prefillRowsExecuted()` and treats the last step that
+ * advanced that counter as the end of prefill. If a workload ever
+ * staggers arrivals the two phases interleave and this split stops
+ * meaning what it says; the printed prefill-step count is the tell.
+ *
+ * Requests are submitted through `Scheduler.submit` (no sampler), which
+ * is the GREEDY path — deterministic, so `first:` below is a correctness
+ * control and not a sample from a distribution.
+ *
+ *   run <model.gguf> [seqs=N] [prompt=N] [gen=N] [chunk=N] [ctx=N]
+ */
+public final class SchedThroughput {
+
+    private SchedThroughput() { }
+
+    static int32 intArg(String[] args, String key, int32 dflt) {
+        int32 i = 0;
+        int32 klen = key.byteLength();
+        while (i < (int32) args.count()) {
+            String a = args[i];
+            if (a.startsWith(key)) {
+                String v #= a.substring(klen, a.byteLength());
+                return Integer.parseInt(v);
+            }
+            i = i + 1;
+        }
+        return dflt;
+    }
+
+    public static void run(String[] args) {
+        if (args.count() < 1) {
+            System.stdout.println("usage: <model.gguf> [seqs=N] [prompt=N] "
+                + "[gen=N] [chunk=N] [ctx=N]");
+            return;
+        }
+        String path = args[0];
+        int32 seqs   = SchedThroughput.intArg(args, "seqs=", 1);
+        int32 preLen = SchedThroughput.intArg(args, "prompt=", 512);
+        int32 gen    = SchedThroughput.intArg(args, "gen=", 64);
+        // The DEFAULT is EngineOptions' own default rather than a literal
+        // repeated here: 12.9 says "the chunk the scheduler actually
+        // uses", so a constant copied into the bench could drift from the
+        // engine and quietly measure a shape nothing runs.
+        EngineOptions probe #= heap EngineOptions(path);
+        int32 chunk  = SchedThroughput.intArg(args, "chunk=", probe.chunk);
+        int32 ctx    = SchedThroughput.intArg(args, "ctx=", preLen + gen + 64);
+
+        EngineOptions o #= heap EngineOptions(path);
+        o.ctx = ctx;
+        o.maxSeqs = seqs;
+        o.chunk = chunk;
+
+        int64 t0 = Clock.nanoTime();
+        LlmEngine e #= LlmEngine.load(#o);
+        float64 loadMs = (float64) (Clock.nanoTime() - t0) / 1000000.0;
+
+        // Same synthetic prompt PackedResident uses, so the greedy first
+        // token is comparable against the single-pass path measured there.
+        int32[] toks #= heap int32[preLen];
+        int32 i = 0;
+        while (i < preLen) { toks[i] = 1000 + i * 7; i = i + 1; }
+
+        Scheduler s = e.scheduler();
+        int32[] ids #= heap int32[seqs];
+        int32 k = 0;
+        while (k < seqs) {
+            ids[k] = s.submit(toks, preLen, gen);
+            k = k + 1;
+        }
+
+        System.stdout.println("seqs: " + seqs + "  prompt: " + preLen
+            + "  gen: " + gen + "  chunk: " + chunk + "  ctx: " + ctx);
+        System.stdout.println("load ms: " + loadMs);
+
+        // PHASE BOUNDARY. `prefillRowsExecuted` counts DECODE rows too, and
+        // that is 13.14 working as designed rather than a counter bug:
+        // "prefill is N=chunk, decode is N=1" is ONE path, so a decode step
+        // advances it by exactly 1. Measured on the first run of this
+        // bench: prompt=512 gen=64 reported 575 rows = 512 + 63, and 67
+        // steps = 4 chunks + 63 decodes.
+        //
+        // So the boundary is not "the counter moved" but "the counter
+        // reached the prompt total" — exact for this workload, where every
+        // request is submitted at once and all prompts are consumed before
+        // any sequence is decoding alone.
+        int32 promptRows = seqs * preLen;
+        int32 lastRows = 0;
+        int32 prefillSteps = 0;
+        int32 steps = 0;
+        int64 p0 = Clock.nanoTime();
+        int64 prefillEnd = p0;
+        boolean inPrefill = true;
+        while (!s.allDone()) {
+            e.stepOnce();
+            steps = steps + 1;
+            int32 rows = s.prefillRowsExecuted();
+            if (inPrefill) {
+                prefillSteps = prefillSteps + 1;
+                if (rows >= promptRows) {
+                    prefillEnd = Clock.nanoTime();
+                    inPrefill = false;
+                }
+            }
+            lastRows = rows;
+        }
+        int64 tEnd = Clock.nanoTime();
+
+        float64 preMs = (float64) (prefillEnd - p0) / 1000000.0;
+        float64 decMs = (float64) (tEnd - prefillEnd) / 1000000.0;
+
+        int32 totalGen = 0;
+        int32 j = 0;
+        int32 first = 0 - 1;
+        while (j < seqs) {
+            Request r = s.request(ids[j]);
+            totalGen = totalGen + r.generatedCount();
+            if (j == 0 && r.generatedCount() > 0) { first = r.generatedAt(0); }
+            j = j + 1;
+        }
+
+        int32 promptTotal = seqs * preLen;
+        float64 preTps = 0.0;
+        if (preMs > 0.0) { preTps = (float64) promptTotal * 1000.0 / preMs; }
+        float64 decTps = 0.0;
+        if (decMs > 0.0) { decTps = (float64) totalGen * 1000.0 / decMs; }
+        float64 msPerTokPerSeq = 0.0;
+        if (totalGen > 0) {
+            msPerTokPerSeq = decMs / ((float64) totalGen / (float64) seqs);
+        }
+
+        // The chunking CONTROL. 12.9's whole point is that this is not one
+        // pass: with chunk<prompt there must be ceil(prompt/chunk) prefill
+        // steps per sequence. If this prints 1 per sequence the chunk knob
+        // did not take and the number below is the easy shape wearing the
+        // hard shape's label.
+        // Two legitimate expectations, and WHICH ONE HOLDS IS ITSELF THE
+        // FINDING: 6.20 assembles a step from whatever is runnable, so N
+        // sequences may share one step (batched) or take one each
+        // (serial). Printing both means a number that matches neither is
+        // visible as a real anomaly instead of hiding behind whichever
+        // single guess was written down.
+        int32 chunksPerSeq = (preLen + chunk - 1) / chunk;
+        int32 expectBatched = chunksPerSeq;
+        int32 expectSerial = chunksPerSeq * seqs;
+        String verdict = "  NEITHER — investigate";
+        if (prefillSteps == expectBatched) { verdict = "  OK (batched: steps shared across sequences)"; }
+        if (prefillSteps == expectSerial) { verdict = "  OK (serial: one step per sequence-chunk)"; }
+        System.stdout.println("prefill steps: " + prefillSteps
+            + "  (batched " + expectBatched + " | serial " + expectSerial
+            + ", ceil(" + preLen + "/" + chunk + ")=" + chunksPerSeq
+            + " x " + seqs + " seqs)" + verdict);
+        // Total rows = prompt rows + one per decode token (13.14, above),
+        // less the first token, which the LAST PREFILL CHUNK emits.
+        int32 expectRows = promptTotal + totalGen - seqs;
+        System.stdout.println("total rows: " + lastRows
+            + "  (expected " + expectRows + " = " + promptTotal
+            + " prompt + " + (totalGen - seqs) + " decode)"
+            + (lastRows == expectRows ? "  OK" : "  MISMATCH"));
+        System.stdout.println("steps: " + steps
+            + "  admitted: " + s.admittedCount()
+            + "  preempted: " + s.preemptedCount()
+            + "  resumed: " + s.resumedCount());
+        System.stdout.println("prefill ms: " + preMs
+            + "  tok/s: " + preTps);
+        System.stdout.println("decode ms: " + decMs
+            + "  tok/s: " + decTps
+            + "  ms/token/seq: " + msPerTokPerSeq);
+        System.stdout.println("generated: " + totalGen
+            + "  first token (greedy): " + first);
+        e.close();
+    }
+}
