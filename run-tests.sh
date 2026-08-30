@@ -72,6 +72,35 @@ cajeta_artifact_path() {
 XPU_BACKEND="${XPU_BACKEND:-${CAJETA_XPU_BACKEND:-cpu}}"
 echo ">> compile backend: ${XPU_BACKEND}"
 
+# Run one suite binary and report what it ACTUALLY exercised.
+#
+# The pass count alone cannot tell a device run from a skipped one: a test
+# that takes its `Device.activeBackend()` early-return still reports PASS,
+# so cpu and amdgpu both print "257 passed" while 22 of those tests never
+# touched a kernel on cpu (measured 2026-08-30). The compile-backend banner
+# above catches the 2026-08-23 failure (compiled for cpu, labelled amdgpu);
+# this catches the quieter one -- compiled and dispatched correctly, but the
+# TESTS opted out. Print both skip families so a vacuous green is visible in
+# the log instead of inferred later from a differential.
+run_suite() {
+    local bin="$1" label="$2" log
+    log="$(mktemp)"
+    set +e
+    "$bin" 2>&1 | tee "$log"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    local nocoop skipped
+    nocoop=$(grep -c "has no coop kernel" "$log" || true)
+    skipped=$(grep -c "xpu-kernel-skipped" "$log" || true)
+    echo ">> ${label}: in-test device skips: ${nocoop} 'no coop kernel', ${skipped} 'xpu-kernel-skipped'"
+    if [ "${nocoop}" != "0" ] || [ "${skipped}" != "0" ]; then
+        echo ">> NOTE: ${nocoop} test(s) reported PASS without running device code."
+        echo ">>       On a backend that claims device support this is a VACUOUS green."
+    fi
+    rm -f "$log"
+    return $rc
+}
+
 # Ownership-migration switches (ownership/transfer-of-borrow compiler):
 # the return-side (OWNED_BIND) and captured-borrow checks land warn-first
 # there, and this library has NOT done its migration pass yet — the chat
@@ -214,7 +243,7 @@ echo ">> building + running the test binary"
     -o "$out/llamatests" \
     dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
-"$out/llamatests"
+run_suite "$out/llamatests" "test profile"
 
 echo ">> building + running the test binary under --release --live-set=bounded"
 # Second pass, plan 6.1.7: the zero-allocation decode invariant (and the
@@ -226,4 +255,4 @@ echo ">> building + running the test binary under --release --live-set=bounded"
     -o "$out/llamatests-release" \
     dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
-"$out/llamatests-release"
+run_suite "$out/llamatests-release" "release, bounded live-set"
