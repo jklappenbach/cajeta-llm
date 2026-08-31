@@ -1,0 +1,220 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ModelConfig;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+
+/**
+ * cajeta-llm plan 15.1.4 — MODEL-LEVEL agreement across two backends.
+ *
+ * The gate that would have caught Unit 22. Every kernel-level agreement
+ * test compares a kernel against its host twin and passes; none ran a
+ * forward pass, so when the host and device attention paths began
+ * producing different tokens nothing noticed, and it surfaced only
+ * because a bench arm was built by hand to look. Blocked since
+ * 2026-08-20 on two obstacles, both now gone: the stated one (`HostOps`
+ * host-only) was refuted 2026-08-30, and Unit 24 supplied the first
+ * fixture that reaches device code.
+ *
+ * BOTH SIDES RUN THE SAME WEIGHTS. `QuantKernel.setRoutingEnabled(false)`
+ * turns off every device route at once — `deviceLaunchable()` consults
+ * it — so the host arm dequantizes the SAME Q4_K bytes and runs scalar
+ * matmuls over the SAME values. That matters for which thresholds apply:
+ * spec 13.21 exempts quantized execution from the tight bar because a
+ * Q4_K-vs-fp32 comparison carries quantization error. This comparison
+ * does NOT. Identical weights, identical dequantized values, one
+ * variable — the compute path. Anything beyond float reassociation here
+ * is a kernel defect, so the unquantized thresholds are the right bar
+ * and the exemption does not apply.
+ *
+ *   cosine >= 0.99999   softmax KL <= 1e-6   top-1 exact
+ *   greedy >= 0.99 agreement, divergence only where top-2 gap < 1e-3
+ */
+public class BackendParityTest {
+
+    static final String FIX = "src/test/fixtures/gguf/toy-routable.gguf";
+    static final int32 PROMPT = 12;
+    static final int32 GEN = 32;
+
+    public BackendParityTest() { return; }
+
+    static #CausalLM mk() {
+        Checkpoint ck #= Checkpoint.open(BackendParityTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    /** A COPY of the logits. `logits()` hands back interior storage that
+     *  the next forward pass overwrites, so comparing two passes needs
+     *  the first one's values taken out of the way (CLAUDE.md §3: a view
+     *  return is a borrow, the caller copies to outlive the container). */
+    static #float32[] logitsOf(CausalLM m) {
+        int32 v = m.vocabSize();
+        Tensor<float32> t = m.logits();
+        float32[] hb = t.hostBuffer();
+        int64 base = t.hostBase();
+        float32[] out #= heap float32[v];
+        int32 i = 0;
+        while (i < v) {
+            out[i] = hb[base + (int64) i];
+            i = i + 1;
+        }
+        return #out;
+    }
+
+    /** The gap between the top two logits — 13.22's tie test. */
+    static float64 top2Gap(float32[] a, int32 n) {
+        int32 best = Metrics.argmax(a, n);
+        float64 second = 0.0 - 1.0e30;
+        int32 i = 0;
+        while (i < n) {
+            if (i != best && (float64) a[i] > second) {
+                second = (float64) a[i];
+            }
+            i = i + 1;
+        }
+        return (float64) a[best] - second;
+    }
+
+    static #int32[] promptOf(int32 len) {
+        int32[] p #= heap int32[len];
+        int32 i = 0;
+        while (i < len) {
+            p[i] = (i * 7 + 3) % 200;
+            i = i + 1;
+        }
+        return #p;
+    }
+
+    /** 15.1.4 (a) — the logits themselves, at 13.21's thresholds. */
+    @Test
+    public void logitsAgreeAcrossBackendsWithinTolerance() {
+        CausalLM probe #= BackendParityTest.mk();
+        if (!RoutableFixtureTest.deviceHere(probe)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 vocab = probe.vocabSize();
+        int32[] p #= BackendParityTest.promptOf(BackendParityTest.PROMPT);
+
+        // DEVICE arm first, while routing is on.
+        CausalLM dev #= BackendParityTest.mk();
+        dev.prefill(p, BackendParityTest.PROMPT);
+        float32[] dl #= BackendParityTest.logitsOf(dev);
+
+        // HOST arm: flip the master switch, then build a FRESH model, so
+        // no device state survives from the arm above.
+        QuantKernel.setRoutingEnabled(false);
+        CausalLM host #= BackendParityTest.mk();
+        host.prefill(p, BackendParityTest.PROMPT);
+        float32[] hl #= BackendParityTest.logitsOf(host);
+        QuantKernel.setRoutingEnabled(true);
+
+        float64 cos = Metrics.cosine(hl, dl, vocab);
+        float64 kl = Metrics.softmaxKl(hl, dl, vocab);
+        int32 hTop = Metrics.argmax(hl, vocab);
+        int32 dTop = Metrics.argmax(dl, vocab);
+        System.stdout.println("  15.1.4 logits: cosine " + cos
+            + "  softmaxKl " + kl + "  top1 host " + hTop
+            + " device " + dTop);
+        Assert.isTrue(cos >= 0.99999);
+        Assert.isTrue(kl <= 1.0e-6);
+        Assert.equals((int64) hTop, (int64) dTop);
+    }
+
+    /** 15.1.4 (b) — greedy agreement over 32 tokens, 13.22's tie clause.
+     *
+     *  TEACHER-FORCED, and it has to be: once two greedy runs diverge
+     *  their contexts differ, and every later position is comparing
+     *  different conversations rather than different backends. Feeding
+     *  BOTH arms the device arm's tokens keeps the only difference the
+     *  one under test. */
+    @Test
+    public void greedyOutputAgreesAcrossBackends() {
+        CausalLM probe #= BackendParityTest.mk();
+        if (!RoutableFixtureTest.deviceHere(probe)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 vocab = probe.vocabSize();
+        int32[] p #= BackendParityTest.promptOf(BackendParityTest.PROMPT);
+
+        CausalLM dev #= BackendParityTest.mk();
+        int32[] devToks #= heap int32[BackendParityTest.GEN];
+        int32 cur = dev.prefill(p, BackendParityTest.PROMPT);
+        int32 i = 0;
+        while (i < BackendParityTest.GEN) {
+            devToks[i] = cur;
+            if (i + 1 < BackendParityTest.GEN) { cur = dev.decodeStep(cur); }
+            i = i + 1;
+        }
+
+        // NON-DEGENERACY CONTROL, and it is not optional. The fixture's
+        // weights are tiled from 8 real Q4_K blocks, so a collapsed model
+        // that emits one token forever is entirely plausible — and then
+        // "32/32 agree" would be two arms agreeing on a constant, which
+        // proves nothing about either. Count distinct tokens and require
+        // more than one, so the agreement number has something to mean.
+        int32 distinct = 0;
+        int32 di = 0;
+        while (di < BackendParityTest.GEN) {
+            boolean seen = false;
+            int32 dj = 0;
+            while (dj < di) {
+                if (devToks[dj] == devToks[di]) { seen = true; }
+                dj = dj + 1;
+            }
+            if (!seen) { distinct = distinct + 1; }
+            di = di + 1;
+        }
+        System.stdout.println("  15.1.4 reference sequence: " + distinct
+            + " distinct token(s) in " + BackendParityTest.GEN);
+        Assert.isTrue(distinct > 1);
+
+        QuantKernel.setRoutingEnabled(false);
+        CausalLM host #= BackendParityTest.mk();
+        int32 agree = 0;
+        int32 tieDiverge = 0;
+        int32 hardDiverge = 0;
+        int32 h = host.prefill(p, BackendParityTest.PROMPT);
+        i = 0;
+        while (i < BackendParityTest.GEN) {
+            if (h == devToks[i]) {
+                agree = agree + 1;
+            } else {
+                float32[] hl #= BackendParityTest.logitsOf(host);
+                if (BackendParityTest.top2Gap(hl, vocab) < 1.0e-3) {
+                    tieDiverge = tieDiverge + 1;
+                } else {
+                    hardDiverge = hardDiverge + 1;
+                }
+            }
+            // Teacher forcing: advance on the DEVICE arm's token.
+            if (i + 1 < BackendParityTest.GEN) {
+                h = host.decodeStep(devToks[i]);
+            }
+            i = i + 1;
+        }
+        QuantKernel.setRoutingEnabled(true);
+
+        float64 rate = (float64) agree / (float64) BackendParityTest.GEN;
+        System.stdout.println("  15.1.4 greedy: " + agree + "/"
+            + BackendParityTest.GEN + " agree (" + rate
+            + "), tie-divergences " + tieDiverge
+            + ", NON-tie divergences " + hardDiverge);
+        // The tie clause carries the weight (13.22): the rate alone would
+        // pass a systematic bug that flips one token in two hundred at
+        // positions that are not close calls.
+        Assert.equals((int64) 0, (int64) hardDiverge);
+        Assert.isTrue(rate >= 0.99);
+    }
+}
