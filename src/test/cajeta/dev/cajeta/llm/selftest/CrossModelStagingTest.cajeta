@@ -1,0 +1,135 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.model.CausalLM;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+
+/**
+ * cajeta-llm plan 25.3 — the batched staging cache must never serve one
+ * model another model's activations.
+ *
+ * The cache (`Linear.btTag` and friends) is STATIC — one per process —
+ * but until 25.3 the tag sequence keyed on it was PER-INSTANCE: every
+ * model emitted 1, 2, 3, ... So two same-shaped models could produce
+ * identical (tag, rows, n) triples, and the second model's stage would
+ * early-return on the first model's entry without refreshing the
+ * activation source. With the first model dropped that is a launch on a
+ * freed buffer; with it alive, silently swapped activations and wrong
+ * logits — no diagnostic at all (25.2).
+ *
+ * WHY DIFFERENT PROMPTS, SAME LENGTH: every prior test fed the same
+ * prompt to the same fixture, so a stale hit served byte-identical
+ * activations and was coincidentally correct — the identical-input trap
+ * (25.2, and 15.2.8 before it). Different prompts make a served-stale
+ * window WRONG; the same length keeps (rows, n) matching so the
+ * collision stays reachable. A control asserts the two prompts really
+ * do produce different logits, so "different" is measured, not assumed.
+ *
+ * The launch-failure delta (Device.launchFailures, 25.4) is asserted
+ * alongside the logits because the two catch different halves: a dead
+ * buffer fails the launch without necessarily changing the output,
+ * and a live stale buffer changes the output without failing anything.
+ */
+public class CrossModelStagingTest {
+
+    static final int32 PROMPT = 12;
+
+    public CrossModelStagingTest() { return; }
+
+    static #int32[] promptB(int32 len) {
+        int32[] p #= heap int32[len];
+        int32 i = 0;
+        while (i < len) {
+            p[i] = (i * 11 + 5) % 200;
+            i = i + 1;
+        }
+        return #p;
+    }
+
+    static float64 maxAbsDiff(float32[] a, float32[] b, int32 n) {
+        float64 worst = 0.0;
+        int32 i = 0;
+        while (i < n) {
+            float64 d = (float64) a[i] - (float64) b[i];
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > worst) { worst = d; }
+            i = i + 1;
+        }
+        return worst;
+    }
+
+    /** One prefill of `p`, logits copied out, model dropped. */
+    static #float32[] soloLogits(int32[] p) {
+        CausalLM m #= BackendParityTest.mk();
+        m.prefill(p, CrossModelStagingTest.PROMPT);
+        return BackendParityTest.logitsOf(m);
+    }
+
+    @Test
+    public void secondModelGetsItsOwnActivationsNotTheFirstModels() {
+        CausalLM probe #= BackendParityTest.mk();
+        if (!RoutableFixtureTest.deviceHere(probe)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 vocab = probe.vocabSize();
+        int32[] p1 #= BackendParityTest.promptOf(CrossModelStagingTest.PROMPT);
+        int32[] p2 #= CrossModelStagingTest.promptB(CrossModelStagingTest.PROMPT);
+
+        int64 f0 = Device.launchFailures();
+
+        // Solo oracles, one prefill each, model dropped after.
+        float32[] o1 #= CrossModelStagingTest.soloLogits(p1);
+        float32[] o2 #= CrossModelStagingTest.soloLogits(p2);
+
+        // CONTROL: the prompts must actually disagree, or a stale window
+        // served whole would compare equal and the test proves nothing.
+        float64 spread = CrossModelStagingTest.maxAbsDiff(o1, o2, vocab);
+        System.stdout.println("  25.3 control: p1-vs-p2 logit spread "
+            + spread);
+        Assert.isTrue(spread > 0.0);
+
+        // Scenario 1 — first model DEAD when the second stages. A stale
+        // hit here launches the lazy pack on a freed buffer: the driver
+        // refuses it and the counter moves (the shape the suite caught).
+        {
+            CausalLM a #= BackendParityTest.mk();
+            a.prefill(p1, CrossModelStagingTest.PROMPT);
+        }
+        CausalLM b #= BackendParityTest.mk();
+        b.prefill(p2, CrossModelStagingTest.PROMPT);
+        float32[] bl #= BackendParityTest.logitsOf(b);
+        float64 dDead = CrossModelStagingTest.maxAbsDiff(o2, bl, vocab);
+
+        // Scenario 2 — first model ALIVE when the second stages. A stale
+        // hit here fails nothing: the second model silently computes on
+        // the first model's activations (the cabra host-mode shape).
+        CausalLM a2 #= BackendParityTest.mk();
+        a2.prefill(p1, CrossModelStagingTest.PROMPT);
+        CausalLM b2 #= BackendParityTest.mk();
+        b2.prefill(p2, CrossModelStagingTest.PROMPT);
+        float32[] b2l #= BackendParityTest.logitsOf(b2);
+        float32[] a2l #= BackendParityTest.logitsOf(a2);
+        float64 dLive = CrossModelStagingTest.maxAbsDiff(o2, b2l, vocab);
+        float64 dLiveA = CrossModelStagingTest.maxAbsDiff(o1, a2l, vocab);
+
+        int64 f1 = Device.launchFailures();
+        System.stdout.println("  25.3: dead-first maxAbsDiff " + dDead
+            + "  live-first maxAbsDiff " + dLive
+            + "  first-model maxAbsDiff " + dLiveA
+            + "  launch failures " + (f1 - f0));
+
+        // Same weights, same backend, same prompt: each model's logits
+        // must MATCH its own solo oracle bit-for-bit — the forward is
+        // deterministic, and any nonzero diff here is served-stale state,
+        // not float noise (reassociation needs a different compute path,
+        // and there is only one).
+        Assert.isTrue(dDead == 0.0);
+        Assert.isTrue(dLive == 0.0);
+        Assert.isTrue(dLiveA == 0.0);
+        Assert.equals(f0, f1);
+    }
+}

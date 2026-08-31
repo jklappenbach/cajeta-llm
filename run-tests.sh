@@ -86,7 +86,12 @@ run_suite() {
     local bin="$1" label="$2" log
     log="$(mktemp)"
     set +e
-    "$bin" 2>&1 | tee "$log"
+    # Line-buffer stdout: the runtime prints its diagnostics (launch FAILED
+    # etc.) to unbuffered stderr, and against block-buffered stdout they land
+    # beside the WRONG test in the merged log — Unit 25 triage chased a
+    # misattribution that pure buffering created. Line-buffered, adjacency
+    # in the log is truth.
+    stdbuf -oL -eL "$bin" 2>&1 | tee "$log"
     local rc=${PIPESTATUS[0]}
     set -e
     local nocoop skipped
