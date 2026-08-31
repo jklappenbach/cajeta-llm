@@ -2,75 +2,297 @@ package dev.cajeta.llm.selftest;
 
 import cajeta.collection.ArrayList;
 import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
 import dev.cajeta.llm.Diag;
-import dev.cajeta.llm.DiagSink;
+import dev.cajeta.llm.DiagCallback;
+import dev.cajeta.llm.DiagRecord;
+import dev.cajeta.llm.LlmException;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.sched.Scheduler;
 
 /**
- * The engine's diagnostics must be SILENT unless an embedder asks for
- * them (Julian 2026-08-27: stderr reads as an error channel and alarms;
- * in a combined console it is noise).
+ * cajeta-llm plan 21.1 — diagnostics as RECORDS to a registered
+ * callback (spec 11.8).
  *
- * The important arm is the negative one. "Nothing was written" is the
- * behaviour that regresses invisibly — a stray print added later still
- * passes every functional test in the suite, and only shows up as a
- * complaint about console noise weeks afterwards. So `on()` is asserted
- * false at rest, and a sink installed afterwards is asserted to receive
- * nothing from the quiet period.
+ * The capability the old text sink lacked entirely is ATTRIBUTION: with
+ * several sequences in flight, a formatted line cannot say whose it
+ * was. So the justifying test (21.1.1) runs two real sessions through
+ * the scheduler and asserts their records are distinguishable, and the
+ * launch-failure test (21.1.6) asserts the one event that used to be a
+ * stderr orphan now arrives with a session on it.
  */
 public class DiagTest {
 
-    /** Records what the engine emitted, so the test can assert on it. */
-    static class Capture implements DiagSink {
-        public ArrayList<String> lines;
+    /** Copies every record's fields out — the record is valid only
+     *  during the call, so keeping history means copying (11.8.3). */
+    static class Capture implements DiagCallback {
+        public ArrayList<String> cats;
+        public ArrayList<String> names;
+        public int64[] sess;
+        public int64[] w0;
+        public int64[] w1;
+        public int32 n;
         public Capture() {
-            this.lines = heap ArrayList<String>();
+            this.cats = heap ArrayList<String>();
+            this.names = heap ArrayList<String>();
+            this.sess #= heap int64[1024];
+            this.w0 #= heap int64[1024];
+            this.w1 #= heap int64[1024];
+            this.n = 0;
         }
-        public void line(String message) {
-            int8[] b #= message.toBytes();
-            String cp = heap String(#b, message.byteLength());
-            this.lines.add(#cp);
+        static #String cp(String s) {
+            int8[] b #= s.toBytes();
+            String c = heap String(#b, s.byteLength());
+            return #= c;
+        }
+        public void onRecord(DiagRecord r) {
+            if (this.n >= 1024) { return; }
+            this.cats.add(#Capture.cp(r.category));
+            this.names.add(#Capture.cp(r.name != null ? r.name : "-"));
+            this.sess[this.n] = (int64) r.session;
+            this.w0[this.n] = r.v0;
+            this.w1[this.n] = r.v1;
+            this.n = this.n + 1;
+            return;
+        }
+        public int32 countOf(String cat) {
+            int32 c = 0;
+            int32 i = 0;
+            while (i < this.n) {
+                if (this.cats.get(i).equals(cat)) { c = c + 1; }
+                i = i + 1;
+            }
+            return c;
+        }
+        public boolean sawSession(String cat, int64 s) {
+            int32 i = 0;
+            while (i < this.n) {
+                if (this.cats.get(i).equals(cat)
+                        && this.sess[i] == s) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            return false;
+        }
+    }
+
+    /** A consumer whose logging is broken — 11.8.5's subject. */
+    static class Thrower implements DiagCallback {
+        public int32 calls;
+        public Thrower() { this.calls = 0; }
+        public void onRecord(DiagRecord r) {
+            this.calls = this.calls + 1;
+            throw heap LlmException("consumer fault, deliberately");
+        }
+    }
+
+    // 21.1.6 manufactures its dead buffer the way 25.2 did, and the
+    // shape is LOAD-BEARING, each step probed 2026-08-31: a direct
+    // static `#=` of a local or field PARKS the owner (the ownership
+    // runtime keeps it alive — the launch quietly succeeds), and so
+    // does a dropped slice view. Only a borrow that arrives as a plain
+    // CALL PARAMETER and is then recorded by a static `#=` escapes the
+    // park chain — exactly `stageBatchFromDevice(src)` into
+    // `btXhSrc #= src`. The owner then really dies and the launch is
+    // really refused (b1 rec=NULL, garbage handle).
+    static KernelBuffer<float32> deadSrc;
+
+    static class BufHolder {
+        public KernelBuffer<float32> buf;
+        public BufHolder() {
+            this.buf #= heap KernelBuffer<float32>((uint64) 1024L);
             return;
         }
     }
 
+    static void captureAsParam(KernelBuffer<float32> src) {
+        DiagTest.deadSrc #= src;
+        return;
+    }
+
     public DiagTest() { return; }
 
-    /** DEFAULT: nothing is listening, and `say` writes nowhere. */
+    /** 21.1.1 — the justifying test: two sessions in flight produce
+     *  DISTINGUISHABLE records. The old text stream could not do this
+     *  at all. */
     @Test
-    public void diagnosticsAreOffByDefault() {
-        Diag.setSink(null);
+    public void twoSessionsInFlightProduceDistinguishableRecords() {
+        Capture cap = heap Capture();
+        Diag.register(cap);
+        CausalLM m = SchedulerTest.mk("diag2s", 2, 0);
+        Scheduler s = heap Scheduler(m, 4);
+        int32[] pa #= SchedulerTest.promptOf(8, 3);
+        int32[] pb #= SchedulerTest.promptOf(8, 11);
+        int32 a = s.submit(pa, 8, 4);
+        int32 b = s.submit(pb, 8, 4);
+        s.runAll(200);
+        Diag.register(null);
+
+        Assert.isTrue(cap.countOf("sched-step") > 0);
+        Assert.isTrue(cap.sawSession("sched-step", (int64) a));
+        Assert.isTrue(cap.sawSession("sched-step", (int64) b));
+        Assert.isTrue(cap.sawSession("sched-admit", (int64) a));
+        Assert.isTrue(cap.sawSession("sched-admit", (int64) b));
+    }
+
+    /** 21.1.2 — with no callback, nothing is emitted AND no record is
+     *  built. `builtCount` is the assertable form of "an unobserved
+     *  diagnostic costs field-filling and nothing more" — here it does
+     *  not even fill fields. */
+    @Test
+    public void unregisteredDiagnosticsBuildNothing() {
+        Diag.register(null);
         Assert.isFalse(Diag.on());
-        // Must not throw, must not print: the no-sink path is the one
-        // every embedder runs.
-        Diag.say("this line must go nowhere");
+        int64 b0 = Diag.builtCount();
+
+        // A REAL decision path, not a bare emit: a toy prefill crosses
+        // the prefill-mode site with rows > 1.
+        CausalLM m = SchedulerTest.mk("diagoff", 1, 0);
+        int32[] p #= SchedulerTest.promptOf(4, 5);
+        m.prefill(p, 4);
+
+        Diag.emit("batch-route", 0 - 1, "nobody-listens",
+            1L, 2L, 0L, 0L, 0L, 0L);
+        Assert.equals(b0, Diag.builtCount());
         Assert.isFalse(Diag.on());
     }
 
-    /** Installed: the embedder gets exactly what the engine emitted. */
+    /** 21.1.3 — a callback that throws does not fail the turn, and
+     *  delivery keeps working afterwards. */
     @Test
-    public void anInstalledSinkReceivesTheLines() {
+    public void aThrowingCallbackDoesNotFailTheTurn() {
+        Thrower bad = heap Thrower();
+        Diag.register(bad);
+        // Direct emit survives the throw.
+        Diag.emit("batch-route", 0 - 1, "boom", 1L, 2L, 0L, 0L, 0L, 0L);
+        Assert.equals(1L, (int64) bad.calls);
+
+        // A whole generation survives a consumer that throws on EVERY
+        // record — the turn completes and produces its tokens.
+        CausalLM m = SchedulerTest.mk("diagthrow", 1, 0);
+        Scheduler s = heap Scheduler(m, 4);
+        int32[] p #= SchedulerTest.promptOf(6, 7);
+        int32 id = s.submit(p, 6, 3);
+        s.runAll(100);
+        Assert.equals((int64) 3,
+            (int64) s.request(id).generatedCount());
+        Assert.isTrue(bad.calls > 1);
+
+        // The fault was the consumer's; a healthy one still receives.
         Capture cap = heap Capture();
-        Diag.setSink(cap);
-        Assert.isTrue(Diag.on());
-        Diag.say("batch-route: test out=1 in=2");
-        Assert.equals(1L, (int64) cap.lines.count());
-        Assert.equals("batch-route: test out=1 in=2", cap.lines.get(0));
-        Diag.setSink(null);
-        Assert.isFalse(Diag.on());
+        Diag.register(cap);
+        Diag.emit("batch-route", 0 - 1, "after", 3L, 4L, 0L, 0L, 0L, 0L);
+        Diag.register(null);
+        Assert.equals(1L, (int64) cap.countOf("batch-route"));
     }
 
-    /** Removing the sink stops delivery — an embedder can turn it back
-     *  off, and the quiet period really is quiet. */
+    /** 21.1.4 — records arrive DURING the step, on the engine's thread:
+     *  by the time each stepOnce() returns, that step's records are
+     *  already in the consumer. An engine that buffered and flushed at
+     *  completion would fail the mid-run assertions. */
     @Test
-    public void clearingTheSinkStopsDelivery() {
+    public void deliveryIsSynchronousWithTheStep() {
         Capture cap = heap Capture();
-        Diag.setSink(cap);
-        Diag.say("first");
-        Diag.setSink(null);
-        Diag.say("second must not arrive");
-        Assert.equals(1L, (int64) cap.lines.count());
-        Assert.equals("first", cap.lines.get(0));
+        Diag.register(cap);
+        CausalLM m = SchedulerTest.mk("diagsync", 1, 0);
+        Scheduler s = heap Scheduler(m, 4);
+        int32[] p #= SchedulerTest.promptOf(12, 9);
+        s.submit(p, 12, 4);
+
+        int32 prev = 0;
+        int32 grewMidRun = 0;
+        boolean more = true;
+        while (more) {
+            more = s.stepOnce();
+            if (more && cap.n > prev) {
+                grewMidRun = grewMidRun + 1;
+            }
+            prev = cap.n;
+        }
+        Diag.register(null);
+        // Records arrived while unfinished work REMAINED — before any
+        // "run finished" moment a buffering engine could flush at.
+        Assert.isTrue(grewMidRun > 0);
+    }
+
+    /** 21.1.5 — NEGATIVE ARM's positive twin: with a callback
+     *  registered, the records a known decision produces DO arrive.
+     *  Silence-when-unregistered alone would pass an engine that emits
+     *  nothing at all. */
+    @Test
+    public void aKnownDecisionEmitsItsRecord() {
+        Capture cap = heap Capture();
+        Diag.register(cap);
+        CausalLM m = SchedulerTest.mk("diagpos", 1, 0);
+        int32[] p #= SchedulerTest.promptOf(4, 13);
+        m.prefill(p, 4);
+        Diag.register(null);
+
+        Assert.equals(1L, (int64) cap.countOf("prefill-mode"));
+        int32 i = 0;
+        while (i < cap.n) {
+            if (cap.cats.get(i).equals("prefill-mode")) {
+                // rows rode in v0; the route name is real, not empty.
+                Assert.equals(4L, cap.w0[i]);
+                Assert.isTrue(cap.names.get(i).byteLength() > 0);
+            }
+            i = i + 1;
+        }
+    }
+
+    /** 21.1.6 — a launch failure becomes a RECORD attributed to the
+     *  step window's session (21.2.5), not just a stderr line. Forced
+     *  with a genuinely dead device buffer: an owner is dropped while a
+     *  `#=` alias keeps its handle — the 25.2 corpse shape, aimed at a
+     *  harmless launch. Vulkan-only: the refusal is driver behavior. */
+    @Test
+    public void aLaunchFailureBecomesAnAttributedRecord() {
+        String be #= Device.activeBackend();
+        if (!be.equals("vulkan")) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        Capture cap = heap Capture();
+        Diag.register(cap);
+        CausalLM m = SchedulerTest.mk("diaglf", 1, 0);
+        Scheduler s = heap Scheduler(m, 4);
+        // Long prompt: the session is still RUNNING when the failure
+        // surfaces, so the window has a sole owner to attribute to.
+        int32[] p #= SchedulerTest.promptOf(16, 15);
+        int32 id = s.submit(p, 16, 4);
+        Assert.isTrue(s.stepOnce());
+
+        // The deliberate failure, declared to the 25.4 suite gate
+        // first. The output buffer is allocated BEFORE the owner dies
+        // so the freed handle slot cannot be recycled by this test's
+        // own allocations.
+        LaunchFailureBudget.expect(1L);
+        KernelBuffer<int8> out #= heap KernelBuffer<int8>((uint64) 4096L);
+        {
+            BufHolder h #= heap BufHolder();
+            DiagTest.captureAsParam(h.buf);
+        }
+        QuantKernel.q8kPackLaunchNoSync(out, DiagTest.deadSrc, 256L);
+
+        // The failure landed BETWEEN steps; delta accounting must hand
+        // it to the NEXT step's window.
+        s.stepOnce();
+        s.runAll(200);
+        Diag.register(null);
+
+        Assert.equals(1L, (int64) cap.countOf("launch-failure"));
+        Assert.isTrue(cap.sawSession("launch-failure", (int64) id));
+        int32 i = 0;
+        while (i < cap.n) {
+            if (cap.cats.get(i).equals("launch-failure")) {
+                Assert.equals(1L, cap.w0[i]);
+            }
+            i = i + 1;
+        }
     }
 }

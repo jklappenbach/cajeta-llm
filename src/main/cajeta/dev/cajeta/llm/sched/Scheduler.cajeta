@@ -2,6 +2,7 @@ package dev.cajeta.llm.sched;
 
 import cajeta.collection.ArrayList;
 import cajeta.lang.String;
+import cajeta.xpu.Device;
 import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.gen.SampleParams;
@@ -63,6 +64,9 @@ public final class Scheduler {
     int32[] tailIds;          // stop-string window scratch (16 ids)
 
     public Scheduler(CausalLM model, int32 chunk) {
+        // 21.2.5: launch failures BEFORE this scheduler existed are not
+        // its steps' to report.
+        this.lfSeen = Device.launchFailures();
         this.model = model;
         this.chunk = chunk;
         this.maxSeqs = model.maxSequences();
@@ -187,6 +191,28 @@ public final class Scheduler {
         return this.steps;
     }
 
+    // The launch-failure counter as of the last step boundary; anything
+    // above it at the next boundary happened in that step's window.
+    int64 lfSeen;
+
+    /** The id of the only RUNNING request, or -1 when zero or several
+     *  are — a failure inside a multi-session step has no single owner
+     *  (21.2.5's attribution is the WINDOW, not a guess). */
+    int32 soleRunning() {
+        int32 found = 0 - 1;
+        int32 i = 0;
+        while (i < this.reqs.count()) {
+            if (this.reqs.get(i).state == Request.RUNNING) {
+                if (found >= 0) {
+                    return 0 - 1;
+                }
+                found = i;
+            }
+            i = i + 1;
+        }
+        return found;
+    }
+
     public boolean allDone() {
         int32 i = 0;
         while (i < this.reqs.count()) {
@@ -210,6 +236,9 @@ public final class Scheduler {
     public boolean stepOnce() {
         this.steps = this.steps + 1;
         this.admitPhase();
+        // 21.2.5: who owns a launch failure surfacing this step. Taken
+        // AFTER admission so a request admitted this step counts.
+        int32 lfOwner = Diag.on() ? this.soleRunning() : (0 - 1);
         PagedKvCache cache = this.model.kvCache();
         int32 i = 0;
         while (i < this.reqs.count()) {
@@ -238,10 +267,10 @@ public final class Scheduler {
                     continue;
                 }
                 if (Diag.on()) {
-                    Diag.say("sched step=" + this.steps + " req=" + i
-                        + " slot=" + r.slot + " cachedLen=" + r.cachedLen
-                        + " n=" + n + " totalLen=" + r.totalLen
-                        + " cacheLen=" + cache.lengthOf(r.slot, 0));
+                    Diag.emit("sched-step", i, null, (int64) this.steps,
+                        (int64) r.slot, (int64) r.cachedLen, (int64) n,
+                        (int64) r.totalLen,
+                        (int64) cache.lengthOf(r.slot, 0));
                 }
                 int32 ret = this.model.stepSeq(r.slot, r.all, r.cachedLen, n);
                 r.cachedLen = r.cachedLen + n;
@@ -291,6 +320,21 @@ public final class Scheduler {
         }
         // Completions freed blocks: same-step admission (6.24).
         this.admitPhase();
+        // 21.2.5: launch failures become records. The counter moving
+        // since the last boundary means some dispatch in this window
+        // never ran — the engine's output past that point is suspect,
+        // and the HOST decides what to do about it (11.8.6). Delta
+        // accounting (not a start-of-step snapshot) so a failure landing
+        // BETWEEN steps still surfaces in the next step's record.
+        if (Diag.on()) {
+            int64 lfNow = Device.launchFailures();
+            if (lfNow > this.lfSeen) {
+                Diag.emit("launch-failure", lfOwner, null,
+                    lfNow - this.lfSeen, (int64) this.steps,
+                    0L, 0L, 0L, 0L);
+            }
+            this.lfSeen = lfNow;
+        }
         return !this.allDone();
     }
 
@@ -410,9 +454,9 @@ public final class Scheduler {
             }
             this.slotReq[slot] = pick;
             if (Diag.on()) {
-                Diag.say("sched admit req=" + pick + " -> slot=" + slot
-                    + (isResume ? " (resume)" : " (new)")
-                    + " cacheLen=" + cache.lengthOf(slot, 0));
+                Diag.emit("sched-admit", pick,
+                    isResume ? "resume" : "new", (int64) slot,
+                    (int64) cache.lengthOf(slot, 0), 0L, 0L, 0L, 0L);
             }
             r.slot = slot;
             r.cachedLen = 0;

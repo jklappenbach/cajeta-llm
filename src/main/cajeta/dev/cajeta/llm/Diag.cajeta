@@ -3,69 +3,112 @@ package dev.cajeta.llm;
 import cajeta.lang.String;
 
 /**
- * Engine diagnostics — OFF by default, and off means nothing is written
- * to any stream.
+ * Engine diagnostics — OFF by default, and off means nothing is built,
+ * formatted, or written anywhere.
  *
- * These lines exist for a good reason (a silent fallback that produces
+ * These records exist for a good reason (a silent fallback that produces
  * CORRECT output is indistinguishable from a failed optimization — the
  * batched-prefill route once read as "batching bought 4%" when it had
  * never engaged), but they are the engine talking to whoever is tuning
- * it, not to the user of whatever is embedding the engine.
+ * or hosting it, not to the user of whatever is embedding the engine.
  *
- * They were briefly written to stderr, which is worse than stdout rather
- * than better: stderr is a SEVERITY channel, so IDEs and log collectors
- * paint it red and alert on it, and "we picked the batched kernel" gets
- * laundered into "something went wrong". A combined console just sees
- * noise. Julian called this out 2026-08-27.
+ * Since 11.8 (Unit 21) the engine emits structured RECORDS to a
+ * registered callback rather than pushing formatted text into a sink:
  *
- * So: a hook, not a dependency. The engine is a LIBRARY — it must not
- * pick a logging backend for its embedder, and cajeta has no env-var API
- * to read a level from, so enabling is an explicit call. An application
- * installs a sink — cabra AND the `cajeta-llm` CLI both bridge to
- * `dev.cajeta.logging` at DEBUG, through `Log.at` so the lines aggregate
- * into the host's single stream rather than opening a second one — and
- * with no sink installed `say` is a couple of predictable branches.
+ *  - a record carries category, session, and typed fields, so a host
+ *    with several sequences in flight can attribute, filter, or forward
+ *    a session's diagnostics to the client that owns it (11.8.7) — the
+ *    text stream could not say whose line was whose;
+ *  - the engine formats NO strings and holds NO buffer (11.8.2, 11.8.3);
+ *    formatting and history are consumer policy, paid by the consumer
+ *    that wants them;
+ *  - the callback runs on the engine's thread and must return promptly
+ *    (11.8.4); one that throws does not fail the turn (11.8.5);
+ *  - the engine picks no logging backend (11.8.6): cabra and the CLI
+ *    both bridge records onto `dev.cajeta.logging` themselves, and the
+ *    LIBRARY packages import no logger.
  *
- * The CLI briefly used a plain stderr sink (2026-08-30) and that was
- * wrong for the reason stated above; it is gone, and nothing in this
- * project writes diagnostics to stderr any more. That makes stderr
- * meaningful again: output there is a fault, not chatter.
+ * stderr history, still binding: these were briefly written to stderr,
+ * which is worse than stdout rather than better — stderr is a SEVERITY
+ * channel, so IDEs and log collectors paint it red, and "we picked the
+ * batched kernel" gets laundered into "something went wrong" (Julian,
+ * 2026-08-27). Nothing in this project writes diagnostics to stderr;
+ * output there is a fault, not chatter.
  *
- * Call sites MUST guard with `Diag.on()`. `sayRoute` runs per projection
- * and the strings concatenate several fields; building them only to drop
- * them on the floor is a cost every embedder would pay for a feature
- * almost none of them turn on.
+ * Call sites guard with `Diag.on()` only where ARGUMENTS cost something
+ * to gather (a cache-length query, a bitmask build). `emit` self-guards,
+ * so a site whose arguments are locals and literals needs no guard.
  */
 public final class Diag {
 
-    // null == silent, and that is the default.
-    //
-    // Writing this the obvious way used to CRASH the compiler: comparing a
-    // static field of interface type against null hit
-    // "ICmpInst::AssertOK(): Both operands to ICmp instruction are not of
-    // the same type!", and the same path SIGSEGV'd at runtime for a plain
-    // `Sink s = null` local. Both are fixed in cajeta as of 2026-08-27
-    // (InterfaceStaticNullCompareTests), so this reads naturally again
-    // instead of carrying a parallel boolean.
-    static DiagSink sink;
+    // null == silent, and that is the default. Registration stores a
+    // BORROW: the host owns its callback for as long as it stays
+    // registered (the CLI parks it in a static for the process's life).
+    static DiagCallback cb;
+
+    // ONE scratch record, reused per emission: an observed diagnostic
+    // costs field-stores and a call, never an allocation (11.8.2's
+    // "field-filling and nothing more"). Safe because the callback
+    // contract says the record is valid only during the call.
+    static DiagRecord scratch;
+
+    // Emissions since process start. Monotonic. This is how a test
+    // asserts the OFF path does no work: an emit with no callback
+    // registered must leave it unchanged (21.1.2).
+    static int64 built;
 
     public Diag() { return; }
 
-    /** Install a sink. Passing null turns diagnostics back off. */
-    public static void setSink(DiagSink s) {
-        Diag.sink = s;
+    /** Register the host's callback (11.8.1). Null turns diagnostics
+     *  back off. The engine borrows it — the host keeps ownership. */
+    public static void register(DiagCallback c) {
+        Diag.cb = c;
         return;
     }
 
-    /** Whether anything is listening. Guard every call site with this. */
+    /** Whether anything is listening. Guard call sites with this only
+     *  when gathering the arguments costs something. */
     public static boolean on() {
-        return Diag.sink != null;
+        return Diag.cb != null;
     }
 
-    /** Emit one diagnostic line, if anything is listening. */
-    public static void say(String message) {
-        if (Diag.sink != null) {
-            Diag.sink.line(message);
+    /** How many records have ever been BUILT. A quiet period leaves
+     *  this unchanged — the assertable form of "unobserved diagnostics
+     *  cost nothing" (21.1.2). */
+    public static int64 builtCount() {
+        return Diag.built;
+    }
+
+    /**
+     * Emit one record, if anything is listening. Self-guarding; the
+     * fields land in the shared scratch record (see `DiagRecord` for
+     * the per-category field meanings).
+     */
+    public static void emit(String category, int32 session, String name,
+            int64 v0, int64 v1, int64 v2, int64 v3, int64 v4, int64 v5) {
+        if (Diag.cb == null) {
+            return;
+        }
+        if (Diag.scratch == null) {
+            Diag.scratch #= heap DiagRecord();
+        }
+        DiagRecord r = Diag.scratch;
+        r.category #= category;
+        r.session = session;
+        r.name #= name;
+        r.v0 = v0;
+        r.v1 = v1;
+        r.v2 = v2;
+        r.v3 = v3;
+        r.v4 = v4;
+        r.v5 = v5;
+        Diag.built = Diag.built + 1L;
+        // 11.8.5: a consumer's logging fault is not a generation fault.
+        try {
+            Diag.cb.onRecord(r);
+        } catch (Exception e) {
+            // Deliberately swallowed; the record is diagnostics, and
+            // failing the turn over it inverts the priority.
         }
         return;
     }
