@@ -1,0 +1,162 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.DeviceKv;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+
+/**
+ * cajeta-llm plan Unit 24 TDD — the first fixture that can drive a
+ * forward pass through DEVICE code.
+ *
+ * Every other model fixture is H=16/HD=4 and the device routes reject it
+ * three ways over, so until this one no automated test could reach the
+ * device path at all. That absence has a measured cost: Unit 22, where
+ * the host and device attention paths disagreed for an unknown period
+ * and were caught by a hand-built bench arm rather than a gate, and
+ * 15.1.4, blocked since 2026-08-20.
+ *
+ * THE FIRST TEST HERE IS THE PRECONDITION, deliberately. A fixture that
+ * quietly stops routing — one dimension edited, one route gated off —
+ * turns every test built on it green while testing nothing. That is not
+ * hypothetical: `run-tests.sh` reports 11 in-test device skips and warns
+ * that a PASS is not proof of a device run, because the amdgpu suite
+ * compiled `cpu` for weeks without anyone noticing.
+ */
+public class RoutableFixtureTest {
+
+    static final String FIX = "src/test/fixtures/gguf/toy-routable.gguf";
+
+    public RoutableFixtureTest() { return; }
+
+    static #CausalLM mk(int32 maxSeqs) {
+        Checkpoint ck #= Checkpoint.open(RoutableFixtureTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, maxSeqs, 0);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    /**
+     * Does the DEVICE-RESIDENT batched path exist here?
+     *
+     * MEASURED, not guessed — two weaker predicates were tried and both
+     * are TRUE on the cpu backend, where the batched path does not
+     * exist: `deviceRoutable()` (every projection really is
+     * device-launchable there, the cpu XPU backend has Q4_K kernels)
+     * and `Linear.devicePackOn()`. Each produced a red suite on a
+     * backend that was behaving correctly.
+     *
+     * So gate on the predicate the prefill path ITSELF checks —
+     * `batched = rows > 1 && batchReady(rows)` — which cannot drift away
+     * from the condition it stands for.
+     *
+     * A CAPABILITY, never an outcome. A skip derived from "no slots were
+     * allocated" could not fail, which is the whole defect class this
+     * fixture exists to close.
+     */
+    static boolean deviceHere(CausalLM m) {
+        return m.deviceRoutable() && m.batchRoutedFor(8);
+    }
+
+    static void saySkip() {
+        System.stdout.println("  (skipped: backend "
+            + Device.activeBackend()
+            + " has no coop kernel for the routable fixture)");
+        return;
+    }
+
+    static #int32[] promptOf(int32 len, int32 seed) {
+        int32[] p #= heap int32[len];
+        int32 i = 0;
+        while (i < len) {
+            p[i] = (i * 7 + seed) % 200;
+            i = i + 1;
+        }
+        return #p;
+    }
+
+    /** 24.1.1 — the fixture satisfies every routing precondition the
+     *  device path checks. Asserted on the ENGINE's own predicates, not
+     *  restated here: a copy of the rule in the test would agree with a
+     *  stale copy of the rule in the fixture and both could be wrong. */
+    @Test
+    public void fixtureSatisfiesEveryDeviceRoutingPrecondition() {
+        // Read the config straight from the fixture, so a `supports`
+        // failure is distinguishable from a routing failure instead of
+        // both arriving as one false.
+        Checkpoint ck #= Checkpoint.open(RoutableFixtureTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        ck.close();
+        Assert.isTrue(DeviceKv.supports(cfg));
+
+        // Routing is backend-independent for this fixture: every
+        // projection is device-launchable on cpu AND vulkan. Assert it
+        // unconditionally — this is the fixture's own contract, and a
+        // skip here would hide the very thing being checked.
+        CausalLM m #= RoutableFixtureTest.mk(1);
+        Assert.isTrue(m.deviceRoutable());
+    }
+
+    /** 24.1.2 — a forward pass EXECUTES device code, read from the
+     *  launch counters rather than from a wall-clock. A stopwatch cannot
+     *  separate "ran on the host" from "ran on the device slowly", which
+     *  is exactly the confusion that made Unit 22 cost a day. */
+    @Test
+    public void forwardPassExecutesDeviceCode() {
+        CausalLM m #= RoutableFixtureTest.mk(1);
+        if (!RoutableFixtureTest.deviceHere(m)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        // batchCalls, not devCalls. `nDevCalls` counts the SINGLE-ROW
+        // `matvecIntoDevice` decode path; a prefill of 8 rows goes
+        // through `matmulBatchKeep`, which is `btCalls`. Asserting the
+        // wrong counter is indistinguishable from the device not
+        // running, and the first draft of this test did exactly that.
+        int64 before = Linear.batchCalls();
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+        int32 tok = m.prefill(p, 8);
+        Assert.isTrue(tok >= 0);
+        Assert.isTrue(Linear.batchCalls() > before);
+    }
+
+    /** 24.1.3 — the NEGATIVE arm. With the device attend switched off
+     *  the device KV slot must stay unallocated. A probe that cannot go
+     *  quiet proves nothing when it is loud, and 15.2.8's first attempt
+     *  is the standing proof: a guard that never fired read exactly like
+     *  a guard that worked. */
+    @Test
+    public void deviceKvStaysUnallocatedWhenTheAttendIsOff() {
+        boolean was = CausalLM.deviceAttentionEnabled();
+        CausalLM.setDeviceAttention(false);
+        CausalLM m #= RoutableFixtureTest.mk(1);
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+        m.prefill(p, 8);
+        int32 off = m.deviceKvSlotsActive();
+        CausalLM.setDeviceAttention(was);
+        Assert.equals((int64) 0, (int64) off);
+    }
+
+    /** 24.1.2's positive twin for the DEVICE KV specifically: with the
+     *  attend on, a prefill leaves the slot resident. Together with the
+     *  test above this is the pair CLAUDE.md asks for — one that asserts
+     *  the mechanism fires and one that asserts it does not. */
+    @Test
+    public void deviceKvSlotIsResidentAfterPrefill() {
+        CausalLM m #= RoutableFixtureTest.mk(1);
+        if (!RoutableFixtureTest.deviceHere(m)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+        m.prefill(p, 8);
+        Assert.equals((int64) 1, (int64) m.deviceKvSlotsActive());
+    }
+}
