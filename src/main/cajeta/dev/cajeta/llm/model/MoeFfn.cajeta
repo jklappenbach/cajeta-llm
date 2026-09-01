@@ -4,6 +4,9 @@ import cajeta.lang.Math;
 import cajeta.time.Clock;
 import cajeta.lang.String;
 import cajeta.math.Tensor;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.Checkpoint;
@@ -28,6 +31,8 @@ public final class MoeFfn extends InfModule {
 
     Linear router;             // ffn_gate_inp: [experts, hidden] f32
     int32 layerIdx;    // moe-cache unit 3: record attribution; -1 until set
+    KernelBuffer<float32> crossDev;   // unit 39: mixed-regime eOut up-leg
+    float32[] crossHost;              // unit 39: contiguous copy for upload
 
     // ── forwardRow phase split (parity attribution, decode). ──
     static int64 mtRouteNs;    // router matvec + softmax + top-k
@@ -265,6 +270,122 @@ public final class MoeFfn extends InfModule {
      * that is 15.16's sparsity claim, and ExpertBank's counters at the
      * mat-vec seam are its instrument.
      */
+    /**
+     * Unit 39 (spec 15.21.2, the expert half): the expert chain never
+     * leaves the device. Routing runs on the HOST from `x` — the
+     * caller's crossing already downloaded the normed activation for
+     * exactly this — and each selected expert then chains
+     * stage(x) -> gate -> up -> GLU -> stage(g) -> down -> axpby as
+     * NoSync stream launches against its slots, accumulating into
+     * `acc` (beta=0 on the first write). Nothing crosses per expert;
+     * the caller folds `acc` into the residual with one addDevice.
+     *
+     * The MIXED regime (39.2.3): an expert without a launchable slot
+     * runs its mat-vecs on the host from `x` — the windowed path,
+     * counted as such — and its eOut goes up once and joins the same
+     * accumulation. The stream is drained before that upload: the
+     * previous expert's queued launches may still be reading the
+     * shared stage and the scratch buffer.
+     *
+     * Returns false — take the unit-38 whole-host crossing — when the
+     * model has a shared expert (a host-only sublayer today, qwen2moe;
+     * the 30B and the qwen3moe fixture have none).
+     */
+    boolean forwardRowResident(KernelBuffer<float32> xDev,
+            Tensor<float32> x, int64 xOff, KernelBuffer<float32> acc,
+            int32 act) {
+        if (this.sharedW != 0) { return false; }
+        int64 h0 = ExpertBank.residencyHits();
+        int64 w0 = ExpertBank.residencyWindowed();
+        int64 a0 = ExpertBank.residencyAdmissions();
+        int64 b0 = ExpertBank.residencyAdmissionBytes();
+        int64 tr0 = Clock.nanoTime();
+        this.routeInto(x, xOff, this.sc.sel, this.sc.w);
+        MoeFfn.mtRouteNs = MoeFfn.mtRouteNs + (Clock.nanoTime() - tr0);
+        int64 hid = (int64) this.hidden;
+        int64 wid = (int64) this.widthN;
+        boolean first = true;
+        int32 k = 0;
+        while (k < this.usedN) {
+            int32 e = this.sc.sel[k];
+            float32 w = this.sc.w[k];
+            int64 tg0 = Clock.nanoTime();
+            if (this.gateB.stagedKeepReady(e)
+                    && this.upB.stagedKeepReady(e)
+                    && this.downB.stagedKeepReady(e)) {
+                Linear.stageDeviceActivation(xDev, hid);
+                this.gateB.matvecStagedKeepAt(e);
+                this.upB.matvecStagedKeepAt(e);
+                MoeFfn.mtGateUpNs = MoeFfn.mtGateUpNs
+                    + (Clock.nanoTime() - tg0);
+                int64 tgl0 = Clock.nanoTime();
+                Prim.gluDevice(this.gateB.outOf(e), this.upB.outOf(e),
+                    wid, act);
+                MoeFfn.mtGluNs = MoeFfn.mtGluNs
+                    + (Clock.nanoTime() - tgl0);
+                int64 td0 = Clock.nanoTime();
+                Linear.stageDeviceActivation(this.gateB.outOf(e), wid);
+                this.downB.matvecStagedKeepAt(e);
+                MoeFfn.mtDownNs = MoeFfn.mtDownNs
+                    + (Clock.nanoTime() - td0);
+                int64 tc0 = Clock.nanoTime();
+                Prim.axpbyDevice(acc, this.downB.outOf(e), w,
+                    first ? 0.0f : 1.0f, hid);
+                MoeFfn.mtCombNs = MoeFfn.mtCombNs
+                    + (Clock.nanoTime() - tc0);
+            } else {
+                // Host mid-chain: exactly the windowed forwardRow body
+                // for this one expert, then one upload into the same
+                // accumulation.
+                float32[] xb = x.hostBuffer();
+                int64 xo = x.hostBase() + xOff;
+                float32[] gb = this.sc.g.hostBuffer();
+                int64 go = this.sc.g.hostBase();
+                float32[] eb = this.sc.eOut.hostBuffer();
+                int64 eo = this.sc.eOut.hostBase();
+                this.gateB.matvecAt(e, xb, xo, gb, go);
+                this.upB.matvecAt(e, xb, xo,
+                    this.sc.u.hostBuffer(), this.sc.u.hostBase());
+                MoeFfn.mtGateUpNs = MoeFfn.mtGateUpNs
+                    + (Clock.nanoTime() - tg0);
+                int64 tgl0 = Clock.nanoTime();
+                Prim.gluRowHost(this.sc.g, 0L, this.sc.u, 0L,
+                    this.sc.g, 0L, this.widthN, act);
+                MoeFfn.mtGluNs = MoeFfn.mtGluNs
+                    + (Clock.nanoTime() - tgl0);
+                int64 td0 = Clock.nanoTime();
+                this.downB.matvecAt(e, gb, go, eb, eo);
+                MoeFfn.mtDownNs = MoeFfn.mtDownNs
+                    + (Clock.nanoTime() - td0);
+                int64 tc0 = Clock.nanoTime();
+                if (this.crossDev == null) {
+                    this.crossDev #= heap KernelBuffer<float32>(
+                        (uint64) hid);
+                    this.crossHost #= heap float32[hid];
+                }
+                // Queued launches may still read the stage and the
+                // scratch; the slow path pays the drain, not the fast
+                // one.
+                KernelStream cs = QuantKernel.stream();
+                cs.sync();
+                int64 ci = 0;
+                while (ci < hid) {
+                    this.crossHost[ci] = eb[eo + ci];
+                    ci = ci + 1;
+                }
+                this.crossDev.upload(this.crossHost, hid);
+                Prim.axpbyDevice(acc, this.crossDev, w,
+                    first ? 0.0f : 1.0f, hid);
+                MoeFfn.mtCombNs = MoeFfn.mtCombNs
+                    + (Clock.nanoTime() - tc0);
+            }
+            first = false;
+            k = k + 1;
+        }
+        this.emitCacheRecord("row", h0, w0, a0, b0);
+        return true;
+    }
+
     public void forwardRow(Tensor<float32> x, int64 xOff,
             Tensor<float32> out, int64 outOff, int32 act) {
         int64 h0 = ExpertBank.residencyHits();
