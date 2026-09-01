@@ -4,6 +4,8 @@ import cajeta.math.Tensor;
 import cajeta.xpu.Device;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
+import cajeta.lang.Math;
+import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.model.CausalLM;
 import dev.cajeta.llm.model.ExpertBank;
 import dev.cajeta.llm.model.MoeFfn;
@@ -222,6 +224,143 @@ public class MoeSlotTest {
             Tensor<float32> o, int32 rows) {
         moe.forwardBatch(x, o, rows, 0);
         return;
+    }
+
+    /** 2.1.2 + 2.1.1 + the resident half of 2.1.4 — decode on
+     *  resident experts launches on the DEVICE and reads NOTHING from
+     *  the mapping: after a batch admits row 0's experts, a forwardRow
+     *  of that same row takes exactly 3*used slot hits (gate, up,
+     *  down per selected expert), every bank's touched counter stays
+     *  0, and each slot's charge still equals what it holds (the
+     *  decode route must not bind an uncharged form). The T0 arm —
+     *  budget 0 reads used strides per token — stays in
+     *  MoeForwardTest.aDecodeCountsUsedStridesPerToken, which runs at
+     *  the 0 default. */
+    @Test
+    public void residentDecodeHitsSlotsAndReadsNoBytes() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        if (!moe.deviceGroupedFor(8)) {
+            MoeSlotTest.saySkip();
+            return;
+        }
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        Tensor<float32> x #= MoeSlotTest.rowsOf(8);
+        Tensor<float32> o #= MoeSlotTest.outOf(8);
+        moe.forwardBatch(x, o, 8, 0);
+
+        // Row 0's routing was in the batch, so its experts are
+        // admitted in all three banks.
+        moe.resetTouched();
+        int64 hits0 = ExpertBank.residencyHits();
+        Tensor<float32> or1 #= MoeSlotTest.outOf(1);
+        moe.forwardRow(x, 0L, or1, 0L, 0);
+        int64 dHits = ExpertBank.residencyHits() - hits0;
+        Assert.equals((int64) (3 * moe.used()), dHits);
+        int32 b = 0;
+        while (b < 3) {
+            ExpertBank bank = moe.gateBank();
+            if (b == 1) { bank = moe.upBank(); }
+            if (b == 2) { bank = moe.downBank(); }
+            int32 e = 0;
+            while (e < bank.experts()) {
+                Assert.equals(0L, bank.touchedBytes(e));
+                if (bank.isAdmitted(e)) {
+                    Assert.equals(bank.slotBytesOf(e),
+                        bank.slotDeviceBytes(e));
+                }
+                e = e + 1;
+            }
+            b = b + 1;
+        }
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
+    }
+
+    /** Budget 0: a decode row takes ZERO slot hits — the negative arm
+     *  without which the counter above could count anything. */
+    @Test
+    public void budgetZeroDecodeTakesNoSlotHits() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        if (!moe.deviceGroupedFor(8)) {
+            MoeSlotTest.saySkip();
+            return;
+        }
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(0L);
+        int64 hits0 = ExpertBank.residencyHits();
+        Tensor<float32> x #= MoeSlotTest.rowsOf(1);
+        Tensor<float32> o #= MoeSlotTest.outOf(1);
+        moe.forwardRow(x, 0L, o, 0L, 0);
+        Assert.equals(hits0, ExpertBank.residencyHits());
+        ExpertBank.resetResidency();
+    }
+
+    /** 2.1.3 — resident decode agrees with the host decode. The
+     *  device mat-vec rides the q8 integer route (activations
+     *  quantized to q8_K), so this is 13.21's quantized-execution
+     *  regime, not the bit-exact one: thresholds CALIBRATED below
+     *  from the measured run (printed), with the host arm exact.
+     *  Mixed (capped) sits between the brackets by construction —
+     *  each expert takes one arm or the other, and both arms are
+     *  asserted here. */
+    @Test
+    public void residentDecodeMatchesHostDecode() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        if (!moe.deviceGroupedFor(8)) {
+            MoeSlotTest.saySkip();
+            return;
+        }
+        int32 h = MoeForwardTest.H;
+        Tensor<float32> x #= MoeSlotTest.rowsOf(8);
+
+        // HOST arm first (budget 0, routing pinned off so the shexp
+        // Linears stay exact-host too — the MoeGroupedTest control).
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(0L);
+        QuantKernel.setRoutingEnabled(false);
+        Tensor<float32> oh #= MoeSlotTest.outOf(1);
+        moe.forwardRow(x, 0L, oh, 0L, 0);
+        QuantKernel.setRoutingEnabled(true);
+
+        // RESIDENT arm: admit via a batch, then decode the same row.
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        Tensor<float32> ob #= MoeSlotTest.outOf(8);
+        moe.forwardBatch(x, ob, 8, 0);
+        int64 hits0 = ExpertBank.residencyHits();
+        Tensor<float32> od #= MoeSlotTest.outOf(1);
+        moe.forwardRow(x, 0L, od, 0L, 0);
+        Assert.isTrue(ExpertBank.residencyHits() > hits0);
+
+        float32[] hb = oh.hostBuffer();
+        int64 ho = oh.hostBase();
+        float32[] db = od.hostBuffer();
+        int64 dof = od.hostBase();
+        float64 dot = 0.0;
+        float64 nh = 0.0;
+        float64 nd = 0.0;
+        float64 maxAbs = 0.0;
+        int32 i = 0;
+        while (i < h) {
+            float64 a = (float64) hb[ho + (int64) i];
+            float64 c = (float64) db[dof + (int64) i];
+            dot = dot + a * c;
+            nh = nh + a * a;
+            nd = nd + c * c;
+            float64 ad = a - c;
+            if (ad < 0.0) { ad = 0.0 - ad; }
+            if (ad > maxAbs) { maxAbs = ad; }
+            i = i + 1;
+        }
+        float64 cos = dot / (Math.sqrt(nh) * Math.sqrt(nd));
+        System.stdout.println("  mec 2.1.3 ffn-row: cosine " + cos
+            + "  maxAbs " + maxAbs);
+        Assert.isTrue(cos >= 0.9999);
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
     }
 
     /** 1.1.5 — accounting is readable and consistent (spec 3.2.4):

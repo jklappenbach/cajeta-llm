@@ -3,6 +3,7 @@ package dev.cajeta.llm.model;
 import cajeta.lang.Math;
 import cajeta.lang.String;
 import cajeta.math.Tensor;
+import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.Checkpoint;
 
@@ -25,6 +26,7 @@ import dev.cajeta.llm.io.Checkpoint;
 public final class MoeFfn extends InfModule {
 
     Linear router;             // ffn_gate_inp: [experts, hidden] f32
+    int32 layerIdx;    // moe-cache unit 3: record attribution; -1 until set
     ExpertBank gateB;
     ExpertBank upB;
     ExpertBank downB;
@@ -68,6 +70,7 @@ public final class MoeFfn extends InfModule {
         this.widthN = cfg.expertFfn;   // 0 = derive from the slab
         this.hidden = cfg.hiddenSize;
         this.router = heap Linear(cfg.hiddenSize, cfg.expertCount);
+        this.layerIdx = 0 - 1;
         this.gateB = heap ExpertBank();
         this.upB = heap ExpertBank();
         this.downB = heap ExpertBank();
@@ -240,6 +243,10 @@ public final class MoeFfn extends InfModule {
      */
     public void forwardRow(Tensor<float32> x, int64 xOff,
             Tensor<float32> out, int64 outOff, int32 act) {
+        int64 h0 = ExpertBank.residencyHits();
+        int64 w0 = ExpertBank.residencyWindowed();
+        int64 a0 = ExpertBank.residencyAdmissions();
+        int64 b0 = ExpertBank.residencyAdmissionBytes();
         this.routeInto(x, xOff, this.sc.sel, this.sc.w);
         float32[] xb = x.hostBuffer();
         int64 xo = x.hostBase() + xOff;
@@ -257,12 +264,23 @@ public final class MoeFfn extends InfModule {
         int32 k = 0;
         while (k < this.usedN) {
             int32 e = this.sc.sel[k];
-            this.gateB.matvecAt(e, xb, xo, gb, go);
-            this.upB.matvecAt(e, xb, xo,
-                this.sc.u.hostBuffer(), this.sc.u.hostBase());
+            // moe-cache 2.2.1: a RESIDENT expert's mat-vec launches on
+            // the device against its slot; an un-admitted one keeps
+            // the host path. Per expert, per bank (spec 3.3.2) — the
+            // combination below is identical either way.
+            if (!this.gateB.matvecDeviceAt(e, xb, xo, gb, go)) {
+                this.gateB.matvecAt(e, xb, xo, gb, go);
+            }
+            if (!this.upB.matvecDeviceAt(e, xb, xo,
+                    this.sc.u.hostBuffer(), this.sc.u.hostBase())) {
+                this.upB.matvecAt(e, xb, xo,
+                    this.sc.u.hostBuffer(), this.sc.u.hostBase());
+            }
             Prim.gluRowHost(this.sc.g, 0L, this.sc.u, 0L, this.sc.g, 0L,
                 this.widthN, act);
-            this.downB.matvecAt(e, gb, go, eb, eo);
+            if (!this.downB.matvecDeviceAt(e, gb, go, eb, eo)) {
+                this.downB.matvecAt(e, gb, go, eb, eo);
+            }
             float32 w = this.sc.w[k];
             j = 0;
             while (j < (int64) this.hidden) {
@@ -272,6 +290,7 @@ public final class MoeFfn extends InfModule {
             k = k + 1;
         }
         this.addSharedRow(x, xOff, ob, oo, act);
+        this.emitCacheRecord("row", h0, w0, a0, b0);
         return;
     }
 
@@ -331,6 +350,10 @@ public final class MoeFfn extends InfModule {
      */
     public void forwardBatch(Tensor<float32> x, Tensor<float32> out,
             int32 rows, int32 act) {
+        int64 h0 = ExpertBank.residencyHits();
+        int64 w0 = ExpertBank.residencyWindowed();
+        int64 a0 = ExpertBank.residencyAdmissions();
+        int64 b0 = ExpertBank.residencyAdmissionBytes();
         this.sc.ensureBatch(rows, this.usedN, this.expertsN,
             this.widthN, this.hidden);
         int64 h = (int64) this.hidden;
@@ -466,6 +489,32 @@ public final class MoeFfn extends InfModule {
                 act);
             r = r + 1;
         }
+        this.emitCacheRecord("batch", h0, w0, a0, b0);
+        return;
+    }
+
+    /**
+     * moe-expert-cache unit 3 (spec 8.1): ONE record per MoE layer
+     * call — this layer's slot hits, windowed fallbacks, admissions
+     * and admitted bytes for the call just made, plus this layer's
+     * total resident bytes. The per-layer hit/fallback split cabra
+     * renders IS the record stream keyed by v0. Emitted through the
+     * unit-21 seam: with no callback registered `Diag.emit` builds
+     * nothing, and the four counter snapshots around the call are
+     * plain static reads. A dense model never reaches this method, so
+     * a non-MoE run emits nothing (spec 9.1.5) without a guard.
+     */
+    void emitCacheRecord(String mode, int64 h0, int64 w0, int64 a0,
+            int64 b0) {
+        if (!Diag.on()) { return; }
+        int64 res = this.gateB.residentBytes()
+            + this.upB.residentBytes() + this.downB.residentBytes();
+        Diag.emit("expert-cache", 0 - 1, mode, (int64) this.layerIdx,
+            ExpertBank.residencyHits() - h0,
+            ExpertBank.residencyWindowed() - w0,
+            ExpertBank.residencyAdmissions() - a0,
+            ExpertBank.residencyAdmissionBytes() - b0,
+            res);
         return;
     }
 

@@ -1,0 +1,146 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.DiagCallback;
+import dev.cajeta.llm.DiagRecord;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.MoeFfn;
+
+/**
+ * moe-expert-cache plan 3.1 — the `expert-cache` record (spec 8.1).
+ *
+ * One record per MoE layer call: the call's slot hits, T0 dispatches
+ * (window, host grouped, or host mat-vec — every non-slot serving),
+ * admissions and admitted bytes, plus the layer's resident total.
+ * Rides the unit-21 seam: no callback, nothing built (21.1.2's rule);
+ * a dense model never reaches the emit site, so non-MoE emits nothing
+ * by construction — asserted here anyway, on a dense fixture, because
+ * "by construction" is how vacuous greens are born.
+ */
+public class MoeCacheRecordTest {
+
+    public MoeCacheRecordTest() { return; }
+
+    /** 3.1.1 — with a callback registered, a grouped forward emits
+     *  one record whose deltas match the counters: the FIRST batch
+     *  admits (device) or serves T0 (any backend); a SECOND batch on
+     *  the device serves from slots. Runs on every backend — the
+     *  device-only claims gate themselves on the grouped route. */
+    @Test
+    public void moeForwardEmitsTheCacheRecord() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        boolean dev = moe.deviceGroupedFor(8);
+        ExpertBank.resetResidency();
+        if (dev) {
+            ExpertBank.setResidencyBudget(1152921504606846976L);
+        }
+        CacheRecCapture cap = heap CacheRecCapture();
+        Diag.register(cap);
+        Tensor<float32> x #= MoeSlotTest.rowsOf(8);
+        Tensor<float32> o #= MoeSlotTest.outOf(8);
+        moe.forwardBatch(x, o, 8, 0);
+        int32 first = cap.n;
+        moe.forwardBatch(x, o, 8, 0);
+        Diag.register(null);
+
+        Assert.equals(1L, (int64) first);
+        Assert.equals(2L, (int64) cap.n);
+        // Layer attribution and mode ride the record.
+        Assert.equals(0L, cap.layer[0]);
+        Assert.isTrue(cap.mode0.equals("batch"));
+        if (dev) {
+            // First batch: admissions, no hits. Second: hits, no
+            // admissions — the per-layer split cabra renders.
+            Assert.isTrue(cap.admits[0] > 0L);
+            Assert.equals(0L, cap.hits[0]);
+            Assert.equals(0L, cap.admits[1]);
+            Assert.isTrue(cap.hits[1] > 0L);
+            Assert.isTrue(cap.resident[1] > 0L);
+        } else {
+            // Host grouped path: every dispatch is T0, nothing admits.
+            Assert.isTrue(cap.windowed[0] > 0L);
+            Assert.equals(0L, cap.admits[0]);
+            Assert.equals(0L, cap.hits[0]);
+        }
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
+    }
+
+    /** 3.1.1's negative half — no callback, NOTHING is built. */
+    @Test
+    public void unregisteredMoeForwardBuildsNoRecord() {
+        Diag.register(null);
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        int64 b0 = Diag.builtCount();
+        Tensor<float32> x #= MoeSlotTest.rowsOf(4);
+        Tensor<float32> o #= MoeSlotTest.outOf(4);
+        moe.forwardBatch(x, o, 4, 0);
+        Assert.equals(b0, Diag.builtCount());
+    }
+
+    /** 3.1.2 — a dense model emits no expert-cache record and moves
+     *  no residency counter. */
+    @Test
+    public void denseModelEmitsNoCacheRecord() {
+        ExpertBank.resetResidency();
+        CacheRecCapture cap = heap CacheRecCapture();
+        Diag.register(cap);
+        CausalLM m #= RoutableFixtureTest.mk(1);
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+        int32 tok = m.prefill(p, 8);
+        Diag.register(null);
+        Assert.isTrue(tok >= 0);
+        Assert.equals(0L, (int64) cap.n);
+        Assert.equals(0L, ExpertBank.residencyAdmissions());
+        Assert.equals(0L, ExpertBank.residencyHits());
+    }
+}
+
+/** Copies each expert-cache record's fields (valid only during the
+ *  call, 11.8.3). Layout: v0 layer, v1 hits, v2 T0 dispatches,
+ *  v3 admissions, v4 admitted bytes, v5 resident bytes. */
+final class CacheRecCapture implements DiagCallback {
+    public int32 n;
+    public String mode0;
+    public int64[] layer;
+    public int64[] hits;
+    public int64[] windowed;
+    public int64[] admits;
+    public int64[] bytes;
+    public int64[] resident;
+    public CacheRecCapture() {
+        this.n = 0;
+        this.mode0 #= "";
+        this.layer #= heap int64[64];
+        this.hits #= heap int64[64];
+        this.windowed #= heap int64[64];
+        this.admits #= heap int64[64];
+        this.bytes #= heap int64[64];
+        this.resident #= heap int64[64];
+    }
+    public void onRecord(DiagRecord r) {
+        if (!r.category.equals("expert-cache")) { return; }
+        if (this.n >= 64) { return; }
+        if (this.n == 0) {
+            int8[] b #= r.name.toBytes();
+            String c = heap String(#b,
+                r.name.byteLength());
+            this.mode0 #= #c;
+        }
+        this.layer[this.n] = r.v0;
+        this.hits[this.n] = r.v1;
+        this.windowed[this.n] = r.v2;
+        this.admits[this.n] = r.v3;
+        this.bytes[this.n] = r.v4;
+        this.resident[this.n] = r.v5;
+        this.n = this.n + 1;
+        return;
+    }
+}
