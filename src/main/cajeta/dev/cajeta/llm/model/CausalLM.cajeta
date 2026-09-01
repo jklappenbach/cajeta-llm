@@ -365,11 +365,22 @@ public final class CausalLM extends InfModule {
         // worst of both. rows==1 because only decode has a residual chain
         // short enough for one buffer.
         boolean resident = rows == 1 && this.deviceResidentReady();
+        if (rows == 1 && !this.decSaid) {
+            // The decode twin of `prefill-mode` (unit 38): which path
+            // this engine's decode actually takes, said once, by the
+            // engine — a timing inference is not a mechanism check.
+            this.decSaid = true;
+            Diag.emit("decode-mode", 0 - 1,
+                resident ? "resident" : "host", 0L, 0L, 0L, 0L, 0L, 0L);
+        }
         if (!resident) {
             // The host path reads K/V bytes, so the device planes owe the
             // cache whatever they hold beyond it (10.11.2). Prefill, a
             // non-Llama layout and a disabled route all land here.
+            int64 tsk0 = Clock.nanoTime();
             this.syncKvToHost(seq);
+            CausalLM.hdSyncKvNs = CausalLM.hdSyncKvNs
+                + (Clock.nanoTime() - tsk0);
         }
         if (resident) {
             int64 tp0 = Clock.nanoTime();
@@ -438,8 +449,8 @@ public final class CausalLM extends InfModule {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
             if (resident) {
-                this.residentLayer(seq, l, d, a, q, k, v, ao, scores,
-                    h, qd, kvd, inter, nH, nKv, hd, startPos);
+                this.residentLayer(seq, l, d, a, xn, mlpOut, q, k, v, ao,
+                    scores, h, qd, kvd, inter, nH, nKv, hd, startPos);
                 l = l + 1;
                 continue;
             }
@@ -452,6 +463,7 @@ public final class CausalLM extends InfModule {
                 int32 p = startPos + r;
 
                 // Attention sublayer.
+                int64 tph0 = Clock.nanoTime();
                 Prim.rmsnormRowHost(hs, rh, d.inputLayernorm.weight,
                     d.inputLayernorm.eps, xn, rh, h, d.normForm);
                 // A NEW activation is current: `xn` was just rewritten at
@@ -493,10 +505,14 @@ public final class CausalLM extends InfModule {
                     throw heap LlmException("kv pool exhausted at layer "
                         + l + " position " + p);
                 }
+                int64 tat0 = Clock.nanoTime();
+                CausalLM.hdProjNs = CausalLM.hdProjNs + (tat0 - tph0);
                 // Causal by construction; the layer's window clamps in
                 // prefill AND decode inside the cache read (spec 5.9).
                 this.cache.attendRow(seq, l, q, rq, a.scale, scores, ao, rq,
                     nH, nKv, hd);
+                int64 top0 = Clock.nanoTime();
+                CausalLM.hdAttendNs = CausalLM.hdAttendNs + (top0 - tat0);
                 a.oProj.matvecInto(ao, rq, proj, rh);
                 if (d.fourNorm) {
                     // Gemma layout: post-norm on the sublayer OUTPUT.
@@ -506,6 +522,8 @@ public final class CausalLM extends InfModule {
                         d.normForm);
                 }
                 HostOps.addRow(hs, rh, proj, rh, h);
+                int64 tmlp0 = Clock.nanoTime();
+                CausalLM.hdOProjNs = CausalLM.hdOProjNs + (tmlp0 - top0);
 
                 // MLP sublayer. Two-norm layout uses
                 // post_attention_layernorm as the pre-MLP norm.
@@ -558,6 +576,8 @@ public final class CausalLM extends InfModule {
                         d.normForm);
                 }
                 HostOps.addRow(hs, rh, mlpOut, rh, h);
+                CausalLM.hdMlpNs = CausalLM.hdMlpNs
+                    + (Clock.nanoTime() - tmlp0);
                 r = r + 1;
             }
             if (d.moe != null) {
@@ -567,7 +587,10 @@ public final class CausalLM extends InfModule {
                 // a multi-row chunk (15.12 — each selected expert's
                 // bytes read once per batch).
                 if (rows == 1) {
+                    int64 tmoe0 = Clock.nanoTime();
                     d.moe.forwardRow(xn, 0L, mlpOut, 0L, d.activation);
+                    CausalLM.hdMoeNs = CausalLM.hdMoeNs
+                        + (Clock.nanoTime() - tmoe0);
                 } else {
                     d.moe.forwardBatch(xn, mlpOut, rows, d.activation);
                 }
@@ -685,6 +708,7 @@ public final class CausalLM extends InfModule {
     // the residual stream and one for the norm output, allocated once.
     KernelBuffer<float32> hsDev;
     KernelBuffer<float32> xnDev;
+    KernelBuffer<float32> moeDev;   // unit 38: MoE crossing up-leg
     float32[] hsHost;
 
     // Prefill-resident hidden state (10.12.7.b): `[rows x h]` device
@@ -927,6 +951,32 @@ public final class CausalLM extends InfModule {
         CausalLM.fuseTail = on;
     }
 
+    // ── Host-path decode phase split (parity attribution): where a
+    // per-row token goes when the resident path is refused (MoE /
+    // QK-norm shapes). Wall time per section; the bench resets before
+    // its decode loop and divides by tokens. ──
+    static int64 hdSyncKvNs;  // syncKvToHost at forwardRows entry
+    static int64 hdProjNs;    // pre-norm + q/k/v proj + qk-norm + rope + append
+    static int64 hdAttendNs;  // cache.attendRow (host attention over KV)
+    static int64 hdOProjNs;   // oProj + residual add
+    static int64 hdMlpNs;     // dense MLP sublayer (nil on all-MoE models)
+    static int64 hdMoeNs;     // moe.forwardRow
+    public static int64 hostDecSyncKvNs() { return CausalLM.hdSyncKvNs; }
+    public static int64 hostDecProjNs()   { return CausalLM.hdProjNs; }
+    public static int64 hostDecAttendNs() { return CausalLM.hdAttendNs; }
+    public static int64 hostDecOProjNs()  { return CausalLM.hdOProjNs; }
+    public static int64 hostDecMlpNs()    { return CausalLM.hdMlpNs; }
+    public static int64 hostDecMoeNs()    { return CausalLM.hdMoeNs; }
+    public static void resetHostDecTimers() {
+        CausalLM.hdSyncKvNs = 0L;
+        CausalLM.hdProjNs = 0L;
+        CausalLM.hdAttendNs = 0L;
+        CausalLM.hdOProjNs = 0L;
+        CausalLM.hdMlpNs = 0L;
+        CausalLM.hdMoeNs = 0L;
+        return;
+    }
+
     static int64 dtPreNs;
     static int64 dtSyncNs;
     static int64 dtHsDownNs;
@@ -1035,15 +1085,25 @@ public final class CausalLM extends InfModule {
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
-            if (d.moe != null) { return false; }   // unit 28
-            if (d.fourNorm || a.qNorm != null) { return false; }
+            // Unit 38 (spec 15.21.1): qNorm no longer disqualifies —
+            // the per-head norms run on the device between projection
+            // and rope (unit 29's kernel, nH/nKv rows of hd) — and an
+            // MoE layer's FFN takes the host crossing (correct with
+            // slots or windowed), so only the four attention
+            // projections must route. Before this, the 30B decoded on
+            // the host attention path: 110 ms of a 211 ms token.
+            if (d.fourNorm) { return false; }
             if (!a.qProj.isDeviceRouted() || !a.kProj.isDeviceRouted()
                     || !a.vProj.isDeviceRouted()
-                    || !a.oProj.isDeviceRouted()
-                    || !d.mlp.gateProj.isDeviceRouted()
-                    || !d.mlp.upProj.isDeviceRouted()
-                    || !d.mlp.downProj.isDeviceRouted()) {
+                    || !a.oProj.isDeviceRouted()) {
                 return false;
+            }
+            if (d.moe == null) {
+                if (!d.mlp.gateProj.isDeviceRouted()
+                        || !d.mlp.upProj.isDeviceRouted()
+                        || !d.mlp.downProj.isDeviceRouted()) {
+                    return false;
+                }
             }
             l = l + 1;
         }
@@ -1098,15 +1158,23 @@ public final class CausalLM extends InfModule {
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
-            if (d.moe != null) { return false; }   // unit 28
+            // Unit 38: an MoE layer's FFN never runs through `d.mlp`,
+            // so only its attention projections gate the device
+            // planes; refusing MoE here starved `ensureDeviceKv` and
+            // forced the host attend under an otherwise-resident
+            // stack.
             if (!a.qProj.deviceLaunchable()
                     || !a.kProj.deviceLaunchable()
                     || !a.vProj.deviceLaunchable()
-                    || !a.oProj.deviceLaunchable()
-                    || !d.mlp.gateProj.deviceLaunchable()
-                    || !d.mlp.upProj.deviceLaunchable()
-                    || !d.mlp.downProj.deviceLaunchable()) {
+                    || !a.oProj.deviceLaunchable()) {
                 return false;
+            }
+            if (d.moe == null) {
+                if (!d.mlp.gateProj.deviceLaunchable()
+                        || !d.mlp.upProj.deviceLaunchable()
+                        || !d.mlp.downProj.deviceLaunchable()) {
+                    return false;
+                }
             }
             l = l + 1;
         }
@@ -1122,6 +1190,7 @@ public final class CausalLM extends InfModule {
      *  other's entries — 25.3). */
     int64 stageTag;
     boolean batchSaid;
+    boolean decSaid;
 
     /**
      * The layer stack with the PROJECTIONS BATCHED over all rows.
@@ -1674,6 +1743,10 @@ public final class CausalLM extends InfModule {
         this.hsHost #= heap float32[(int64) h];
         this.hsDev #= heap KernelBuffer<float32>((uint64) h);
         this.xnDev #= heap KernelBuffer<float32>((uint64) h);
+        // Unit 38: the MoE host-crossing's up-leg (h floats). Its own
+        // buffer, not xnDev — the expert sum must not clobber the
+        // normed activation mid-flight on the stream.
+        this.moeDev #= heap KernelBuffer<float32>((uint64) h);
         return;
     }
 
@@ -1688,6 +1761,7 @@ public final class CausalLM extends InfModule {
      * layer where the host-driven path has eleven.
      */
     void residentLayer(int32 seq, int32 li, DecoderLayer d, Attention a,
+            Tensor<float32> xn, Tensor<float32> mlpOut,
             Tensor<float32> q, Tensor<float32> k, Tensor<float32> v,
             Tensor<float32> ao, Tensor<float32> scores,
             int32 h, int32 qd, int32 kvd, int32 inter,
@@ -1711,6 +1785,18 @@ public final class CausalLM extends InfModule {
             a.qProj.matvecStagedKeep();
             a.kProj.matvecStagedKeep();
             a.vProj.matvecStagedKeep();
+            if (a.qNorm != null) {
+                // Per-head QK-norm BEFORE RoPE (spec 5.10, build_qwen3
+                // order) — unit 29's kernel: nH (nKv) rows of hd
+                // sharing one [hd] weight, in place in the
+                // projections' own output buffers, on the same stream.
+                Prim.rmsnormBatchDevice(a.qProj.out(), a.qProj.out(),
+                    a.qNorm.deviceWeight(), (int64) nH, (int64) hd,
+                    a.qNorm.eps, d.normForm);
+                Prim.rmsnormBatchDevice(a.kProj.out(), a.kProj.out(),
+                    a.kNorm.deviceWeight(), (int64) nKv, (int64) hd,
+                    a.kNorm.eps, d.normForm);
+            }
             dkv.rope(li, a.qProj.out(), a.kProj.out(), p);
             dkv.append(li, a.kProj.out(), a.vProj.out(), p);
             dkv.attend(li, a.qProj.out(), p, a.scale);
@@ -1720,6 +1806,24 @@ public final class CausalLM extends InfModule {
             a.qProj.matvecStaged(q, 0L);
             a.kProj.matvecStaged(k, 0L);
             a.vProj.matvecStaged(v, 0L);
+            if (a.qNorm != null) {
+                // Host attend fallback: q/k are already down, so the
+                // per-head norms run where the per-row path runs them.
+                int32 hh = 0;
+                while (hh < nH) {
+                    Prim.rmsnormRowHost(q, (int64) (hh * hd),
+                        a.qNorm.weight, a.qNorm.eps,
+                        q, (int64) (hh * hd), hd, d.normForm);
+                    hh = hh + 1;
+                }
+                hh = 0;
+                while (hh < nKv) {
+                    Prim.rmsnormRowHost(k, (int64) (hh * hd),
+                        a.kNorm.weight, a.kNorm.eps,
+                        k, (int64) (hh * hd), hd, d.normForm);
+                    hh = hh + 1;
+                }
+            }
             Prim.ropeRowHost(q, 0L, nH, hd, p, a.ropeInv);
             Prim.ropeRowHost(k, 0L, nKv, hd, p, a.ropeInv);
             if (!this.cache.appendRow(seq, li, k, 0L, v, 0L, p)) {
@@ -1736,6 +1840,36 @@ public final class CausalLM extends InfModule {
         Prim.rmsnormDevice(this.xnDev, this.hsDev,
             d.postAttentionLayernorm.deviceWeight(), (int64) h,
             d.postAttentionLayernorm.eps, d.normForm);
+        if (d.moe != null) {
+            // MoE FFN via the HOST CROSSING (unit 38; unit 39 keeps
+            // the chain on the device): the normed activation comes
+            // down, the expert forward runs exactly as the host path
+            // runs it — resident slots or windowed, spec 3.3.2 — and
+            // the expert sum goes back up onto the residual stream.
+            // The unit-29 prefill seam, per decode row. The sync is
+            // the layer's only one, and it is what unit 39 removes.
+            KernelStream ms = QuantKernel.stream();
+            ms.sync();
+            this.xnDev.download(this.hsHost, (int64) h);
+            float32[] xb = xn.hostBuffer();
+            int64 xo = xn.hostBase();
+            int64 cm = 0;
+            while (cm < (int64) h) {
+                xb[xo + cm] = this.hsHost[cm];
+                cm = cm + 1;
+            }
+            d.moe.forwardRow(xn, 0L, mlpOut, 0L, d.activation);
+            float32[] mb = mlpOut.hostBuffer();
+            int64 mo = mlpOut.hostBase();
+            cm = 0;
+            while (cm < (int64) h) {
+                this.hsHost[cm] = mb[mo + cm];
+                cm = cm + 1;
+            }
+            this.moeDev.upload(this.hsHost, (int64) h);
+            Prim.addDevice(this.hsDev, this.moeDev, (int64) h);
+            return;
+        }
         Linear.stageDeviceActivation(this.xnDev, (int64) h);
         d.mlp.gateProj.matvecStagedKeep();
         d.mlp.upProj.matvecStagedKeep();

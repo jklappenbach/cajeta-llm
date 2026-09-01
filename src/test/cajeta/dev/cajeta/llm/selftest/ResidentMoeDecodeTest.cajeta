@@ -1,0 +1,257 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.DiagCallback;
+import dev.cajeta.llm.DiagRecord;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+
+/**
+ * cajeta-llm plan 38.1 — resident decode for the QK-norm + MoE shape
+ * (spec 15.21.1).
+ *
+ * Before unit 38 `deviceResidentReady` refused any model with
+ * `qNorm != null` or an MoE layer, so the 30B decoded on the host
+ * attention path — measured 2026-09-01 as 110 ms of the 211 ms token
+ * at 512 ctx. The fixture is toy-routable-moe: the routable dims under
+ * arch qwen3moe (4 experts, top-2, expert width 512, per-head q/k
+ * norms) — the 30B's shape class at fixture scale, satisfying every
+ * routing precondition toy-routable satisfies.
+ *
+ * The engagement assertions ride the engine's own `decode-mode` record
+ * (prefill-mode's twin), never a timing inference; the capability gate
+ * rides `Linear.residentEnabled()` and the DENSE twin's
+ * `deviceRoutable()` — properties of the backend and geometry, never
+ * the shape predicate under test (QkNormBatchTest's rule).
+ */
+public class ResidentMoeDecodeTest {
+
+    static final String FIX =
+        "src/test/fixtures/gguf/toy-routable-moe.gguf";
+
+    public ResidentMoeDecodeTest() { return; }
+
+    static #CausalLM mk() {
+        Checkpoint ck #= Checkpoint.open(ResidentMoeDecodeTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    /** Backend + geometry capability, via the dense twin. */
+    static boolean residentHere() {
+        if (!Linear.residentEnabled()) { return false; }
+        CausalLM dense #= RoutableFixtureTest.mk(1);
+        return dense.deviceRoutable();
+    }
+
+    /** Prefill 8, then 6 greedy decode steps. Tokens land in `toks`
+     *  (7 entries: prefill argmax + 6 steps); the LAST step's logits
+     *  are copied into `lg`. */
+    static void gen(CausalLM m, int32[] toks, float32[] lg) {
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+        int32 nxt = m.prefill(p, 8);
+        toks[0] = nxt;
+        int32[] one = heap int32[1];
+        int32 g = 0;
+        while (g < 6) {
+            one[0] = nxt;
+            nxt = m.stepSeq(0, one, 0, 1);
+            toks[g + 1] = nxt;
+            g = g + 1;
+        }
+        Tensor<float32> lt = m.logits();
+        float32[] lb = lt.hostBuffer();
+        int64 lo = lt.hostBase();
+        int32 i = 0;
+        while (i < (int32) lg.count()) {
+            lg[i] = lb[lo + (int64) i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** The fixture's own contract: arch qwen3moe turns BOTH the
+     *  per-head norms and the expert config on. Without this arm the
+     *  parity arms below could agree on a dense, norm-free forward. */
+    @Test
+    public void fixtureDeclaresTheShape() {
+        Checkpoint ck #= Checkpoint.open(ResidentMoeDecodeTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        ck.close();
+        Assert.isTrue(cfg.qkNorm);
+        Assert.equals(4L, (int64) cfg.expertCount);
+        Assert.equals(2L, (int64) cfg.expertUsedCount);
+        Assert.equals(512L, (int64) cfg.expertFfn);
+    }
+
+    /** 38.1.1 — the qk+moe shape decodes RESIDENT, says so in the
+     *  record, and matches the forced-host arm token-for-token with a
+     *  calibrated logit bar. Prefill runs under identical settings in
+     *  both arms; only the decode steps differ. */
+    @Test
+    public void residentDecodeEngagesAndMatchesHost() {
+        if (!ResidentMoeDecodeTest.residentHere()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        // HOST arm: residency toggled off for the decode steps only.
+        CausalLM mh #= ResidentMoeDecodeTest.mk();
+        int32[] th = heap int32[7];
+        float32[] lh = heap float32[256];
+        DecodeModeCapture capH = heap DecodeModeCapture();
+        Diag.register(capH);
+        int32[] ph #= RoutableFixtureTest.promptOf(8, 3);
+        int32 nh = mh.prefill(ph, 8);
+        Linear.setDeviceResident(false);
+        th[0] = nh;
+        int32[] oneH = heap int32[1];
+        int32 gh = 0;
+        while (gh < 6) {
+            oneH[0] = nh;
+            nh = mh.stepSeq(0, oneH, 0, 1);
+            th[gh + 1] = nh;
+            gh = gh + 1;
+        }
+        Linear.setDeviceResident(true);
+        Diag.register(null);
+        Tensor<float32> lth = mh.logits();
+        float32[] lhb = lth.hostBuffer();
+        int64 lho = lth.hostBase();
+        int32 ci = 0;
+        while (ci < 256) {
+            lh[ci] = lhb[lho + (int64) ci];
+            ci = ci + 1;
+        }
+        Assert.isTrue(capH.saw);
+        Assert.isTrue(capH.mode.equals("host"));
+
+        // RESIDENT arm.
+        CausalLM mr #= ResidentMoeDecodeTest.mk();
+        int32[] tr = heap int32[7];
+        float32[] lr = heap float32[256];
+        DecodeModeCapture capR = heap DecodeModeCapture();
+        Diag.register(capR);
+        ResidentMoeDecodeTest.gen(mr, tr, lr);
+        Diag.register(null);
+        Assert.isTrue(capR.saw);
+        Assert.isTrue(capR.mode.equals("resident"));
+
+        // Same tokens, then the logit bar on the final step.
+        int32 t = 0;
+        while (t < 7) {
+            Assert.equals((int64) th[t], (int64) tr[t]);
+            t = t + 1;
+        }
+        float64 dot = 0.0;
+        float64 nh2 = 0.0;
+        float64 nr2 = 0.0;
+        int32 i = 0;
+        while (i < 256) {
+            float64 a = (float64) lh[i];
+            float64 b = (float64) lr[i];
+            dot = dot + a * b;
+            nh2 = nh2 + a * a;
+            nr2 = nr2 + b * b;
+            i = i + 1;
+        }
+        float64 cos = dot / (Math.sqrt(nh2) * Math.sqrt(nr2));
+        System.stdout.println("  38.1.1 decode logits: cosine " + cos);
+        // CALIBRATED (suite run, 2026-09-01, amdgpu): the printed
+        // cosine is 1 — the residual is below print precision, and
+        // the token stream is identical, so the two arms differ by at
+        // most the 13.21 float-reassociation class. The bar stays
+        // finite (not ==1.0) for other backends' reassociation room;
+        // it is still ~1000x tighter than a wrong-path failure (a
+        // skipped qk-norm moves 1-cos to ~1e-2 end-to-end,
+        // QkNormProbe).
+        Assert.isTrue(cos >= 0.99999);
+    }
+
+    /** 38.1.2 — the widened predicate holds across the toy shapes.
+     *  The dense qk twin (toy-routable-qk) ENGAGES — before unit 38
+     *  qNorm alone disqualified it. toy-moe engages TOO (measured
+     *  2026-09-01: even its H=16 attention projections route on
+     *  amdgpu — the "unroutable tiny shape" belief was wrong), so its
+     *  honest check is PARITY with its own forced-host arm, not a
+     *  mode assertion encoding a false refusal. The refusal path
+     *  itself is covered by 38.1.1's toggled host arm. */
+    @Test
+    public void residentPredicateIsHonestBothWays() {
+        if (!ResidentMoeDecodeTest.residentHere()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        CausalLM mq #= QkNormBatchTest.mk();
+        DecodeModeCapture capQ = heap DecodeModeCapture();
+        Diag.register(capQ);
+        int32[] pq #= RoutableFixtureTest.promptOf(8, 3);
+        int32 nq = mq.prefill(pq, 8);
+        int32[] oneQ = heap int32[1];
+        oneQ[0] = nq;
+        nq = mq.stepSeq(0, oneQ, 0, 1);
+        Diag.register(null);
+        Assert.isTrue(nq >= 0);
+        Assert.isTrue(capQ.saw);
+        Assert.isTrue(capQ.mode.equals("resident"));
+
+        // toy-moe: whatever mode the backend chooses, the tokens must
+        // match the forced-host arm — 4 steps, both arms fresh.
+        int32[] tr = heap int32[4];
+        int32[] th = heap int32[4];
+        ResidentMoeDecodeTest.gen4(tr);
+        Linear.setDeviceResident(false);
+        ResidentMoeDecodeTest.gen4(th);
+        Linear.setDeviceResident(true);
+        int32 t = 0;
+        while (t < 4) {
+            Assert.equals((int64) th[t], (int64) tr[t]);
+            t = t + 1;
+        }
+    }
+
+    /** 4 greedy decode steps over toy-moe, fresh model. */
+    static void gen4(int32[] toks) {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+        int32 n = m.prefill(p, 8);
+        int32[] one = heap int32[1];
+        int32 g = 0;
+        while (g < 4) {
+            one[0] = n;
+            n = m.stepSeq(0, one, 0, 1);
+            toks[g] = n;
+            g = g + 1;
+        }
+        return;
+    }
+}
+
+/** Captures the engine's `decode-mode` record (valid only during the
+ *  callback — the mode string is copied). */
+final class DecodeModeCapture implements DiagCallback {
+    public boolean saw;
+    public String mode;
+    public DecodeModeCapture() {
+        this.saw = false;
+        this.mode #= "";
+    }
+    public void onRecord(DiagRecord r) {
+        if (!r.category.equals("decode-mode")) { return; }
+        this.saw = true;
+        int8[] b #= r.name.toBytes();
+        String c = heap String(#b, r.name.byteLength());
+        this.mode #= #c;
+        return;
+    }
+}

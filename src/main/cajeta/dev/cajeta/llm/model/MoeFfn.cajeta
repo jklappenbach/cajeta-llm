@@ -1,6 +1,7 @@
 package dev.cajeta.llm.model;
 
 import cajeta.lang.Math;
+import cajeta.time.Clock;
 import cajeta.lang.String;
 import cajeta.math.Tensor;
 import dev.cajeta.llm.Diag;
@@ -27,6 +28,29 @@ public final class MoeFfn extends InfModule {
 
     Linear router;             // ffn_gate_inp: [experts, hidden] f32
     int32 layerIdx;    // moe-cache unit 3: record attribution; -1 until set
+
+    // ── forwardRow phase split (parity attribution, decode). ──
+    static int64 mtRouteNs;    // router matvec + softmax + top-k
+    static int64 mtGateUpNs;   // gate + up expert mat-vecs
+    static int64 mtGluNs;      // host GLU fold
+    static int64 mtDownNs;     // down expert mat-vecs
+    static int64 mtCombNs;     // weighted accumulate into the row
+    static int64 mtSharedNs;   // shared-expert sublayer
+    public static int64 rowRouteNs()  { return MoeFfn.mtRouteNs; }
+    public static int64 rowGateUpNs() { return MoeFfn.mtGateUpNs; }
+    public static int64 rowGluNs()    { return MoeFfn.mtGluNs; }
+    public static int64 rowDownNs()   { return MoeFfn.mtDownNs; }
+    public static int64 rowCombNs()   { return MoeFfn.mtCombNs; }
+    public static int64 rowSharedNs() { return MoeFfn.mtSharedNs; }
+    public static void resetRowTimers() {
+        MoeFfn.mtRouteNs = 0L;
+        MoeFfn.mtGateUpNs = 0L;
+        MoeFfn.mtGluNs = 0L;
+        MoeFfn.mtDownNs = 0L;
+        MoeFfn.mtCombNs = 0L;
+        MoeFfn.mtSharedNs = 0L;
+        return;
+    }
     ExpertBank gateB;
     ExpertBank upB;
     ExpertBank downB;
@@ -247,7 +271,9 @@ public final class MoeFfn extends InfModule {
         int64 w0 = ExpertBank.residencyWindowed();
         int64 a0 = ExpertBank.residencyAdmissions();
         int64 b0 = ExpertBank.residencyAdmissionBytes();
+        int64 tr0 = Clock.nanoTime();
         this.routeInto(x, xOff, this.sc.sel, this.sc.w);
+        MoeFfn.mtRouteNs = MoeFfn.mtRouteNs + (Clock.nanoTime() - tr0);
         float32[] xb = x.hostBuffer();
         int64 xo = x.hostBase() + xOff;
         float32[] ob = out.hostBuffer();
@@ -264,6 +290,7 @@ public final class MoeFfn extends InfModule {
         int32 k = 0;
         while (k < this.usedN) {
             int32 e = this.sc.sel[k];
+            int64 tg0 = Clock.nanoTime();
             // moe-cache 2.2.1: a RESIDENT expert's mat-vec launches on
             // the device against its slot; an un-admitted one keeps
             // the host path. Per expert, per bank (spec 3.3.2) — the
@@ -276,20 +303,29 @@ public final class MoeFfn extends InfModule {
                 this.upB.matvecAt(e, xb, xo,
                     this.sc.u.hostBuffer(), this.sc.u.hostBase());
             }
+            int64 tgl0 = Clock.nanoTime();
+            MoeFfn.mtGateUpNs = MoeFfn.mtGateUpNs + (tgl0 - tg0);
             Prim.gluRowHost(this.sc.g, 0L, this.sc.u, 0L, this.sc.g, 0L,
                 this.widthN, act);
+            int64 td0 = Clock.nanoTime();
+            MoeFfn.mtGluNs = MoeFfn.mtGluNs + (td0 - tgl0);
             if (!this.downB.matvecDeviceAt(e, gb, go, eb, eo)) {
                 this.downB.matvecAt(e, gb, go, eb, eo);
             }
+            int64 tc0 = Clock.nanoTime();
+            MoeFfn.mtDownNs = MoeFfn.mtDownNs + (tc0 - td0);
             float32 w = this.sc.w[k];
             j = 0;
             while (j < (int64) this.hidden) {
                 ob[oo + j] = ob[oo + j] + w * eb[eo + j];
                 j = j + 1;
             }
+            MoeFfn.mtCombNs = MoeFfn.mtCombNs + (Clock.nanoTime() - tc0);
             k = k + 1;
         }
+        int64 tsh0 = Clock.nanoTime();
         this.addSharedRow(x, xOff, ob, oo, act);
+        MoeFfn.mtSharedNs = MoeFfn.mtSharedNs + (Clock.nanoTime() - tsh0);
         this.emitCacheRecord("row", h0, w0, a0, b0);
         return;
     }

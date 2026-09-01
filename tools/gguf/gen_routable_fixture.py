@@ -90,19 +90,23 @@ deq4 = np.frombuffer(open(os.path.join(KQ, "q4_k.f32"), "rb").read(),
 assert len(q4k) == SRC_BLOCKS * BLOCK_BYTES, len(q4k)
 assert deq4.size == SRC_BLOCKS * BLOCK_ELEMS, deq4.size
 
-def q4k_tile(rows, cols):
+def q4k_tile(rows, cols, phase=0):
     """`rows x cols` of real Q4_K blocks, tiled cyclically.
 
     A Q4_K row is a whole number of 256-element superblocks laid out
     along the row — which is exactly why `cols % 256 == 0` is a routing
     precondition rather than a nicety. Returns the packed payload and
     its exact dequantization, so an oracle never re-derives the values.
+    `phase` offsets the tiling so different experts' slabs are not the
+    same bytes (gen_moe_fixture's rule: a mis-sliced expert view must
+    not accidentally agree with the oracle). phase=0 keeps toy-routable
+    and toy-routable-qk BYTE-IDENTICAL to their calibrated builds.
     """
     assert cols % BLOCK_ELEMS == 0, (rows, cols)
     bpr = cols // BLOCK_ELEMS
     pay, deq = [], []
     for i in range(rows * bpr):
-        k = i % SRC_BLOCKS
+        k = (i + phase) % SRC_BLOCKS
         pay.append(q4k[k * BLOCK_BYTES:(k + 1) * BLOCK_BYTES])
         deq.append(deq4[k * BLOCK_ELEMS:(k + 1) * BLOCK_ELEMS])
     return b"".join(pay), np.concatenate(deq).reshape(rows, cols)
@@ -229,3 +233,83 @@ kvs, tensors = build("llama", False)
 write("toy-routable.gguf", kvs, tensors)
 kvs, tensors = build("qwen3", True)
 write("toy-routable-qk.gguf", kvs, tensors)
+
+# Unit 38 adds the THIRD fixture: toy-routable-moe is the routable dims
+# under arch `qwen3moe` — MoE (4 experts, top-2, expert width 512) plus
+# the per-head q/k norms the arch implies. This is the 30B's SHAPE
+# CLASS (the shape `deviceResidentReady` refused before unit 38) at
+# fixture scale: every tensor still satisfies the routing preconditions
+# above, so the resident decode path, the grouped expert dispatch and
+# the slot mat-vecs all engage on it.
+E, USED, IT_E = 4, 2, 512
+
+def build_moe():
+    tensors = []
+    def add_q4k(name, rows, cols, ne=None, phase=0):
+        pay, _deq = q4k_tile(rows, cols, phase)
+        tensors.append((name, ne if ne else [cols, rows], GG_Q4_K, pay))
+    def add_f32(name, arr):
+        ne = list(reversed(arr.shape))
+        tensors.append((name, ne, GG_F32, arr.astype("<f4").tobytes()))
+
+    def router_weights(rows, cols):
+        # gen_moe_fixture's rule: each expert's row peaks on a
+        # different residual phase, so top-2 identity varies by token
+        # and a top-k bug cannot hide behind a constant selection.
+        a = np.zeros((rows, cols), dtype=np.float32)
+        for r in range(rows):
+            idx = (np.arange(cols) + 7 * r) % 25
+            a[r] = ((idx - 12).astype(np.float32) / 64.0) * 1.28
+        return a.astype(np.float32)
+
+    add_f32("token_embd.weight", f32_ramp(V, H))
+    for i in range(L):
+        g = f"blk.{i}."
+        add_f32(g + "attn_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
+        add_q4k(g + "attn_q.weight",      NH * HD, H)
+        add_q4k(g + "attn_k.weight",      NKV * HD, H)
+        add_q4k(g + "attn_v.weight",      NKV * HD, H)
+        add_q4k(g + "attn_output.weight", H, NH * HD)
+        add_f32(g + "attn_q_norm.weight", f32_ramp(HD, scale=0.01, bias=1.0))
+        add_f32(g + "attn_k_norm.weight", f32_ramp(HD, scale=0.01, bias=1.05))
+        add_f32(g + "ffn_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
+        add_f32(g + "ffn_gate_inp.weight", router_weights(E, H))
+        # Merged rank-3 slabs, expert-major (the ONLY layout the loader
+        # accepts); per-expert AND per-bank phases keep every slice's
+        # bytes distinct.
+        for bank, base in (("gate", 0), ("up", 2), ("down", 4)):
+            rows, cols = (H, IT_E) if bank == "down" else (IT_E, H)
+            pay = b"".join(
+                q4k_tile(rows, cols, phase=base + e)[0] for e in range(E))
+            tensors.append((f"{g}ffn_{bank}_exps.weight",
+                            [cols, rows, E], GG_Q4_K, pay))
+    add_f32("output_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
+    add_q4k("output.weight", V, H)
+
+    toks = [f"<0x{b:02X}>" for b in range(V)]
+    kp = "qwen3moe."
+    kvs = [
+        kv_str("general.architecture", "qwen3moe"),
+        kv_str("general.name", "cajeta-toy-routable-moe"),
+        kv_u32(kp + "embedding_length", H),
+        kv_u32(kp + "block_count", L),
+        kv_u32(kp + "attention.head_count", NH),
+        kv_u32(kp + "attention.head_count_kv", NKV),
+        kv_u32(kp + "feed_forward_length", IT),
+        kv_u32(kp + "context_length", CTX),
+        kv_u32(kp + "rope.dimension_count", HD),
+        kv_u32(kp + "vocab_size", V),
+        kv_u32(kp + "expert_count", E),
+        kv_u32(kp + "expert_used_count", USED),
+        kv_u32(kp + "expert_feed_forward_length", IT_E),
+        kv_f32(kp + "attention.layer_norm_rms_epsilon", 1e-5),
+        kv_f32(kp + "rope.freq_base", 10000.0),
+        kv_str("tokenizer.ggml.model", "llama"),
+        kv_arr_str("tokenizer.ggml.tokens", toks),
+        kv_arr_f32("tokenizer.ggml.scores", [0.0] * V),
+        kv_arr_i32("tokenizer.ggml.token_type", [6] * V),
+    ]
+    return kvs, tensors
+
+kvs, tensors = build_moe()
+write("toy-routable-moe.gguf", kvs, tensors)
