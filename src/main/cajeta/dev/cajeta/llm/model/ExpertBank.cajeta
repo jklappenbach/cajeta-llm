@@ -1,0 +1,130 @@
+package dev.cajeta.llm.model;
+
+import cajeta.lang.String;
+import dev.cajeta.llm.LlmException;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.Quant;
+
+/**
+ * One projection's bank of experts (spec 15.2): a merged rank-3 GGUF
+ * slab held as ONE packed payload, each expert addressed as an offset
+ * view — never copied out per expert. 15.3 is what makes the view
+ * legal: the slab's inner dimension is a whole number of quant blocks,
+ * so every expert's rows start on a block boundary and the existing
+ * packed kernels can serve a per-expert GEMV through (slab, offset)
+ * unchanged. A slab that breaks that is rejected with the dimension
+ * named, never mis-sliced — the real Q4_K_M qwen2moe witness ships its
+ * 1408-wide down projection as Q8_0 for exactly this reason.
+ */
+public final class ExpertBank {
+
+    int32 expertsN;
+    int32 rowsN;       // per-expert out dim
+    int32 colsN;       // in dim (the slab's fastest dimension)
+    int32 packedTy;
+    int8[] slab;       // owned — the ONE payload for all experts
+    int64 stride;      // bytes per expert
+
+    ExpertBank() {
+        this.expertsN = 0;
+        this.rowsN = 0;
+        this.colsN = 0;
+        this.packedTy = 0 - 1;
+        this.slab = null;
+        this.stride = 0L;
+        return;
+    }
+
+    /** Bind `name` as a rank-3 [experts, out, in] packed slab.
+     *  `expectRows`/`expectCols` of 0 mean "derive from the slab" —
+     *  qwen2moe ships no expert-width key, so deriving is the normal
+     *  case, not a fallback. */
+    void bind(Checkpoint ckpt, String name, int32 experts,
+            int32 expectRows, int32 expectCols) {
+        int64[] shp = ckpt.shapeOf(name);
+        if (shp == null || (int32) shp.count() != 3) {
+            throw heap LlmException("moe: '" + name + "' has rank "
+                + (shp == null ? 0 : (int32) shp.count())
+                + "; expected a rank-3 merged expert slab "
+                + "[experts, out, in]");
+        }
+        // TORCH order: [experts, out, in].
+        if (shp[0] != (int64) experts) {
+            throw heap LlmException("moe: '" + name + "' holds "
+                + shp[0] + " experts; the config declares " + experts);
+        }
+        int32 rows = (int32) shp[1];
+        int32 cols = (int32) shp[2];
+        if (expectRows > 0 && rows != expectRows) {
+            throw heap LlmException("moe: '" + name + "' expert out dim "
+                + rows + " does not match the expected " + expectRows);
+        }
+        if (expectCols > 0 && cols != expectCols) {
+            throw heap LlmException("moe: '" + name + "' expert in dim "
+                + cols + " does not match the expected " + expectCols);
+        }
+        int32 pty = ckpt.packedTypeOf(name);
+        if (pty < 0) {
+            throw heap LlmException("moe: '" + name + "' is not a "
+                + "supported packed quant type; expert slabs bind "
+                + "packed (no witness ships float expert slabs)");
+        }
+        int32 be = Quant.blockElems(pty);
+        if (cols % be != 0) {
+            // 15.3: the reject arm. Naming the dimension is the point.
+            throw heap LlmException("moe: '" + name + "' inner "
+                + "dimension " + cols + " is not a whole number of "
+                + be + "-element blocks (ggml type " + pty + "); an "
+                + "expert slice cannot begin on a block boundary "
+                + "(spec 15.3)");
+        }
+        int8[] p #= ckpt.loadPacked(name);
+        int64 rowBytes = ((int64) cols / (int64) be)
+            * (int64) Quant.blockBytes(pty);
+        int64 want = (int64) experts * (int64) rows * rowBytes;
+        if ((int64) p.count() != want) {
+            throw heap LlmException("moe: '" + name + "' packed payload "
+                + "is " + (int64) p.count() + " bytes; expected " + want
+                + " for [" + experts + ", " + rows + ", " + cols + "]");
+        }
+        this.slab #= p;
+        this.packedTy = pty;
+        this.expertsN = experts;
+        this.rowsN = rows;
+        this.colsN = cols;
+        this.stride = (int64) rows * rowBytes;
+        return;
+    }
+
+    public int32 experts() {
+        return this.expertsN;
+    }
+
+    public int32 rows() {
+        return this.rowsN;
+    }
+
+    public int32 cols() {
+        return this.colsN;
+    }
+
+    public int32 packedType() {
+        return this.packedTy;
+    }
+
+    /** Bytes from one expert's first block to the next expert's. */
+    public int64 strideBytes() {
+        return this.stride;
+    }
+
+    /** Expert `e`'s view: an offset into THE slab, nothing copied. */
+    public int64 offsetBytes(int32 e) {
+        return (int64) e * this.stride;
+    }
+
+    /** Total bytes held — exactly one slab, which is the in-place
+     *  claim in a form a test can assert. */
+    public int64 bytesHeld() {
+        return (int64) this.slab.count();
+    }
+}

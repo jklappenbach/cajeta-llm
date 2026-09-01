@@ -1,0 +1,249 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.LlmException;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.model.MoeFfn;
+
+/**
+ * Plan 26.1 — the MoE loader: architectures, merged rank-3 slabs, and
+ * the reject arms. Everything here binds; nothing here forwards (the
+ * sparse pass is unit 27, and until it lands a forward must be an
+ * EXPLICIT gap, never silence).
+ *
+ * The fixture facts these tests lean on were MEASURED against the real
+ * witnesses (tools/gguf/gen_moe_fixture.py header): qwen2moe ships NO
+ * expert-width key, so the width must come from the slab; the router
+ * is `ffn_gate_inp` F32; the shared expert carries its own sigmoid
+ * gate vector (`ffn_gate_inp_shexp`).
+ */
+public class MoeLoaderTest {
+
+    static final String FIX = "src/test/fixtures/gguf/toy-moe.gguf";
+    static final String SPLIT =
+        "src/test/fixtures/gguf/toy-moe-split-bad.gguf";
+    static final String BADW =
+        "src/test/fixtures/gguf/toy-moe-badwidth.gguf";
+    static final String Q15 = "/home/julian/models/"
+        + "Qwen1.5-MoE-A2.7B-Chat-GGUF/Qwen1.5-MoE-A2.7B-Chat.Q4_K_M.gguf";
+    static final String Q3 = "/home/julian/models/"
+        + "Qwen3-Coder-30B-A3B-Instruct-GGUF/"
+        + "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf";
+    static final String MIX = "/home/julian/models/"
+        + "Mixtral-8x7B-Instruct-v0.1-GGUF/"
+        + "Mixtral-8x7B-Instruct-v0.1.Q4_K_M.gguf";
+
+    public MoeLoaderTest() { return; }
+
+    static #CausalLM bindFix() {
+        Checkpoint ck #= Checkpoint.open(MoeLoaderTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        return #m;
+    }
+
+    /** 26.2.1/26.2.3 — the qwen2moe key family, INCLUDING the absence
+     *  that matters: no expert-width key, so the config carries 0 and
+     *  the bind derives it from the slab. */
+    @Test
+    public void configReadsMoeFieldsFromTheFixture() {
+        Checkpoint ck #= Checkpoint.open(MoeLoaderTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        ck.close();
+        Assert.equals(4L, (int64) cfg.expertCount);
+        Assert.equals(2L, (int64) cfg.expertUsedCount);
+        Assert.equals(0L, (int64) cfg.expertFfn);
+        Assert.equals(512L, (int64) cfg.intermediateSize);
+    }
+
+    /** 26.1.2/26.2.2 — the slabs come up rank-3 addressed IN PLACE:
+     *  one payload per projection, per-expert views as offsets into
+     *  it, never a per-expert copy. The byte math is the proof: held
+     *  bytes equal ONE slab, and each view is exactly one expert
+     *  stride further in. */
+    @Test
+    public void fixtureBindsSlabsInPlace() {
+        CausalLM m #= MoeLoaderTest.bindFix();
+        MoeFfn moe = m.moeAt(0);
+        Assert.isTrue(moe != null);
+        Assert.equals(4L, (int64) moe.experts());
+        // Width derived from the slab (the config key is absent).
+        Assert.equals(256L, (int64) moe.width());
+
+        ExpertBank gb = moe.gateBank();
+        // gate: per expert [256 out, 512 in] Q4_K -> 2 blocks/row,
+        // 288 bytes/row, 73728 bytes/expert.
+        Assert.equals(73728L, gb.strideBytes());
+        Assert.equals(0L, gb.offsetBytes(0));
+        Assert.equals(221184L, gb.offsetBytes(3));
+        Assert.equals(294912L, gb.bytesHeld());
+
+        ExpertBank db = moe.downBank();
+        // down: per expert [512 out, 256 in] Q4_K -> 1 block/row.
+        Assert.equals(73728L, db.strideBytes());
+        Assert.equals(294912L, db.bytesHeld());
+
+        // 15.18's cast: the gated shared expert bound too.
+        Assert.isTrue(moe.hasShared());
+        Assert.isTrue(moe.hasSharedGate());
+    }
+
+    /** 26.1.3 / 15.17 — the legacy split-expert layout is refused
+     *  NAMING THE FIX, not as a bare missing-tensor throw. */
+    @Test
+    public void splitExpertLayoutIsRejectedNamingTheFix() {
+        Checkpoint ck #= Checkpoint.open(MoeLoaderTest.SPLIT);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        Assert.equals(4L, (int64) cfg.expertCount);
+        CausalLM m #= heap CausalLM(#cfg, 64, 1, 0);
+        String msg = "";
+        try {
+            m.bind(ck, false);
+        } catch (LlmException e) {
+            String em #= e.getMessage();
+            msg = "" + em;
+        }
+        Assert.isTrue(msg.contains("split-expert"));
+        Assert.isTrue(msg.contains("merged-slab requant"));
+    }
+
+    /** 26.1.4 / 15.3 — a quantized slab whose inner dim is not whole
+     *  blocks cannot be sliced on a block boundary: refused with the
+     *  width NAMED, never mis-sliced. */
+    @Test
+    public void offBlockExpertWidthIsRejectedNamingTheWidth() {
+        Checkpoint ck #= Checkpoint.open(MoeLoaderTest.BADW);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 64, 1, 0);
+        String msg = "";
+        try {
+            m.bind(ck, false);
+        } catch (LlmException e) {
+            String em #= e.getMessage();
+            msg = "" + em;
+        }
+        Assert.isTrue(msg.contains("320"));
+        Assert.isTrue(msg.contains("block"));
+    }
+
+    /** Until unit 27 lands, a forward through an MoE layer is an
+     *  EXPLICIT gap: a bound model that silently computed garbage
+     *  would be strictly worse than one that refuses. This test flips
+     *  to a parity assertion in 27. */
+    @Test
+    public void moeForwardIsAnExplicitGapNotSilence() {
+        CausalLM m #= MoeLoaderTest.bindFix();
+        int32[] p #= heap int32[4];
+        p[0] = 1; p[1] = 2; p[2] = 3; p[3] = 4;
+        String msg = "";
+        try {
+            int32 tok = m.prefill(p, 4);
+            Assert.isTrue(tok < 0 - 1);   // unreachable: must throw
+        } catch (LlmException e) {
+            String em #= e.getMessage();
+            msg = "" + em;
+        }
+        Assert.isTrue(msg.contains("unit 27"));
+    }
+
+    /** 26.1.2 — the smallest REAL witness binds when its file is on
+     *  this box: 60 experts, 4 used, width 1408 from the slab alone,
+     *  and the gated shared expert present. (The 17–26 GB witnesses
+     *  are 26.3.1's acceptance run, not suite work.) */
+    @Test
+    public void qwen15WitnessBindsWhenPresent() {
+        Path p #= Path.of(MoeLoaderTest.Q15);
+        if (!p.exists()) {
+            System.stderr.println("  [skip] qwen1.5-moe witness not on "
+                + "this box: " + MoeLoaderTest.Q15);
+            return;
+        }
+        Checkpoint ck #= Checkpoint.open(MoeLoaderTest.Q15);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        Assert.equals(60L, (int64) cfg.expertCount);
+        Assert.equals(4L, (int64) cfg.expertUsedCount);
+        Assert.equals(0L, (int64) cfg.expertFfn);
+        CausalLM m #= heap CausalLM(#cfg, 256, 1, 0);
+        m.bind(ck, false);
+        MoeFfn moe = m.moeAt(0);
+        Assert.equals(60L, (int64) moe.experts());
+        Assert.equals(1408L, (int64) moe.width());
+        Assert.isTrue(moe.hasShared());
+        Assert.isTrue(moe.hasSharedGate());
+    }
+
+    /** 26.3.1 — the BIG witnesses bind only when the acceptance
+     *  marker exists (tmp/run-big-witness): a 17 GB + 26 GB load is an
+     *  acceptance run, not suite work. Run once, record in the plan. */
+    @Test
+    public void bigWitnessesBindWhenMarked() {
+        Path mk #= Path.of("tmp/run-big-witness");
+        if (!mk.exists()) {
+            return;
+        }
+        Path p3 #= Path.of(MoeLoaderTest.Q3);
+        if (p3.exists()) {
+            Checkpoint ck3 #= Checkpoint.open(MoeLoaderTest.Q3);
+            ModelConfig cfg3 #= ModelConfig.fromGguf(ck3.gguf());
+            CausalLM m3 #= heap CausalLM(#cfg3, 256, 1, 0);
+            m3.bind(ck3, false);
+            MoeFfn moe3 = m3.moeAt(0);
+            Assert.equals(128L, (int64) moe3.experts());
+            Assert.equals(768L, (int64) moe3.width());
+            Assert.isFalse(moe3.hasShared());
+            System.stderr.println("  [26.3.1] qwen3-30b BOUND");
+        }
+        Path pm #= Path.of(MoeLoaderTest.MIX);
+        if (pm.exists()) {
+            Checkpoint ckx #= Checkpoint.open(MoeLoaderTest.MIX);
+            ModelConfig cfgx #= ModelConfig.fromGguf(ckx.gguf());
+            CausalLM mx #= heap CausalLM(#cfgx, 256, 1, 0);
+            mx.bind(ckx, false);
+            MoeFfn moex = mx.moeAt(0);
+            Assert.equals(8L, (int64) moex.experts());
+            Assert.equals(14336L, (int64) moex.width());
+            Assert.isFalse(moex.hasShared());
+            System.stderr.println("  [26.3.1] mixtral-8x7b BOUND");
+        }
+    }
+
+    /** 26.2.1 — the other two witnesses' CONFIGS parse (metadata only,
+     *  no payload): qwen3moe's width key is present and read; Mixtral
+     *  is plain-llama arch whose MoE-ness is expert_count ALONE — the
+     *  loader must not accept it as dense llama. */
+    @Test
+    public void bigWitnessConfigsParseWhenPresent() {
+        Path p3 #= Path.of(MoeLoaderTest.Q3);
+        if (p3.exists()) {
+            Checkpoint ck #= Checkpoint.open(MoeLoaderTest.Q3);
+            ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+            ck.close();
+            Assert.equals(128L, (int64) cfg.expertCount);
+            Assert.equals(8L, (int64) cfg.expertUsedCount);
+            Assert.equals(768L, (int64) cfg.expertFfn);
+            Assert.isTrue(cfg.qkNorm);
+        } else {
+            System.stderr.println("  [skip] qwen3 witness not on this "
+                + "box");
+        }
+        Path pm #= Path.of(MoeLoaderTest.MIX);
+        if (pm.exists()) {
+            Checkpoint ck2 #= Checkpoint.open(MoeLoaderTest.MIX);
+            ModelConfig cfg2 #= ModelConfig.fromGguf(ck2.gguf());
+            ck2.close();
+            Assert.equals(8L, (int64) cfg2.expertCount);
+            Assert.equals(2L, (int64) cfg2.expertUsedCount);
+        } else {
+            System.stderr.println("  [skip] mixtral witness not on this "
+                + "box");
+        }
+    }
+}

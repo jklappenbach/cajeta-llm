@@ -1,0 +1,151 @@
+package dev.cajeta.llm.model;
+
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llm.LlmException;
+import dev.cajeta.llm.io.Checkpoint;
+
+/**
+ * The MoE replacement for a layer's dense FFN (spec 15.1): a router
+ * plus three expert banks, and — when the checkpoint ships one — a
+ * dense shared expert with its own learned sigmoid gate (15.18,
+ * qwen2moe's shape; qwen3moe declares its shared width as 0 and binds
+ * none).
+ *
+ * Unit 26 scope: this BINDS. The sparse forward is plan unit 27, and
+ * until it lands `CausalLM` refuses to forward an MoE model rather
+ * than silently computing garbage through a dense path that no longer
+ * exists.
+ *
+ * Binding is by ggml tensor names directly (`blk.N.ffn_gate_exps…`):
+ * MoE checkpoints are GGUF-only (spec §15's scope), and the merged
+ * slab names have no torch state_dict equivalent to map from.
+ */
+public final class MoeFfn extends InfModule {
+
+    Linear router;             // ffn_gate_inp: [experts, hidden] f32
+    ExpertBank gateB;
+    ExpertBank upB;
+    ExpertBank downB;
+    Linear sharedGateProj;     // null when the model has no shexp
+    Linear sharedUpProj;
+    Linear sharedDownProj;
+    Tensor<float32> sharedGate; // ffn_gate_inp_shexp [hidden], or null
+
+    int32 expertsN;
+    int32 usedN;
+    int32 widthN;              // resolved at bind (config key or slab)
+    int32 hidden;
+
+    MoeFfn(ModelConfig cfg) {
+        this.expertsN = cfg.expertCount;
+        this.usedN = cfg.expertUsedCount;
+        this.widthN = cfg.expertFfn;   // 0 = derive from the slab
+        this.hidden = cfg.hiddenSize;
+        this.router = heap Linear(cfg.hiddenSize, cfg.expertCount);
+        this.gateB = heap ExpertBank();
+        this.upB = heap ExpertBank();
+        this.downB = heap ExpertBank();
+        this.sharedGateProj = null;
+        this.sharedUpProj = null;
+        this.sharedDownProj = null;
+        this.sharedGate = null;
+        return;
+    }
+
+    /** `gp` is the layer's ggml prefix, `blk.<i>.`. */
+    void bind(Checkpoint ckpt, String gp, boolean toDevice) {
+        if (!ckpt.contains(gp + "ffn_gate_exps.weight")) {
+            if (ckpt.contains(gp + "ffn_gate.0.weight")) {
+                // 15.17: the pre-2024-04 llama.cpp layout, one tensor
+                // per expert. Refused NAMING THE FIX — files in this
+                // layout stopped being produced, and supporting both
+                // would double every dispatch test.
+                throw heap LlmException("moe: this checkpoint uses the "
+                    + "legacy split-expert layout ('" + gp
+                    + "ffn_gate.0.weight' — one tensor per expert, "
+                    + "pre-2024-04 llama.cpp); use a merged-slab "
+                    + "requant of the same model instead (e.g. "
+                    + "mradermacher's builds carry the merged "
+                    + "ffn_gate_exps form)");
+            }
+            throw heap LlmException("moe: '" + gp + "ffn_gate_exps."
+                + "weight' is missing — the config declares "
+                + this.expertsN + " experts but the checkpoint carries "
+                + "no merged expert slab");
+        }
+        this.gateB.bind(ckpt, gp + "ffn_gate_exps.weight",
+            this.expertsN, this.widthN, this.hidden);
+        if (this.widthN == 0) {
+            // qwen2moe ships no expert-width key: the slab is the
+            // authority (measured on the witness, 2026-08-31).
+            this.widthN = this.gateB.rows();
+        }
+        this.upB.bind(ckpt, gp + "ffn_up_exps.weight",
+            this.expertsN, this.widthN, this.hidden);
+        this.downB.bind(ckpt, gp + "ffn_down_exps.weight",
+            this.expertsN, this.hidden, this.widthN);
+        this.router.bind(ckpt, gp + "ffn_gate_inp.weight", false);
+
+        if (ckpt.contains(gp + "ffn_gate_shexp.weight")) {
+            // The shared expert's width comes from its own tensor —
+            // there is no reliable key (qwen2moe reuses
+            // feed_forward_length, qwen3moe writes 0).
+            int64[] shp = ckpt.shapeOf(gp + "ffn_gate_shexp.weight");
+            if (shp == null || (int32) shp.count() != 2) {
+                throw heap LlmException("moe: '" + gp
+                    + "ffn_gate_shexp.weight' is not rank 2");
+            }
+            int32 sw = (int32) shp[0];
+            this.sharedGateProj = heap Linear(this.hidden, sw);
+            this.sharedUpProj = heap Linear(this.hidden, sw);
+            this.sharedDownProj = heap Linear(sw, this.hidden);
+            this.sharedGateProj.bind(ckpt, gp + "ffn_gate_shexp.weight",
+                toDevice);
+            this.sharedUpProj.bind(ckpt, gp + "ffn_up_shexp.weight",
+                toDevice);
+            this.sharedDownProj.bind(ckpt, gp + "ffn_down_shexp.weight",
+                toDevice);
+            if (ckpt.contains(gp + "ffn_gate_inp_shexp.weight")) {
+                Tensor<float32> g #= ckpt.loadF32(
+                    gp + "ffn_gate_inp_shexp.weight");
+                this.sharedGate #= g;
+            }
+        }
+        return;
+    }
+
+    public int32 experts() {
+        return this.expertsN;
+    }
+
+    public int32 used() {
+        return this.usedN;
+    }
+
+    /** The per-expert FFN width, resolved at bind. */
+    public int32 width() {
+        return this.widthN;
+    }
+
+    public ExpertBank gateBank() {
+        return this.gateB;
+    }
+
+    public ExpertBank upBank() {
+        return this.upB;
+    }
+
+    public ExpertBank downBank() {
+        return this.downB;
+    }
+
+    public boolean hasShared() {
+        return this.sharedGateProj != null;
+    }
+
+    /** 15.18: the shared expert's own learned sigmoid gate. */
+    public boolean hasSharedGate() {
+        return this.sharedGate != null;
+    }
+}
