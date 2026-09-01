@@ -1,0 +1,231 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import dev.cajeta.llm.DiagCallback;
+import dev.cajeta.llm.DiagRecord;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.MoeFfn;
+import dev.cajeta.llm.model.ModelConfig;
+
+/** Unit 28 divergence instrument: host vs device forwardBatch at the
+ *  MoeFfn seam, per-component max diff — isolates the expert-window
+ *  GEMMs from the rest of the engine. Usage: MoeDevProbe <toy-moe>. */
+final class RouteTrace implements DiagCallback {
+    RouteTrace() { return; }
+    public void onRecord(DiagRecord r) {
+        System.stdout.println("[diag] " + r.category + " " + r.name
+            + " " + r.v0 + "x" + r.v1);
+        return;
+    }
+}
+
+public class MoeDevProbe {
+    public static void run(String[] args) {
+        RouteTrace tr #= heap RouteTrace();
+        Diag.register(tr);
+        Checkpoint ck #= Checkpoint.open(args[0]);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        MoeFfn moe = m.moeAt(0);
+        int32 h = 512;
+        int32 rows = 8;
+        int64[] bs = heap int64[1];
+        bs[0] = (int64) (rows * h);
+        Tensor<float32> x #= Tensor.zeros<float32>(bs);
+        Tensor<float32> oh #= Tensor.zeros<float32>(bs);
+        Tensor<float32> od #= Tensor.zeros<float32>(bs);
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase();
+        int32 r = 0;
+        while (r < rows) {
+            int32 j = 0;
+            while (j < h) {
+                float32 v = (float32) ((3 * j + 7 * r) % 25 - 12)
+                    / 64.0f;
+                xb[xo + (int64) (r * h + j)] = v;
+                j = j + 1;
+            }
+            r = r + 1;
+        }
+        System.stdout.println("deviceGroupedFor(8) = "
+            + moe.deviceGroupedFor(8));
+        QuantKernel.setRoutingEnabled(false);
+        moe.forwardBatch(x, oh, rows, 0);
+        QuantKernel.setRoutingEnabled(true);
+        moe.forwardBatch(x, od, rows, 0);
+        float32[] hb = oh.hostBuffer();
+        int64 ho = oh.hostBase();
+        float32[] db = od.hostBuffer();
+        int64 dof = od.hostBase();
+        r = 0;
+        while (r < rows) {
+            float64 mx = 0.0;
+            float64 hm = 0.0;
+            int32 j = 0;
+            while (j < h) {
+                float64 d = (float64) hb[ho + (int64) (r * h + j)]
+                    - (float64) db[dof + (int64) (r * h + j)];
+                if (d < 0.0) { d = 0.0 - d; }
+                if (d > mx) { mx = d; }
+                float64 a = (float64) hb[ho + (int64) (r * h + j)];
+                if (a < 0.0) { a = 0.0 - a; }
+                if (a > hm) { hm = a; }
+                j = j + 1;
+            }
+            System.stdout.println("row " + r + ": maxdiff " + mx
+                + "  hostmax " + hm
+                + "  h[0] " + hb[ho + (int64) (r * h)]
+                + "  d[0] " + db[dof + (int64) (r * h)]);
+            r = r + 1;
+        }
+
+        // CONTROL PAIR (controls must vary the mechanism): the SAME
+        // batched route at the same activations —
+        //   arm A: a dense resident Linear (shexp gate, whole tensor
+        //          uploaded once by ensureDevice), matmulInto
+        //   arm B: the expert window (per-group staged bytes)
+        // both against their host-exact twins. If A is tight and B is
+        // loose, the window path is defective; if both are equally
+        // loose, the route's q8 activation quantization is the cost.
+        MoeFfn moe0 = m.moeAt(0);
+        int64 tagc = Linear.nextStageTag();
+        Linear.stageBatch(x, 0L, rows, h, tagc);
+        int64[] cs = heap int64[1];
+        cs[0] = (int64) (rows * 256);
+        Tensor<float32> ya #= Tensor.zeros<float32>(cs);
+        Tensor<float32> yb #= Tensor.zeros<float32>(cs);
+        moe0.gateBank().gemmDeviceAt(0, rows, yb, 0L);
+        float32[] dqc = heap float32[256 * h];
+        QuantKernel.setRoutingEnabled(false);
+        moe0.gateBank().gemmAt(0, xb, xo, rows,
+            ya.hostBuffer(), ya.hostBase(), dqc);
+        QuantKernel.setRoutingEnabled(true);
+        float64 wmx = 0.0;
+        float64 wsc = 0.0;
+        float32[] yab = ya.hostBuffer();
+        int64 yao = ya.hostBase();
+        float32[] ybb = yb.hostBuffer();
+        int64 ybo = yb.hostBase();
+        int32 ci = 0;
+        while (ci < rows * 256) {
+            float64 d = (float64) yab[yao + (int64) ci]
+                - (float64) ybb[ybo + (int64) ci];
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > wmx) { wmx = d; }
+            float64 a = (float64) yab[yao + (int64) ci];
+            if (a < 0.0) { a = 0.0 - a; }
+            if (a > wsc) { wsc = a; }
+            ci = ci + 1;
+        }
+        System.stdout.println("window gate GEMM e0: maxdiff " + wmx
+            + "  hostmax " + wsc);
+
+        // ARM C — the route's own approximation, isolated: round-trip
+        // the activations through q8_K ON THE HOST (the same quantizer
+        // stageBatch runs) and feed the EXACT host GEMM. If device ~=
+        // this arm, the device gap IS the activation quantization; a
+        // residual gap is a window defect.
+        Tensor<float32> xrt #= Tensor.zeros<float32>(bs);
+        float32[] xrb = xrt.hostBuffer();
+        int64 xro = xrt.hostBase();
+        int32 rr = 0;
+        while (rr < rows) {
+            int32 blk = 0;
+            while (blk < h / 256) {
+                int64 b0 = (int64) (rr * h + blk * 256);
+                float32 amax = 0.0f;
+                int32 k = 0;
+                while (k < 256) {
+                    float32 v = xb[xo + b0 + (int64) k];
+                    if (v < 0.0f) { v = 0.0f - v; }
+                    if (v > amax) { amax = v; }
+                    k = k + 1;
+                }
+                float32 inv = 0.0f;
+                if (amax > 0.0f) { inv = 127.0f / amax; }
+                float32 dscale = 0.0f;
+                if (amax > 0.0f) { dscale = amax / 127.0f; }
+                k = 0;
+                while (k < 256) {
+                    float32 q = (float32) Math.round(
+                        xb[xo + b0 + (int64) k] * inv);
+                    xrb[xro + b0 + (int64) k] = q * dscale;
+                    k = k + 1;
+                }
+                blk = blk + 1;
+            }
+            rr = rr + 1;
+        }
+        Tensor<float32> yc #= Tensor.zeros<float32>(cs);
+        QuantKernel.setRoutingEnabled(false);
+        moe0.gateBank().gemmAt(0, xrb, xro, rows,
+            yc.hostBuffer(), yc.hostBase(), dqc);
+        QuantKernel.setRoutingEnabled(true);
+        float64 cmx = 0.0;
+        float32[] ycb = yc.hostBuffer();
+        int64 yco = yc.hostBase();
+        ci = 0;
+        while (ci < rows * 256) {
+            float64 d2 = (float64) ycb[yco + (int64) ci]
+                - (float64) ybb[ybo + (int64) ci];
+            if (d2 < 0.0) { d2 = 0.0 - d2; }
+            if (d2 > cmx) { cmx = d2; }
+            ci = ci + 1;
+        }
+        System.stdout.println("device vs q8-roundtrip host: maxdiff "
+            + cmx);
+
+        // The 28.1.2 comparison itself: engine prefill logits, device
+        // arm vs host arm, fresh binds (the BackendParityTest shape).
+        int32[] p = heap int32[8];
+        int32 i = 0;
+        while (i < 8) {
+            p[i] = 3 * i + 5;
+            i = i + 1;
+        }
+        Checkpoint ck2 #= Checkpoint.open(args[0]);
+        ModelConfig cfg2 #= ModelConfig.fromGguf(ck2.gguf());
+        CausalLM dm #= heap CausalLM(#cfg2, 128, 1, 0);
+        dm.bind(ck2, false);
+        int32 dTop = dm.prefill(p, 8);
+        Tensor<float32> dlg = dm.logits();
+        int32 v = (int32) dlg.shape()[0];
+        float32[] dl = heap float32[v];
+        float32[] src = dlg.hostBuffer();
+        int64 so = dlg.hostBase();
+        i = 0;
+        while (i < v) {
+            dl[i] = src[so + (int64) i];
+            i = i + 1;
+        }
+        QuantKernel.setRoutingEnabled(false);
+        Checkpoint ck3 #= Checkpoint.open(args[0]);
+        ModelConfig cfg3 #= ModelConfig.fromGguf(ck3.gguf());
+        CausalLM hm2 #= heap CausalLM(#cfg3, 128, 1, 0);
+        hm2.bind(ck3, false);
+        int32 hTop = hm2.prefill(p, 8);
+        QuantKernel.setRoutingEnabled(true);
+        Tensor<float32> hlg = hm2.logits();
+        float32[] hl = heap float32[v];
+        float32[] hsrc = hlg.hostBuffer();
+        int64 hso = hlg.hostBase();
+        i = 0;
+        while (i < v) {
+            hl[i] = hsrc[hso + (int64) i];
+            i = i + 1;
+        }
+        float64 cos = Metrics.cosine(hl, dl, v);
+        float64 kl = Metrics.softmaxKl(hl, dl, v);
+        System.stdout.println("logits: cos " + cos + "  kl " + kl
+            + "  hTop " + hTop + "  dTop " + dTop);
+        return;
+    }
+}

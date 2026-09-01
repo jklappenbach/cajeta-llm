@@ -3,6 +3,8 @@ package dev.cajeta.llm.model;
 import cajeta.lang.String;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.Checkpoint;
+import cajeta.io.file.MappedFile;
+import cajeta.math.Tensor;
 import dev.cajeta.llm.io.Quant;
 
 /**
@@ -22,18 +24,27 @@ public final class ExpertBank {
     int32 rowsN;       // per-expert out dim
     int32 colsN;       // in dim (the slab's fastest dimension)
     int32 packedTy;
-    int8[] slab;       // owned — the ONE payload for all experts
+    MappedFile map;    // owned — this bank's own mapping (15.19:
+                       // reads go through the page cache, so the
+                       // OS is the eviction policy and a slab
+                       // larger than RAM still binds and runs)
+    int64 mapOff;      // absolute file offset of the slab payload
+    int8[] eStage;     // one expert's staged bytes, [stride]
     int64 stride;      // bytes per expert
     int64[] touched;   // bytes served per expert (15.16's instrument)
+    Linear winLin;     // unit 28: the device expert window (lazy)
 
-    ExpertBank() {
+    public ExpertBank() {
         this.expertsN = 0;
         this.rowsN = 0;
         this.colsN = 0;
         this.packedTy = 0 - 1;
-        this.slab = null;
+        this.map = null;
+        this.mapOff = 0L;
+        this.eStage = null;
         this.stride = 0L;
         this.touched = null;
+        this.winLin = null;
         return;
     }
 
@@ -41,7 +52,7 @@ public final class ExpertBank {
      *  `expectRows`/`expectCols` of 0 mean "derive from the slab" —
      *  qwen2moe ships no expert-width key, so deriving is the normal
      *  case, not a fallback. */
-    void bind(Checkpoint ckpt, String name, int32 experts,
+    public void bind(Checkpoint ckpt, String name, int32 experts,
             int32 expectRows, int32 expectCols) {
         int64[] shp = ckpt.shapeOf(name);
         if (shp == null || (int32) shp.count() != 3) {
@@ -80,16 +91,25 @@ public final class ExpertBank {
                 + "expert slice cannot begin on a block boundary "
                 + "(spec 15.3)");
         }
-        int8[] p #= ckpt.loadPacked(name);
+        // 15.19: NO copy — the slab binds as (mapping, offset) and
+        // expert strides are read on access. loadPacked here would
+        // materialize the whole slab at bind, which is exactly the
+        // eager pass that turns a bigger-than-RAM MoE into "does not
+        // start" (measured: loadPacked heap-copies via map.read).
+        int64 fo = ckpt.packedFileOffsetOf(name);
         int64 rowBytes = ((int64) cols / (int64) be)
             * (int64) Quant.blockBytes(pty);
         int64 want = (int64) experts * (int64) rows * rowBytes;
-        if ((int64) p.count() != want) {
-            throw heap LlmException("moe: '" + name + "' packed payload "
-                + "is " + (int64) p.count() + " bytes; expected " + want
-                + " for [" + experts + ", " + rows + ", " + cols + "]");
+        String fp #= ckpt.filePath();
+        MappedFile mm #= heap MappedFile(fp);
+        if (mm.size() < fo + want) {
+            throw heap LlmException("moe: '" + name + "' payload wants "
+                + want + " bytes at offset " + fo + " but '" + fp
+                + "' holds " + mm.size());
         }
-        this.slab #= p;
+        this.map #= mm;
+        this.mapOff = fo;
+        this.eStage = heap int8[(int64) rows * rowBytes];
         this.packedTy = pty;
         this.expertsN = experts;
         this.rowsN = rows;
@@ -105,34 +125,133 @@ public final class ExpertBank {
      * reads expert weights, which is what makes 15.16's byte count a
      * count of the mechanism rather than of a wall-clock.
      */
-    void matvecAt(int32 e, float32[] x, int64 xOff,
+    public void matvecAt(int32 e, float32[] x, int64 xOff,
             float32[] y, int64 yOff) {
-        int64 po = (int64) e * this.stride;
-        int64 r = (int64) this.rowsN;
+        // Unit-37 workaround: test-profile codegen leaks ~16 B of
+        // stack per vector-lane extract, restored only at the
+        // decoder's RETURN — one call over a big expert ([1024 x
+        // 8192] measured) walks off the guard page. Chunk the rows so
+        // each decoder call's leak stays bounded; remove when the
+        // compiler fix (plan unit 37) lands.
+        int8[] es = this.stageExpert(e);
         int64 c = (int64) this.colsN;
+        int64 blocksPerRow = c / (int64) Quant.blockElems(this.packedTy);
+        int64 chunk = 1048576L / (blocksPerRow * 512L);
+        if (chunk < 1L) {
+            chunk = 1L;
+        }
+        int64 rowBytes = this.stride / (int64) this.rowsN;
+        int64 r0 = 0L;
+        while (r0 < (int64) this.rowsN) {
+            int64 r = (int64) this.rowsN - r0;
+            if (r > chunk) {
+                r = chunk;
+            }
+            this.matvecRows(es, r0 * rowBytes, r, c, x, xOff,
+                y, yOff + r0);
+            r0 = r0 + r;
+        }
+        this.touched[e] = this.touched[e] + this.stride;
+        return;
+    }
+
+    /** One bounded decoder call over `r` rows at `po` bytes into the
+     *  staged expert. */
+    void matvecRows(int8[] es, int64 po, int64 r, int64 c,
+            float32[] x, int64 xOff, float32[] y, int64 yOff) {
         if (this.packedTy == Quant.GG_Q4_K) {
-            Quant.q4kMatVecIntoAt(this.slab, po, r, c, x, xOff, y, yOff);
+            Quant.q4kMatVecIntoAt(es, po, r, c, x, xOff, y, yOff);
         } else if (this.packedTy == Quant.GG_Q8_0) {
-            Quant.q8MatVecIntoAt(this.slab, po, r, c, x, xOff, y, yOff);
+            Quant.q8MatVecIntoAt(es, po, r, c, x, xOff, y, yOff);
         } else if (this.packedTy == Quant.GG_Q6_K) {
-            Quant.q6kMatVecIntoAt(this.slab, po, r, c, x, xOff, y, yOff);
+            Quant.q6kMatVecIntoAt(es, po, r, c, x, xOff, y, yOff);
         } else if (this.packedTy == Quant.GG_Q5_K) {
-            Quant.q5kMatVecIntoAt(this.slab, po, r, c, x, xOff, y, yOff);
+            Quant.q5kMatVecIntoAt(es, po, r, c, x, xOff, y, yOff);
         } else if (this.packedTy == Quant.GG_Q2_K) {
-            Quant.q2kMatVecIntoAt(this.slab, po, r, c, x, xOff, y, yOff);
+            Quant.q2kMatVecIntoAt(es, po, r, c, x, xOff, y, yOff);
         } else if (this.packedTy == Quant.GG_Q3_K) {
-            Quant.q3kMatVecIntoAt(this.slab, po, r, c, x, xOff, y, yOff);
+            Quant.q3kMatVecIntoAt(es, po, r, c, x, xOff, y, yOff);
         } else if (this.packedTy == Quant.GG_Q4_0) {
-            Quant.q40MatVecIntoAt(this.slab, po, r, c, x, xOff, y, yOff);
+            Quant.q40MatVecIntoAt(es, po, r, c, x, xOff, y, yOff);
         } else if (this.packedTy == Quant.GG_Q5_0) {
-            Quant.q50MatVecIntoAt(this.slab, po, r, c, x, xOff, y, yOff);
+            Quant.q50MatVecIntoAt(es, po, r, c, x, xOff, y, yOff);
         } else {
             // A bare else would route a future format through another
             // format's tables — fluent wrong output (the Linear lesson).
             throw heap LlmException("moe: no host expert mat-vec for "
                 + "packed type " + this.packedTy);
         }
+        return;
+    }
+
+    /**
+     * Expert `e`'s grouped GEMM (15.12): decode the expert's packed
+     * bytes ONCE into `dq` ([rows x cols] f32, caller-owned staging),
+     * then multiply the `m` gathered rows at `xs[xsOff…)` into
+     * `ys[ysOff…)` ([m x rows], row-major). The counter increments one
+     * stride regardless of `m` — and that is honest, not bookkeeping:
+     * the packed bytes really are read exactly once, by the dequant
+     * pass; the GEMM reads only `dq`.
+     */
+    public void gemmAt(int32 e, float32[] xs, int64 xsOff, int32 m,
+            float32[] ys, int64 ysOff, float32[] dq) {
+        int64 bb = (int64) Quant.blockBytes(this.packedTy);
+        int8[] es = this.stageExpert(e);
+        Quant.dequantize(this.packedTy, es, 0L,
+            this.stride / bb, dq, 0L);
         this.touched[e] = this.touched[e] + this.stride;
+        int64 r = (int64) this.rowsN;
+        int64 c = (int64) this.colsN;
+        int32 t = 0;
+        while (t < m) {
+            int64 xo = xsOff + (int64) t * c;
+            int64 yo = ysOff + (int64) t * r;
+            int64 i = 0;
+            while (i < r) {
+                float32 acc = 0.0f;
+                int64 dqo = i * c;
+                int64 j = 0;
+                while (j < c) {
+                    acc = acc + dq[dqo + j] * xs[xo + j];
+                    j = j + 1;
+                }
+                ys[yo + i] = acc;
+                i = i + 1;
+            }
+            t = t + 1;
+        }
+        return;
+    }
+
+    /** Can a group of `m` rows take the device GEMM for this bank?
+     *  Lazily builds the expert-window Linear and asks the SAME
+     *  predicate the dense batched path asks — which also honors
+     *  QuantKernel's routing switch, so parity tests force the host
+     *  arm the usual way. */
+    boolean devRoutableFor(int32 m) {
+        if (this.winLin == null) {
+            this.winLin = heap Linear(this.colsN, this.rowsN);
+            this.winLin.bindExpertWindow(this.packedTy, this.stride);
+        }
+        return this.winLin.isBatchRoutedFor((int64) m);
+    }
+
+    /**
+     * Expert `e`'s grouped GEMM on the DEVICE (15.12/15.19): the
+     * expert's bytes are staged into the stride-sized window — the
+     * per-selected-expert-group upload 15.19 requires, never a slab —
+     * and the batched route runs over the activations the caller
+     * staged with Linear.stageBatch. Counts one stride at the same
+     * seam as the host paths, and that is the read: the slab bytes are
+     * touched exactly once, by the staging copy.
+     */
+    public void gemmDeviceAt(int32 e, int32 m, Tensor<float32> dst,
+            int64 dstOff) {
+        this.map.read(this.mapOff + (int64) e * this.stride,
+            this.winLin.winStage, 0L, this.stride);
+        this.winLin.stageExpertWindowStaged();
+        this.touched[e] = this.touched[e] + this.stride;
+        this.winLin.matmulInto(m, dst, dstOff);
         return;
     }
 
@@ -177,9 +296,31 @@ public final class ExpertBank {
         return (int64) e * this.stride;
     }
 
-    /** Total bytes held — exactly one slab, which is the in-place
-     *  claim in a form a test can assert. */
+    /** Read expert `e`'s stride through the mapping into the reused
+     *  staging buffer — the ONE place slab bytes are read (15.16), and
+     *  the mechanism that keeps residency at the touched working set
+     *  (15.19): the page cache holds what was read, and the OS may
+     *  drop it. */
+    int8[] stageExpert(int32 e) {
+        int64 got = this.map.read(this.mapOff + (int64) e * this.stride,
+            this.eStage, 0L, this.stride);
+        if (got != this.stride) {
+            throw heap LlmException("moe: mapped read of expert " + e
+                + " returned " + got + " of " + this.stride + " bytes");
+        }
+        return this.eStage;
+    }
+
+    /** Total slab bytes addressed (never held resident by this class —
+     *  15.19's claim in a form a test can assert). */
     public int64 bytesHeld() {
-        return (int64) this.slab.count();
+        return (int64) this.expertsN * this.stride;
+    }
+
+    /** Device bytes this bank holds: ZERO until the first routed
+     *  group builds the expert window, then exactly one stride —
+     *  never a slab (15.19). */
+    public int64 deviceWindowBytes() {
+        return this.winLin == null ? 0L : this.stride;
     }
 }

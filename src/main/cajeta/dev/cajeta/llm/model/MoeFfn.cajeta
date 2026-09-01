@@ -271,36 +271,200 @@ public final class MoeFfn extends InfModule {
             }
             k = k + 1;
         }
-        if (this.sharedGateProj != null) {
-            // 15.18: the dense shared expert, gated by its own learned
-            // sigmoid when the file carries the gate vector (qwen2moe;
-            // computed as sigma(g.x) — llama.cpp spells the same value
-            // silu(z)/z).
-            this.sharedGateProj.matvecInto(x, xOff, this.sc.shG, 0L);
-            this.sharedUpProj.matvecInto(x, xOff, this.sc.shU, 0L);
-            Prim.gluRowHost(this.sc.shG, 0L, this.sc.shU, 0L,
-                this.sc.shG, 0L, this.sharedW, act);
-            this.sharedDownProj.matvecInto(this.sc.shG, 0L,
-                this.sc.shOut, 0L);
-            float32 gs = 1.0f;
-            if (this.sharedGate != null) {
-                float32[] gv = this.sharedGate.hostBuffer();
-                int64 gvo = this.sharedGate.hostBase();
-                float32 z = 0.0f;
-                j = 0;
-                while (j < (int64) this.hidden) {
-                    z = z + gv[gvo + j] * xb[xo + j];
-                    j = j + 1;
-                }
-                gs = 1.0f / (1.0f + Math.exp(0.0f - z));
-            }
-            float32[] sb = this.sc.shOut.hostBuffer();
-            int64 so = this.sc.shOut.hostBase();
+        this.addSharedRow(x, xOff, ob, oo, act);
+        return;
+    }
+
+    /**
+     * 15.18: the dense shared expert for one row, ADDED into
+     * `ob[oo…oo+hidden)`, gated by its own learned sigmoid when the
+     * file carries the gate vector (qwen2moe; computed as sigma(g.x) —
+     * llama.cpp spells the same value silu(z)/z). No-op when the model
+     * binds no shared expert. Shared by the per-row and grouped paths.
+     */
+    void addSharedRow(Tensor<float32> x, int64 xOff, float32[] ob,
+            int64 oo, int32 act) {
+        if (this.sharedGateProj == null) {
+            return;
+        }
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase() + xOff;
+        this.sharedGateProj.matvecInto(x, xOff, this.sc.shG, 0L);
+        this.sharedUpProj.matvecInto(x, xOff, this.sc.shU, 0L);
+        Prim.gluRowHost(this.sc.shG, 0L, this.sc.shU, 0L,
+            this.sc.shG, 0L, this.sharedW, act);
+        this.sharedDownProj.matvecInto(this.sc.shG, 0L,
+            this.sc.shOut, 0L);
+        float32 gs = 1.0f;
+        int64 j = 0;
+        if (this.sharedGate != null) {
+            float32[] gv = this.sharedGate.hostBuffer();
+            int64 gvo = this.sharedGate.hostBase();
+            float32 z = 0.0f;
             j = 0;
             while (j < (int64) this.hidden) {
-                ob[oo + j] = ob[oo + j] + gs * sb[so + j];
+                z = z + gv[gvo + j] * xb[xo + j];
                 j = j + 1;
             }
+            gs = 1.0f / (1.0f + Math.exp(0.0f - z));
+        }
+        float32[] sb = this.sc.shOut.hostBuffer();
+        int64 so = this.sc.shOut.hostBase();
+        j = 0;
+        while (j < (int64) this.hidden) {
+            ob[oo + j] = ob[oo + j] + gs * sb[so + j];
+            j = j + 1;
+        }
+        return;
+    }
+
+    /**
+     * The grouped batch forward (15.12): route every row, group the
+     * (row, expert, weight) picks by expert, and serve each selected
+     * expert ONCE — dequantize its bank bytes one time and GEMM the
+     * whole gathered group through them (`ExpertBank.gemmAt`), then
+     * weighted-scatter the group outputs back to their rows. `x` and
+     * `out` are row-major [rows x hidden] at host offset 0. The device
+     * expert dispatch (28.2.1's coop route) hangs off this same
+     * grouping; with routing off or unroutable banks the host GEMM
+     * above is the whole story.
+     */
+    public void forwardBatch(Tensor<float32> x, Tensor<float32> out,
+            int32 rows, int32 act) {
+        this.sc.ensureBatch(rows, this.usedN, this.expertsN,
+            this.widthN, this.hidden);
+        int64 h = (int64) this.hidden;
+        int32 r = 0;
+        while (r < rows) {
+            this.routeInto(x, (int64) r * h, this.sc.sel, this.sc.w);
+            int32 k = 0;
+            while (k < this.usedN) {
+                this.sc.selAll[r * this.usedN + k] = this.sc.sel[k];
+                this.sc.wAll[r * this.usedN + k] = this.sc.w[k];
+                k = k + 1;
+            }
+            r = r + 1;
+        }
+        float32[] ob = out.hostBuffer();
+        int64 oo = out.hostBase();
+        int64 zi = 0;
+        while (zi < (int64) rows * h) {
+            ob[oo + zi] = 0.0f;
+            zi = zi + 1;
+        }
+        // Group by expert: counting sort of the rows*used picks.
+        int32 e = 0;
+        while (e < this.expertsN) {
+            this.sc.gCnt[e] = 0;
+            e = e + 1;
+        }
+        int32 np = rows * this.usedN;
+        int32 i = 0;
+        while (i < np) {
+            this.sc.gCnt[this.sc.selAll[i]] =
+                this.sc.gCnt[this.sc.selAll[i]] + 1;
+            i = i + 1;
+        }
+        this.sc.gOff[0] = 0;
+        e = 0;
+        while (e < this.expertsN) {
+            this.sc.gOff[e + 1] = this.sc.gOff[e] + this.sc.gCnt[e];
+            this.sc.gCur[e] = this.sc.gOff[e];
+            e = e + 1;
+        }
+        i = 0;
+        while (i < np) {
+            int32 ex = this.sc.selAll[i];
+            int32 slot = this.sc.gCur[ex];
+            this.sc.gCur[ex] = slot + 1;
+            this.sc.gRow[slot] = i / this.usedN;
+            this.sc.gW[slot] = this.sc.wAll[i];
+            i = i + 1;
+        }
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase();
+        float32[] bxb = this.sc.bx.hostBuffer();
+        int64 bxo = this.sc.bx.hostBase();
+        float32[] bgb = this.sc.bg.hostBuffer();
+        int64 bgo = this.sc.bg.hostBase();
+        float32[] bub = this.sc.bu.hostBuffer();
+        int64 buo = this.sc.bu.hostBase();
+        float32[] beb = this.sc.be.hostBuffer();
+        int64 beo = this.sc.be.hostBase();
+        int64 wN = (int64) this.widthN;
+        e = 0;
+        while (e < this.expertsN) {
+            int32 g0 = this.sc.gOff[e];
+            int32 m = this.sc.gOff[e + 1] - g0;
+            if (m > 0) {
+                int32 t = 0;
+                while (t < m) {
+                    int64 src = xo
+                        + (int64) this.sc.gRow[g0 + t] * h;
+                    int64 dst = bxo + (int64) t * h;
+                    int64 j = 0;
+                    while (j < h) {
+                        bxb[dst + j] = xb[src + j];
+                        j = j + 1;
+                    }
+                    t = t + 1;
+                }
+                // The DEVICE expert dispatch (28.2.1): the same
+                // grouping, with each bank's GEMM going through its
+                // stride-sized expert window and the existing batched
+                // route (coop on vulkan, dp4a elsewhere). Falls to the
+                // host dequant GEMM per group when any bank cannot
+                // route — same math, same counters, one variable.
+                boolean dev = this.gateB.devRoutableFor(m)
+                    && this.upB.devRoutableFor(m)
+                    && this.downB.devRoutableFor(m);
+                if (dev) {
+                    Linear.stageBatch(this.sc.bx, 0L, m, this.hidden,
+                        Linear.nextStageTag());
+                    this.gateB.gemmDeviceAt(e, m, this.sc.bg, 0L);
+                    this.upB.gemmDeviceAt(e, m, this.sc.bu, 0L);
+                } else {
+                    this.gateB.gemmAt(e, bxb, bxo, m, bgb, bgo,
+                        this.sc.dq);
+                    this.upB.gemmAt(e, bxb, bxo, m, bub, buo,
+                        this.sc.dq);
+                }
+                t = 0;
+                while (t < m) {
+                    Prim.gluRowHost(this.sc.bg, (int64) t * wN,
+                        this.sc.bu, (int64) t * wN,
+                        this.sc.bg, (int64) t * wN, this.widthN, act);
+                    t = t + 1;
+                }
+                if (dev) {
+                    Linear.stageBatch(this.sc.bg, 0L, m, this.widthN,
+                        Linear.nextStageTag());
+                    this.downB.gemmDeviceAt(e, m, this.sc.be, 0L);
+                } else {
+                    this.downB.gemmAt(e, bgb, bgo, m, beb, beo,
+                        this.sc.dq);
+                }
+                t = 0;
+                while (t < m) {
+                    float32 w = this.sc.gW[g0 + t];
+                    int64 dst = oo
+                        + (int64) this.sc.gRow[g0 + t] * h;
+                    int64 src = beo + (int64) t * h;
+                    int64 j = 0;
+                    while (j < h) {
+                        ob[dst + j] = ob[dst + j] + w * beb[src + j];
+                        j = j + 1;
+                    }
+                    t = t + 1;
+                }
+            }
+            e = e + 1;
+        }
+        r = 0;
+        while (r < rows) {
+            this.addSharedRow(x, (int64) r * h, ob, oo + (int64) r * h,
+                act);
+            r = r + 1;
         }
         return;
     }
@@ -311,6 +475,14 @@ public final class MoeFfn extends InfModule {
         this.upB.resetTouched();
         this.downB.resetTouched();
         return;
+    }
+
+    /** Can a group of `m` rows take the device expert GEMMs on all
+     *  three banks (28.1.2's gate)? Honors the routing switch. */
+    public boolean deviceGroupedFor(int32 m) {
+        return this.gateB.devRoutableFor(m)
+            && this.upB.devRoutableFor(m)
+            && this.downB.devRoutableFor(m);
     }
 
     public int32 experts() {

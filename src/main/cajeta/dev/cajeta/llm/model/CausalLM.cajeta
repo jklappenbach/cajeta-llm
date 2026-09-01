@@ -516,10 +516,14 @@ public final class CausalLM extends InfModule {
                 Prim.rmsnormRowHost(hs, rh, pre.weight, pre.eps,
                     xn, rh, h, d.normForm);
                 if (d.moe != null) {
-                    // MoE FFN (unit 27): per-token sparse dispatch
-                    // on the host. The device path is unit 28.
-                    d.moe.forwardRow(xn, rh, mlpOut, rh,
-                        d.activation);
+                    // MoE FFN: deferred to a GROUPED dispatch after the
+                    // row loop (15.12, unit 28). Safe because rows
+                    // couple only through the KV cache, which is
+                    // attention-phase state — hs/xn/mlpOut windows are
+                    // per-row disjoint. fourNorm and the residual for
+                    // these rows run in the deferred block too.
+                    r = r + 1;
+                    continue;
                 } else {
                     Linear.beginSharedActivation();
                     if (d.mlp.gateProj.isDeviceRouted()
@@ -555,6 +559,30 @@ public final class CausalLM extends InfModule {
                 }
                 HostOps.addRow(hs, rh, mlpOut, rh, h);
                 r = r + 1;
+            }
+            if (d.moe != null) {
+                // The deferred MoE FFN for every row of this layer:
+                // per-token at decode (the zero-allocation path, and
+                // 15.16's per-token instrument), grouped by expert for
+                // a multi-row chunk (15.12 — each selected expert's
+                // bytes read once per batch).
+                if (rows == 1) {
+                    d.moe.forwardRow(xn, 0L, mlpOut, 0L, d.activation);
+                } else {
+                    d.moe.forwardBatch(xn, mlpOut, rows, d.activation);
+                }
+                int32 mr = 0;
+                while (mr < rows) {
+                    int64 mrh = (int64) mr * (int64) h;
+                    if (d.fourNorm) {
+                        Prim.rmsnormRowHost(mlpOut, mrh,
+                            d.postFeedforwardLayernorm.weight,
+                            d.postFeedforwardLayernorm.eps, mlpOut, mrh,
+                            h, d.normForm);
+                    }
+                    HostOps.addRow(hs, mrh, mlpOut, mrh, h);
+                    mr = mr + 1;
+                }
             }
             l = l + 1;
         }

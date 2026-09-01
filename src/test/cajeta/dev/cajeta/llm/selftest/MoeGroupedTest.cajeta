@@ -1,0 +1,221 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.MoeFfn;
+
+/**
+ * Plan 28.1 — prefill groups tokens by expert (spec 15.12), and the
+ * device expert dispatch agrees with the host (15.1.4's shape).
+ *
+ * The 15.12 claim is asserted on the MECHANISM, at the same
+ * ExpertBank counter seam 27.1.3 used: a grouped dispatch serves each
+ * selected expert's stride ONCE per batch, so no counter may ever
+ * exceed one stride — while the per-token dispatch it replaces is
+ * GUARANTEED to (4 tokens x 2 picks into 4 experts pigeonholes some
+ * expert into >= 2 strides). The assertion is selection-agnostic on
+ * purpose: it needs no oracle for which experts the rows pick.
+ */
+public class MoeGroupedTest {
+
+    public MoeGroupedTest() { return; }
+
+    /** Grouped host math against the per-row path 27 proved: three
+     *  rows whose selections differ (the 27.1.1 probe pair plus a
+     *  third), forwardBatch vs forwardRow, same bytes, tol 1e-4 —
+     *  the two differ only by f32 accumulation order. */
+    @Test
+    public void groupedForwardMatchesPerRowOnTheHost() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        int32 h = MoeForwardTest.H;
+        int32 rows = 3;
+
+        int64[] bs = heap int64[1];
+        bs[0] = (int64) (rows * h);
+        Tensor<float32> x #= Tensor.zeros<float32>(bs);
+        Tensor<float32> outB #= Tensor.zeros<float32>(bs);
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase();
+        Tensor<float32> p0 #= MoeForwardTest.probeRow(false);
+        Tensor<float32> p1 #= MoeForwardTest.probeRow(true);
+        float32[] pb = p0.hostBuffer();
+        int64 po = p0.hostBase();
+        float32[] qb = p1.hostBuffer();
+        int64 qo = p1.hostBase();
+        int32 j = 0;
+        while (j < h) {
+            xb[xo + (int64) j] = pb[po + (int64) j];
+            xb[xo + (int64) (h + j)] = qb[qo + (int64) j];
+            xb[xo + (int64) (2 * h + j)] =
+                (float32) ((5 * j) % 31 - 15) / 64.0f;
+            j = j + 1;
+        }
+
+        Tensor<float32> outA #= Tensor.zeros<float32>(bs);
+        // BOTH arms pinned to the host: this test is about the grouped
+        // MATH, and forwardRow's shexp Linears would otherwise take the
+        // device single-row route on a real backend (its q8 activation
+        // approximation is not what 1e-4 measures).
+        QuantKernel.setRoutingEnabled(false);
+        moe.forwardBatch(x, outB, rows, 0);
+        int32 r = 0;
+        while (r < rows) {
+            moe.forwardRow(x, (int64) (r * h), outA,
+                (int64) (r * h), 0);
+            r = r + 1;
+        }
+        QuantKernel.setRoutingEnabled(true);
+        float32[] ab = outA.hostBuffer();
+        int64 ao = outA.hostBase();
+        float32[] bb = outB.hostBuffer();
+        int64 bo = outB.hostBase();
+        int32 i = 0;
+        while (i < rows * h) {
+            float64 d = (float64) ab[ao + (int64) i]
+                - (float64) bb[bo + (int64) i];
+            if (d < 0.0) {
+                d = 0.0 - d;
+            }
+            Assert.isTrue(d < 0.0001);
+            i = i + 1;
+        }
+    }
+
+    /** The direct-probe once-per-batch claim: a grouped forward over
+     *  rows with differing selections serves each selected expert's
+     *  bytes exactly once, and gate/up/down agree on which. */
+    @Test
+    public void groupedForwardReadsEachSelectedExpertOnce() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        int32 h = MoeForwardTest.H;
+        int32 rows = 3;
+        int64[] bs = heap int64[1];
+        bs[0] = (int64) (rows * h);
+        Tensor<float32> x #= Tensor.zeros<float32>(bs);
+        Tensor<float32> out #= Tensor.zeros<float32>(bs);
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase();
+        Tensor<float32> p0 #= MoeForwardTest.probeRow(false);
+        Tensor<float32> p1 #= MoeForwardTest.probeRow(true);
+        float32[] pb = p0.hostBuffer();
+        int64 po = p0.hostBase();
+        float32[] qb = p1.hostBuffer();
+        int64 qo = p1.hostBase();
+        int32 j = 0;
+        while (j < h) {
+            xb[xo + (int64) j] = pb[po + (int64) j];
+            xb[xo + (int64) (h + j)] = qb[qo + (int64) j];
+            xb[xo + (int64) (2 * h + j)] = pb[po + (int64) j];
+            j = j + 1;
+        }
+        moe.resetTouched();
+        QuantKernel.setRoutingEnabled(false);
+        moe.forwardBatch(x, out, rows, 0);
+        QuantKernel.setRoutingEnabled(true);
+        MoeGroupedTest.assertOncePerBatch(moe);
+        // Rows 0 and 2 are the SAME probe (selection {0,1}), row 1 the
+        // negated one ({3,2}) — 27.1.1's oracle — so the union is all
+        // four experts and a per-token dispatch would have doubled
+        // experts 0 and 1.
+        Assert.equals(moe.gateBank().strideBytes(),
+            moe.gateBank().touchedBytes(0));
+        Assert.equals(moe.gateBank().strideBytes(),
+            moe.gateBank().touchedBytes(1));
+    }
+
+    /** 28.1.1 at the ENGINE level: a 4-token prefill through the full
+     *  stack is GROUPED — no expert's counter exceeds one stride per
+     *  bank, at least `used` experts are touched, and the three banks
+     *  agree. 8 picks into 4 experts pigeonhole >= 2 strides onto some
+     *  expert under the old per-token dispatch, so this fails against
+     *  it regardless of what the rows select. */
+    @Test
+    public void aPrefillReadsEachSelectedExpertOncePerBatch() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        moe.resetTouched();
+        int32[] p = heap int32[4];
+        p[0] = 1; p[1] = 2; p[2] = 3; p[3] = 4;
+        int32 tok = m.prefill(p, 4);
+        Assert.isTrue(tok >= 0);
+        Assert.isTrue(tok < 256);
+        MoeGroupedTest.assertOncePerBatch(moe);
+    }
+
+    static void assertOncePerBatch(MoeFfn moe) {
+        ExpertBank gbk = moe.gateBank();
+        ExpertBank ubk = moe.upBank();
+        ExpertBank dbk = moe.downBank();
+        int32 touched = 0;
+        int32 e = 0;
+        while (e < moe.experts()) {
+            int64 g = gbk.touchedBytes(e);
+            Assert.isTrue(g == 0L || g == gbk.strideBytes());
+            if (g > 0L) {
+                touched = touched + 1;
+                Assert.equals(ubk.strideBytes(), ubk.touchedBytes(e));
+                Assert.equals(dbk.strideBytes(), dbk.touchedBytes(e));
+            } else {
+                Assert.equals(0L, ubk.touchedBytes(e));
+                Assert.equals(0L, dbk.touchedBytes(e));
+            }
+            e = e + 1;
+        }
+        Assert.isTrue(touched >= moe.used());
+    }
+
+    /** 28.1.2 — device and host MoE forward agree (the 15.1.4
+     *  BackendParityTest shape and arm order, on toy-moe). Skips where
+     *  the batched device path is not routable; exercised under
+     *  XPU_BACKEND=amdgpu.
+     *
+     *  THRESHOLDS ARE NOT BackendParityTest's, and the difference is
+     *  measured, not guessed (2026-09-01, MoeDevProbe): on this
+     *  backend the expert-group GEMMs take the dotAccum route, whose
+     *  activations are q8_K-QUANTIZED — the two arms do NOT read
+     *  identical values, so 13.21's quantized-execution exemption
+     *  applies where the dense test argued it away. Attribution
+     *  trail: window GEMM vs exact host 0.42% relative; vs a host
+     *  q8-roundtrip arm half that; the dense fixture through the SAME
+     *  route passes the tight bar because its statistics cancel less
+     *  (toy-moe expert dots cancel ~35x). Measured engine-level:
+     *  cos 0.999973, kl 8.8e-5, argmax equal — bars set with ~4x/10x
+     *  margin. A route change that widens this is still caught. */
+    @Test
+    public void moeLogitsAgreeAcrossBackends() {
+        CausalLM dm #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        if (!dm.moeAt(0).deviceGroupedFor(8)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32[] p = heap int32[8];
+        int32 i = 0;
+        while (i < 8) {
+            p[i] = 3 * i + 5;
+            i = i + 1;
+        }
+        int32 dTop = dm.prefill(p, 8);
+        float32[] dl #= BackendParityTest.logitsOf(dm);
+
+        QuantKernel.setRoutingEnabled(false);
+        CausalLM hm #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        int32 hTop = hm.prefill(p, 8);
+        float32[] hl #= BackendParityTest.logitsOf(hm);
+        QuantKernel.setRoutingEnabled(true);
+
+        int32 vocab = (int32) hl.count();
+        float64 cos = Metrics.cosine(hl, dl, vocab);
+        float64 kl = Metrics.softmaxKl(hl, dl, vocab);
+        Assert.isTrue(cos >= 0.9999);
+        Assert.isTrue(kl <= 0.001);
+        Assert.equals((int64) hTop, (int64) dTop);
+    }
+}

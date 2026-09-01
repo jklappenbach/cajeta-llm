@@ -1,0 +1,137 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.io.file.OpenMode;
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.ExpertBank;
+
+/**
+ * Plan 28.2.2 — spec 15.19 v1: NOTHING eagerly materializes a full
+ * expert slab. A 576 MiB synthetic slab (written SPARSE, the
+ * SafetensorsTest idiom: real GGUF header, payload materialized by
+ * truncate — all-zero Q4_K blocks decode to zeros) binds without
+ * faulting the payload in, and touching two experts stays near the
+ * touched working set. This is the invariant that lets a
+ * bigger-than-RAM MoE load and run on the host path with the page
+ * cache as the eviction policy; it FAILED against unit 27's bind,
+ * which heap-copied the slab via loadPacked.
+ */
+public class MoeResidencyTest {
+
+    static final int32 EXPERTS = 128;
+    static final int32 ROWS = 1024;
+    static final int32 COLS = 8192;
+
+    public MoeResidencyTest() { return; }
+
+    static void putU32(int8[] b, int64 at, int64 v) {
+        b[at] = (int8) (v & 255L);
+        b[at + 1L] = (int8) ((v >> 8) & 255L);
+        b[at + 2L] = (int8) ((v >> 16) & 255L);
+        b[at + 3L] = (int8) ((v >> 24) & 255L);
+        return;
+    }
+
+    /** Write the sparse big-slab GGUF: 24-byte header, zero kvs, one
+     *  rank-3 Q4_K tensor info, data at the 32-aligned offset, payload
+     *  from truncate. Layout measured against GgufFile's parser and
+     *  gen_moe_fixture's writer. */
+    static #String writeBigGguf() {
+        String path #= SafetensorsTest.tmpDir() + "_big_moe.gguf";
+        String name = "blk.0.ffn_gate_exps.weight";
+        int8[] nb #= name.toBytes();
+        int64 nlen = (int64) nb.count();
+        // header 24 + name(8+nlen) + nd 4 + 3*8 + type 4 + offset 8
+        int64 hlen = 24L + 8L + nlen + 4L + 24L + 4L + 8L;
+        int8[] hb = heap int8[hlen];
+        MoeResidencyTest.putU32(hb, 0L, 0x46554747L);   // 'GGUF'
+        MoeResidencyTest.putU32(hb, 4L, 3L);            // version
+        SafetensorsTest.putU64(hb, 8L, 1L);             // tensors
+        SafetensorsTest.putU64(hb, 16L, 0L);            // kvs
+        int64 p = 24L;
+        SafetensorsTest.putU64(hb, p, nlen);
+        p = p + 8L;
+        int64 i = 0;
+        while (i < nlen) {
+            hb[p + i] = nb[i];
+            i = i + 1;
+        }
+        p = p + nlen;
+        MoeResidencyTest.putU32(hb, p, 3L);             // nd
+        p = p + 4L;
+        // ne is FASTEST-FIRST: [cols, rows, experts]
+        SafetensorsTest.putU64(hb, p, (int64) MoeResidencyTest.COLS);
+        SafetensorsTest.putU64(hb, p + 8L,
+            (int64) MoeResidencyTest.ROWS);
+        SafetensorsTest.putU64(hb, p + 16L,
+            (int64) MoeResidencyTest.EXPERTS);
+        p = p + 24L;
+        MoeResidencyTest.putU32(hb, p, 12L);            // GG_Q4_K
+        p = p + 4L;
+        SafetensorsTest.putU64(hb, p, 0L);              // data offset
+        p = p + 8L;
+        File.writeAllBytes(path, hb, hlen);
+        int64 dataStart = (hlen + 31L) / 32L * 32L;
+        int64 rowBytes = (int64) MoeResidencyTest.COLS / 256L * 144L;
+        int64 payload = (int64) MoeResidencyTest.EXPERTS
+            * (int64) MoeResidencyTest.ROWS * rowBytes;
+        File f = File.open(path, OpenMode.READ_WRITE);
+        f.truncate(dataStart + payload);
+        f.close();
+        return #path;
+    }
+
+    @Test
+    public void bigSlabBindsLazilyAndTouchStaysNearWorkingSet() {
+        String path #= MoeResidencyTest.writeBigGguf();
+        int64 before = SafetensorsTest.rssKb();
+        if (before <= 0) {
+            Assert.fail("rss probe returned " + before);
+        }
+
+        Checkpoint ck #= Checkpoint.open(path);
+        ExpertBank b = heap ExpertBank();
+        b.bind(ck, "blk.0.ffn_gate_exps.weight",
+            MoeResidencyTest.EXPERTS, MoeResidencyTest.ROWS,
+            MoeResidencyTest.COLS);
+        Assert.equals(603979776L, b.bytesHeld());
+        Assert.equals(0L, b.deviceWindowBytes());   // no device prewarm
+
+        int64 afterBind = SafetensorsTest.rssKb();
+        // Bind must not fault the payload in. The slab is 589824 KiB;
+        // the bar is <64 MiB — a copy overshoots it 9x.
+        if (afterBind - before >= 64L * 1024L) {
+            Assert.fail("bind materialized the slab: rss delta "
+                + (afterBind - before) + " KiB against a 589824 KiB "
+                + "payload (15.19: nothing may eagerly materialize a "
+                + "full expert slab)");
+        }
+
+        // Touch two experts; zero blocks decode to zeros.
+        float32[] x = heap float32[MoeResidencyTest.COLS];
+        float32[] y = heap float32[MoeResidencyTest.ROWS];
+        int32 j = 0;
+        while (j < MoeResidencyTest.COLS) {
+            x[j] = 1.0f;
+            j = j + 1;
+        }
+        b.matvecAt(0, x, 0L, y, 0L);
+        b.matvecAt(77, x, 0L, y, 0L);
+        Assert.isTrue(y[0] == 0.0f);
+        Assert.equals(b.strideBytes(), b.touchedBytes(0));
+        Assert.equals(b.strideBytes(), b.touchedBytes(77));
+
+        int64 afterTouch = SafetensorsTest.rssKb();
+        // Two strides is ~9.2 MiB; the bar leaves room for the page
+        // cache and staging but sits 4.6x under the slab.
+        if (afterTouch - before >= 128L * 1024L) {
+            Assert.fail("touching 2 experts cost rss delta "
+                + (afterTouch - before)
+                + " KiB — not near the touched working set");
+        }
+        ck.close();
+    }
+}

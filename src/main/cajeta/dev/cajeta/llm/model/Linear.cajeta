@@ -638,6 +638,8 @@ public final class Linear extends InfModule {
         this.yScratch = null;
         this.unified = false;
         this.q8 = false;
+        this.winStage = null;
+        this.winLen = 0L;
     }
 
     /** True when the weight is held in its PACKED block form and consumed
@@ -1196,6 +1198,70 @@ public final class Linear extends InfModule {
 
     public static void setMmq(boolean on) { Linear.mmqOn = on; }
     public static void setCoop(boolean on) { Linear.coopOn = on; }
+
+    // ── Unit 28: the EXPERT WINDOW (15.12/15.19) — this Linear's
+    // device weight is ONE expert stride, re-staged per selected
+    // expert group. The only device memory the MoE path ever holds is
+    // this window plus its repack twins — never a slab, which is
+    // 15.19's load-bearing constraint. All the batched machinery
+    // (matmulBatchKeep's route tree, the shared activation staging,
+    // yBatch) works unchanged because ensureDevice early-returns on
+    // the preallocated packedDev.
+    int8[] winStage;            // host staging, [winLen]
+    int64 winLen;
+
+    /** Configure as an expert window: type set, stride-sized device
+     *  weight allocated, nothing uploaded yet. */
+    void bindExpertWindow(int32 ty, int64 len) {
+        this.packedTy = ty;
+        this.winLen = len;
+        this.winStage = heap int8[len];
+        this.packedDev #= heap KernelBuffer<int8>((uint64) len);
+        return;
+    }
+
+    /** Re-stage the window to `slab[off .. off+winLen)` and refresh
+     *  every derived device buffer IN PLACE — every expert shares the
+     *  window's shape, so the builders' allocations are reused and
+     *  only their kernels re-run. Safe against in-flight reads: every
+     *  group's GEMM is drained by matmulInto's sync before the next
+     *  group stages. */
+    void stageExpertWindow(int8[] slab, int64 off) {
+        int64 i = 0;
+        while (i < this.winLen) {
+            this.winStage[i] = slab[off + i];
+            i = i + 1;
+        }
+        this.stageExpertWindowStaged();
+        return;
+    }
+
+    /** As {@link #stageExpertWindow} but the caller already filled
+     *  `winStage` (ExpertBank reads its mapping straight into it). */
+    void stageExpertWindowStaged() {
+        this.packedDev.upload(this.winStage);
+        if (this.q6PadDev != null) {
+            int64 nb6 = (int64) this.outDim * ((int64) this.inDim / 256L);
+            QuantKernel.q6kPadLaunch(this.q6PadDev, this.packedDev, nb6);
+        }
+        if (this.coopDev != null) {
+            int64 nBlocks = (int64) this.outDim * ((int64) this.inDim
+                / (int64) Quant.blockElems(this.packedTy));
+            int32 sb = Quant.blockBytes(this.packedTy);
+            int32 db = QuantKernel.coopBlockWords(this.packedTy) * 4;
+            if (this.packedTy == Quant.GG_Q3_K) {
+                QuantKernel.blockPadLaunch(this.coopDev, this.packedDev,
+                    nBlocks, sb, db);
+            } else {
+                QuantKernel.blockRepack2Launch(this.coopDev,
+                    this.packedDev, nBlocks, sb, db);
+            }
+        }
+        if (this.deqDev != null) {
+            this.runDeqWiden();
+        }
+        return;
+    }
 
     void ensurePackedW() {
         if (this.packedW == null) {
@@ -2232,6 +2298,13 @@ public final class Linear extends InfModule {
         if (this.deqDev != null) { return; }
         int64 n = (int64) this.outDim * (int64) this.inDim;
         this.deqDev #= heap KernelBuffer<int8>((uint64) n);
+        this.runDeqWiden();
+        return;
+    }
+
+    /** ensureDeq's widen pass, separated so stageExpertWindow can
+     *  re-run it over freshly staged bytes without reallocating. */
+    void runDeqWiden() {
         if (this.packedTy == Quant.GG_Q6_K) {
             WmmaKernel.q6kWidenLaunch(this.deqDev, this.packedDev,
                 (int64) this.outDim, (int64) this.inDim);
