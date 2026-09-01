@@ -1,0 +1,336 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.LlmException;
+import cajeta.io.file.Path;
+import cajeta.lang.System;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.model.MoeFfn;
+
+/**
+ * Plan 27.1 — router, combine, and the sparse host forward.
+ *
+ * The router oracle constants were computed OFFLINE by the fixture
+ * generator (tools/gguf/gen_moe_fixture.py, "ORACLE 27.1.1") from the
+ * same f32 formulas that wrote the file — not by re-running the engine's
+ * own arithmetic in the test. The probe row is
+ * `x[j] = ((3j % 25) - 12) / 64`, exact grid values in f32.
+ *
+ * Gating semantics under test are llama.cpp's, measured in
+ * build_moe_ffn and its call sites (2026-08-31): full softmax over all
+ * experts, top-k by probability, weights = the selected probabilities,
+ * renormalized by their clamped sum only when the arch (or a present
+ * metadata key, 15.6) says so — qwen2moe does NOT renormalize.
+ */
+public class MoeForwardTest {
+
+    static final String FIX = "src/test/fixtures/gguf/toy-moe.gguf";
+    static final String NOSH =
+        "src/test/fixtures/gguf/toy-moe-noshexp.gguf";
+    static final String SH0 =
+        "src/test/fixtures/gguf/toy-moe-shexp0.gguf";
+    static final String NORM =
+        "src/test/fixtures/gguf/toy-moe-norm.gguf";
+    static final String SIG =
+        "src/test/fixtures/gguf/toy-moe-sigmoid.gguf";
+    static final int32 H = 512;
+
+    public MoeForwardTest() { return; }
+
+    static #CausalLM bindPath(String path) {
+        Checkpoint ck #= Checkpoint.open(path);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        return #m;
+    }
+
+    /** The 27.1.1 probe row: x[j] = ((3j % 25) - 12) / 64. */
+    static #Tensor<float32> probeRow(boolean negated) {
+        int64[] shp = heap int64[1];
+        shp[0] = (int64) MoeForwardTest.H;
+        Tensor<float32> x #= Tensor.zeros<float32>(shp);
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase();
+        int32 j = 0;
+        while (j < MoeForwardTest.H) {
+            float32 v = (float32) ((3 * j) % 25 - 12) / 64.0f;
+            if (negated) {
+                v = 0.0f - v;
+            }
+            xb[xo + (int64) j] = v;
+            j = j + 1;
+        }
+        return #x;
+    }
+
+    static void near(float64 want, float32 got, float64 tol) {
+        float64 d = (float64) got - want;
+        if (d < 0.0) {
+            d = 0.0 - d;
+        }
+        Assert.isTrue(d < tol);
+    }
+
+    /** 27.1.1, raw arm (qwen2moe: NO top-k renorm): scores, top-k
+     *  identity and combining weights against the generator's offline
+     *  oracle, for two probe rows whose selections differ — a stuck
+     *  top-k cannot pass both. */
+    @Test
+    public void routerMatchesTheHandOracle() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        int32[] sel = heap int32[2];
+        float32[] w = heap float32[2];
+
+        Tensor<float32> x #= MoeForwardTest.probeRow(false);
+        moe.routeInto(x, 0L, sel, w);
+        Assert.equals(0L, (int64) sel[0]);
+        Assert.equals(1L, (int64) sel[1]);
+        MoeForwardTest.near(0.71762824, w[0], 0.0001);
+        MoeForwardTest.near(0.22958289, w[1], 0.0001);
+
+        Tensor<float32> x2 #= MoeForwardTest.probeRow(true);
+        moe.routeInto(x2, 0L, sel, w);
+        Assert.equals(3L, (int64) sel[0]);
+        Assert.equals(2L, (int64) sel[1]);
+        MoeForwardTest.near(0.87409478, w[0], 0.0001);
+        MoeForwardTest.near(0.09893262, w[1], 0.0001);
+    }
+
+    /** 27.1.1, norm arm + 15.6: an expert_weights_norm key PRESENT in
+     *  the file is honored — same selection, weights renormalized by
+     *  their sum. (No real witness carries the key; this file is the
+     *  metadata-read proof.) */
+    @Test
+    public void normTopkRenormalizesWhenTheFileSaysSo() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.NORM);
+        MoeFfn moe = m.moeAt(0);
+        int32[] sel = heap int32[2];
+        float32[] w = heap float32[2];
+        Tensor<float32> x #= MoeForwardTest.probeRow(false);
+        moe.routeInto(x, 0L, sel, w);
+        Assert.equals(0L, (int64) sel[0]);
+        Assert.equals(1L, (int64) sel[1]);
+        MoeForwardTest.near(0.75762224, w[0], 0.0001);
+        MoeForwardTest.near(0.24237773, w[1], 0.0001);
+    }
+
+    /** 27.1.2 / 15.18: the shared expert's output is multiplied by its
+     *  learned sigmoid gate. Three arms, one lever each: no shexp (the
+     *  control — isolates the shexp contribution), the real gate
+     *  vector (contribution x sigma(g.x)), and a ZEROED gate vector
+     *  (contribution x sigma(0) = 0.5 exactly). The ratio of the two
+     *  contributions must be sigma(g.x)/0.5 at every component that
+     *  carries signal — measured without dequantizing a single block
+     *  outside the engine. */
+    @Test
+    public void sharedExpertMultipliesByItsSigmoidGate() {
+        Tensor<float32> x #= MoeForwardTest.probeRow(false);
+        int64[] shp = heap int64[1];
+        shp[0] = (int64) MoeForwardTest.H;
+        Tensor<float32> a #= Tensor.zeros<float32>(shp);
+        Tensor<float32> b #= Tensor.zeros<float32>(shp);
+        Tensor<float32> c #= Tensor.zeros<float32>(shp);
+
+        CausalLM ma #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        ma.moeAt(0).forwardRow(x, 0L, a, 0L, 0);
+        CausalLM mb #= MoeForwardTest.bindPath(MoeForwardTest.NOSH);
+        mb.moeAt(0).forwardRow(x, 0L, b, 0L, 0);
+        CausalLM mc #= MoeForwardTest.bindPath(MoeForwardTest.SH0);
+        mc.moeAt(0).forwardRow(x, 0L, c, 0L, 0);
+
+        // sigma(g.x) from the FILE's gate vector (and the offline
+        // oracle agrees: 0.92898820).
+        Checkpoint ck #= Checkpoint.open(MoeForwardTest.FIX);
+        Tensor<float32> gv #= ck.loadF32(
+            "blk.0.ffn_gate_inp_shexp.weight");
+        float32[] gb = gv.hostBuffer();
+        int64 go = gv.hostBase();
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase();
+        float32 z = 0.0f;
+        int32 j = 0;
+        while (j < MoeForwardTest.H) {
+            z = z + gb[go + (int64) j] * xb[xo + (int64) j];
+            j = j + 1;
+        }
+        float32 gs = 1.0f / (1.0f + Math.exp(0.0f - z));
+        MoeForwardTest.near(0.92898820, gs, 0.0001);
+
+        float32[] ab = a.hostBuffer();
+        float32[] bb = b.hostBuffer();
+        float32[] cb = c.hostBuffer();
+        int64 ao = a.hostBase();
+        int64 bo = b.hostBase();
+        int64 co = c.hostBase();
+        float32 want = gs / 0.5f;
+        int32 signal = 0;
+        j = 0;
+        while (j < MoeForwardTest.H) {
+            float32 d1 = ab[ao + (int64) j] - bb[bo + (int64) j];
+            float32 d0 = cb[co + (int64) j] - bb[bo + (int64) j];
+            // The toy's activations are ~1e-5 (small grid weights
+            // through two GLU squashes), so signal is anything above
+            // f32 noise; d0 = 0.5*sh is a power-of-two scale, so the
+            // ratio is exact to rounding even at these magnitudes
+            // (measured: 1.85798 at every component, gs/0.5).
+            if (d0 > 0.000001f || d0 < 0.0f - 0.000001f) {
+                MoeForwardTest.near((float64) want, d1 / d0, 0.01);
+                signal = signal + 1;
+            }
+            j = j + 1;
+        }
+        // The claim is vacuous if the shexp contributes nothing.
+        Assert.isTrue(signal > 50);
+    }
+
+    /** 27.1.3 / 15.16: SPARSITY BY MECHANISM. One forward touches
+     *  exactly the selected experts' slab bytes — counted at the
+     *  expert-GEMV seam, one stride per bank per selected expert — and
+     *  the negative arm: every unselected expert reads ZERO bytes.
+     *  Never a wall-clock. */
+    @Test
+    public void aForwardTouchesExactlyTheSelectedExperts() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        Tensor<float32> x #= MoeForwardTest.probeRow(false);
+        int32[] sel = heap int32[2];
+        float32[] w = heap float32[2];
+        moe.routeInto(x, 0L, sel, w);
+
+        int64[] shp = heap int64[1];
+        shp[0] = (int64) MoeForwardTest.H;
+        Tensor<float32> out #= Tensor.zeros<float32>(shp);
+        moe.resetTouched();
+        moe.forwardRow(x, 0L, out, 0L, 0);
+
+        ExpertBank gbk = moe.gateBank();
+        ExpertBank ubk = moe.upBank();
+        ExpertBank dbk = moe.downBank();
+        int32 e = 0;
+        while (e < moe.experts()) {
+            boolean selected = e == sel[0] || e == sel[1];
+            if (selected) {
+                Assert.equals(gbk.strideBytes(), gbk.touchedBytes(e));
+                Assert.equals(ubk.strideBytes(), ubk.touchedBytes(e));
+                Assert.equals(dbk.strideBytes(), dbk.touchedBytes(e));
+            } else {
+                Assert.equals(0L, gbk.touchedBytes(e));
+                Assert.equals(0L, ubk.touchedBytes(e));
+                Assert.equals(0L, dbk.touchedBytes(e));
+            }
+            e = e + 1;
+        }
+    }
+
+    /** 27.1.3 at the ENGINE level: a 4-token prefill through the full
+     *  stack serves exactly tokens x used strides per bank — the
+     *  per-token dispatch really is what the model runs, not just what
+     *  the probe runs. */
+    @Test
+    public void aPrefillCountsTokensTimesUsedStrides() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        moe.resetTouched();
+        int32[] p = heap int32[4];
+        p[0] = 1; p[1] = 2; p[2] = 3; p[3] = 4;
+        int32 tok = m.prefill(p, 4);
+        Assert.isTrue(tok >= 0);
+        Assert.isTrue(tok < 256);
+        ExpertBank gbk = moe.gateBank();
+        int64 total = 0L;
+        int32 e = 0;
+        while (e < moe.experts()) {
+            total = total + gbk.touchedBytes(e);
+            e = e + 1;
+        }
+        Assert.equals(4L * 2L * gbk.strideBytes(), total);
+    }
+
+    /** A greedy MoE forward is deterministic: the same prompt yields
+     *  the same next token across two fresh binds. (Real-model parity
+     *  vs llama.cpp is 27.1.4/27.3.1, recorded in the plan.) */
+    @Test
+    public void moeGreedyIsDeterministicAcrossBinds() {
+        int32[] p = heap int32[4];
+        p[0] = 5; p[1] = 9; p[2] = 2; p[3] = 7;
+        CausalLM m1 #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        int32 t1 = m1.prefill(p, 4);
+        CausalLM m2 #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        int32 t2 = m2.prefill(p, 4);
+        Assert.equals((int64) t1, (int64) t2);
+    }
+
+    /** 27.2.1 / 15.4 / 15.13: expert_gating_func=2 (sigmoid) has no
+     *  witness model — refused NAMING the function and the policy,
+     *  never run with guessed semantics. */
+    @Test
+    public void sigmoidGatingIsRefusedNamingTheGap() {
+        Checkpoint ck #= Checkpoint.open(MoeForwardTest.SIG);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        Assert.equals(2L, (int64) cfg.expertGating);
+        String msg = "";
+        try {
+            CausalLM m #= heap CausalLM(#cfg, 64, 1, 0);
+            Assert.isTrue(m == null);   // unreachable: must throw
+        } catch (LlmException e) {
+            String em #= e.getMessage();
+            msg = "" + em;
+        }
+        Assert.isTrue(msg.contains("sigmoid"));
+        Assert.isTrue(msg.contains("witness"));
+    }
+
+    /** The 27.1.4 divergence's fix, both arms (a check needs a test
+     *  that it FIRES and one that it does not): absent add_bos_token,
+     *  a qwen2-pre BPE file gets NO bos (llama.cpp's default, measured
+     *  in llama-vocab.cpp — the old blanket TRUE made the engine
+     *  answer a different prompt), while an SPM-tokenizer file still
+     *  defaults to bos. An explicit key always wins. */
+    @Test
+    public void bosDefaultFollowsTheTokenizerType() {
+        // The toy fixtures ship NO bos_token_id at all: whatever the
+        // type default says, there is no id to add — never a bos.
+        Checkpoint ck #= Checkpoint.open(MoeForwardTest.FIX);
+        Assert.isFalse(ck.gguf().tokenizer().addsBos());
+        ck.close();
+        // SPM with an EXPLICIT add_bos_token=1 -> true (Mixtral).
+        String mix = "/home/julian/models/Mixtral-8x7B-Instruct-v0.1-"
+            + "GGUF/Mixtral-8x7B-Instruct-v0.1.Q4_K_M.gguf";
+        Path pmx #= Path.of(mix);
+        if (pmx.exists()) {
+            Checkpoint cmx #= Checkpoint.open(mix);
+            Assert.isTrue(cmx.gguf().tokenizer().addsBos());
+            cmx.close();
+        }
+        // llama-bpe pre, NO key -> still true (the 8B witness).
+        String l31 = "/home/julian/models/Meta-Llama-3.1-8B-Instruct-"
+            + "GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf";
+        Path pl3 #= Path.of(l31);
+        if (pl3.exists()) {
+            Checkpoint cl3 #= Checkpoint.open(l31);
+            Assert.isTrue(cl3.gguf().tokenizer().addsBos());
+            cl3.close();
+        }
+        // qwen2-pre BPE, no key -> FALSE (the real witness, when here).
+        String q15 = "/home/julian/models/Qwen1.5-MoE-A2.7B-Chat-GGUF/"
+            + "Qwen1.5-MoE-A2.7B-Chat.Q4_K_M.gguf";
+        Path p15 #= Path.of(q15);
+        if (p15.exists()) {
+            Checkpoint c2 #= Checkpoint.open(q15);
+            Assert.isFalse(c2.gguf().tokenizer().addsBos());
+            c2.close();
+        } else {
+            System.stderr.println("  [skip] qwen1.5-moe witness not on "
+                + "this box");
+        }
+    }
+}

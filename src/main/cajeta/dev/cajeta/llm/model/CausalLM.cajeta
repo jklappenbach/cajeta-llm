@@ -257,14 +257,6 @@ public final class CausalLM extends InfModule {
      * block sized to the actual chunk (spec 4.9).
      */
     public int32 stepSeq(int32 seq, int32[] tokens, int32 off, int32 n) {
-        if (this.cfg.expertCount > 0) {
-            // Unit 26 binds MoE checkpoints; the sparse forward is
-            // unit 27. An EXPLICIT gap — a dense pass through a layer
-            // whose Mlp does not exist would be silence or a crash.
-            throw heap LlmException("moe: the sparse forward pass is "
-                + "not yet implemented (plan unit 27); this build binds "
-                + "MoE checkpoints but cannot run them");
-        }
         if (n <= 0) {
             throw heap LlmException("step: token count must be positive");
         }
@@ -523,30 +515,37 @@ public final class CausalLM extends InfModule {
                 }
                 Prim.rmsnormRowHost(hs, rh, pre.weight, pre.eps,
                     xn, rh, h, d.normForm);
-                Linear.beginSharedActivation();
-                if (d.mlp.gateProj.isDeviceRouted()
-                        && d.mlp.upProj.isDeviceRouted()
-                        && d.mlp.downProj.isDeviceRouted()) {
-                    // THE MLP MIDDLE NEVER LEAVES THE DEVICE (plan 10.2).
-                    // gate and up are produced there, the SwiGLU runs there,
-                    // and down quantizes the result there — where the host
-                    // path downloads gate and up, folds them, and uploads
-                    // the fold again, three crossings a layer for a value
-                    // no one on this side ever looks at.
-                    d.mlp.gateProj.matvecKeepOnDevice(xn, rh);
-                    d.mlp.upProj.matvecKeepOnDevice(xn, rh);
-                    Linear.endSharedActivation();
-                    Prim.gluDevice(d.mlp.gateProj.out(), d.mlp.upProj.out(),
-                        (int64) inter, d.activation);
-                    d.mlp.downProj.matvecFromDevice(d.mlp.gateProj.out(),
-                        (int64) inter, mlpOut, rh);
-                } else {
-                    d.mlp.gateProj.matvecInto(xn, rh, gate, ri);
-                    d.mlp.upProj.matvecInto(xn, rh, up, ri);
-                    Linear.endSharedActivation();
-                    Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
+                if (d.moe != null) {
+                    // MoE FFN (unit 27): per-token sparse dispatch
+                    // on the host. The device path is unit 28.
+                    d.moe.forwardRow(xn, rh, mlpOut, rh,
                         d.activation);
-                    d.mlp.downProj.matvecInto(gate, ri, mlpOut, rh);
+                } else {
+                    Linear.beginSharedActivation();
+                    if (d.mlp.gateProj.isDeviceRouted()
+                            && d.mlp.upProj.isDeviceRouted()
+                            && d.mlp.downProj.isDeviceRouted()) {
+                        // THE MLP MIDDLE NEVER LEAVES THE DEVICE (plan 10.2).
+                        // gate and up are produced there, the SwiGLU runs there,
+                        // and down quantizes the result there — where the host
+                        // path downloads gate and up, folds them, and uploads
+                        // the fold again, three crossings a layer for a value
+                        // no one on this side ever looks at.
+                        d.mlp.gateProj.matvecKeepOnDevice(xn, rh);
+                        d.mlp.upProj.matvecKeepOnDevice(xn, rh);
+                        Linear.endSharedActivation();
+                        Prim.gluDevice(d.mlp.gateProj.out(), d.mlp.upProj.out(),
+                            (int64) inter, d.activation);
+                        d.mlp.downProj.matvecFromDevice(d.mlp.gateProj.out(),
+                            (int64) inter, mlpOut, rh);
+                    } else {
+                        d.mlp.gateProj.matvecInto(xn, rh, gate, ri);
+                        d.mlp.upProj.matvecInto(xn, rh, up, ri);
+                        Linear.endSharedActivation();
+                        Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
+                            d.activation);
+                        d.mlp.downProj.matvecInto(gate, ri, mlpOut, rh);
+                    }
                 }
                 if (d.fourNorm) {
                     Prim.rmsnormRowHost(mlpOut, rh,
@@ -997,6 +996,7 @@ public final class CausalLM extends InfModule {
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
+            if (d.moe != null) { return false; }   // unit 28
             if (d.fourNorm || a.qNorm != null) { return false; }
             if (!a.qProj.isDeviceRouted() || !a.kProj.isDeviceRouted()
                     || !a.vProj.isDeviceRouted()
@@ -1019,6 +1019,7 @@ public final class CausalLM extends InfModule {
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
+            if (d.moe != null) { return false; }   // unit 28
             if (d.fourNorm || a.qNorm != null) { return false; }
             if (!a.qProj.isBatchRoutedFor((int64) rows)
                     || !a.kProj.isBatchRoutedFor((int64) rows)
@@ -1046,6 +1047,7 @@ public final class CausalLM extends InfModule {
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
+            if (d.moe != null) { return false; }   // unit 28
             if (!a.qProj.deviceLaunchable()
                     || !a.kProj.deviceLaunchable()
                     || !a.vProj.deviceLaunchable()
@@ -1324,7 +1326,20 @@ public final class CausalLM extends InfModule {
                 this.stageTag = Linear.nextStageTag();
                 Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
             }
-            if (Linear.devicePackOn()) {
+            if (d.moe != null) {
+                // MoE FFN (unit 27): the chunk loops rows through the
+                // host per-token dispatch; grouping and the device
+                // expert path are unit 28.
+                int64 tmoe = Clock.nanoTime();
+                r = 0;
+                while (r < rows) {
+                    d.moe.forwardRow(xn, (int64) r * (int64) h,
+                        mlpOut, (int64) r * (int64) h, d.activation);
+                    r = r + 1;
+                }
+                CausalLM.pfPrimNs = CausalLM.pfPrimNs
+                    + (Clock.nanoTime() - tmoe);
+            } else if (Linear.devicePackOn()) {
                 // RESIDENT MLP CHAIN (10.12.7.a): gate and up never
                 // leave the device — the GLU runs in place on gate's
                 // yBatch and the down projection packs straight from

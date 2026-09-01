@@ -61,6 +61,7 @@ def s(x):
 def kv_str(k, v):  return s(k) + struct.pack("<I", T_STR) + s(v)
 def kv_u32(k, v):  return s(k) + struct.pack("<II", T_U32, v)
 def kv_f32(k, v):  return s(k) + struct.pack("<I", T_F32) + struct.pack("<f", v)
+def kv_bool(k, v): return s(k) + struct.pack("<I", 7) + struct.pack("<B", 1 if v else 0)
 def kv_arr_str(k, xs):
     return s(k) + struct.pack("<I", T_ARR) + struct.pack("<IQ", T_STR, len(xs)) \
         + b"".join(s(x) for x in xs)
@@ -214,6 +215,68 @@ for gg, ne, ty, _pay in tensors:
 assert (IT_E * H) % BLOCK_ELEMS == 0     # expert stride lands on blocks
 assert IT_E % 128 == 0 and H % 256 == 0  # each VIEW routes like a Linear
 print("routing preconditions hold, per-expert views included")
+
+# ── unit 27 arms ────────────────────────────────────────────────────────
+# Same model, one lever moved per file (controls vary the mechanism):
+#   noshexp — the shared expert absent entirely (27.1.2's control);
+#   shexp0  — the shexp gate VECTOR zeroed, so its sigmoid is exactly 0.5
+#             (with the real vector the multiply is sigma(g.x); the ratio
+#             of the two shexp contributions is the sigmoid, measured
+#             without dequantizing anything in the oracle);
+#   norm    — expert_weights_norm=true carried IN METADATA (15.6: the
+#             reader honors a present key; no witness carries one);
+#   sigmoid — expert_gating_func=2, which must REFUSE (15.4/15.13).
+t_noshexp = [t for t in tensors if "shexp" not in t[0]]
+write_gguf(os.path.join(OUT, "toy-moe-noshexp.gguf"), kvs, t_noshexp)
+
+t_shexp0 = [(n, ne, ty,
+             (np.zeros(H, dtype="<f4").tobytes()
+              if n.endswith("ffn_gate_inp_shexp.weight") else pay))
+            for (n, ne, ty, pay) in tensors]
+write_gguf(os.path.join(OUT, "toy-moe-shexp0.gguf"), kvs, t_shexp0)
+
+kvs_norm = kvs + [kv_bool("qwen2moe.expert_weights_norm", True)]
+write_gguf(os.path.join(OUT, "toy-moe-norm.gguf"), kvs_norm, tensors)
+
+kvs_sig = kvs + [kv_u32("qwen2moe.expert_gating_func", 2)]
+write_gguf(os.path.join(OUT, "toy-moe-sigmoid.gguf"), kvs_sig, tensors)
+
+# ── the 27.1.1 router oracle ────────────────────────────────────────────
+# Computed here from the SAME formulas that wrote the file, in f32, for
+# the probe row the test constructs: x[j] = ((3j % 25) - 12) / 64.
+xp = ((np.arange(H) * 3 % 25) - 12).astype(np.float32) / np.float32(64.0)
+R = router_weights(E, H)
+logits = (R.astype(np.float32) @ xp).astype(np.float32)
+pr = np.exp((logits - logits.max()).astype(np.float32)).astype(np.float32)
+pr = (pr / pr.sum().astype(np.float32)).astype(np.float32)
+order = np.argsort(-pr, kind="stable")
+sel = order[:USED]
+w_raw = pr[sel]
+w_norm = (w_raw / max(w_raw.sum(), np.float32(6.103515625e-5))).astype(np.float32)
+gvec = f32_ramp(H, scale=0.02)
+gs = 1.0 / (1.0 + np.exp(-float(np.dot(gvec.astype(np.float32), xp))))
+print("ORACLE 27.1.1 (x[j] = ((3j %% 25) - 12)/64):")
+print("  logits  =", " ".join("%.8f" % v for v in logits))
+print("  probs   =", " ".join("%.8f" % v for v in pr))
+print("  top%d    =" % USED, " ".join(str(int(e)) for e in sel))
+print("  w_raw   =", " ".join("%.8f" % v for v in w_raw))
+print("  w_norm  =", " ".join("%.8f" % v for v in w_norm))
+print("  shexp gate sigma(g.x) = %.8f" % gs)
+assert len(set(np.round(pr, 6))) == E, "router probs must be distinct"
+
+# Second probe: the NEGATED row must flip the selection (an oracle a
+# stuck always-[0,1] top-k cannot pass).
+xn2 = (-xp).astype(np.float32)
+l2 = (R.astype(np.float32) @ xn2).astype(np.float32)
+p2 = np.exp((l2 - l2.max()).astype(np.float32)).astype(np.float32)
+p2 = (p2 / p2.sum().astype(np.float32)).astype(np.float32)
+o2 = np.argsort(-p2, kind="stable")[:USED]
+w2 = p2[o2]
+print("ORACLE 27.1.1 probe 2 (x2 = -x):")
+print("  top%d    =" % USED, " ".join(str(int(e)) for e in o2))
+print("  w_raw   =", " ".join("%.8f" % v for v in w2))
+assert set(o2) != set(int(e) for e in sel), "probe 2 must select differently"
+
 
 # ── toy-moe-split-bad.gguf (15.17) ──────────────────────────────────────
 # TheBloke's pre-2024-04 Mixtral layout, reproduced small: plain llama

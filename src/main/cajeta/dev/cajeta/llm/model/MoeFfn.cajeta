@@ -1,5 +1,6 @@
 package dev.cajeta.llm.model;
 
+import cajeta.lang.Math;
 import cajeta.lang.String;
 import cajeta.math.Tensor;
 import dev.cajeta.llm.LlmException;
@@ -34,10 +35,34 @@ public final class MoeFfn extends InfModule {
 
     int32 expertsN;
     int32 usedN;
+    int32 gating;              // gguf enum: 1 softmax, 2 sigmoid
+    boolean normTopk;          // renormalize top-k weights by sum
+    float32 wScale;            // 0 = none
+    int32 sharedW;             // shared expert width, 0 = none
+    MoeScratch sc;             // NOT a parameter (plain class ref)
     int32 widthN;              // resolved at bind (config key or slab)
     int32 hidden;
 
     MoeFfn(ModelConfig cfg) {
+        if (cfg.expertGating != 1) {
+            // 15.4/15.13: sigmoid (2) and softmax-after-top-k (3)
+            // exist in the key's enum but NO witness file carries
+            // them; a wrong gating function is fluent wrong output,
+            // so an unwitnessed value refuses instead of guessing.
+            String nm = "" + cfg.expertGating;
+            if (cfg.expertGating == 2) {
+                nm = "sigmoid (2)";
+            }
+            throw heap LlmException("moe: expert_gating_func " + nm
+                + " has no witness model; only softmax (1) is "
+                + "implemented (spec 15.4; 15.13 defers the rest "
+                + "until a witness exists)");
+        }
+        this.gating = cfg.expertGating;
+        this.normTopk = cfg.expertNormTopk;
+        this.wScale = cfg.expertScale;
+        this.sharedW = 0;
+        this.sc = null;
         this.expertsN = cfg.expertCount;
         this.usedN = cfg.expertUsedCount;
         this.widthN = cfg.expertFfn;   // 0 = derive from the slab
@@ -97,6 +122,7 @@ public final class MoeFfn extends InfModule {
                     + "ffn_gate_shexp.weight' is not rank 2");
             }
             int32 sw = (int32) shp[0];
+            this.sharedW = sw;
             this.sharedGateProj = heap Linear(this.hidden, sw);
             this.sharedUpProj = heap Linear(this.hidden, sw);
             this.sharedDownProj = heap Linear(sw, this.hidden);
@@ -112,6 +138,178 @@ public final class MoeFfn extends InfModule {
                 this.sharedGate #= g;
             }
         }
+        this.sc = heap MoeScratch(this.expertsN, this.usedN,
+            this.widthN, this.hidden, this.sharedW);
+        return;
+    }
+
+    /**
+     * Router selection for one activation row (15.5–15.8): logits
+     * through the gating function over ALL experts, top-`used` by
+     * gating probability (ties to the LOWER index, argsort's order),
+     * combining weights the selected probabilities — renormalized by
+     * their clamped sum when the arch says so (qwen3moe, Mixtral) and
+     * NOT when it says not (qwen2moe), scaled only when the file
+     * carries a scale. Semantics measured against llama.cpp's
+     * build_moe_ffn, 2026-08-31.
+     */
+    public void routeInto(Tensor<float32> x, int64 xOff,
+            int32[] selOut, float32[] wOut) {
+        this.router.matvecInto(x, xOff, this.sc.logits, 0L);
+        float32[] lb = this.sc.logits.hostBuffer();
+        int64 lo = this.sc.logits.hostBase();
+        // Softmax over all experts (gating 1 — the ctor refused the
+        // rest). Selection order is unchanged by the monotone map, but
+        // the COMBINING WEIGHTS are these probabilities, so the full
+        // softmax is load-bearing even without renormalization.
+        float32 mx = lb[lo];
+        int32 e = 1;
+        while (e < this.expertsN) {
+            if (lb[lo + (int64) e] > mx) {
+                mx = lb[lo + (int64) e];
+            }
+            e = e + 1;
+        }
+        float32 sum = 0.0f;
+        e = 0;
+        while (e < this.expertsN) {
+            float32 p = Math.exp(lb[lo + (int64) e] - mx);
+            this.sc.probs[e] = p;
+            sum = sum + p;
+            e = e + 1;
+        }
+        e = 0;
+        while (e < this.expertsN) {
+            this.sc.probs[e] = this.sc.probs[e] / sum;
+            e = e + 1;
+        }
+        // Top-k by probability, strict > so ties keep the lower index.
+        int32 k = 0;
+        while (k < this.usedN) {
+            int32 best = 0 - 1;
+            float32 bp = 0.0f;
+            e = 0;
+            while (e < this.expertsN) {
+                if (this.sc.probs[e] >= 0.0f
+                        && (best < 0 || this.sc.probs[e] > bp)) {
+                    best = e;
+                    bp = this.sc.probs[e];
+                }
+                e = e + 1;
+            }
+            selOut[k] = best;
+            wOut[k] = bp;
+            this.sc.probs[best] = 0.0f - 1.0f;   // taken
+            k = k + 1;
+        }
+        if (this.normTopk) {
+            float32 ws = 0.0f;
+            k = 0;
+            while (k < this.usedN) {
+                ws = ws + wOut[k];
+                k = k + 1;
+            }
+            // llama.cpp clamps the divisor at the smallest f16 normal.
+            if (ws < 0.00006103515625f) {
+                ws = 0.00006103515625f;
+            }
+            k = 0;
+            while (k < this.usedN) {
+                wOut[k] = wOut[k] / ws;
+                k = k + 1;
+            }
+        }
+        if (this.wScale != 0.0f && this.wScale != 1.0f) {
+            k = 0;
+            while (k < this.usedN) {
+                wOut[k] = wOut[k] * this.wScale;
+                k = k + 1;
+            }
+        }
+        return;
+    }
+
+    /**
+     * One token's MoE FFN on the host (15.9–15.11, 15.18):
+     * `out = Σ_k w_k · down_k(act(gate_k(x)) · up_k(x))`, plus the gated
+     * shared expert when the checkpoint ships one. Writes (does not
+     * accumulate) `hidden` floats at `out[outOff]`. `act` is the layer's
+     * GLU activation. Only the SELECTED experts' bank bytes are read —
+     * that is 15.16's sparsity claim, and ExpertBank's counters at the
+     * mat-vec seam are its instrument.
+     */
+    public void forwardRow(Tensor<float32> x, int64 xOff,
+            Tensor<float32> out, int64 outOff, int32 act) {
+        this.routeInto(x, xOff, this.sc.sel, this.sc.w);
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase() + xOff;
+        float32[] ob = out.hostBuffer();
+        int64 oo = out.hostBase() + outOff;
+        int64 j = 0;
+        while (j < (int64) this.hidden) {
+            ob[oo + j] = 0.0f;
+            j = j + 1;
+        }
+        float32[] gb = this.sc.g.hostBuffer();
+        int64 go = this.sc.g.hostBase();
+        float32[] eb = this.sc.eOut.hostBuffer();
+        int64 eo = this.sc.eOut.hostBase();
+        int32 k = 0;
+        while (k < this.usedN) {
+            int32 e = this.sc.sel[k];
+            this.gateB.matvecAt(e, xb, xo, gb, go);
+            this.upB.matvecAt(e, xb, xo,
+                this.sc.u.hostBuffer(), this.sc.u.hostBase());
+            Prim.gluRowHost(this.sc.g, 0L, this.sc.u, 0L, this.sc.g, 0L,
+                this.widthN, act);
+            this.downB.matvecAt(e, gb, go, eb, eo);
+            float32 w = this.sc.w[k];
+            j = 0;
+            while (j < (int64) this.hidden) {
+                ob[oo + j] = ob[oo + j] + w * eb[eo + j];
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+        if (this.sharedGateProj != null) {
+            // 15.18: the dense shared expert, gated by its own learned
+            // sigmoid when the file carries the gate vector (qwen2moe;
+            // computed as sigma(g.x) — llama.cpp spells the same value
+            // silu(z)/z).
+            this.sharedGateProj.matvecInto(x, xOff, this.sc.shG, 0L);
+            this.sharedUpProj.matvecInto(x, xOff, this.sc.shU, 0L);
+            Prim.gluRowHost(this.sc.shG, 0L, this.sc.shU, 0L,
+                this.sc.shG, 0L, this.sharedW, act);
+            this.sharedDownProj.matvecInto(this.sc.shG, 0L,
+                this.sc.shOut, 0L);
+            float32 gs = 1.0f;
+            if (this.sharedGate != null) {
+                float32[] gv = this.sharedGate.hostBuffer();
+                int64 gvo = this.sharedGate.hostBase();
+                float32 z = 0.0f;
+                j = 0;
+                while (j < (int64) this.hidden) {
+                    z = z + gv[gvo + j] * xb[xo + j];
+                    j = j + 1;
+                }
+                gs = 1.0f / (1.0f + Math.exp(0.0f - z));
+            }
+            float32[] sb = this.sc.shOut.hostBuffer();
+            int64 so = this.sc.shOut.hostBase();
+            j = 0;
+            while (j < (int64) this.hidden) {
+                ob[oo + j] = ob[oo + j] + gs * sb[so + j];
+                j = j + 1;
+            }
+        }
+        return;
+    }
+
+    /** Zero every bank's per-expert byte counters (15.16's window). */
+    public void resetTouched() {
+        this.gateB.resetTouched();
+        this.upB.resetTouched();
+        this.downB.resetTouched();
         return;
     }
 
