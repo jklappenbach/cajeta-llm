@@ -1220,6 +1220,42 @@ public final class Linear extends InfModule {
         return;
     }
 
+    // moe-expert-cache 1.2.1: a resident SLOT is a Linear bound once
+    // from ONE expert's bytes (spec 3.1.2). It differs from the window
+    // in what it owns: no host staging (the bank lends its own for the
+    // single admission upload), and the batch output rides the SHARED
+    // slotY scratch below — a per-slot output would multiply
+    // rows x outDim across thousands of slots. Weight buffers stay
+    // per-slot and IMMUTABLE, so the derived forms (deq widen, q6 pad,
+    // coop repack) bind lazily inside the first launch that routes to
+    // them and are never re-staged — laziness is exactly right here,
+    // where it was re-run per group on the window.
+    boolean slotMode;
+    int64 devWBytes;   // device WEIGHT bytes bound, counted at alloc
+
+    void bindExpertSlot(int32 ty, int64 len) {
+        this.packedTy = ty;
+        this.winLen = len;
+        this.slotMode = true;
+        this.packedDev #= heap KernelBuffer<int8>((uint64) len);
+        this.devWBytes = this.devWBytes + len;
+        return;
+    }
+
+    /** The slot's one admission upload, from the bank's staging. */
+    void stageExpertSlot(int8[] bytes) {
+        this.packedDev.upload(bytes);
+        return;
+    }
+
+    /** Device weight bytes this Linear holds — packed plus every
+     *  derived form, incremented BESIDE each allocation so the number
+     *  cannot drift from what was actually bound (the moe-cache 1.1.1
+     *  audit compares the budget's charge against this). */
+    public int64 devWeightBytes() {
+        return this.devWBytes;
+    }
+
     /** Re-stage the window to `slab[off .. off+winLen)` and refresh
      *  every derived device buffer IN PLACE — every expert shares the
      *  window's shape, so the builders' allocations are reused and
@@ -1273,6 +1309,7 @@ public final class Linear extends InfModule {
         if (this.q6PadW == null) {
             int64 nBlocks = (int64) this.outDim
                 * ((int64) this.inDim / 256L);
+            this.devWBytes = this.devWBytes + nBlocks * 212L;
             this.q6PadDev #= heap KernelBuffer<int8>(
                 (uint64) (nBlocks * 212L));
             QuantKernel.q6kPadLaunch(this.q6PadDev, this.packedDev,
@@ -1301,6 +1338,7 @@ public final class Linear extends InfModule {
             * ((int64) this.inDim / (int64) Quant.blockElems(ty));
         int32 sb = Quant.blockBytes(ty);
         int32 db = QuantKernel.coopBlockWords(ty) * 4;
+        this.devWBytes = this.devWBytes + nBlocks * (int64) db;
         this.coopDev #= heap KernelBuffer<int8>(
             (uint64) (nBlocks * (int64) db));
         if (ty == Quant.GG_Q3_K) {
@@ -2297,6 +2335,7 @@ public final class Linear extends InfModule {
     void ensureDeq() {
         if (this.deqDev != null) { return; }
         int64 n = (int64) this.outDim * (int64) this.inDim;
+        this.devWBytes = this.devWBytes + n;
         this.deqDev #= heap KernelBuffer<int8>((uint64) n);
         this.runDeqWiden();
         return;
@@ -2336,7 +2375,33 @@ public final class Linear extends InfModule {
     float32[] yBatchH;
     int32 yBatchRows;
 
+    // moe-expert-cache 1.2.1: ONE batch-output scratch shared by every
+    // slot Linear — outputs are transient (matmulInto downloads before
+    // the next dispatch), so per-slot buffers would spend rows x outDim
+    // per admitted expert on bytes nothing keeps.
+    static KernelBuffer<float32> slotY;
+    static float32[] slotYH;
+    static int64 slotYCap;
+
     void ensureBatchOut(int32 rows) {
+        if (this.slotMode) {
+            int64 n = (int64) rows * (int64) this.outDim;
+            if (Linear.slotYCap < n) {
+                // Growth drains the stream first: a NoSync GEMM from
+                // another slot may still be reading the old buffer.
+                QuantKernel.stream().sync();
+                Linear.slotY #= heap KernelBuffer<float32>((uint64) n);
+                Linear.slotYH #= heap float32[n];
+                Linear.slotYCap = n;
+            }
+            // Re-lent EVERY dispatch, never cached across calls: the
+            // static reallocates on growth and a stale borrow would
+            // dangle. Plain `=` — the static keeps title.
+            this.yBatch = Linear.slotY;
+            this.yBatchH = Linear.slotYH;
+            this.yBatchRows = rows;
+            return;
+        }
         if (this.yBatch != null && this.yBatchRows >= rows) { return; }
         int64 n = (int64) rows * (int64) this.outDim;
         this.yBatch #= heap KernelBuffer<float32>((uint64) n);
@@ -2482,6 +2547,7 @@ public final class Linear extends InfModule {
      *  buffer, the shared stage, and every latched routing flag. */
     void ensureDevice() {
         if (this.packedDev != null) { return; }
+            this.devWBytes = this.devWBytes + (int64) this.packed.count();
             this.packedDev #= heap KernelBuffer<int8>(
                 (uint64) this.packed.count());
             this.packedDev.upload(this.packed);

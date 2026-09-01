@@ -1,0 +1,271 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.math.Tensor;
+import cajeta.xpu.Device;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.MoeFfn;
+
+/**
+ * moe-expert-cache plan 1.1 — device-resident expert slots (spec T1,
+ * §3.1/§3.2).
+ *
+ * A slot is admitted on FIRST device dispatch — one mapping read, one
+ * upload, one repack chain — and every later dispatch of that expert
+ * reads the slot with zero host traffic (spec 3.1.1/3.1.2). Past the
+ * budget an expert keeps the unit-28 windowed path; budget 0 IS that
+ * path (spec 3.1.7). All tests gate on the device grouped route the
+ * dispatch itself uses (deviceGroupedFor), the MoeGroupedTest pattern.
+ */
+public class MoeSlotTest {
+
+    public MoeSlotTest() { return; }
+
+    static void saySkip() {
+        System.stdout.println("  (skipped: backend "
+            + Device.activeBackend()
+            + " has no batch route for the moe fixture)");
+        return;
+    }
+
+    /** 8 rows with varied content so routing spreads across experts —
+     *  the probe pair plus ramps. */
+    static #Tensor<float32> rowsOf(int32 rows) {
+        int32 h = MoeForwardTest.H;
+        int64[] bs = heap int64[1];
+        bs[0] = (int64) (rows * h);
+        Tensor<float32> x #= Tensor.zeros<float32>(bs);
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase();
+        int32 r = 0;
+        while (r < rows) {
+            int32 j = 0;
+            while (j < h) {
+                int32 v = ((j * (3 + r) + r * 7) % 25) - 12;
+                if (r % 2 == 1) { v = 0 - v; }
+                xb[xo + (int64) (r * h + j)]
+                    = (float32) v / 64.0f;
+                j = j + 1;
+            }
+            r = r + 1;
+        }
+        return #x;
+    }
+
+    static #Tensor<float32> outOf(int32 rows) {
+        int64[] bs = heap int64[1];
+        bs[0] = (int64) (rows * MoeForwardTest.H);
+        Tensor<float32> o #= Tensor.zeros<float32>(bs);
+        return #o;
+    }
+
+    /** 1.1.1 — the form audit: what the budget was CHARGED for an
+     *  admitted expert equals the device weight bytes its slot
+     *  actually holds — after dispatches at TWO row counts, because
+     *  the route (and so the buffer set: packed alone, or packed plus
+     *  a derived form) depends on rows, and a buffer bound by a later
+     *  route after the charge is exactly the silent under-accounting
+     *  this test exists to catch (spec 3.1.4). */
+    @Test
+    public void slotChargeMatchesTheBuffersTheSlotHolds() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        if (!moe.deviceGroupedFor(8)) {
+            MoeSlotTest.saySkip();
+            return;
+        }
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+
+        // Small group first, then a larger one: two dispatch shapes,
+        // two chances for the route tree to bind different forms.
+        Tensor<float32> x3 #= MoeSlotTest.rowsOf(3);
+        Tensor<float32> o3 #= MoeSlotTest.outOf(3);
+        moe.forwardBatch(x3, o3, 3, 0);
+        Tensor<float32> x8 #= MoeSlotTest.rowsOf(8);
+        Tensor<float32> o8 #= MoeSlotTest.outOf(8);
+        moe.forwardBatch(x8, o8, 8, 0);
+
+        ExpertBank gb = moe.gateBank();
+        int32 checked = 0;
+        int32 e = 0;
+        while (e < gb.experts()) {
+            if (gb.isAdmitted(e)) {
+                // Charged == held, and held is at least the packed
+                // stride (a slot with no weight bytes is not a slot).
+                Assert.equals(gb.slotBytesOf(e), gb.slotDeviceBytes(e));
+                Assert.isTrue(gb.slotDeviceBytes(e)
+                    >= gb.strideBytes());
+                checked = checked + 1;
+            }
+            e = e + 1;
+        }
+        Assert.isTrue(checked > 0);
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
+    }
+
+    /** 1.1.2 — admission happens ONCE: an identical second batch
+     *  admits nothing and reads nothing from the mapping; it is served
+     *  from slots (spec 3.1.1, plan 9.1.1's mechanism). */
+    @Test
+    public void secondIdenticalBatchAdmitsNothingAndReadsNoBytes() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        if (!moe.deviceGroupedFor(8)) {
+            MoeSlotTest.saySkip();
+            return;
+        }
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+
+        Tensor<float32> x #= MoeSlotTest.rowsOf(8);
+        Tensor<float32> o #= MoeSlotTest.outOf(8);
+        moe.forwardBatch(x, o, 8, 0);
+        int64 admits = ExpertBank.residencyAdmissions();
+        Assert.isTrue(admits > 0L);
+
+        // Snapshot the mapping-read counters, then go again.
+        moe.resetTouched();
+        int64 hits0 = ExpertBank.residencyHits();
+        moe.forwardBatch(x, o, 8, 0);
+        Assert.equals(admits, ExpertBank.residencyAdmissions());
+        Assert.isTrue(ExpertBank.residencyHits() > hits0);
+        ExpertBank gb = moe.gateBank();
+        int32 e = 0;
+        while (e < gb.experts()) {
+            Assert.equals(0L, gb.touchedBytes(e));
+            e = e + 1;
+        }
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
+    }
+
+    /** 1.1.3 — budget 0 is the T0 path on the same binary (spec
+     *  3.1.7): no slot allocated, asserted on the counters, not on
+     *  the absence of a crash; the dispatch still ran (windowed
+     *  counter advanced). */
+    @Test
+    public void budgetZeroAllocatesNoSlotAndStaysWindowed() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        if (!moe.deviceGroupedFor(8)) {
+            MoeSlotTest.saySkip();
+            return;
+        }
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(0L);
+        int64 w0 = ExpertBank.residencyWindowed();
+        Tensor<float32> x #= MoeSlotTest.rowsOf(8);
+        Tensor<float32> o #= MoeSlotTest.outOf(8);
+        moe.forwardBatch(x, o, 8, 0);
+        Assert.equals(0L, ExpertBank.residencyAdmissions());
+        Assert.equals(0L, ExpertBank.residencyUsedBytes());
+        Assert.equals(0L, (int64) moe.gateBank().admittedCount());
+        Assert.isTrue(ExpertBank.residencyWindowed() > w0);
+        ExpertBank.resetResidency();
+    }
+
+    /** 1.1.4 — a capped budget degrades, IDENTICALLY (spec 7.1.1,
+     *  9.1.3): both paths feed the same kernels the same working-form
+     *  bytes, so the outputs must be bit-identical, not merely close —
+     *  anything weaker hides a staging bug. The vacuity guard: the
+     *  capped run must show BOTH admissions and windowed fallbacks,
+     *  or the identity arm proved nothing. */
+    @Test
+    public void cappedBudgetIsBitIdenticalAndActuallyMixed() {
+        CausalLM ma #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moeA = ma.moeAt(0);
+        if (!moeA.deviceGroupedFor(8)) {
+            MoeSlotTest.saySkip();
+            return;
+        }
+        int32 rows = 8;
+        int32 h = MoeForwardTest.H;
+
+        // FULL arm: everything admits; remember what that cost.
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        Tensor<float32> x #= MoeSlotTest.rowsOf(rows);
+        Tensor<float32> oa #= MoeSlotTest.outOf(rows);
+        MoeSlotTest.runOnce(moeA, x, oa, rows);
+        int64 fullBytes = ExpertBank.residencyAdmissionBytes();
+        Assert.isTrue(fullBytes > 0L);
+
+        // CAPPED arm on a FRESH model: half the full bytes admits some
+        // experts and must refuse others.
+        CausalLM mb #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moeB = mb.moeAt(0);
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(fullBytes / 2L);
+        Tensor<float32> ob #= MoeSlotTest.outOf(rows);
+        MoeSlotTest.runOnce(moeB, x, ob, rows);
+        Assert.isTrue(ExpertBank.residencyAdmissions() > 0L);
+        Assert.isTrue(ExpertBank.residencyWindowed() > 0L);
+
+        float32[] ab = oa.hostBuffer();
+        int64 ao = oa.hostBase();
+        float32[] bb = ob.hostBuffer();
+        int64 bo = ob.hostBase();
+        int32 i = 0;
+        while (i < rows * h) {
+            Assert.isTrue(ab[ao + (int64) i] == bb[bo + (int64) i]);
+            i = i + 1;
+        }
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
+    }
+
+    static void runOnce(MoeFfn moe, Tensor<float32> x,
+            Tensor<float32> o, int32 rows) {
+        moe.forwardBatch(x, o, rows, 0);
+        return;
+    }
+
+    /** 1.1.5 — accounting is readable and consistent (spec 3.2.4):
+     *  each bank's resident bytes are the sum of its admitted slots'
+     *  charges, and the process total is the sum over the banks that
+     *  admitted. */
+    @Test
+    public void accountingSumsAcrossSlotsAndBanks() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        MoeFfn moe = m.moeAt(0);
+        if (!moe.deviceGroupedFor(8)) {
+            MoeSlotTest.saySkip();
+            return;
+        }
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        Tensor<float32> x #= MoeSlotTest.rowsOf(8);
+        Tensor<float32> o #= MoeSlotTest.outOf(8);
+        moe.forwardBatch(x, o, 8, 0);
+
+        int64 total = 0L;
+        int32 b = 0;
+        while (b < 3) {
+            ExpertBank bank = moe.gateBank();
+            if (b == 1) { bank = moe.upBank(); }
+            if (b == 2) { bank = moe.downBank(); }
+            int64 bankSum = 0L;
+            int32 n = 0;
+            int32 e = 0;
+            while (e < bank.experts()) {
+                if (bank.isAdmitted(e)) {
+                    bankSum = bankSum + bank.slotBytesOf(e);
+                    n = n + 1;
+                }
+                e = e + 1;
+            }
+            Assert.equals(bankSum, bank.residentBytes());
+            Assert.equals((int64) n, (int64) bank.admittedCount());
+            total = total + bankSum;
+            b = b + 1;
+        }
+        Assert.isTrue(total > 0L);
+        Assert.equals(total, ExpertBank.residencyUsedBytes());
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
+    }
+}

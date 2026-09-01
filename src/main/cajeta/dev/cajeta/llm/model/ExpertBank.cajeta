@@ -1,5 +1,6 @@
 package dev.cajeta.llm.model;
 
+import cajeta.collection.ArrayList;
 import cajeta.lang.String;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.Checkpoint;
@@ -33,6 +34,26 @@ public final class ExpertBank {
     int64 stride;      // bytes per expert
     int64[] touched;   // bytes served per expert (15.16's instrument)
     Linear winLin;     // unit 28: the device expert window (lazy)
+    // moe-expert-cache T1 (spec 3.1/3.2): device-resident slots.
+    // `slotOwn` owns the admitted Linears; `slots` is the borrow index
+    // by expert (the layerArr pattern), null = not admitted.
+    ArrayList<Linear> slotOwn;
+    Linear[] slots;
+    boolean[] refused;      // trial admission failed once; never retried
+    int64[] slotCharge;     // budget bytes charged per admitted expert
+    int64 residentB;
+    int32 admittedN;
+
+    // Process-wide residency state (spec 10.7: T1 assumes one MoE
+    // model per process; the accessors keep the option open).
+    // resBudget == 0 means residency is OFF and every dispatch takes
+    // the T0 windowed path (spec 3.1.7).
+    static int64 resBudget;
+    static int64 resUsed;
+    static int64 resAdmissions;
+    static int64 resAdmissionBytes;
+    static int64 resHits;
+    static int64 resWindowed;
 
     public ExpertBank() {
         this.expertsN = 0;
@@ -45,7 +66,81 @@ public final class ExpertBank {
         this.stride = 0L;
         this.touched = null;
         this.winLin = null;
+        this.slotOwn = null;
+        this.slots = null;
+        this.refused = null;
+        this.slotCharge = null;
+        this.residentB = 0L;
+        this.admittedN = 0;
         return;
+    }
+
+    public static void setResidencyBudget(int64 bytes) {
+        ExpertBank.resBudget = bytes;
+        return;
+    }
+
+    public static int64 residencyBudget() {
+        return ExpertBank.resBudget;
+    }
+
+    public static int64 residencyUsedBytes() {
+        return ExpertBank.resUsed;
+    }
+
+    public static int64 residencyAdmissions() {
+        return ExpertBank.resAdmissions;
+    }
+
+    public static int64 residencyAdmissionBytes() {
+        return ExpertBank.resAdmissionBytes;
+    }
+
+    public static int64 residencyHits() {
+        return ExpertBank.resHits;
+    }
+
+    public static int64 residencyWindowed() {
+        return ExpertBank.resWindowed;
+    }
+
+    /** Zero the residency counters and the global charge — a
+     *  measurement seam for tests and probes. Live slots are NOT
+     *  freed (dropping the model frees them), so reset only between
+     *  models. */
+    public static void resetResidency() {
+        ExpertBank.resUsed = 0L;
+        ExpertBank.resAdmissions = 0L;
+        ExpertBank.resAdmissionBytes = 0L;
+        ExpertBank.resHits = 0L;
+        ExpertBank.resWindowed = 0L;
+        return;
+    }
+
+    public boolean isAdmitted(int32 e) {
+        if (this.slots == null) { return false; }
+        return this.slots[e] != null;
+    }
+
+    /** The budget's charge for expert `e`'s slot. */
+    public int64 slotBytesOf(int32 e) {
+        if (this.slotCharge == null) { return 0L; }
+        return this.slotCharge[e];
+    }
+
+    /** The device weight bytes the slot ACTUALLY holds — the 1.1.1
+     *  audit's ground truth, counted beside each allocation. */
+    public int64 slotDeviceBytes(int32 e) {
+        if (!this.isAdmitted(e)) { return 0L; }
+        return this.slots[e].devWeightBytes();
+    }
+
+    public int64 residentBytes() {
+        return this.residentB;
+    }
+
+    public int32 admittedCount() {
+        return this.admittedN;
     }
 
     /** Bind `name` as a rank-3 [experts, out, in] packed slab.
@@ -247,11 +342,79 @@ public final class ExpertBank {
      */
     public void gemmDeviceAt(int32 e, int32 m, Tensor<float32> dst,
             int64 dstOff) {
+        if (this.isAdmitted(e)) {
+            Linear sl = this.slots[e];
+            ExpertBank.resHits = ExpertBank.resHits + 1L;
+            sl.matmulInto(m, dst, dstOff);
+            // Reconcile AFTER every slot launch (plan 1.1.1): the
+            // route depends on rows, and a new group shape may have
+            // just bound a derived form the admission never charged.
+            int64 now = sl.devWeightBytes();
+            if (now != this.slotCharge[e]) {
+                int64 d = now - this.slotCharge[e];
+                this.slotCharge[e] = now;
+                this.residentB = this.residentB + d;
+                ExpertBank.resUsed = ExpertBank.resUsed + d;
+                ExpertBank.resAdmissionBytes =
+                    ExpertBank.resAdmissionBytes + d;
+            }
+            return;
+        }
+        boolean tryAdmit = ExpertBank.resBudget > 0L
+            && ExpertBank.resUsed < ExpertBank.resBudget;
+        if (tryAdmit && this.refused != null && this.refused[e]) {
+            tryAdmit = false;
+        }
+        if (tryAdmit) {
+            this.admitAndRun(e, m, dst, dstOff);
+            return;
+        }
+        ExpertBank.resWindowed = ExpertBank.resWindowed + 1L;
         this.map.read(this.mapOff + (int64) e * this.stride,
             this.winLin.winStage, 0L, this.stride);
         this.winLin.stageExpertWindowStaged();
         this.touched[e] = this.touched[e] + this.stride;
         this.winLin.matmulInto(m, dst, dstOff);
+        return;
+    }
+
+    /** TRIAL admission (plan 1.2.2): build the slot, run the dispatch
+     *  on it, then charge the budget with what it ACTUALLY bound — no
+     *  predicted sizes to drift from the route tree. Over budget, the
+     *  slot is dropped and the expert marked refused, never retried:
+     *  the one trial cost the same staging a windowed dispatch pays,
+     *  plus a transient allocation (spec 3.1.3's decision, made
+     *  exact). */
+    void admitAndRun(int32 e, int32 m, Tensor<float32> dst,
+            int64 dstOff) {
+        if (this.slots == null) {
+            this.slotOwn = heap ArrayList<Linear>();
+            this.slots = heap Linear[this.expertsN];
+            this.refused #= heap boolean[this.expertsN];
+            this.slotCharge #= heap int64[this.expertsN];
+        }
+        Linear sl = heap Linear(this.colsN, this.rowsN);
+        sl.bindExpertSlot(this.packedTy, this.stride);
+        this.map.read(this.mapOff + (int64) e * this.stride,
+            this.eStage, 0L, this.stride);
+        sl.stageExpertSlot(this.eStage);
+        this.touched[e] = this.touched[e] + this.stride;
+        sl.matmulInto(m, dst, dstOff);
+        int64 charge = sl.devWeightBytes();
+        if (ExpertBank.resUsed + charge > ExpertBank.resBudget) {
+            this.refused[e] = true;
+            ExpertBank.resWindowed = ExpertBank.resWindowed + 1L;
+            return;
+        }
+        this.slots[e] = sl;
+        this.slotOwn.add(#sl);
+        this.slotCharge[e] = charge;
+        this.residentB = this.residentB + charge;
+        this.admittedN = this.admittedN + 1;
+        ExpertBank.resUsed = ExpertBank.resUsed + charge;
+        ExpertBank.resAdmissions = ExpertBank.resAdmissions + 1L;
+        ExpertBank.resAdmissionBytes =
+            ExpertBank.resAdmissionBytes + charge;
         return;
     }
 

@@ -8,6 +8,8 @@ import dev.cajeta.llm.DiagRecord;
 import cajeta.lang.String;
 import cajeta.lang.System;
 import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.Linear;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.model.CausalLM;
 import dev.cajeta.llm.model.ModelConfig;
@@ -18,13 +20,43 @@ import dev.cajeta.llm.tok.Tokenizer;
  *  [noroute]. The prompt is real text repeated to length, encoded with
  *  the model's own policy, so routing sees natural statistics. */
 public class MoeBenchProbe {
+    static void timers(String tag) {
+        System.stdout.println("[" + tag + " gemm-ms: pack "
+            + (Linear.batchPackNs() / 1000000L) + " upload "
+            + (Linear.batchUploadNs() / 1000000L) + " launch "
+            + (Linear.batchLaunchNs() / 1000000L) + " down "
+            + (Linear.batchDownNs() / 1000000L) + " copy "
+            + (Linear.batchCopyNs() / 1000000L) + " calls "
+            + Linear.batchCalls() + "]");
+        Linear.resetBatchTimers();
+        return;
+    }
+
     public static void run(String[] args) {
         String model = args[0];
         int32 nPre = Integer.parseInt(args[1]);
         int32 nDec = Integer.parseInt(args[2]);
+        boolean resident = false;
         if ((int32) args.count() > 3 && args[3].equals("noroute")) {
             QuantKernel.setRoutingEnabled(false);
             System.stdout.println("[device routing OFF]");
+        }
+        boolean twice = false;
+        if ((int32) args.count() > 3 && args[3].equals("twice")) {
+            // Control arm: two prefills WITHOUT residency, so the
+            // steady-state comparison is second-prefill vs
+            // second-prefill — a first-vs-second compare confounds
+            // allocator and cache state with the mechanism.
+            twice = true;
+        }
+        if ((int32) args.count() > 3 && args[3].equals("resident")) {
+            // moe-expert-cache 1.3.1: an explicit huge budget (the
+            // measured DEFAULT is that plan's unit 4). Prefill runs
+            // TWICE: the first admits, the second is the steady state
+            // the acceptance row records.
+            ExpertBank.setResidencyBudget(1152921504606846976L);
+            resident = true;
+            System.stdout.println("[expert residency ON]");
         }
         Diag.register(heap RouteSay());
         Checkpoint ck #= Checkpoint.open(model);
@@ -50,12 +82,45 @@ public class MoeBenchProbe {
             i = i + 1;
         }
         System.stdout.println("prefill " + nPre + " tokens...");
+        Linear.resetBatchTimers();
         int64 t0 = Clock.nanoTime();
         int32 nxt = m.prefill(p, nPre);
         int64 t1 = Clock.nanoTime();
         float64 preMs = (float64) (t1 - t0) / 1000000.0;
         System.stdout.println("prefill: " + preMs + " ms total, "
             + (preMs / (float64) nPre) + " ms/tok");
+        MoeBenchProbe.timers("first");
+        if (twice) {
+            m.resetSeq(0);
+            int64 t0c = Clock.nanoTime();
+            nxt = m.prefill(p, nPre);
+            int64 t1c = Clock.nanoTime();
+            float64 preC = (float64) (t1c - t0c) / 1000000.0;
+            System.stdout.println("prefill second (windowed): " + preC
+                + " ms total, " + (preC / (float64) nPre)
+                + " ms/tok");
+            MoeBenchProbe.timers("second");
+        }
+        if (resident) {
+            System.stdout.println("[cold: admits "
+                + ExpertBank.residencyAdmissions() + " ("
+                + ExpertBank.residencyAdmissionBytes() + " B) hits "
+                + ExpertBank.residencyHits() + " windowed "
+                + ExpertBank.residencyWindowed() + "]");
+            m.resetSeq(0);
+            int64 t0b = Clock.nanoTime();
+            nxt = m.prefill(p, nPre);
+            int64 t1b = Clock.nanoTime();
+            float64 preB = (float64) (t1b - t0b) / 1000000.0;
+            System.stdout.println("prefill steady: " + preB
+                + " ms total, " + (preB / (float64) nPre)
+                + " ms/tok");
+            MoeBenchProbe.timers("steady");
+            System.stdout.println("[steady: admits "
+                + ExpertBank.residencyAdmissions() + " hits "
+                + ExpertBank.residencyHits() + " windowed "
+                + ExpertBank.residencyWindowed() + "]");
+        }
 
         int32[] one = heap int32[1];
         int32 g = 0;
