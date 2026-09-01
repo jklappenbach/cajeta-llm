@@ -730,6 +730,17 @@ public final class CausalLM extends InfModule {
         return;
     }
 
+    // Unit 29: the MoE expert sum's ride back up to the resident hs.
+    KernelBuffer<float32> pfMoeDev;
+    int64 pfMoeCap;
+
+    void ensurePrefillMoe(int64 n) {
+        if (this.pfMoeCap >= n) { return; }
+        this.pfMoeDev #= heap KernelBuffer<float32>((uint64) n);
+        this.pfMoeCap = n;
+        return;
+    }
+
     KernelBuffer<float32> pfLastDev;
     int64 pfLastCap;
 
@@ -1047,13 +1058,25 @@ public final class CausalLM extends InfModule {
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
-            if (d.moe != null) { return false; }   // unit 28
-            if (d.fourNorm || a.qNorm != null) { return false; }
+            // Unit 29: qNorm no longer disqualifies — the batched path
+            // applies the per-head norms between projection and rope
+            // (llama.cpp's build_qwen3 order, read rather than assumed).
+            if (d.fourNorm) { return false; }
             if (!a.qProj.isBatchRoutedFor((int64) rows)
                     || !a.kProj.isBatchRoutedFor((int64) rows)
                     || !a.vProj.isBatchRoutedFor((int64) rows)
-                    || !a.oProj.isBatchRoutedFor((int64) rows)
-                    || !d.mlp.gateProj.isBatchRoutedFor((int64) rows)
+                    || !a.oProj.isBatchRoutedFor((int64) rows)) {
+                return false;
+            }
+            if (d.moe != null) {
+                // Unit 29: an MoE FFN places no static claim here — the
+                // grouped dispatch (unit 28) chooses device or host PER
+                // EXPERT GROUP inside forwardBatch, so only the dense
+                // attention stack must batch.
+                l = l + 1;
+                continue;
+            }
+            if (!d.mlp.gateProj.isBatchRoutedFor((int64) rows)
                     || !d.mlp.upProj.isBatchRoutedFor((int64) rows)
                     || !d.mlp.downProj.isBatchRoutedFor((int64) rows)) {
                 return false;
@@ -1203,6 +1226,25 @@ public final class CausalLM extends InfModule {
                 int64 tr0 = CausalLM.pfMark();
                 CausalLM.pfGemmNs = CausalLM.pfGemmNs + (tr0 - tg0);
                 CausalLM.pfGQkvNs = CausalLM.pfGQkvNs + (tr0 - tg0);
+                if (a.qNorm != null) {
+                    // QK-norm BEFORE RoPE (spec 5.10), per head: the
+                    // [rows x nH x hd] tensor is rows*nH contiguous
+                    // hd-rows sharing one [hd] weight — exactly
+                    // rmsnormRowsF32's shape, and in place is safe
+                    // because each workgroup reads and writes only its
+                    // own row.
+                    Prim.rmsnormBatchDevice(a.qProj.yBatch,
+                        a.qProj.yBatch, a.qNorm.deviceWeight(),
+                        (int64) rows * (int64) nH, (int64) hd,
+                        a.qNorm.eps, d.normForm);
+                    Prim.rmsnormBatchDevice(a.kProj.yBatch,
+                        a.kProj.yBatch, a.kNorm.deviceWeight(),
+                        (int64) rows * (int64) nKv, (int64) hd,
+                        a.kNorm.eps, d.normForm);
+                    int64 tqn = CausalLM.pfMark();
+                    CausalLM.pfPrimNs = CausalLM.pfPrimNs + (tqn - tr0);
+                    tr0 = tqn;
+                }
                 Prim.ropeBatchDevice(a.qProj.yBatch, a.deviceRopeInv(),
                     this.pfPosDev, (int64) rows, nH, hd);
                 Prim.ropeBatchDevice(a.kProj.yBatch, a.deviceRopeInv(),
@@ -1252,6 +1294,30 @@ public final class CausalLM extends InfModule {
             a.qProj.matmulInto(rows, q, 0L);
             a.kProj.matmulInto(rows, k, 0L);
             a.vProj.matmulInto(rows, v, 0L);
+            if (a.qNorm != null) {
+                // QK-norm BEFORE RoPE (spec 5.10), per head per row —
+                // the host twin of the resident arm's device norms.
+                r = 0;
+                while (r < rows) {
+                    int64 rqn = (int64) r * (int64) qd;
+                    int64 rkn = (int64) r * (int64) kvd;
+                    int32 hh = 0;
+                    while (hh < nH) {
+                        Prim.rmsnormRowHost(q, rqn + (int64) (hh * hd),
+                            a.qNorm.weight, a.qNorm.eps,
+                            q, rqn + (int64) (hh * hd), hd, d.normForm);
+                        hh = hh + 1;
+                    }
+                    hh = 0;
+                    while (hh < nKv) {
+                        Prim.rmsnormRowHost(k, rkn + (int64) (hh * hd),
+                            a.kNorm.weight, a.kNorm.eps,
+                            k, rkn + (int64) (hh * hd), hd, d.normForm);
+                        hh = hh + 1;
+                    }
+                    r = r + 1;
+                }
+            }
 
             // RoPE and the cache append stay on the host: they are O(n)
             // and they are what keeps the paged cache authoritative for
@@ -1355,15 +1421,39 @@ public final class CausalLM extends InfModule {
                 Linear.stageBatch(xn, 0L, rows, h, this.stageTag);
             }
             if (d.moe != null) {
-                // MoE FFN (unit 27): the chunk loops rows through the
-                // host per-token dispatch; grouping and the device
-                // expert path are unit 28.
+                // MoE FFN: unit 28's GROUPED dispatch — route every
+                // row, serve each selected expert once per batch. The
+                // dispatch is host-anchored by design (the banks read
+                // expert strides through the page cache and fork device
+                // vs host PER GROUP), so under the resident hidden
+                // state the activations cross to the host here and the
+                // expert sum crosses back — 15.19's priced seam, not a
+                // leak in it.
                 int64 tmoe = Clock.nanoTime();
-                r = 0;
-                while (r < rows) {
-                    d.moe.forwardRow(xn, (int64) r * (int64) h,
-                        mlpOut, (int64) r * (int64) h, d.activation);
-                    r = r + 1;
+                if (res) {
+                    KernelStream ms = QuantKernel.stream();
+                    ms.sync();
+                    this.pfXnDev.download(this.pfHsHost, nHs);
+                    float32[] xb = xn.hostBuffer();
+                    int64 xb0 = xn.hostBase();
+                    int64 cm = 0;
+                    while (cm < nHs) {
+                        xb[xb0 + cm] = this.pfHsHost[cm];
+                        cm = cm + 1;
+                    }
+                }
+                d.moe.forwardBatch(xn, mlpOut, rows, d.activation);
+                if (res) {
+                    float32[] mb = mlpOut.hostBuffer();
+                    int64 mb0 = mlpOut.hostBase();
+                    int64 cm2 = 0;
+                    while (cm2 < nHs) {
+                        this.pfHsHost[cm2] = mb[mb0 + cm2];
+                        cm2 = cm2 + 1;
+                    }
+                    this.ensurePrefillMoe(nHs);
+                    this.pfMoeDev.upload(this.pfHsHost, nHs);
+                    Prim.addDevice(this.pfHsDev, this.pfMoeDev, nHs);
                 }
                 CausalLM.pfPrimNs = CausalLM.pfPrimNs
                     + (Clock.nanoTime() - tmoe);

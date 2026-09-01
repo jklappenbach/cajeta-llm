@@ -119,83 +119,113 @@ def f32_ramp(rows, cols=None, scale=0.02, bias=0.0):
     return a.reshape(shape).astype(np.float32)
 
 # (gguf_name, ne fastest-dim-first, ggml type, payload)
-tensors = []
-def add_q4k(name, rows, cols):
-    pay, _deq = q4k_tile(rows, cols)
-    tensors.append((name, [cols, rows], GG_Q4_K, pay))
-def add_f32(name, arr):
-    ne = list(reversed(arr.shape))
-    tensors.append((name, ne, GG_F32, arr.astype("<f4").tobytes()))
+#
+# Unit 29 adds a SECOND fixture from the same builder: toy-routable-qk
+# is toy-routable plus per-head q/k RMS norms under arch `qwen3` — the
+# dense Qwen3 shape, whose loader path sets qkNorm from the arch the
+# same way qwen3moe does. Same Q4_K bytes, same dims, one variable: the
+# norm pair between projection and rope. toy-routable itself must stay
+# BYTE-IDENTICAL (its oracles and parity thresholds are calibrated), so
+# the builder writes it first and the md5 is asserted in the repo test
+# suite by simply not regenerating expectations.
 
-add_f32("token_embd.weight", f32_ramp(V, H))
-for i in range(L):
-    g = f"blk.{i}."
-    add_f32(g + "attn_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
-    add_q4k(g + "attn_q.weight",      NH * HD, H)
-    add_q4k(g + "attn_k.weight",      NKV * HD, H)
-    add_q4k(g + "attn_v.weight",      NKV * HD, H)
-    add_q4k(g + "attn_output.weight", H, NH * HD)
-    add_f32(g + "ffn_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
-    add_q4k(g + "ffn_gate.weight", IT, H)
-    add_q4k(g + "ffn_up.weight",   IT, H)
-    add_q4k(g + "ffn_down.weight", H, IT)
-add_f32("output_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
-add_q4k("output.weight", V, H)
+def build(arch, qk_norm):
+    tensors = []
+    def add_q4k(name, rows, cols):
+        pay, _deq = q4k_tile(rows, cols)
+        tensors.append((name, [cols, rows], GG_Q4_K, pay))
+    def add_f32(name, arr):
+        ne = list(reversed(arr.shape))
+        tensors.append((name, ne, GG_F32, arr.astype("<f4").tobytes()))
 
-# A byte vocabulary, exactly V tokens: no merges to get wrong, and the
-# vocab size is then the same constraint-satisfying 256 the output
-# projection needs rather than a second number to keep in step.
-toks = [f"<0x{b:02X}>" for b in range(V)]
-types = [6] * V
-scores = [0.0] * V
+    add_f32("token_embd.weight", f32_ramp(V, H))
+    for i in range(L):
+        g = f"blk.{i}."
+        add_f32(g + "attn_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
+        add_q4k(g + "attn_q.weight",      NH * HD, H)
+        add_q4k(g + "attn_k.weight",      NKV * HD, H)
+        add_q4k(g + "attn_v.weight",      NKV * HD, H)
+        add_q4k(g + "attn_output.weight", H, NH * HD)
+        if qk_norm:
+            # Per-head norms, [HD]. bias=1.0 keeps them near identity so
+            # the fixture's activations stay in the regime the parity
+            # thresholds were calibrated in; scale=0.01 makes them NOT
+            # identity, so a path that skips the norm fails parity
+            # instead of passing vacuously.
+            add_f32(g + "attn_q_norm.weight",
+                    f32_ramp(HD, scale=0.01, bias=1.0))
+            add_f32(g + "attn_k_norm.weight",
+                    f32_ramp(HD, scale=0.01, bias=1.05))
+        add_f32(g + "ffn_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
+        add_q4k(g + "ffn_gate.weight", IT, H)
+        add_q4k(g + "ffn_up.weight",   IT, H)
+        add_q4k(g + "ffn_down.weight", H, IT)
+    add_f32("output_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
+    add_q4k("output.weight", V, H)
 
-kvs = [
-    kv_str("general.architecture", "llama"),
-    kv_str("general.name", "cajeta-toy-routable"),
-    kv_u32("llama.embedding_length", H),
-    kv_u32("llama.block_count", L),
-    kv_u32("llama.attention.head_count", NH),
-    kv_u32("llama.attention.head_count_kv", NKV),
-    kv_u32("llama.feed_forward_length", IT),
-    kv_u32("llama.context_length", CTX),
-    kv_u32("llama.rope.dimension_count", HD),
-    kv_u32("llama.vocab_size", V),
-    kv_f32("llama.attention.layer_norm_rms_epsilon", 1e-5),
-    kv_f32("llama.rope.freq_base", 10000.0),
-    kv_str("tokenizer.ggml.model", "llama"),
-    kv_arr_str("tokenizer.ggml.tokens", toks),
-    kv_arr_f32("tokenizer.ggml.scores", scores),
-    kv_arr_i32("tokenizer.ggml.token_type", types),
-]
+    # A byte vocabulary, exactly V tokens: no merges to get wrong, and the
+    # vocab size is then the same constraint-satisfying 256 the output
+    # projection needs rather than a second number to keep in step.
+    toks = [f"<0x{b:02X}>" for b in range(V)]
+    types = [6] * V
+    scores = [0.0] * V
 
-ALIGN = 32
-dirs, off = [], 0
-for gg, ne, ty, pay in tensors:
-    dirs.append(s(gg) + struct.pack("<I", len(ne))
-                + b"".join(struct.pack("<Q", n) for n in ne)
-                + struct.pack("<IQ", ty, off))
-    off += (len(pay) + ALIGN - 1) // ALIGN * ALIGN
+    kp = arch + "."
+    kvs = [
+        kv_str("general.architecture", arch),
+        kv_str("general.name", "cajeta-toy-routable"
+               + ("-qk" if qk_norm else "")),
+        kv_u32(kp + "embedding_length", H),
+        kv_u32(kp + "block_count", L),
+        kv_u32(kp + "attention.head_count", NH),
+        kv_u32(kp + "attention.head_count_kv", NKV),
+        kv_u32(kp + "feed_forward_length", IT),
+        kv_u32(kp + "context_length", CTX),
+        kv_u32(kp + "rope.dimension_count", HD),
+        kv_u32(kp + "vocab_size", V),
+        kv_f32(kp + "attention.layer_norm_rms_epsilon", 1e-5),
+        kv_f32(kp + "rope.freq_base", 10000.0),
+        kv_str("tokenizer.ggml.model", "llama"),
+        kv_arr_str("tokenizer.ggml.tokens", toks),
+        kv_arr_f32("tokenizer.ggml.scores", scores),
+        kv_arr_i32("tokenizer.ggml.token_type", types),
+    ]
+    return kvs, tensors
 
-head = struct.pack("<IIQQ", GGUF_MAGIC, 3, len(tensors), len(kvs))
-body = head + b"".join(kvs) + b"".join(dirs)
-blob = body + b"\x00" * ((-len(body)) % ALIGN)
-for _gg, _ne, _ty, pay in tensors:
-    blob += pay + b"\x00" * ((-len(pay)) % ALIGN)
+def write(name, kvs, tensors):
+    ALIGN = 32
+    dirs, off = [], 0
+    for gg, ne, ty, pay in tensors:
+        dirs.append(s(gg) + struct.pack("<I", len(ne))
+                    + b"".join(struct.pack("<Q", n) for n in ne)
+                    + struct.pack("<IQ", ty, off))
+        off += (len(pay) + ALIGN - 1) // ALIGN * ALIGN
 
-os.makedirs(OUT, exist_ok=True)
-path = os.path.join(OUT, "toy-routable.gguf")
-open(path, "wb").write(blob)
-print(path, len(blob), "bytes,", len(tensors), "tensors")
+    head = struct.pack("<IIQQ", GGUF_MAGIC, 3, len(tensors), len(kvs))
+    body = head + b"".join(kvs) + b"".join(dirs)
+    blob = body + b"\x00" * ((-len(body)) % ALIGN)
+    for _gg, _ne, _ty, pay in tensors:
+        blob += pay + b"\x00" * ((-len(pay)) % ALIGN)
 
-# Restate the routing preconditions as ASSERTS, so a future dimension
-# edit fails HERE rather than as a mysteriously vacuous test.
-assert HD <= 128 and HD % 2 == 0, "DeviceKv.supports: headDim"
-assert NH % NKV == 0, "DeviceKv.supports: head_count % head_count_kv"
-for gg, ne, ty, _pay in tensors:
-    if ty != GG_Q4_K:
-        continue
-    cols, rows = ne[0], ne[1]
-    assert cols % 256 == 0, (gg, "coopColsOk: cols % 256", cols)
-    assert rows % 128 == 0, (gg, "coop route: outDim % 128", rows)
-print("routing preconditions hold for all",
-      sum(1 for t in tensors if t[2] == GG_Q4_K), "Q4_K tensors")
+    os.makedirs(OUT, exist_ok=True)
+    path = os.path.join(OUT, name)
+    open(path, "wb").write(blob)
+    print(path, len(blob), "bytes,", len(tensors), "tensors")
+
+    # Restate the routing preconditions as ASSERTS, so a future dimension
+    # edit fails HERE rather than as a mysteriously vacuous test.
+    assert HD <= 128 and HD % 2 == 0, "DeviceKv.supports: headDim"
+    assert NH % NKV == 0, "DeviceKv.supports: head_count % head_count_kv"
+    for gg, ne, ty, _pay in tensors:
+        if ty != GG_Q4_K:
+            continue
+        cols, rows = ne[0], ne[1]
+        assert cols % 256 == 0, (gg, "coopColsOk: cols % 256", cols)
+        assert rows % 128 == 0, (gg, "coop route: outDim % 128", rows)
+    print("routing preconditions hold for all",
+          sum(1 for t in tensors if t[2] == GG_Q4_K), "Q4_K tensors")
+
+kvs, tensors = build("llama", False)
+write("toy-routable.gguf", kvs, tensors)
+kvs, tensors = build("qwen3", True)
+write("toy-routable-qk.gguf", kvs, tensors)

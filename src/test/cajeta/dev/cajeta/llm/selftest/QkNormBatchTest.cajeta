@@ -1,0 +1,169 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.DiagCallback;
+import dev.cajeta.llm.DiagRecord;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+
+/**
+ * cajeta-llm plan 29.1 — QK-norm on the BATCHED path (spec 15.14).
+ *
+ * Before unit 29, `batchReady` rejected any model with `qNorm != null`,
+ * so every Qwen3 prefill ran per-row — 28.3.1 measured that as the
+ * second-largest structural lever against llama.cpp. The fixture is
+ * toy-routable-qk: toy-routable's exact Q4_K bytes and dims under arch
+ * `qwen3`, plus per-head q/k norm tensors that are near-identity
+ * (activations stay in the calibrated regime) but NOT identity (a path
+ * that skips the norm fails parity instead of passing vacuously).
+ */
+public class QkNormBatchTest {
+
+    static final String FIX = "src/test/fixtures/gguf/toy-routable-qk.gguf";
+
+    public QkNormBatchTest() { return; }
+
+    static #CausalLM mk() {
+        Checkpoint ck #= Checkpoint.open(QkNormBatchTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    /** Gate on the BACKEND's capability via the dense twin, never on
+     *  the qk model's own `batchRoutedFor` — that predicate is the
+     *  thing under test, and a gate on it would skip exactly when the
+     *  fix is missing. */
+    static boolean backendBatches() {
+        CausalLM dense #= RoutableFixtureTest.mk(1);
+        return RoutableFixtureTest.deviceHere(dense);
+    }
+
+    /** The fixture's own contract: the loader sees arch `qwen3` and
+     *  turns the per-head norms ON. Without this arm, both parity arms
+     *  could silently run WITHOUT any q/k norm and agree perfectly. */
+    @Test
+    public void fixtureDeclaresQkNorm() {
+        Checkpoint ck #= Checkpoint.open(QkNormBatchTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        ck.close();
+        Assert.isTrue(cfg.qkNorm);
+    }
+
+    /** 29.1.1 — a QK-norm model takes BATCHED prefill, asserted on the
+     *  mechanism: the engine's own route record says `batched` and the
+     *  batched-GEMM counter advances. */
+    @Test
+    public void qkNormModelTakesBatchedPrefill() {
+        if (!QkNormBatchTest.backendBatches()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        CausalLM m #= QkNormBatchTest.mk();
+        // The capability itself: batchReady no longer rejects qNorm.
+        Assert.isTrue(m.batchRoutedFor(8));
+
+        PrefillModeCapture cap = heap PrefillModeCapture();
+        Diag.register(cap);
+        int64 before = Linear.batchCalls();
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+        int32 tok = m.prefill(p, 8);
+        Diag.register(null);
+        Assert.isTrue(tok >= 0);
+        Assert.isTrue(Linear.batchCalls() > before);
+        Assert.isTrue(cap.saw);
+        Assert.isTrue(cap.mode.equals("batched"));
+    }
+
+    /** 29.1.2 — batched and per-row prefill AGREE on the qk fixture.
+     *
+     *  Routing off makes the host arm dequantize the SAME bytes to the
+     *  SAME values, so the one variable is the compute path. Thresholds
+     *  CALIBRATED (QkNormProbe, 2026-09-01, backend amdgpu), not
+     *  copied from the dense test:
+     *
+     *    batched-qk vs per-row-qk    1-cos 1.05e-5  kl 2.8e-7  top1 =
+     *    dense twin, same route      1-cos 6e-6     (BackendParityTest)
+     *    per-row-qk vs per-row-dense 1-cos 9.5e-3   (the norm's effect)
+     *
+     *  The qk fixture sits 4.5e-6 beyond its dense twin — the two
+     *  per-layer tree-reduced norm reductions the batched arm adds,
+     *  13.21's float-reassociation class. The bar is 2x the measured
+     *  residual, still ~900x tighter than the norm's own end-to-end
+     *  effect, which the last arm below pins so a batched path that
+     *  SKIPPED the norm cannot pass. KL keeps the dense bar (3.5x
+     *  margin measured). */
+    @Test
+    public void qkNormBatchedMatchesPerRowLogits() {
+        if (!QkNormBatchTest.backendBatches()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32[] p #= RoutableFixtureTest.promptOf(12, 5);
+
+        // BATCHED arm first, while routing is on.
+        CausalLM dev #= QkNormBatchTest.mk();
+        Assert.isTrue(dev.batchRoutedFor(12));
+        dev.prefill(p, 12);
+        float32[] dl #= BackendParityTest.logitsOf(dev);
+        int32 vocab = dev.vocabSize();
+
+        // PER-ROW arm: flip the master switch, then build a FRESH
+        // model, so no device state survives from the arm above.
+        QuantKernel.setRoutingEnabled(false);
+        CausalLM host #= QkNormBatchTest.mk();
+        host.prefill(p, 12);
+        float32[] hl #= BackendParityTest.logitsOf(host);
+
+        // SENSITIVITY arm, still routing-off: the dense twin holds the
+        // same weights minus the norms, so this distance is the norm's
+        // whole effect — the scale a norm-skipping batched path would
+        // fail at. Without this arm, both arms above could silently
+        // skip the norm together and agree perfectly.
+        CausalLM dense #= RoutableFixtureTest.mk(1);
+        dense.prefill(p, 12);
+        float32[] nl #= BackendParityTest.logitsOf(dense);
+        QuantKernel.setRoutingEnabled(true);
+
+        float64 cos = Metrics.cosine(hl, dl, vocab);
+        float64 kl = Metrics.softmaxKl(hl, dl, vocab);
+        float64 cosN = Metrics.cosine(hl, nl, vocab);
+        int32 hTop = Metrics.argmax(hl, vocab);
+        int32 dTop = Metrics.argmax(dl, vocab);
+        System.stdout.println("  29.1.2 logits: cosine " + cos
+            + "  softmaxKl " + kl + "  top1 per-row " + hTop
+            + " batched " + dTop + "  norm-effect cosine " + cosN);
+        Assert.isTrue(cos >= 0.99998);
+        Assert.isTrue(kl <= 1.0e-6);
+        Assert.equals((int64) hTop, (int64) dTop);
+        Assert.isTrue(cosN < 0.999);
+    }
+}
+
+/** Copies the one field this file asserts on; the record is valid only
+ *  during the call (11.8.3). */
+final class PrefillModeCapture implements DiagCallback {
+    public boolean saw;
+    public String mode;
+    public PrefillModeCapture() {
+        this.saw = false;
+        this.mode #= "";
+    }
+    public void onRecord(DiagRecord r) {
+        if (!r.category.equals("prefill-mode")) { return; }
+        this.saw = true;
+        int8[] b #= r.name.toBytes();
+        String c = heap String(#b, r.name.byteLength());
+        this.mode #= #c;
+        return;
+    }
+}
