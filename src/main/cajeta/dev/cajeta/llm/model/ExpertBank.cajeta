@@ -39,6 +39,7 @@ public final class ExpertBank {
     // dispatch reads — and per-expert slots become zero-copy SLICES of
     // it. One admission, one charge, one upload per bank. ──
     KernelBuffer<int8> slabDev;
+    KernelBuffer<int32> slabW;         // unit 44: word view of the slab
     boolean slabRefused;
     int64 stride;      // bytes per expert
     int64[] touched;   // bytes served per expert (15.16's instrument)
@@ -443,8 +444,12 @@ public final class ExpertBank {
         }
         int8[] hostSlab #= heap int8[charge];
         this.map.read(this.mapOff, hostSlab, 0L, charge);
-        this.slabDev #= heap KernelBuffer<int8>((uint64) charge);
+        // Four spare bytes past the last block: the Q6_K multi-wave
+        // id-GEMM assembles its unaligned words through a funnel that
+        // reads the aligned word after the bytes it wants.
+        this.slabDev #= heap KernelBuffer<int8>((uint64) (charge + 4L));
         this.slabDev.upload(hostSlab, charge);
+        this.slabW #= this.slabDev.wordView();
         this.residentB = this.residentB + charge;
         ExpertBank.resUsed = ExpertBank.resUsed + charge;
         ExpertBank.resAdmissions = ExpertBank.resAdmissions + 1L;
@@ -517,6 +522,39 @@ public final class ExpertBank {
                 ExpertBank.resAdmissionBytes + d;
         }
         return true;
+    }
+
+    /**
+     * Unit 44: the multi-wave id-GEMM with the packed-direct B feed —
+     * the maps stride 64 rows (up to four token tiles per entry). Serves
+     * Q4_K banks whose outDim is a multiple of 128; {@link #idMwReady}
+     * says which. Every covered group counts its hit.
+     */
+    public boolean gemmIdBatchMw(KernelBuffer<float32> y,
+            KernelBuffer<int8> xp, KernelBuffer<int32> mapE,
+            KernelBuffer<int32> mapT0, KernelBuffer<int32> mapM1,
+            int32 nChunks, int32 groups) {
+        if (!this.idMwReady()) { return false; }
+        if (this.packedTy == 12) {
+            WmmaKernel.q4kWmmaIdMwLaunchNoSync(y, this.slabDev,
+                this.slabW, xp, mapE, mapT0, mapM1, (int64) nChunks,
+                (int64) this.rowsN, (int64) this.colsN,
+                (int64) this.rowsN);
+        } else {
+            WmmaKernel.q6kWmmaIdMwLaunchNoSync(y, this.slabDev,
+                this.slabW, xp, mapE, mapT0, mapM1, (int64) nChunks,
+                (int64) this.rowsN, (int64) this.colsN,
+                (int64) this.rowsN);
+        }
+        ExpertBank.resHits = ExpertBank.resHits + (int64) groups;
+        return true;
+    }
+
+    /** Whether {@link #gemmIdBatchMw} can serve this bank. */
+    public boolean idMwReady() {
+        if (this.slabDev == null || this.slabW == null) { return false; }
+        return (this.packedTy == 12 || this.packedTy == 14)
+            && this.rowsN % 128 == 0;
     }
 
     /**

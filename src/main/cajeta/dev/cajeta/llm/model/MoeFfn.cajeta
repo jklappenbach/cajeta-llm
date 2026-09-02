@@ -82,6 +82,13 @@ public final class MoeFfn extends InfModule {
     static KernelBuffer<int32> mapEDev;
     static KernelBuffer<int32> mapT0Dev;
     static KernelBuffer<int32> mapM1Dev;
+    // Unit 44: the 64-row-chunk maps for the multi-wave id-GEMM.
+    static int32[] map64EH;
+    static int32[] map64T0H;
+    static int32[] map64M1H;
+    static KernelBuffer<int32> map64EDev;
+    static KernelBuffer<int32> map64T0Dev;
+    static KernelBuffer<int32> map64M1Dev;
     static KernelBuffer<int8> xpBxDev;        // packed batch activations
     static KernelBuffer<int8> xpBgDev;        // packed GLU'd middle
 
@@ -917,6 +924,20 @@ public final class MoeFfn extends InfModule {
         return;
     }
 
+    /** One bank's id-GEMM: the multi-wave kernel where it applies,
+     *  the epi-id kernel otherwise. */
+    void idGemm(ExpertBank bank, KernelBuffer<float32> y,
+            KernelBuffer<int8> xp, int32 nT, int32 nC, int32 groups) {
+        if (bank.idMwReady()) {
+            bank.gemmIdBatchMw(y, xp, MoeFfn.map64EDev, MoeFfn.map64T0Dev,
+                MoeFfn.map64M1Dev, nC, groups);
+        } else {
+            bank.gemmIdBatch(y, xp, MoeFfn.mapEDev, MoeFfn.mapT0Dev,
+                MoeFfn.mapM1Dev, nT, groups);
+        }
+        return;
+    }
+
     void ensureDevBatch(int32 rows) {
         int64 np = (int64) rows * (int64) this.usedN;
         int64 wid = (int64) this.widthN;
@@ -935,9 +956,10 @@ public final class MoeFfn extends InfModule {
         // old set.
         QuantKernel.stream().sync();
         MoeFfn.fbEdbAllocs = MoeFfn.fbEdbAllocs + 1L;
-        // +16 rows of slack everywhere the id-GEMM's padded tiles may
-        // READ past the last group (their stores are guarded).
-        int64 npp = np + 16L;
+        // +64 rows of slack everywhere the id-GEMMs' padded tiles may
+        // READ past the last group (their stores are guarded): the
+        // multi-wave kernel's map strides 64.
+        int64 npp = np + 64L;
         MoeFfn.gRowDev #= heap KernelBuffer<int32>((uint64) np);
         MoeFfn.gWDev #= heap KernelBuffer<float32>((uint64) np);
         MoeFfn.rowSlotDev #= heap KernelBuffer<int32>((uint64) np);
@@ -953,6 +975,12 @@ public final class MoeFfn extends InfModule {
         MoeFfn.mapEDev #= heap KernelBuffer<int32>((uint64) tiles);
         MoeFfn.mapT0Dev #= heap KernelBuffer<int32>((uint64) tiles);
         MoeFfn.mapM1Dev #= heap KernelBuffer<int32>((uint64) tiles);
+        MoeFfn.map64EH #= heap int32[tiles];
+        MoeFfn.map64T0H #= heap int32[tiles];
+        MoeFfn.map64M1H #= heap int32[tiles];
+        MoeFfn.map64EDev #= heap KernelBuffer<int32>((uint64) tiles);
+        MoeFfn.map64T0Dev #= heap KernelBuffer<int32>((uint64) tiles);
+        MoeFfn.map64M1Dev #= heap KernelBuffer<int32>((uint64) tiles);
         MoeFfn.xpBxDev #= heap KernelBuffer<int8>(
             (uint64) ((npp * h / 256L) * 320L));
         MoeFfn.xpBgDev #= heap KernelBuffer<int8>(
@@ -1067,7 +1095,15 @@ public final class MoeFfn extends InfModule {
             && this.gateB.idGemmReady() && this.upB.idGemmReady()
             && this.downB.idGemmReady();
         int32 nT = 0;
+        int32 nC = 0;
         int32 groups = 0;
+        // Unit 44: the multi-wave kernel takes 64-row chunk maps; the
+        // epi-id kernels (q6k, or an outDim off the 128 grid) keep the
+        // 16-row tile maps. A bank picks by idMwReady().
+        boolean anyMw = this.gateB.idMwReady() || this.upB.idMwReady()
+            || this.downB.idMwReady();
+        boolean any16 = !this.gateB.idMwReady() || !this.upB.idMwReady()
+            || !this.downB.idMwReady();
         if (idPath) {
             e = 0;
             while (e < this.expertsN) {
@@ -1083,19 +1119,32 @@ public final class MoeFfn extends InfModule {
                         nT = nT + 1;
                         tw = tw + 1;
                     }
+                    tw = 0;
+                    while (tw * 64 < m) {
+                        MoeFfn.map64EH[nC] = e;
+                        MoeFfn.map64T0H[nC] = g0 + tw * 64;
+                        MoeFfn.map64M1H[nC] = g0 + m;
+                        nC = nC + 1;
+                        tw = tw + 1;
+                    }
                 }
                 e = e + 1;
             }
-            MoeFfn.mapEDev.upload(MoeFfn.mapEH, (int64) nT);
-            MoeFfn.mapT0Dev.upload(MoeFfn.mapT0H, (int64) nT);
-            MoeFfn.mapM1Dev.upload(MoeFfn.mapM1H, (int64) nT);
+            if (any16) {
+                MoeFfn.mapEDev.upload(MoeFfn.mapEH, (int64) nT);
+                MoeFfn.mapT0Dev.upload(MoeFfn.mapT0H, (int64) nT);
+                MoeFfn.mapM1Dev.upload(MoeFfn.mapM1H, (int64) nT);
+            }
+            if (anyMw) {
+                MoeFfn.map64EDev.upload(MoeFfn.map64EH, (int64) nC);
+                MoeFfn.map64T0Dev.upload(MoeFfn.map64T0H, (int64) nC);
+                MoeFfn.map64M1Dev.upload(MoeFfn.map64M1H, (int64) nC);
+            }
             QuantKernel.q8kPackLaunchNoSync(MoeFfn.xpBxDev, MoeFfn.bxDev,
                 (int64) np * h);
-            this.gateB.gemmIdBatch(MoeFfn.bgDev, MoeFfn.xpBxDev,
-                MoeFfn.mapEDev, MoeFfn.mapT0Dev, MoeFfn.mapM1Dev, nT,
+            this.idGemm(this.gateB, MoeFfn.bgDev, MoeFfn.xpBxDev, nT, nC,
                 groups);
-            this.upB.gemmIdBatch(MoeFfn.buDev, MoeFfn.xpBxDev,
-                MoeFfn.mapEDev, MoeFfn.mapT0Dev, MoeFfn.mapM1Dev, nT,
+            this.idGemm(this.upB, MoeFfn.buDev, MoeFfn.xpBxDev, nT, nC,
                 groups);
             MoeFfn.phaseSync();
             MoeFfn.fbGemm1Ns = MoeFfn.fbGemm1Ns
@@ -1124,8 +1173,7 @@ public final class MoeFfn extends InfModule {
         if (idPath) {
             QuantKernel.q8kPackLaunchNoSync(MoeFfn.xpBgDev, MoeFfn.bgDev,
                 (int64) np * wid);
-            this.downB.gemmIdBatch(MoeFfn.beDev, MoeFfn.xpBgDev,
-                MoeFfn.mapEDev, MoeFfn.mapT0Dev, MoeFfn.mapM1Dev, nT,
+            this.idGemm(this.downB, MoeFfn.beDev, MoeFfn.xpBgDev, nT, nC,
                 groups);
             MoeFfn.phaseSync();
             MoeFfn.fbGemm2Ns = MoeFfn.fbGemm2Ns
