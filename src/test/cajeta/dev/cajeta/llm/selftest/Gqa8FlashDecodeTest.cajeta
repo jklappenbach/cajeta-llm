@@ -1,0 +1,102 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.AttnKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+
+/**
+ * cajeta-llm plan 40 — the GQA x8 flash decode attend (spec 15.21.1's
+ * shape coverage). Every other routable fixture is GQA x4, the ratio
+ * the original flash gate required; the 30B is x8 (32 q heads / 4 kv),
+ * and before this kernel its decode attend silently took the scalar
+ * two-kernel path — measured at 108 us/layer of the token where the
+ * flash shape costs ~25.
+ *
+ * The engagement assertion is the FIRES-check (project method 5): the
+ * flash-decode call counter must ADVANCE during the x8 decode, so a
+ * regressed gate cannot pass by falling back to the scalar path whose
+ * output is also correct.
+ */
+public class Gqa8FlashDecodeTest {
+
+    static final String FIX =
+        "src/test/fixtures/gguf/toy-routable-gqa8.gguf";
+
+    public Gqa8FlashDecodeTest() { return; }
+
+    static #CausalLM mk() {
+        Checkpoint ck #= Checkpoint.open(Gqa8FlashDecodeTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    /** The fixture's contract: the x8 ratio, hd 128. */
+    @Test
+    public void fixtureDeclaresTheGqa8Shape() {
+        Checkpoint ck #= Checkpoint.open(Gqa8FlashDecodeTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        ck.close();
+        Assert.equals(8L, (int64) cfg.numHeads);
+        Assert.equals(1L, (int64) cfg.numKvHeads);
+        Assert.equals(128L, (int64) cfg.headDim);
+    }
+
+    /** Resident x8 decode ENGAGES the flash kernel (counter advances)
+     *  and matches the forced-host arm token-for-token. */
+    @Test
+    public void gqa8FlashDecodeEngagesAndMatchesHost() {
+        if (!ResidentMoeDecodeTest.residentHere()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+
+        // Host arm (residency off for the decode steps).
+        CausalLM mh #= Gqa8FlashDecodeTest.mk();
+        int32[] th = heap int32[6];
+        int32 nh = mh.prefill(p, 8);
+        int32 hp = nh;
+        Linear.setDeviceResident(false);
+        int32[] one = heap int32[1];
+        int32 g = 0;
+        while (g < 5) {
+            one[0] = nh;
+            nh = mh.stepSeq(0, one, 0, 1);
+            th[g] = nh;
+            g = g + 1;
+        }
+        Linear.setDeviceResident(true);
+
+        // Resident arm — the flash-decode counter must move.
+        CausalLM mr #= Gqa8FlashDecodeTest.mk();
+        int32 nr = mr.prefill(p, 8);
+        Assert.equals((int64) hp, (int64) nr);
+        int64 fd0 = AttnKernel.flashDecodeCalls();
+        int32[] tr = heap int32[6];
+        g = 0;
+        int32 cur = nr;
+        while (g < 5) {
+            one[0] = cur;
+            cur = mr.stepSeq(0, one, 0, 1);
+            tr[g] = cur;
+            g = g + 1;
+        }
+        int64 fdN = AttnKernel.flashDecodeCalls() - fd0;
+        System.stdout.println("  gqa8 flash-decode calls: " + fdN);
+        Assert.isTrue(fdN > 0L);
+        g = 0;
+        while (g < 5) {
+            Assert.equals((int64) th[g], (int64) tr[g]);
+            g = g + 1;
+        }
+    }
+}

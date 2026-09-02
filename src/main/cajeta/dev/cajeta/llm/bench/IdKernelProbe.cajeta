@@ -12,6 +12,7 @@ import dev.cajeta.llm.model.CausalLM;
 import dev.cajeta.llm.model.ExpertBank;
 import dev.cajeta.llm.model.ModelConfig;
 import dev.cajeta.llm.model.MoeFfn;
+import dev.cajeta.llm.model.Prim;
 
 /** unit 40 triage: the indirected kernel's effective read rate vs the
  *  wave twin's, same bank, same bytes. Usage: IdKernelProbe <gguf>. */
@@ -63,6 +64,107 @@ public class IdKernelProbe {
         System.stdout.println("id-kernel: "
             + ((float64) (t1 - t0) / 1000000.0 / (float64) N)
             + " ms/launch-set  " + gbps + " GB/s");
+
+        // Per-kernel GPU time for the whole zero-sync chain's pieces,
+        // serialized (sync per phase), N=200 each, us/launch.
+        MoeFfn moe0 = m.moeAt(0);
+        ExpertBank ub = moe0.upBank();
+        ExpertBank db = moe0.downBank();
+        ub.ensureSlab();
+        db.ensureSlab();
+        int64 hid = cols;                 // 2048
+        int64 wid = rows;                 // 768
+        KernelBuffer<float32> logits #= heap KernelBuffer<float32>(128L);
+        KernelBuffer<float32> wsel #= heap KernelBuffer<float32>(8L);
+        KernelBuffer<float32> rw #= heap KernelBuffer<float32>(
+            (uint64) (128L * hid));
+        KernelBuffer<float32> gy2 #= heap KernelBuffer<float32>(
+            (uint64) (8L * wid));
+        KernelBuffer<float32> uy2 #= heap KernelBuffer<float32>(
+            (uint64) (8L * wid));
+        KernelBuffer<float32> dy2 #= heap KernelBuffer<float32>(
+            (uint64) (8L * hid));
+        KernelBuffer<int8> xpg #= heap KernelBuffer<int8>(
+            (uint64) ((8L * wid / 256L) * 320L));
+        int32 M = 200;
+        int64 u0 = 0L;
+        int64 u1 = 0L;
+
+        u0 = Clock.nanoTime();
+        i = 0;
+        while (i < M) {
+            QuantKernel.routerF32MatVecLaunchNoSync(logits, rw, xf,
+                128L, hid);
+            s.sync();
+            i = i + 1;
+        }
+        System.stdout.println("router  " + ((float64) (Clock.nanoTime()
+            - u0) / 1000.0 / (float64) M) + " us");
+        u0 = Clock.nanoTime();
+        i = 0;
+        while (i < M) {
+            QuantKernel.moeTopKLaunchNoSync(sel, wsel, logits, null,
+                128L, 8L, true, 0.0f);
+            s.sync();
+            i = i + 1;
+        }
+        System.stdout.println("topk    " + ((float64) (Clock.nanoTime()
+            - u0) / 1000.0 / (float64) M) + " us");
+        u0 = Clock.nanoTime();
+        i = 0;
+        while (i < M) {
+            QuantKernel.q8kPackLaunchNoSync(xp, xf, hid);
+            s.sync();
+            i = i + 1;
+        }
+        System.stdout.println("packXn  " + ((float64) (Clock.nanoTime()
+            - u0) / 1000.0 / (float64) M) + " us");
+        u0 = Clock.nanoTime();
+        i = 0;
+        while (i < M) {
+            gb.idLaunch(gy2, xp, sel, 8, 0L);
+            s.sync();
+            i = i + 1;
+        }
+        System.stdout.println("gate-id " + ((float64) (Clock.nanoTime()
+            - u0) / 1000.0 / (float64) M) + " us");
+        u0 = Clock.nanoTime();
+        i = 0;
+        while (i < M) {
+            Prim.gluDevice(gy2, uy2, 8L * wid, 0);
+            s.sync();
+            i = i + 1;
+        }
+        System.stdout.println("glu     " + ((float64) (Clock.nanoTime()
+            - u0) / 1000.0 / (float64) M) + " us");
+        u0 = Clock.nanoTime();
+        i = 0;
+        while (i < M) {
+            QuantKernel.q8kPackLaunchNoSync(xpg, gy2, 8L * wid);
+            s.sync();
+            i = i + 1;
+        }
+        System.stdout.println("packGy  " + ((float64) (Clock.nanoTime()
+            - u0) / 1000.0 / (float64) M) + " us");
+        u0 = Clock.nanoTime();
+        i = 0;
+        while (i < M) {
+            db.idLaunch(dy2, xpg, sel, 8, wid / 256L);
+            s.sync();
+            i = i + 1;
+        }
+        System.stdout.println("down-id " + ((float64) (Clock.nanoTime()
+            - u0) / 1000.0 / (float64) M) + " us  (ty "
+            + db.packedType() + ")");
+        u0 = Clock.nanoTime();
+        i = 0;
+        while (i < M) {
+            QuantKernel.moeCombineLaunchNoSync(xf, dy2, wsel, 8L, hid);
+            s.sync();
+            i = i + 1;
+        }
+        System.stdout.println("combine " + ((float64) (Clock.nanoTime()
+            - u0) / 1000.0 / (float64) M) + " us");
 
         // wave twin: 8 per-expert launches per set on the SAME slab
         // bytes through slot slices, one sync at the end.

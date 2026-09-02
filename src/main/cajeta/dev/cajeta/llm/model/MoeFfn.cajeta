@@ -56,6 +56,14 @@ public final class MoeFfn extends InfModule {
     static int64 mtDownNs;     // down expert mat-vecs
     static int64 mtCombNs;     // weighted accumulate into the row
     static int64 mtSharedNs;   // shared-expert sublayer
+    static int64 mtPreNs;      // zero-sync: entry -> first launch stamp
+    static int64 mtPostNs;     // zero-sync: after combine -> exit
+    public static int64 rowPreNs()  { return MoeFfn.mtPreNs; }
+    public static int64 rowPostNs() { return MoeFfn.mtPostNs; }
+    static int64 mtPreANs;     // ... zeroSyncReady
+    static int64 mtPreBNs;     // ... counter snapshots
+    public static int64 rowPreANs() { return MoeFfn.mtPreANs; }
+    public static int64 rowPreBNs() { return MoeFfn.mtPreBNs; }
     public static int64 rowRouteNs()  { return MoeFfn.mtRouteNs; }
     public static int64 rowGateUpNs() { return MoeFfn.mtGateUpNs; }
     public static int64 rowGluNs()    { return MoeFfn.mtGluNs; }
@@ -63,6 +71,10 @@ public final class MoeFfn extends InfModule {
     public static int64 rowCombNs()   { return MoeFfn.mtCombNs; }
     public static int64 rowSharedNs() { return MoeFfn.mtSharedNs; }
     public static void resetRowTimers() {
+        MoeFfn.mtPreNs = 0L;
+        MoeFfn.mtPostNs = 0L;
+        MoeFfn.mtPreANs = 0L;
+        MoeFfn.mtPreBNs = 0L;
         MoeFfn.mtRouteNs = 0L;
         MoeFfn.mtGateUpNs = 0L;
         MoeFfn.mtGluNs = 0L;
@@ -433,6 +445,53 @@ public final class MoeFfn extends InfModule {
     /** Probe access to the gate bank (bench attribution only). */
     public ExpertBank gate() { return this.gateB; }
 
+    // Bench: drain the stream before a phase stamp so the moe-phase
+    // timers become GPU-inclusive (set via CausalLM.setPhaseSync).
+    static boolean phaseSyncOn;
+    public static void setPhaseSync(boolean on) {
+        MoeFfn.phaseSyncOn = on;
+    }
+    static void phaseSync() {
+        if (!MoeFfn.phaseSyncOn) { return; }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
+    /**
+     * Upload the router weight, TRANSPOSED to [E, H] so the device
+     * kernel's lanes stride a row coalesced (the import layout is
+     * [in, out]). Once per layer. The first version of this ran
+     * lazily on the FIRST DECODE TOKEN through Tensor.flatGet —
+     * 48 x ~4.7 ms = ~225 ms of phantom decode time that measurement
+     * attributed before reasoning found it; now it reads the raw host
+     * buffer and forwardBatch arms it during prefill, where a
+     * quarter-second disappears into the seconds a prefill costs.
+     */
+    void ensureRouterDev() {
+        if (this.routerWUp) { return; }
+        int64 hid = (int64) this.hidden;
+        int64 en = (int64) this.expertsN;
+        int64 n = hid * en;
+        float32[] rw #= heap float32[n];
+        Tensor<float32> rt = this.router.weight;
+        float32[] rb = rt.hostBuffer();
+        int64 rbase = rt.hostBase();
+        int64 j = 0;
+        while (j < hid) {
+            int64 e = 0;
+            while (e < en) {
+                rw[e * hid + j] = rb[rbase + j * en + e];
+                e = e + 1;
+            }
+            j = j + 1;
+        }
+        this.routerWDev #= heap KernelBuffer<float32>((uint64) n);
+        this.routerWDev.upload(rw, n);
+        this.routerWUp = true;
+        return;
+    }
+
     void ensureZeroSyncBufs() {
         if (this.logitsDev != null) { return; }
         int64 e = (int64) this.expertsN;
@@ -483,41 +542,27 @@ public final class MoeFfn extends InfModule {
      */
     boolean forwardRowZeroSync(KernelBuffer<float32> xDev,
             KernelBuffer<float32> acc, int32 act) {
+        int64 tpre0 = Clock.nanoTime();
         if (!this.zeroSyncReady()) { return false; }
+        int64 tpa = Clock.nanoTime();
+        MoeFfn.mtPreANs = MoeFfn.mtPreANs + (tpa - tpre0);
         int64 h0 = ExpertBank.residencyHits();
         int64 w0 = ExpertBank.residencyWindowed();
         int64 a0 = ExpertBank.residencyAdmissions();
         int64 b0 = ExpertBank.residencyAdmissionBytes();
+        MoeFfn.mtPreBNs = MoeFfn.mtPreBNs + (Clock.nanoTime() - tpa);
         this.ensureZeroSyncBufs();
         int64 hid = (int64) this.hidden;
         int64 wid = (int64) this.widthN;
-        if (!this.routerWUp) {
-            // The router is ~1 MB of f32; up once, read every token.
-            // TRANSPOSED to [E, H] here so the kernel's lanes stride a
-            // row coalesced — the import layout is [in, out].
-            int64 en = (int64) this.expertsN;
-            int64 n = hid * en;
-            float32[] rw #= heap float32[n];
-            Tensor<float32> rt = this.router.weight;
-            int64 j = 0;
-            while (j < hid) {
-                int64 e = 0;
-                while (e < en) {
-                    rw[e * hid + j] = rt.flatGet(j * en + e);
-                    e = e + 1;
-                }
-                j = j + 1;
-            }
-            this.routerWDev #= heap KernelBuffer<float32>((uint64) n);
-            this.routerWDev.upload(rw, n);
-            this.routerWUp = true;
-        }
+        this.ensureRouterDev();
         int64 tr0 = Clock.nanoTime();
+        MoeFfn.mtPreNs = MoeFfn.mtPreNs + (tr0 - tpre0);
         QuantKernel.routerF32MatVecLaunchNoSync(this.logitsDev,
             this.routerWDev, xDev, (int64) this.expertsN, hid);
         QuantKernel.moeTopKLaunchNoSync(this.selDev, this.wSelDev,
             this.logitsDev, this.probsDev, (int64) this.expertsN,
             (int64) this.usedN, this.normTopk, this.wScale);
+        MoeFfn.phaseSync();
         MoeFfn.mtRouteNs = MoeFfn.mtRouteNs + (Clock.nanoTime() - tr0);
         int64 tg0 = Clock.nanoTime();
         QuantKernel.q8kPackLaunchNoSync(this.xpXnDev, xDev, hid);
@@ -525,22 +570,28 @@ public final class MoeFfn extends InfModule {
             this.usedN, 0L);
         this.upB.idLaunch(this.uyDev, this.xpXnDev, this.selDev,
             this.usedN, 0L);
+        MoeFfn.phaseSync();
         MoeFfn.mtGateUpNs = MoeFfn.mtGateUpNs + (Clock.nanoTime() - tg0);
         int64 tgl0 = Clock.nanoTime();
         Prim.gluDevice(this.gyDev, this.uyDev,
             (int64) this.usedN * wid, act);
+        MoeFfn.phaseSync();
         MoeFfn.mtGluNs = MoeFfn.mtGluNs + (Clock.nanoTime() - tgl0);
         int64 td0 = Clock.nanoTime();
         QuantKernel.q8kPackLaunchNoSync(this.xpGyDev, this.gyDev,
             (int64) this.usedN * wid);
         this.downB.idLaunch(this.dyDev, this.xpGyDev, this.selDev,
             this.usedN, wid / 256L);
+        MoeFfn.phaseSync();
         MoeFfn.mtDownNs = MoeFfn.mtDownNs + (Clock.nanoTime() - td0);
         int64 tc0 = Clock.nanoTime();
         QuantKernel.moeCombineLaunchNoSync(acc, this.dyDev,
             this.wSelDev, (int64) this.usedN, hid);
-        MoeFfn.mtCombNs = MoeFfn.mtCombNs + (Clock.nanoTime() - tc0);
+        MoeFfn.phaseSync();
+        int64 tpost0 = Clock.nanoTime();
+        MoeFfn.mtCombNs = MoeFfn.mtCombNs + (tpost0 - tc0);
         this.emitCacheRecord("row", h0, w0, a0, b0);
+        MoeFfn.mtPostNs = MoeFfn.mtPostNs + (Clock.nanoTime() - tpost0);
         return true;
     }
 
@@ -671,6 +722,13 @@ public final class MoeFfn extends InfModule {
         int64 b0 = ExpertBank.residencyAdmissionBytes();
         this.sc.ensureBatch(rows, this.usedN, this.expertsN,
             this.widthN, this.hidden);
+        if (!this.routerWUp && this.sharedW == 0
+                && this.gateB.slabReady() && this.upB.slabReady()
+                && this.downB.slabReady()) {
+            // Arm the decode's device router while we are already
+            // inside a multi-second prefill (see ensureRouterDev).
+            this.ensureRouterDev();
+        }
         int64 h = (int64) this.hidden;
         int32 r = 0;
         while (r < rows) {

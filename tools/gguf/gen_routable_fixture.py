@@ -58,6 +58,10 @@ OUT = os.path.join(HERE, "..", "..", "src", "test", "fixtures", "gguf")
 KQ = os.path.join(OUT, "kquant")
 
 H, L, NH, NKV, HD, IT, V, CTX = 512, 2, 4, 1, 128, 512, 256, 256
+# Unit 40's GQA x8 witness: 8 q-heads per kv head — the 30B's ratio,
+# which no other fixture has (everything else is x4, the ratio the
+# original flash-decode kernel was gated on). Only NH differs.
+NH8 = 8
 
 GGUF_MAGIC = 0x46554747
 T_U32, T_F32, T_STR, T_ARR, T_I32 = 4, 6, 8, 9, 5
@@ -133,7 +137,7 @@ def f32_ramp(rows, cols=None, scale=0.02, bias=0.0):
 # the builder writes it first and the md5 is asserted in the repo test
 # suite by simply not regenerating expectations.
 
-def build(arch, qk_norm):
+def build(arch, qk_norm, nh=NH, nkv=NKV):
     tensors = []
     def add_q4k(name, rows, cols):
         pay, _deq = q4k_tile(rows, cols)
@@ -146,10 +150,10 @@ def build(arch, qk_norm):
     for i in range(L):
         g = f"blk.{i}."
         add_f32(g + "attn_norm.weight", f32_ramp(H, scale=0.01, bias=1.0))
-        add_q4k(g + "attn_q.weight",      NH * HD, H)
-        add_q4k(g + "attn_k.weight",      NKV * HD, H)
-        add_q4k(g + "attn_v.weight",      NKV * HD, H)
-        add_q4k(g + "attn_output.weight", H, NH * HD)
+        add_q4k(g + "attn_q.weight",      nh * HD, H)
+        add_q4k(g + "attn_k.weight",      nkv * HD, H)
+        add_q4k(g + "attn_v.weight",      nkv * HD, H)
+        add_q4k(g + "attn_output.weight", H, nh * HD)
         if qk_norm:
             # Per-head norms, [HD]. bias=1.0 keeps them near identity so
             # the fixture's activations stay in the regime the parity
@@ -181,8 +185,8 @@ def build(arch, qk_norm):
                + ("-qk" if qk_norm else "")),
         kv_u32(kp + "embedding_length", H),
         kv_u32(kp + "block_count", L),
-        kv_u32(kp + "attention.head_count", NH),
-        kv_u32(kp + "attention.head_count_kv", NKV),
+        kv_u32(kp + "attention.head_count", nh),
+        kv_u32(kp + "attention.head_count_kv", nkv),
         kv_u32(kp + "feed_forward_length", IT),
         kv_u32(kp + "context_length", CTX),
         kv_u32(kp + "rope.dimension_count", HD),
@@ -233,6 +237,8 @@ kvs, tensors = build("llama", False)
 write("toy-routable.gguf", kvs, tensors)
 kvs, tensors = build("qwen3", True)
 write("toy-routable-qk.gguf", kvs, tensors)
+kvs, tensors = build("llama", False, nh=NH8)
+write("toy-routable-gqa8.gguf", kvs, tensors)
 
 # Unit 38 adds the THIRD fixture: toy-routable-moe is the routable dims
 # under arch `qwen3moe` — MoE (4 experts, top-2, expert width 512) plus

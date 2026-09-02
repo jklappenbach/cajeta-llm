@@ -444,6 +444,7 @@ public final class CausalLM extends InfModule {
             return;
         }
 
+        int64 trl0 = Clock.nanoTime();
         int32 l = 0;
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
@@ -608,6 +609,10 @@ public final class CausalLM extends InfModule {
                 }
             }
             l = l + 1;
+        }
+        if (resident) {
+            CausalLM.rlLoopNs = CausalLM.rlLoopNs
+                + (Clock.nanoTime() - trl0);
         }
 
         if (resident && CausalLM.fuseTail && this.lmHead != null
@@ -866,6 +871,55 @@ public final class CausalLM extends InfModule {
     }
 
     static boolean devAttnOn = true;
+    public static void setDevAttn(boolean on) {
+        CausalLM.devAttnOn = on;
+    }
+
+    // Unit-40 defect hunt: per-layer NaN sniffer on the batched
+    // resident hs (bench-only; syncs every layer).
+    static boolean nanSniff;
+    public static void setNanSniff(boolean on) { CausalLM.nanSniff = on; }
+    void sniffRow(String where, int32 li, int32 h) {
+        if (!CausalLM.nanSniff) { return; }
+        KernelStream ns = QuantKernel.stream();
+        ns.sync();
+        this.hsDev.download(this.hsHost, (int64) h);
+        int64 bad = 0L;
+        int64 i = 0;
+        while (i < (int64) h) {
+            float32 v = this.hsHost[i];
+            if (v != v) { bad = bad + 1L; }
+            i = i + 1;
+        }
+        if (bad > 0L) {
+            System.stdout.println("[NAN-DEC " + where + " layer " + li
+                + " count " + bad + "]");
+        }
+        return;
+    }
+
+    void sniff(String where, int32 l, int64 nHs) {
+        if (!CausalLM.nanSniff) { return; }
+        KernelStream ns = QuantKernel.stream();
+        ns.sync();
+        this.pfHsDev.download(this.pfHsHost, nHs);
+        int64 bad = 0L;
+        int64 firstI = 0L - 1L;
+        int64 i = 0;
+        while (i < nHs) {
+            float32 v = this.pfHsHost[i];
+            if (v != v) {
+                bad = bad + 1L;
+                if (firstI < 0L) { firstI = i; }
+            }
+            i = i + 1;
+        }
+        if (bad > 0L) {
+            System.stdout.println("[NAN " + where + " layer " + l
+                + " count " + bad + " first " + firstI + "]");
+        }
+        return;
+    }
     static boolean forceReseed = false;
 
     // 10.12.38: the prefill cache-authority pass is LAZY by default —
@@ -974,6 +1028,51 @@ public final class CausalLM extends InfModule {
         CausalLM.hdOProjNs = 0L;
         CausalLM.hdMlpNs = 0L;
         CausalLM.hdMoeNs = 0L;
+        return;
+    }
+
+    // Triage arm: sync the stream before each resident sublayer
+    // stamp, so rlAttnNs/rlMoeNs become GPU-INCLUSIVE attribution.
+    // Perturbs pipelining (~0.1 ms/token of extra syncs) — bench only.
+    static boolean phaseSyncOn;
+    public static void setPhaseSync(boolean on) {
+        CausalLM.phaseSyncOn = on;
+    }
+
+    // Attention-chain sub-spans (GPU-inclusive under phaseSync).
+    static int64 raNormNs;   // pre-norm + stage
+    static int64 raProjNs;   // q/k/v projections
+    static int64 raRopeNs;   // qk-norm + rope + append
+    static int64 raAttnNs;   // the attend
+    static int64 raOutNs;    // oProj + residual add
+    public static int64 raNorm() { return CausalLM.raNormNs; }
+    public static int64 raProj() { return CausalLM.raProjNs; }
+    public static int64 raRope() { return CausalLM.raRopeNs; }
+    public static int64 raAttn() { return CausalLM.raAttnNs; }
+    public static int64 raOut()  { return CausalLM.raOutNs; }
+    static void aSync() {
+        if (!CausalLM.phaseSyncOn) { return; }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
+    // Resident-loop host attribution (unit 40 triage).
+    static int64 rlAttnNs;   // residentLayer attention sublayer, host span
+    static int64 rlMoeNs;    // residentLayer MoE sublayer, host span
+    static int64 rlLoopNs;   // the whole layer loop, host span
+    public static int64 residentAttnNs() { return CausalLM.rlAttnNs; }
+    public static int64 residentMoeNs()  { return CausalLM.rlMoeNs; }
+    public static int64 residentLoopNs() { return CausalLM.rlLoopNs; }
+    public static void resetResidentTimers() {
+        CausalLM.rlAttnNs = 0L;
+        CausalLM.rlMoeNs = 0L;
+        CausalLM.rlLoopNs = 0L;
+        CausalLM.raNormNs = 0L;
+        CausalLM.raProjNs = 0L;
+        CausalLM.raRopeNs = 0L;
+        CausalLM.raAttnNs = 0L;
+        CausalLM.raOutNs = 0L;
         return;
     }
 
@@ -1454,6 +1553,7 @@ public final class CausalLM extends InfModule {
                 CausalLM.pfGemmNs = CausalLM.pfGemmNs + (tn2 - tg1);
                 CausalLM.pfGONs = CausalLM.pfGONs + (tn2 - tg1);
                 Prim.addDevice(this.pfHsDev, a.oProj.yBatch, nHs);
+                this.sniff("attn", l, nHs);
                 Prim.rmsnormBatchDevice(this.pfXnDev, this.pfHsDev,
                     d.postAttentionLayernorm.deviceWeight(),
                     (int64) rows, (int64) h,
@@ -1524,6 +1624,7 @@ public final class CausalLM extends InfModule {
                     this.pfMoeDev.upload(this.pfHsHost, nHs);
                     Prim.addDevice(this.pfHsDev, this.pfMoeDev, nHs);
                 }
+                this.sniff("moe", l, nHs);
                 CausalLM.pfPrimNs = CausalLM.pfPrimNs
                     + (Clock.nanoTime() - tmoe);
             } else if (Linear.devicePackOn()) {
@@ -1767,10 +1868,14 @@ public final class CausalLM extends InfModule {
             int32 h, int32 qd, int32 kvd, int32 inter,
             int32 nH, int32 nKv, int32 hd, int32 p) {
         // Attention sublayer.
+        int64 tra0 = Clock.nanoTime();
         Prim.rmsnormDevice(this.xnDev, this.hsDev,
             d.inputLayernorm.deviceWeight(), (int64) h,
             d.inputLayernorm.eps, d.normForm);
         Linear.stageDeviceActivation(this.xnDev, (int64) h);
+        CausalLM.aSync();
+        int64 ta1 = Clock.nanoTime();
+        CausalLM.raNormNs = CausalLM.raNormNs + (ta1 - tra0);
         DeviceKv dkv = this.dkvOf(seq);
         if (dkv != null) {
             // THE ATTENTION TAIL NEVER LEAVES THE DEVICE (plan 10.11).
@@ -1785,6 +1890,9 @@ public final class CausalLM extends InfModule {
             a.qProj.matvecStagedKeep();
             a.kProj.matvecStagedKeep();
             a.vProj.matvecStagedKeep();
+            CausalLM.aSync();
+            int64 ta2 = Clock.nanoTime();
+            CausalLM.raProjNs = CausalLM.raProjNs + (ta2 - ta1);
             if (a.qNorm != null) {
                 // Per-head QK-norm BEFORE RoPE (spec 5.10, build_qwen3
                 // order) — unit 29's kernel: nH (nKv) rows of hd
@@ -1799,9 +1907,17 @@ public final class CausalLM extends InfModule {
             }
             dkv.rope(li, a.qProj.out(), a.kProj.out(), p);
             dkv.append(li, a.kProj.out(), a.vProj.out(), p);
+            CausalLM.aSync();
+            int64 ta3 = Clock.nanoTime();
+            CausalLM.raRopeNs = CausalLM.raRopeNs + (ta3 - ta2);
             dkv.attend(li, a.qProj.out(), p, a.scale);
+            CausalLM.aSync();
+            int64 ta4 = Clock.nanoTime();
+            CausalLM.raAttnNs = CausalLM.raAttnNs + (ta4 - ta3);
             Linear.stageDeviceActivation(dkv.out(), (int64) qd);
             a.oProj.matvecStagedKeep();
+            CausalLM.raOutNs = CausalLM.raOutNs
+                + (Clock.nanoTime() - ta4);
         } else {
             a.qProj.matvecStaged(q, 0L);
             a.kProj.matvecStaged(k, 0L);
@@ -1835,6 +1951,13 @@ public final class CausalLM extends InfModule {
             a.oProj.matvecKeepOnDevice(ao, 0L);
         }
         Prim.addDevice(this.hsDev, a.oProj.out(), (int64) h);
+        this.sniffRow("attn", li, h);
+        if (CausalLM.phaseSyncOn) {
+            KernelStream ps = QuantKernel.stream();
+            ps.sync();
+        }
+        int64 trm0 = Clock.nanoTime();
+        CausalLM.rlAttnNs = CausalLM.rlAttnNs + (trm0 - tra0);
 
         // MLP sublayer.
         Prim.rmsnormDevice(this.xnDev, this.hsDev,
@@ -1854,6 +1977,12 @@ public final class CausalLM extends InfModule {
             if (d.moe.forwardRowZeroSync(this.xnDev, this.moeDev,
                     d.activation)) {
                 Prim.addDevice(this.hsDev, this.moeDev, (int64) h);
+                if (CausalLM.phaseSyncOn) {
+                    KernelStream ps2 = QuantKernel.stream();
+                    ps2.sync();
+                }
+                CausalLM.rlMoeNs = CausalLM.rlMoeNs
+                    + (Clock.nanoTime() - trm0);
                 return;
             }
             KernelStream ms = QuantKernel.stream();
@@ -1873,6 +2002,7 @@ public final class CausalLM extends InfModule {
             if (d.moe.forwardRowResident(this.xnDev, xn, 0L,
                     this.moeDev, d.activation)) {
                 Prim.addDevice(this.hsDev, this.moeDev, (int64) h);
+                this.sniffRow("moe-39", li, h);
                 return;
             }
             d.moe.forwardRow(xn, 0L, mlpOut, 0L, d.activation);
