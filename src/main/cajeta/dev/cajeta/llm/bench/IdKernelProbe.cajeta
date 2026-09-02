@@ -1,0 +1,88 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.Integer;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.model.MoeFfn;
+
+/** unit 40 triage: the indirected kernel's effective read rate vs the
+ *  wave twin's, same bank, same bytes. Usage: IdKernelProbe <gguf>. */
+public class IdKernelProbe {
+    public static void run(String[] args) {
+        Checkpoint ck #= Checkpoint.open(args[0]);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 64, 1, 0);
+        m.bind(ck, false);
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        MoeFfn moe = m.moeAt(0);
+        ExpertBank gb = moe.gate();
+        boolean ok = gb.ensureSlab();
+        System.stdout.println("slab: " + ok + " rows " + gb.rows()
+            + " cols " + gb.cols() + " experts " + gb.experts());
+        int64 rows = (int64) gb.rows();
+        int64 cols = (int64) gb.cols();
+        int32 used = 8;
+        // Staged activation: zeros are fine for a bandwidth probe.
+        int64 xBlocks = cols / 256L;
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) (xBlocks * 320L));
+        KernelBuffer<float32> xf #= heap KernelBuffer<float32>(
+            (uint64) cols);
+        QuantKernel.q8kPackLaunchNoSync(xp, xf, cols);
+        KernelBuffer<int32> sel #= heap KernelBuffer<int32>((uint64) used);
+        int32[] ids = heap int32[used];
+        int32 i = 0;
+        while (i < used) { ids[i] = i * 13 + 1; i = i + 1; }
+        sel.upload(ids, (int64) used);
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>(
+            (uint64) ((int64) used * rows));
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int64 bytesPer = (int64) used * rows * (cols / 256L) * 144L;
+
+        // id-kernel: N launches, one sync.
+        int32 N = 50;
+        int64 t0 = Clock.nanoTime();
+        i = 0;
+        while (i < N) {
+            gb.idLaunch(y, xp, sel, used, 0L);
+            i = i + 1;
+        }
+        s.sync();
+        int64 t1 = Clock.nanoTime();
+        float64 gbps = (float64) (bytesPer * (int64) N)
+            / ((float64) (t1 - t0));
+        System.stdout.println("id-kernel: "
+            + ((float64) (t1 - t0) / 1000000.0 / (float64) N)
+            + " ms/launch-set  " + gbps + " GB/s");
+
+        // wave twin: 8 per-expert launches per set on the SAME slab
+        // bytes through slot slices, one sync at the end.
+        t0 = Clock.nanoTime();
+        i = 0;
+        while (i < N) {
+            int32 k = 0;
+            while (k < used) {
+                gb.slotWaveLaunch(ids[k], y, xp,
+                    (int64) k * rows);
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        s.sync();
+        t1 = Clock.nanoTime();
+        gbps = (float64) (bytesPer * (int64) N) / ((float64) (t1 - t0));
+        System.stdout.println("wave twin: "
+            + ((float64) (t1 - t0) / 1000000.0 / (float64) N)
+            + " ms/launch-set  " + gbps + " GB/s");
+        return;
+    }
+}

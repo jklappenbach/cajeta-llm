@@ -3,6 +3,7 @@ package dev.cajeta.llm.model;
 import cajeta.lang.Math;
 import cajeta.time.Clock;
 import cajeta.lang.String;
+import cajeta.lang.System;
 import cajeta.math.Tensor;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
@@ -33,6 +34,20 @@ public final class MoeFfn extends InfModule {
     int32 layerIdx;    // moe-cache unit 3: record attribution; -1 until set
     KernelBuffer<float32> crossDev;   // unit 39: mixed-regime eOut up-leg
     float32[] crossHost;              // unit 39: contiguous copy for upload
+
+    // ── Unit 40: the zero-sync route's device state (lazy; decode
+    // pays nothing until the slab path engages). ──
+    KernelBuffer<float32> logitsDev;   // router logits, [E]
+    KernelBuffer<float32> probsDev;    // top-k scratch, [E]
+    KernelBuffer<int32> selDev;        // selected ids, [used]
+    KernelBuffer<float32> wSelDev;     // combining weights, [used]
+    KernelBuffer<float32> gyDev;       // gate outputs, [used x width]
+    KernelBuffer<float32> uyDev;       // up outputs, [used x width]
+    KernelBuffer<float32> dyDev;       // down outputs, [used x hidden]
+    KernelBuffer<int8> xpXnDev;        // staged activation, per token
+    KernelBuffer<int8> xpGyDev;        // staged GLU'd middle, [used rows]
+    KernelBuffer<float32> routerWDev;  // router weight, f32 [in x E]
+    boolean routerWUp;
 
     // ── forwardRow phase split (parity attribution, decode). ──
     static int64 mtRouteNs;    // router matvec + softmax + top-k
@@ -382,6 +397,149 @@ public final class MoeFfn extends InfModule {
             first = false;
             k = k + 1;
         }
+        this.emitCacheRecord("row", h0, w0, a0, b0);
+        return true;
+    }
+
+    /** Probe: print the device routing buffers (bench triage). */
+    public void dumpZeroSync() {
+        if (this.logitsDev == null) {
+            System.stdout.println("zero-sync never engaged");
+            return;
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int32 en = this.expertsN;
+        float32[] lg = heap float32[en];
+        this.logitsDev.download(lg, (int64) en);
+        int32[] ids = heap int32[this.usedN];
+        this.selDev.download(ids, (int64) this.usedN);
+        float32[] ww = heap float32[this.usedN];
+        this.wSelDev.download(ww, (int64) this.usedN);
+        String o #= "logits:";
+        int32 i = 0;
+        while (i < en) { o #= o + " " + lg[i]; i = i + 1; }
+        System.stdout.println(o);
+        o #= "sel/w:";
+        i = 0;
+        while (i < this.usedN) {
+            o #= o + " " + ids[i] + ":" + ww[i];
+            i = i + 1;
+        }
+        System.stdout.println(o);
+        return;
+    }
+
+    /** Probe access to the gate bank (bench attribution only). */
+    public ExpertBank gate() { return this.gateB; }
+
+    void ensureZeroSyncBufs() {
+        if (this.logitsDev != null) { return; }
+        int64 e = (int64) this.expertsN;
+        int64 u = (int64) this.usedN;
+        int64 wid = (int64) this.widthN;
+        int64 hid = (int64) this.hidden;
+        this.logitsDev #= heap KernelBuffer<float32>((uint64) e);
+        this.probsDev #= heap KernelBuffer<float32>((uint64) e);
+        this.selDev #= heap KernelBuffer<int32>((uint64) u);
+        this.wSelDev #= heap KernelBuffer<float32>((uint64) u);
+        this.gyDev #= heap KernelBuffer<float32>((uint64) (u * wid));
+        this.uyDev #= heap KernelBuffer<float32>((uint64) (u * wid));
+        this.dyDev #= heap KernelBuffer<float32>((uint64) (u * hid));
+        this.xpXnDev #= heap KernelBuffer<int8>(
+            (uint64) ((hid / 256L) * 320L));
+        this.xpGyDev #= heap KernelBuffer<int8>(
+            (uint64) ((u * wid / 256L) * 320L));
+        return;
+    }
+
+    /** The zero-sync route's shape gate (cheap; the slab binds are the
+     *  expensive half and latch their own refusal). */
+    boolean zeroSyncReady() {
+        if (this.sharedW != 0) { return false; }
+        if (this.gating != 1) { return false; }
+        if (this.hidden % 256 != 0) { return false; }
+        if (this.widthN % 256 != 0) { return false; }
+        if (!this.gateB.idReady() || !this.upB.idReady()
+                || !this.downB.idReady()) {
+            return false;
+        }
+        if (!this.gateB.ensureSlab() || !this.upB.ensureSlab()
+                || !this.downB.ensureSlab()) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Unit 40 (spec 15.21.2/15.21.3): the WHOLE MoE FFN as stream
+     * launches — router mat-vec, softmax/top-k, one indirected launch
+     * per bank against its slab, GLU and the weighted combine — with
+     * sel/w living on the device and NOTHING crossing to the host. The
+     * caller adds `acc` onto the residual; the token's only sync stays
+     * the logits fetch at the tail. False = the caller keeps the
+     * unit-39 chain (host routing through the crossing) or the
+     * unit-38 whole-host crossing.
+     */
+    boolean forwardRowZeroSync(KernelBuffer<float32> xDev,
+            KernelBuffer<float32> acc, int32 act) {
+        if (!this.zeroSyncReady()) { return false; }
+        int64 h0 = ExpertBank.residencyHits();
+        int64 w0 = ExpertBank.residencyWindowed();
+        int64 a0 = ExpertBank.residencyAdmissions();
+        int64 b0 = ExpertBank.residencyAdmissionBytes();
+        this.ensureZeroSyncBufs();
+        int64 hid = (int64) this.hidden;
+        int64 wid = (int64) this.widthN;
+        if (!this.routerWUp) {
+            // The router is ~1 MB of f32; up once, read every token.
+            // TRANSPOSED to [E, H] here so the kernel's lanes stride a
+            // row coalesced — the import layout is [in, out].
+            int64 en = (int64) this.expertsN;
+            int64 n = hid * en;
+            float32[] rw #= heap float32[n];
+            Tensor<float32> rt = this.router.weight;
+            int64 j = 0;
+            while (j < hid) {
+                int64 e = 0;
+                while (e < en) {
+                    rw[e * hid + j] = rt.flatGet(j * en + e);
+                    e = e + 1;
+                }
+                j = j + 1;
+            }
+            this.routerWDev #= heap KernelBuffer<float32>((uint64) n);
+            this.routerWDev.upload(rw, n);
+            this.routerWUp = true;
+        }
+        int64 tr0 = Clock.nanoTime();
+        QuantKernel.routerF32MatVecLaunchNoSync(this.logitsDev,
+            this.routerWDev, xDev, (int64) this.expertsN, hid);
+        QuantKernel.moeTopKLaunchNoSync(this.selDev, this.wSelDev,
+            this.logitsDev, this.probsDev, (int64) this.expertsN,
+            (int64) this.usedN, this.normTopk, this.wScale);
+        MoeFfn.mtRouteNs = MoeFfn.mtRouteNs + (Clock.nanoTime() - tr0);
+        int64 tg0 = Clock.nanoTime();
+        QuantKernel.q8kPackLaunchNoSync(this.xpXnDev, xDev, hid);
+        this.gateB.idLaunch(this.gyDev, this.xpXnDev, this.selDev,
+            this.usedN, 0L);
+        this.upB.idLaunch(this.uyDev, this.xpXnDev, this.selDev,
+            this.usedN, 0L);
+        MoeFfn.mtGateUpNs = MoeFfn.mtGateUpNs + (Clock.nanoTime() - tg0);
+        int64 tgl0 = Clock.nanoTime();
+        Prim.gluDevice(this.gyDev, this.uyDev,
+            (int64) this.usedN * wid, act);
+        MoeFfn.mtGluNs = MoeFfn.mtGluNs + (Clock.nanoTime() - tgl0);
+        int64 td0 = Clock.nanoTime();
+        QuantKernel.q8kPackLaunchNoSync(this.xpGyDev, this.gyDev,
+            (int64) this.usedN * wid);
+        this.downB.idLaunch(this.dyDev, this.xpGyDev, this.selDev,
+            this.usedN, wid / 256L);
+        MoeFfn.mtDownNs = MoeFfn.mtDownNs + (Clock.nanoTime() - td0);
+        int64 tc0 = Clock.nanoTime();
+        QuantKernel.moeCombineLaunchNoSync(acc, this.dyDev,
+            this.wSelDev, (int64) this.usedN, hid);
+        MoeFfn.mtCombNs = MoeFfn.mtCombNs + (Clock.nanoTime() - tc0);
         this.emitCacheRecord("row", h0, w0, a0, b0);
         return true;
     }

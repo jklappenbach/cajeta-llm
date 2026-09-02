@@ -8,6 +8,7 @@ import cajeta.io.file.MappedFile;
 import cajeta.math.Tensor;
 import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
 
 /**
  * One projection's bank of experts (spec 15.2): a merged rank-3 GGUF
@@ -32,6 +33,12 @@ public final class ExpertBank {
                        // larger than RAM still binds and runs)
     int64 mapOff;      // absolute file offset of the slab payload
     int8[] eStage;     // one expert's staged bytes, [stride]
+    // ── Unit 40 (spec 15.21.3): bank-slab residency. The WHOLE bank
+    // binds as one device buffer — the granularity the indirected
+    // dispatch reads — and per-expert slots become zero-copy SLICES of
+    // it. One admission, one charge, one upload per bank. ──
+    KernelBuffer<int8> slabDev;
+    boolean slabRefused;
     int64 stride;      // bytes per expert
     int64[] touched;   // bytes served per expert (15.16's instrument)
     Linear winLin;     // unit 28: the device expert window (lazy)
@@ -119,6 +126,7 @@ public final class ExpertBank {
     }
 
     public boolean isAdmitted(int32 e) {
+        if (this.slabDev != null) { return true; }
         if (this.slots == null) { return false; }
         return this.slots[e] != null;
     }
@@ -351,7 +359,7 @@ public final class ExpertBank {
     public void gemmDeviceAt(int32 e, int32 m, Tensor<float32> dst,
             int64 dstOff) {
         if (this.isAdmitted(e)) {
-            Linear sl = this.slots[e];
+            Linear sl = this.slotFor(e);
             ExpertBank.resHits = ExpertBank.resHits + 1L;
             sl.matmulInto(m, dst, dstOff);
             // Reconcile AFTER every slot launch (plan 1.1.1): the
@@ -393,13 +401,163 @@ public final class ExpertBank {
      *  the one trial cost the same staging a windowed dispatch pays,
      *  plus a transient allocation (spec 3.1.3's decision, made
      *  exact). */
-    void admitAndRun(int32 e, int32 m, Tensor<float32> dst,
-            int64 dstOff) {
+    /**
+     * Bind the whole bank as ONE device slab (unit 40). Trial-admission
+     * semantics at bank granularity: the charge is the full
+     * experts x stride, refused permanently when the budget cannot
+     * cover it (per-expert trial admission then continues to serve
+     * exactly as before — the capped regime keeps its mixed shape).
+     * Existing per-expert slots are dropped and their charges refunded:
+     * the slab supersedes them, and future slots bind as zero-copy
+     * slices of it so the batched GEMM route reads the same bytes the
+     * indirected decode dispatch reads.
+     */
+    public boolean ensureSlab() {
+        if (this.slabDev != null) { return true; }
+        if (this.slabRefused) { return false; }
+        if (this.map == null) { return false; }
+        int64 charge = (int64) this.expertsN * this.stride;
+        if (ExpertBank.resBudget <= 0L
+                || ExpertBank.resUsed + charge > ExpertBank.resBudget) {
+            this.slabRefused = true;
+            return false;
+        }
+        // Refund the slots the slab supersedes (their buffers drop with
+        // the list; derived-form charges went through slotCharge too).
+        if (this.slots != null) {
+            int32 e = 0;
+            while (e < this.expertsN) {
+                if (this.slots[e] != null) {
+                    ExpertBank.resUsed =
+                        ExpertBank.resUsed - this.slotCharge[e];
+                    this.residentB = this.residentB - this.slotCharge[e];
+                    this.slotCharge[e] = 0L;
+                    this.slots[e] = null;
+                    this.admittedN = this.admittedN - 1;
+                }
+                this.refused[e] = false;
+                e = e + 1;
+            }
+            this.slotOwn = heap ArrayList<Linear>();
+        }
+        int8[] hostSlab #= heap int8[charge];
+        this.map.read(this.mapOff, hostSlab, 0L, charge);
+        this.slabDev #= heap KernelBuffer<int8>((uint64) charge);
+        this.slabDev.upload(hostSlab, charge);
+        this.residentB = this.residentB + charge;
+        ExpertBank.resUsed = ExpertBank.resUsed + charge;
+        ExpertBank.resAdmissions = ExpertBank.resAdmissions + 1L;
+        ExpertBank.resAdmissionBytes =
+            ExpertBank.resAdmissionBytes + charge;
+        return true;
+    }
+
+    /** Whether the bank slab is bound (the zero-sync dispatch's gate). */
+    public boolean slabReady() {
+        return this.slabDev != null;
+    }
+
+    /** The slab's budget charge — 0 when unbound. Bank-granular
+     *  accounting's counterpart to slotBytesOf (spec 15.21.3: the
+     *  budget accounts at the granularity it binds). */
+    public int64 slabBytes() {
+        if (this.slabDev == null) { return 0L; }
+        return (int64) this.expertsN * this.stride;
+    }
+
+    /** The bound slab (valid only when {@link #slabReady}). */
+    KernelBuffer<int8> slab() {
+        return this.slabDev;
+    }
+
+    /** Bench-only: the wave twin against one expert's slab slice —
+     *  the id-kernel's control arm (same bytes, same staging). */
+    public void slotWaveLaunch(int32 e, KernelBuffer<float32> y,
+            KernelBuffer<int8> xp, int64 yOff) {
+        KernelBuffer<int8> sliceV #= this.slabDev.slice(
+            (uint64) ((int64) e * this.stride),
+            (uint64) this.stride);
+        QuantKernel.q4kQ8WaveMatVecLaunchNoSync(y, sliceV, xp,
+            (int64) this.rowsN, (int64) this.colsN, yOff);
+        return;
+    }
+
+    /** Whether an indirected id-kernel exists for this bank's format
+     *  (Q4_K, Q6_K — the 30B witness's two expert formats). */
+    public boolean idReady() {
+        return this.packedTy == 12 || this.packedTy == 14;
+    }
+
+    /**
+     * Unit 40: the indirected dispatch — ONE launch covers every
+     * selected expert of this bank against the slab, ids read from the
+     * DEVICE sel buffer. Every covered expert counts as a hit: with the
+     * slab bound, a dispatch reads resident bytes by construction.
+     */
+    public boolean idLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> xp, KernelBuffer<int32> sel, int32 used,
+            int64 xRowBlocks) {
+        if (this.slabDev == null) { return false; }
+        boolean ok = QuantKernel.idMatVecLaunchNoSync(this.packedTy, y,
+            this.slabDev, xp, sel, used, (int64) this.rowsN,
+            (int64) this.colsN, xRowBlocks);
+        if (ok) {
+            ExpertBank.resHits = ExpertBank.resHits + (int64) used;
+        }
+        return ok;
+    }
+
+    /**
+     * The slot serving expert `e`, materializing a zero-copy slab
+     * slice on demand — with the slab bound, EVERY expert is admitted
+     * (isAdmitted says so) but its slot object is created lazily at
+     * first use. Null only when nothing admits `e`.
+     */
+    Linear slotFor(int32 e) {
+        if (this.slots != null && this.slots[e] != null) {
+            return this.slots[e];
+        }
+        if (this.slabDev == null) { return null; }
         if (this.slots == null) {
             this.slotOwn = heap ArrayList<Linear>();
             this.slots = heap Linear[this.expertsN];
             this.refused #= heap boolean[this.expertsN];
             this.slotCharge #= heap int64[this.expertsN];
+        }
+        Linear sl = heap Linear(this.colsN, this.rowsN);
+        KernelBuffer<int8> sliceV #= this.slabDev.slice(
+            (uint64) ((int64) e * this.stride),
+            (uint64) this.stride);
+        sl.bindExpertSlice(this.packedTy, this.stride, #sliceV);
+        this.slots[e] = sl;
+        this.slotOwn.add(#sl);
+        this.slotCharge[e] = sl.devWeightBytes();
+        this.residentB = this.residentB + this.slotCharge[e];
+        this.admittedN = this.admittedN + 1;
+        ExpertBank.resUsed = ExpertBank.resUsed + this.slotCharge[e];
+        return this.slots[e];
+    }
+
+    void admitAndRun(int32 e, int32 m, Tensor<float32> dst,
+            int64 dstOff) {
+        // Unit 40: the bank binds as a slab on FIRST TOUCH when the
+        // budget covers it — one upload for the whole bank instead of
+        // one per admitted expert, and the very buffer the indirected
+        // decode dispatch reads. No-ops once bound or refused.
+        this.ensureSlab();
+        if (this.slots == null) {
+            this.slotOwn = heap ArrayList<Linear>();
+            this.slots = heap Linear[this.expertsN];
+            this.refused #= heap boolean[this.expertsN];
+            this.slotCharge #= heap int64[this.expertsN];
+        }
+        if (this.slabDev != null) {
+            // Unit 40: the slot is a zero-copy VIEW of the bank slab —
+            // no staging read, no upload, no charge of its own (the
+            // slab already carries the bank's bytes on the budget).
+            Linear sv = this.slotFor(e);
+            sv.matmulInto(m, dst, dstOff);
+            return;
         }
         Linear sl = heap Linear(this.colsN, this.rowsN);
         sl.bindExpertSlot(this.packedTy, this.stride);
@@ -437,7 +595,7 @@ public final class ExpertBank {
     public boolean matvecDeviceAt(int32 e, float32[] x, int64 xOff,
             float32[] y, int64 yOff) {
         if (!this.isAdmitted(e)) { return false; }
-        Linear sl = this.slots[e];
+        Linear sl = this.slotFor(e);
         if (!sl.deviceLaunchable()) { return false; }
         ExpertBank.resHits = ExpertBank.resHits + 1L;
         sl.matvecIntoDevice(x, xOff, y, yOff);
@@ -463,7 +621,7 @@ public final class ExpertBank {
      */
     public boolean matvecStagedKeepAt(int32 e) {
         if (!this.isAdmitted(e)) { return false; }
-        Linear sl = this.slots[e];
+        Linear sl = this.slotFor(e);
         if (!sl.deviceLaunchable()) { return false; }
         ExpertBank.resHits = ExpertBank.resHits + 1L;
         sl.matvecStagedKeep();
@@ -482,7 +640,8 @@ public final class ExpertBank {
     /** Whether {@link #matvecStagedKeepAt} would serve expert `e`. */
     public boolean stagedKeepReady(int32 e) {
         if (!this.isAdmitted(e)) { return false; }
-        return this.slots[e].deviceLaunchable();
+        Linear sl = this.slotFor(e);
+        return sl != null && sl.deviceLaunchable();
     }
 
     /** Expert `e`'s device output buffer (valid after a staged-keep

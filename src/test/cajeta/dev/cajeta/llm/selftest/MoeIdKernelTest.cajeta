@@ -1,0 +1,201 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.MoeFfn;
+
+/**
+ * cajeta-llm plan 40.1 — the zero-sync route's device kernels against
+ * their host twins (spec 15.21.2, 15.21.3).
+ *
+ * Gate: `Linear.residentEnabled()` — the wave-geometry predicate. The
+ * cpu backend runs these kernels wrong by design (plan 11.5) and is
+ * where the HOST twins are already exercised by every routing test.
+ */
+public class MoeIdKernelTest {
+
+    public MoeIdKernelTest() { return; }
+
+    /** 40.1.1 — device softmax/top-k/renorm vs the host algorithm on
+     *  synthetic logits: well-separated values (selection must match
+     *  exactly), an exact TIE (the lower index must win on both
+     *  sides), and the renorm arm. Weights carry a small tolerance —
+     *  device exp and host exp may differ in the last ulp. */
+    @Test
+    public void deviceTopKMatchesHostRouting() {
+        if (!Linear.residentEnabled()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 E = 128;
+        int32 K = 8;
+        float32[] lg = heap float32[E];
+        int32 e = 0;
+        while (e < E) {
+            // 1/64-grid values, well separated, deterministic.
+            lg[e] = (float32) ((e * 37 + 11) % 128) / 16.0f;
+            e = e + 1;
+        }
+        // An exact tie at the top: experts 7 and 23 share the maximum.
+        lg[7] = 9.5f;
+        lg[23] = 9.5f;
+
+        // HOST twin — the routeInto algorithm verbatim.
+        float32[] probs = heap float32[E];
+        float32 mx = lg[0];
+        e = 1;
+        while (e < E) {
+            if (lg[e] > mx) { mx = lg[e]; }
+            e = e + 1;
+        }
+        float32 sum = 0.0f;
+        e = 0;
+        while (e < E) {
+            float32 p = Math.exp(lg[e] - mx);
+            probs[e] = p;
+            sum = sum + p;
+            e = e + 1;
+        }
+        e = 0;
+        while (e < E) { probs[e] = probs[e] / sum; e = e + 1; }
+        int32[] hSel = heap int32[K];
+        float32[] hW = heap float32[K];
+        int32 k = 0;
+        while (k < K) {
+            int32 best = 0 - 1;
+            float32 bp = 0.0f;
+            e = 0;
+            while (e < E) {
+                if (probs[e] >= 0.0f && (best < 0 || probs[e] > bp)) {
+                    best = e;
+                    bp = probs[e];
+                }
+                e = e + 1;
+            }
+            hSel[k] = best;
+            hW[k] = bp;
+            probs[best] = 0.0f - 1.0f;
+            k = k + 1;
+        }
+        float32 ws = 0.0f;
+        k = 0;
+        while (k < K) { ws = ws + hW[k]; k = k + 1; }
+        if (ws < 0.00006103515625f) { ws = 0.00006103515625f; }
+        k = 0;
+        while (k < K) { hW[k] = hW[k] / ws; k = k + 1; }
+
+        // DEVICE arm.
+        KernelBuffer<float32> lgDev #= heap KernelBuffer<float32>(
+            (uint64) E);
+        lgDev.upload(lg, (int64) E);
+        KernelBuffer<int32> selDev #= heap KernelBuffer<int32>(
+            (uint64) K);
+        KernelBuffer<float32> wDev #= heap KernelBuffer<float32>(
+            (uint64) K);
+        QuantKernel.moeTopKLaunchNoSync(selDev, wDev, lgDev, null,
+            (int64) E, (int64) K, true, 0.0f);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int32[] dSel = heap int32[K];
+        float32[] dW = heap float32[K];
+        selDev.download(dSel, (int64) K);
+        wDev.download(dW, (int64) K);
+
+        // The tie: 7 before 23, in the first two slots.
+        Assert.equals(7L, (int64) dSel[0]);
+        Assert.equals(23L, (int64) dSel[1]);
+        k = 0;
+        while (k < K) {
+            Assert.equals((int64) hSel[k], (int64) dSel[k]);
+            float64 d = (float64) hW[k] - (float64) dW[k];
+            if (d < 0.0) { d = 0.0 - d; }
+            Assert.isTrue(d < 0.000001);
+            k = k + 1;
+        }
+    }
+
+    /** 40.1.2 — the indirected launch vs per-expert wave launches on
+     *  the SAME slab bytes and the SAME staged activation. The two
+     *  decompositions run an identical per-row dot loop, so the
+     *  outputs must be BIT-identical — `==`, not a tolerance. */
+    @Test
+    public void idMatVecMatchesPerExpertWaveLaunches() {
+        if (!Linear.residentEnabled()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        CausalLM m #= ResidentMoeDecodeTest.mk();
+        MoeFfn moe = m.moeAt(0);
+        ExpertBank gb = moe.gate();
+        Assert.isTrue(gb.ensureSlab());
+        int64 rows = (int64) gb.rows();
+        int64 cols = (int64) gb.cols();
+        int32 used = 2;
+        int32[] ids = heap int32[used];
+        ids[0] = 3;
+        ids[1] = 0;
+
+        // A non-trivial staged activation.
+        float32[] xv = heap float32[cols];
+        int64 j = 0;
+        while (j < cols) {
+            xv[j] = (float32) ((j % 25) - 12) / 64.0f;
+            j = j + 1;
+        }
+        KernelBuffer<float32> xf #= heap KernelBuffer<float32>(
+            (uint64) cols);
+        xf.upload(xv, cols);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) ((cols / 256L) * 320L));
+        QuantKernel.q8kPackLaunchNoSync(xp, xf, cols);
+
+        KernelBuffer<int32> sel #= heap KernelBuffer<int32>(
+            (uint64) used);
+        sel.upload(ids, (int64) used);
+        KernelBuffer<float32> yId #= heap KernelBuffer<float32>(
+            (uint64) ((int64) used * rows));
+        KernelBuffer<float32> yWv #= heap KernelBuffer<float32>(
+            (uint64) ((int64) used * rows));
+        Assert.isTrue(gb.idLaunch(yId, xp, sel, used, 0L));
+        int32 k = 0;
+        while (k < used) {
+            gb.slotWaveLaunch(ids[k], yWv, xp, (int64) k * rows);
+            k = k + 1;
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int64 n = (int64) used * rows;
+        float32[] a = heap float32[n];
+        float32[] b = heap float32[n];
+        yId.download(a, n);
+        yWv.download(b, n);
+        int64 i = 0;
+        int64 diff = 0L;
+        while (i < n) {
+            if (a[i] != b[i]) { diff = diff + 1L; }
+            i = i + 1;
+        }
+        Assert.equals(0L, diff);
+        // Vacuity: the outputs are not all zero.
+        boolean nz = false;
+        i = 0;
+        while (i < n) {
+            if (a[i] != 0.0f) { nz = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(nz);
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
+    }
+}
