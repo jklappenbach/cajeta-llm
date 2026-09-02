@@ -1,0 +1,227 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+
+/**
+ * cajeta-llm plan 42.1 — the epi-seam id-GEMM against the 41d
+ * spill-seam id-GEMM (spec 15.21.4).
+ *
+ * Same maps, same slab bytes, same packed activations; the epi kernel
+ * moves the epilogue into the register accumulator, so agreement is
+ * held to the reassociation bar the epi batch kernels are held to
+ * (|diff| <= |oracle|*0.002 + 0.002), with every output row live.
+ * Group sizes 5/32/48/17 cover sub-tile groups and ragged tails —
+ * the guarded store must not land pad rows on the next group.
+ *
+ * The slabs are SYNTHESIZED (deterministic quant bytes, finite half
+ * scale bytes), which is also the first direct q6k id coverage — the
+ * toy fixture's expert banks are all Q4_K, so until now the q6k id
+ * kernels were netted only by the 30B's token identity.
+ */
+public class WmmaIdTileTest {
+
+    public WmmaIdTileTest() { return; }
+
+    static int32 E = 4;
+    static int32 ROWS_E = 32;      // rowsPerExpert, = outDim
+    static int32 COLS = 512;       // 2 blocks per row
+    static int32 NP = 102;         // groups 5 + 32 + 48 + 17
+
+    /** Group row offsets: [0, 5, 37, 85, 102]. */
+    static int32 gOff(int32 e) {
+        if (e == 0) { return 0; }
+        if (e == 1) { return 5; }
+        if (e == 2) { return 37; }
+        if (e == 3) { return 85; }
+        return WmmaIdTileTest.NP;
+    }
+
+    static boolean skip() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")
+                || be.equals("vulkan")) {
+            RoutableFixtureTest.saySkip();
+            return true;
+        }
+        return false;
+    }
+
+    /** The packed group-major activations, all NP + 16 slack rows
+     *  carrying real data so every pad-tile read is defined. */
+    static #KernelBuffer<int8> packActs() {
+        int64 cols = (int64) WmmaIdTileTest.COLS;
+        int64 npp = (int64) WmmaIdTileTest.NP + 16L;
+        float32[] xv = heap float32[npp * cols];
+        int64 i = 0;
+        while (i < npp * cols) {
+            xv[i] = (float32) ((i % 25) - 12) / 64.0f
+                + (float32) (i % 7) * 0.01f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> xf #= heap KernelBuffer<float32>(
+            (uint64) (npp * cols));
+        xf.upload(xv, npp * cols);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) ((npp * cols / 256L) * 320L));
+        QuantKernel.q8kPackLaunchNoSync(xp, xf, npp * cols);
+        return #xp;
+    }
+
+    /** The per-16-row-tile maps both kernels share. */
+    static int32 buildMaps16(int32[] mE, int32[] mT0, int32[] mM1) {
+        int32 nT = 0;
+        int32 e = 0;
+        while (e < WmmaIdTileTest.E) {
+            int32 g0 = WmmaIdTileTest.gOff(e);
+            int32 m = WmmaIdTileTest.gOff(e + 1) - g0;
+            int32 tw = 0;
+            while (tw * 16 < m) {
+                mE[nT] = e;
+                mT0[nT] = g0 + tw * 16;
+                mM1[nT] = g0 + m;
+                nT = nT + 1;
+                tw = tw + 1;
+            }
+            e = e + 1;
+        }
+        return nT;
+    }
+
+    /** Runs both launches on one slab and bit-compares. */
+    static void run(KernelBuffer<int8> slab, boolean q6) {
+        KernelBuffer<int8> xp #= WmmaIdTileTest.packActs();
+        int32 cap = WmmaIdTileTest.NP / 16 + WmmaIdTileTest.E + 1;
+        int32[] mE = heap int32[cap];
+        int32[] mT0 = heap int32[cap];
+        int32[] mM1 = heap int32[cap];
+        int32 n16 = WmmaIdTileTest.buildMaps16(mE, mT0, mM1);
+        KernelBuffer<int32> e16 #= heap KernelBuffer<int32>((uint64) n16);
+        KernelBuffer<int32> t16 #= heap KernelBuffer<int32>((uint64) n16);
+        KernelBuffer<int32> m16 #= heap KernelBuffer<int32>((uint64) n16);
+        e16.upload(mE, (int64) n16);
+        t16.upload(mT0, (int64) n16);
+        m16.upload(mM1, (int64) n16);
+        Assert.equals(8L, (int64) n16);
+
+        int64 outDim = (int64) WmmaIdTileTest.ROWS_E;
+        int64 nOut = (int64) WmmaIdTileTest.NP * outDim;
+        KernelBuffer<float32> y1 #= heap KernelBuffer<float32>(
+            (uint64) nOut);
+        KernelBuffer<float32> y2 #= heap KernelBuffer<float32>(
+            (uint64) nOut);
+        if (q6) {
+            WmmaKernel.q6kWmmaIdLaunchNoSync(y1, slab, xp, e16, t16,
+                m16, (int64) n16, outDim, (int64) WmmaIdTileTest.COLS,
+                (int64) WmmaIdTileTest.ROWS_E);
+            WmmaKernel.q6kWmmaIdEpiLaunchNoSync(y2, slab, xp, e16, t16,
+                m16, (int64) n16, outDim, (int64) WmmaIdTileTest.COLS,
+                (int64) WmmaIdTileTest.ROWS_E);
+        } else {
+            WmmaKernel.q4kWmmaIdLaunchNoSync(y1, slab, xp, e16, t16,
+                m16, (int64) n16, outDim, (int64) WmmaIdTileTest.COLS,
+                (int64) WmmaIdTileTest.ROWS_E);
+            WmmaKernel.q4kWmmaIdEpiLaunchNoSync(y2, slab, xp, e16, t16,
+                m16, (int64) n16, outDim, (int64) WmmaIdTileTest.COLS,
+                (int64) WmmaIdTileTest.ROWS_E);
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a = heap float32[nOut];
+        float32[] b = heap float32[nOut];
+        y1.download(a, nOut);
+        y2.download(b, nOut);
+        boolean nz = false;
+        int64 i = 0;
+        while (i < nOut) {
+            float32 av = a[i];
+            float32 bv = b[i];
+            float32 d = av - bv;
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 mag = av < 0.0f ? 0.0f - av : av;
+            if (d > mag * 0.002f + 0.002f) {
+                Assert.fail("id epi vs spill element " + i + " (token "
+                    + (i / outDim) + ", row " + (i % outDim) + "): "
+                    + bv + " vs " + av
+                    + " - further apart than reassociation explains");
+            }
+            if (av != 0.0f) { nz = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(nz);
+        // Every output row live: a short tiling or an over-eager store
+        // guard zeroes whole rows against smooth data.
+        int64 t = 0;
+        while (t < (int64) WmmaIdTileTest.NP) {
+            boolean live = false;
+            int64 c2 = 0;
+            while (c2 < outDim) {
+                if (b[t * outDim + c2] != 0.0f) { live = true; }
+                c2 = c2 + 1;
+            }
+            Assert.isTrue(live);
+            t = t + 1;
+        }
+    }
+
+    /** 42.1.1 — q4k: epi id vs spill id at the reassociation bar. */
+    @Test
+    public void q4kEpiIdAgreesWithSpillId() {
+        if (WmmaIdTileTest.skip()) { return; }
+        int32 rowBytes = (WmmaIdTileTest.COLS / 256) * 144;
+        int64 total = (int64) WmmaIdTileTest.E
+            * (int64) WmmaIdTileTest.ROWS_E * (int64) rowBytes;
+        int8[] raw = heap int8[total];
+        int64 i = 0;
+        while (i < total) {
+            int64 blk = i / 144L;
+            int64 off = i % 144L;
+            // d and dmin: finite halfs (fixed exponent byte, varying
+            // mantissa); everything else deterministic noise.
+            if (off == 1L) {
+                raw[i] = (int8) 44;   // 0x2C: finite half exponent
+            } else if (off == 3L) {
+                raw[i] = (int8) 40;   // 0x28
+            } else if (off == 0L || off == 2L) {
+                raw[i] = (int8) ((blk * 37L + off * 11L) % 256L);
+            } else {
+                raw[i] = (int8) ((i * 131L + 17L) % 256L);
+            }
+            i = i + 1;
+        }
+        KernelBuffer<int8> slab #= heap KernelBuffer<int8>(
+            (uint64) total);
+        slab.upload(raw, total);
+        WmmaIdTileTest.run(slab, false);
+    }
+
+    /** 42.1.1 — q6k: same bar, the first direct q6k id coverage. */
+    @Test
+    public void q6kEpiIdAgreesWithSpillId() {
+        if (WmmaIdTileTest.skip()) { return; }
+        int32 rowBytes = (WmmaIdTileTest.COLS / 256) * 210;
+        int64 total = (int64) WmmaIdTileTest.E
+            * (int64) WmmaIdTileTest.ROWS_E * (int64) rowBytes;
+        int8[] raw = heap int8[total];
+        int64 i = 0;
+        while (i < total) {
+            int64 off = i % 210L;
+            if (off == 209L) {
+                raw[i] = (int8) 44;   // d's finite half exponent byte
+            } else {
+                raw[i] = (int8) ((i * 131L + 17L) % 256L);
+            }
+            i = i + 1;
+        }
+        KernelBuffer<int8> slab #= heap KernelBuffer<int8>(
+            (uint64) total);
+        slab.upload(raw, total);
+        WmmaIdTileTest.run(slab, true);
+    }
+}

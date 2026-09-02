@@ -600,6 +600,319 @@ public final class WmmaKernel {
     }
 
 
+    /*
+     * ── Unit 42 (spec 15.21.4): the id-GEMM on the EPI seam. 41d
+     * generated the id kernels from the SPILL bodies — per sub-block
+     * they pay a 256-element LDS round trip, a re-splat and two
+     * barriers, which the epi kernels above already retired via the
+     * register accumulator and the scaledAccumInto/rank1Accum verbs.
+     * These are the epi bodies with 41d's map head (workgroup ->
+     * (expert, row base, row end) from three small device maps, the
+     * weight side offset into the bank slab) and a GUARDED store: the
+     * accumulator tile spills to LDS once at the end and only rows
+     * below mEnd land. A 4-token-tile single-wave variant was built
+     * and MEASURED FIRST: bit-identical, ~5% SLOWER end to end
+     * (2.84 -> 2.99 ms/tok steady) — 4x the serial chain and 2x the
+     * LDS per wave lost more to occupancy than the shared widen won,
+     * so the mid-tile axis was dropped for the epilogue seam.
+     */
+    @Kernel
+    public static void q4kWmmaIdEpiKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, uint32 nTilesM, uint32 outDim,
+            uint32 tilesN, int64 blocksPerRow, int64 rowsPerExpert) {
+        Shared<int8> bt = shared int8[4096];
+        Shared<int32> scLds = shared int32[128];
+        Shared<int32> mnLds = shared int32[128];
+        Shared<float32> dLds = shared float32[16];
+        Shared<float32> dmLds = shared float32[16];
+        Shared<float32> xsLds = shared float32[16];
+        Shared<int32> psLds = shared int32[128];
+        Shared<float32> rowFj = shared float32[16];
+        Shared<float32> rowGj = shared float32[16];
+        Shared<float32> colGj = shared float32[16];
+
+        Shared<float32> fs = shared float32[256];
+
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 32;
+        uint32 mapIdx = wg / tilesN;
+        uint32 tileI = wg % tilesN;
+        uint32 i0 = tileI * 16;
+        if (mapIdx < nTilesM && i0 < outDim) {
+            int64 rowBytes = blocksPerRow * 144L;
+            int64 xRowBytes = blocksPerRow * 320L;
+            uint32 t0 = (uint32) mapT0[(int64) mapIdx];
+            uint32 mEnd = (uint32) mapM1[(int64) mapIdx];
+            int64 wOff = (int64) mapE[(int64) mapIdx]
+                * rowsPerExpert * rowBytes;
+
+            CooperativeMatrix<int8,16,16,0> ma;
+            CooperativeMatrix<int8,16,16,1> mb;
+            CooperativeMatrix<int32,16,16,2> mc;
+            CooperativeMatrix<float32,16,16,2> facc;
+            facc.splat(0.0f);
+
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                if (lane < 16) {
+                    int64 ro = wOff + (int64) (i0 + lane) * rowBytes + b * 144L;
+                    dLds[lane] = GgufFile.halfBitsToF32(
+                        ((int32) packed[ro] & 255)
+                        | (((int32) packed[ro + 1L] & 255) << 8));
+                    dmLds[lane] = GgufFile.halfBitsToF32(
+                        ((int32) packed[ro + 2L] & 255)
+                        | (((int32) packed[ro + 3L] & 255) << 8));
+                    int32 q = 0;
+                    while (q < 4) {
+                        int32 dq = (int32) packed[ro + 4L + (int64) q] & 255;
+                        int32 mq = (int32) packed[ro + 8L + (int64) q] & 255;
+                        int32 kq = (int32) packed[ro + 12L + (int64) q] & 255;
+                        scLds[lane * 8 + q] = dq & 63;
+                        scLds[lane * 8 + 4 + q] =
+                            (kq & 15) | ((dq >> 2) & 48);
+                        mnLds[lane * 8 + q] = mq & 63;
+                        mnLds[lane * 8 + 4 + q] =
+                            (kq >> 4) | ((mq >> 2) & 48);
+                        q = q + 1;
+                    }
+                } else {
+                    uint32 tk = lane - 16;
+                    int64 xb = (int64) (t0 + tk) * xRowBytes + b * 320L;
+                    xsLds[tk] = Cajeta.bitsToF32(
+                        ((int32) xp[xb + 288L] & 255)
+                        | (((int32) xp[xb + 289L] & 255) << 8)
+                        | (((int32) xp[xb + 290L] & 255) << 16)
+                        | (((int32) xp[xb + 291L] & 255) << 24));
+                    int32 sbi = 0;
+                    while (sbi < 8) {
+                        int64 at = xb + 256L + (int64) (sbi * 4);
+                        psLds[tk * 8 + sbi] = ((int32) xp[at] & 255)
+                            | (((int32) xp[at + 1L] & 255) << 8)
+                            | (((int32) xp[at + 2L] & 255) << 16)
+                            | (((int32) xp[at + 3L]) << 24);
+                        sbi = sbi + 1;
+                    }
+                }
+                Barrier.workgroup();
+
+                uint32 wnib = lane;
+                while (wnib < 2048) {
+                    uint32 ii = wnib / 128;
+                    uint32 byteIdx = wnib % 128;
+                    int64 ro3 = wOff + (int64) (i0 + ii) * rowBytes + b * 144L
+                        + 16L + (int64) byteIdx;
+                    int32 rb = (int32) packed[ro3] & 255;
+                    uint32 g = byteIdx / 32;
+                    uint32 t2 = byteIdx % 32;
+                    uint32 kLo = 64 * g + t2;
+                    uint32 kHi = 64 * g + 32 + t2;
+                    bt[ii * 256 + kLo] = (int8) (rb & 15);
+                    bt[ii * 256 + kHi] = (int8) ((rb >> 4) & 15);
+                    wnib = wnib + 32;
+                }
+                Barrier.workgroup();
+
+                uint32 j = 0;
+                while (j < 8) {
+                    // ONE fold, ONE barrier envelope for BOTH verbs: the
+                    // d*sc row scale, the -dmin*mn rank-1 row term and
+                    // the xs*ps rank-1 token term of THIS sub-block. The
+                    // first build ran dmin as a separate 8x rank-1 loop
+                    // with its own barriers - measured +42% on the GEMM.
+                    if (lane < 16) {
+                        rowFj[lane] = dLds[lane]
+                            * (float32) scLds[lane * 8 + j];
+                        rowGj[lane] = 0.0f - dmLds[lane]
+                            * (float32) mnLds[lane * 8 + j];
+                        colGj[lane] = xsLds[lane]
+                            * (float32) psLds[lane * 8 + j];
+                    }
+                    Barrier.workgroup();
+                    mc.splat(0);
+                    uint32 half = 0;
+                    while (half < 2) {
+                        uint32 kBase = 32 * j + 16 * half;
+                        int64 aOff = (int64) t0 * xRowBytes + b * 320L
+                            + (int64) kBase;
+                        ma.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
+                        mb.load(bt, kBase, 1, 256);
+                        mc.mma(ma, mb);
+                        half = half + 1;
+                    }
+                    mc.scaledAccumInto(facc, xsLds, rowFj);
+                    facc.rank1Accum(colGj, rowGj);
+                    Barrier.workgroup();
+                    j = j + 1;
+                }
+                b = b + 1;
+            }
+
+            // Pad tokens (groups rounded up to the tile) must
+            // not land: spill the tile once, copy guarded.
+            facc.store(fs, 0, 0, 16);
+            Barrier.workgroup();
+            uint32 w = lane;
+            while (w < 256) {
+                uint32 tt = w / 16;
+                uint32 ii = w % 16;
+                if (t0 + tt < mEnd) {
+                    y[(int64) (t0 + tt) * (int64) outDim
+                        + (int64) (i0 + ii)] = fs[w];
+                }
+                w = w + 32;
+            }
+        }
+    }
+
+    @Kernel
+    public static void q6kWmmaIdEpiKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, uint32 nTilesM, uint32 outDim,
+            uint32 tilesN, int64 blocksPerRow, int64 rowsPerExpert) {
+        Shared<int8> bt = shared int8[4096];
+        Shared<int32> scLds = shared int32[256];
+        Shared<float32> dLds = shared float32[16];
+        Shared<float32> xsLds = shared float32[16];
+        Shared<float32> rowFj = shared float32[16];
+
+        Shared<float32> fs = shared float32[256];
+
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 32;
+        uint32 mapIdx = wg / tilesN;
+        uint32 tileI = wg % tilesN;
+        uint32 i0 = tileI * 16;
+        if (mapIdx < nTilesM && i0 < outDim) {
+            int64 rowBytes = blocksPerRow * 210L;
+            int64 xRowBytes = blocksPerRow * 320L;
+            uint32 t0 = (uint32) mapT0[(int64) mapIdx];
+            uint32 mEnd = (uint32) mapM1[(int64) mapIdx];
+            int64 wOff = (int64) mapE[(int64) mapIdx]
+                * rowsPerExpert * rowBytes;
+
+            CooperativeMatrix<int8,16,16,0> ma;
+            CooperativeMatrix<int8,16,16,1> mb;
+            CooperativeMatrix<int32,16,16,2> mc;
+            CooperativeMatrix<float32,16,16,2> facc;
+            facc.splat(0.0f);
+
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                if (lane < 16) {
+                    int64 ro = wOff + (int64) (i0 + lane) * rowBytes + b * 210L;
+                    dLds[lane] = GgufFile.halfBitsToF32(
+                        ((int32) packed[ro + 208L] & 255)
+                        | (((int32) packed[ro + 209L] & 255) << 8));
+                    int32 s = 0;
+                    while (s < 16) {
+                        scLds[lane * 16 + s] =
+                            (int32) packed[ro + 192L + (int64) s];
+                        s = s + 1;
+                    }
+                } else {
+                    uint32 tk = lane - 16;
+                    int64 xb = (int64) (t0 + tk) * xRowBytes + b * 320L;
+                    xsLds[tk] = Cajeta.bitsToF32(
+                        ((int32) xp[xb + 288L] & 255)
+                        | (((int32) xp[xb + 289L] & 255) << 8)
+                        | (((int32) xp[xb + 290L] & 255) << 16)
+                        | (((int32) xp[xb + 291L] & 255) << 24));
+                }
+                Barrier.workgroup();
+
+                uint32 w6 = lane;
+                while (w6 < 2048) {
+                    uint32 ii = w6 / 128;
+                    uint32 byteIdx = w6 % 128;
+                    uint32 h = byteIdx / 64;
+                    uint32 l64 = byteIdx % 64;
+                    int64 ro2 = wOff + (int64) (i0 + ii) * rowBytes + b * 210L;
+                    int32 qlb = (int32) packed[ro2 + (int64) byteIdx] & 255;
+                    int32 qhb = (int32) packed[ro2 + 128L
+                        + (int64) (32 * h) + (int64) (l64 % 32)] & 255;
+                    uint32 sh = 2 * (l64 / 32);
+                    int32 vLo = ((qlb & 15)
+                        | (((qhb >> sh) & 3) << 4)) - 32;
+                    int32 vHi = (((qlb >> 4) & 15)
+                        | (((qhb >> (sh + 4)) & 3) << 4)) - 32;
+                    uint32 kLo = 128 * h + l64;
+                    bt[ii * 256 + kLo] = (int8) vLo;
+                    bt[ii * 256 + kLo + 64] = (int8) vHi;
+                    w6 = w6 + 32;
+                }
+                Barrier.workgroup();
+
+                uint32 j = 0;
+                while (j < 16) {
+                    if (lane < 16) {
+                        rowFj[lane] = dLds[lane]
+                            * (float32) scLds[lane * 16 + j];
+                    }
+                    Barrier.workgroup();
+                    mc.splat(0);
+                    uint32 kBase = 16 * j;
+                    int64 aOff = (int64) t0 * xRowBytes + b * 320L
+                        + (int64) kBase;
+                    ma.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
+                    mb.load(bt, kBase, 1, 256);
+                    mc.mma(ma, mb);
+                    mc.scaledAccumInto(facc, xsLds, rowFj);
+                    Barrier.workgroup();
+                    j = j + 1;
+                }
+                b = b + 1;
+            }
+
+            // Pad tokens (groups rounded up to the tile) must
+            // not land: spill the tile once, copy guarded.
+            facc.store(fs, 0, 0, 16);
+            Barrier.workgroup();
+            uint32 w = lane;
+            while (w < 256) {
+                uint32 tt = w / 16;
+                uint32 ii = w % 16;
+                if (t0 + tt < mEnd) {
+                    y[(int64) (t0 + tt) * (int64) outDim
+                        + (int64) (i0 + ii)] = fs[w];
+                }
+                w = w + 32;
+            }
+        }
+    }
+
+    public static void q4kWmmaIdEpiLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> slab, KernelBuffer<int8> xp,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, int64 nTilesM, int64 outDim,
+            int64 cols, int64 rowsPerExpert) {
+        int64 tilesN = outDim / 16L;
+        KernelStream s = QuantKernel.stream();
+        q4kWmmaIdEpiKernel.launch(s,
+            grid: [(uint32) (nTilesM * tilesN)], block: [32])
+            (y, slab, xp, mapE, mapT0, mapM1, (uint32) nTilesM,
+             (uint32) outDim, (uint32) tilesN, cols / 256L,
+             rowsPerExpert);
+        return;
+    }
+
+    public static void q6kWmmaIdEpiLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> slab, KernelBuffer<int8> xp,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, int64 nTilesM, int64 outDim,
+            int64 cols, int64 rowsPerExpert) {
+        int64 tilesN = outDim / 16L;
+        KernelStream s = QuantKernel.stream();
+        q6kWmmaIdEpiKernel.launch(s,
+            grid: [(uint32) (nTilesM * tilesN)], block: [32])
+            (y, slab, xp, mapE, mapT0, mapM1, (uint32) nTilesM,
+             (uint32) outDim, (uint32) tilesN, cols / 256L,
+             rowsPerExpert);
+        return;
+    }
+
     /** True when the shapes suit the tiled kernel. */
     public static boolean fits(int64 rows, int64 outDim) {
         return rows % 16L == 0L && outDim % 16L == 0L;
