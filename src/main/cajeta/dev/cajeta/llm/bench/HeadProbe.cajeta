@@ -5,6 +5,8 @@ import cajeta.lang.System;
 import cajeta.time.Clock;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelThread;
+import cajeta.xpu.Vector;
 import dev.cajeta.llm.io.QuantKernel;
 
 /** Unit 51 triage: the wave mat-vecs on the lm-head shape (151936 x
@@ -90,7 +92,66 @@ public class HeadProbe {
         return;
     }
 
+    /** The DRAM read ceiling: every lane streams 16-byte vectors, a
+     *  wave 512 contiguous bytes per load, eight loads in flight per
+     *  lane (4 KB per wave), the whole buffer covered — no compute,
+     *  no reduction, the sum steered never to hit `needle`. */
+    @Kernel
+    public static void streamReadKernel(KernelBuffer<int8> w, KernelBuffer<int32> sink,
+            int64 bytes, int32 needle) {
+        uint32 lane = KernelThread.x();
+        uint32 wave = KernelThread.globalIdX() / 32;
+        int64 base = (int64) wave * 4096L + (int64) lane * 16L;
+        if (base + 3584L + 16L <= bytes) {
+            Vector<int8,16> v0 = w.vload<16>(base);
+            Vector<int8,16> v1 = w.vload<16>(base + 512L);
+            Vector<int8,16> v2 = w.vload<16>(base + 1024L);
+            Vector<int8,16> v3 = w.vload<16>(base + 1536L);
+            Vector<int8,16> v4 = w.vload<16>(base + 2048L);
+            Vector<int8,16> v5 = w.vload<16>(base + 2560L);
+            Vector<int8,16> v6 = w.vload<16>(base + 3072L);
+            Vector<int8,16> v7 = w.vload<16>(base + 3584L);
+            Vector<int8,16> x = v0 ^ v1 ^ v2 ^ v3 ^ v4 ^ v5 ^ v6 ^ v7;
+            int32 acc = (int32) x[0] + (int32) x[5] + (int32) x[10] + (int32) x[15];
+            if (acc == needle) { sink[0L] = acc; }
+        }
+    }
+
+    static void ceiling(int64 bytes) {
+        int8[] h = heap int8[bytes];
+        int64 i = 0;
+        while (i < bytes) { h[i] = (int8) ((i * 131L + 17L) % 256L); i = i + 1; }
+        KernelBuffer<int8> w #= heap KernelBuffer<int8>((uint64) bytes);
+        w.upload(h, bytes);
+        KernelBuffer<int32> sink #= heap KernelBuffer<int32>((uint64) 4);
+        KernelStream s = QuantKernel.stream();
+        uint32 waves = (uint32) (bytes / 4096L);
+        int32 N = 20;
+        int32 rep = 0;
+        while (rep < 3) {
+            s.sync();
+            int64 t0 = Clock.nanoTime();
+            i = 0;
+            while (i < (int64) N) {
+                streamReadKernel.launch(s, grid: [waves], block: [32])(w, sink, bytes, 1234567);
+                i = i + 1;
+            }
+            s.sync();
+            int64 t1 = Clock.nanoTime();
+            System.stdout.println("stream read " + (bytes / 1048576L) + " MB: "
+                + ((float64) (t1 - t0) / 1000.0 / (float64) N) + " us  "
+                + ((float64) (bytes * (int64) N) / (float64) (t1 - t0)) + " GB/s");
+            rep = rep + 1;
+        }
+        return;
+    }
+
     public static void run(String[] args) {
+        if ((int32) args.count() > 0 && args[0].equals("ceiling")) {
+            HeadProbe.ceiling(151936L * 8L * 210L);
+            HeadProbe.ceiling(151936L * 8L * 144L);
+            return;
+        }
         if ((int32) args.count() > 0 && args[0].equals("touched")) {
             HeadProbe.touched(4096L, 2048L);
             return;
