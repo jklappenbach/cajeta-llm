@@ -7377,6 +7377,131 @@ public final class QuantKernel {
         }
     }
 
+    /**
+     * Unit 53: the router + top-k as WAVES — one wave per expert row
+     * (lanes stride the 2048 columns four floats at a time, one wave
+     * reduction, no LDS, no barrier), the last wave to finish selects
+     * with all 128 logits held in four registers per lane: the
+     * softmax max and sum by wave reduction, then the same
+     * threshold-chained rounds as moeTopKKernel on registers. Where
+     * the block form paid an 8-level LDS tree per expert and
+     * recomputed exp across the rounds, this pays neither.
+     */
+    @Kernel
+    public static void routerTopKWaveKernel(KernelBuffer<int32> sel,
+            KernelBuffer<float32> w, KernelBuffer<float32> logits,
+            KernelBuffer<float32> wRouter, KernelBuffer<float32> x,
+            KernelBuffer<int32> counter, uint32 experts, uint32 cols,
+            uint32 used, uint32 normTopk, float32 wScale) {
+        uint32 lane = KernelThread.x();
+        uint32 e = KernelThread.globalIdX() / 32;
+        float32 acc = 0.0f;
+        if (e < experts) {
+            int64 rb = (int64) e * (int64) cols;
+            uint32 j = lane * 4;
+            while (j < cols) {
+                Vector<float32,4> wv = wRouter.vload<4>(rb + (int64) j);
+                Vector<float32,4> xv = x.vload<4>((int64) j);
+                acc = acc + wv[0] * xv[0] + wv[1] * xv[1]
+                    + wv[2] * xv[2] + wv[3] * xv[3];
+                j = j + 128;
+            }
+        }
+        float32 tot = Wave.reduceSumF32(acc);
+        uint32 ticket = 0;
+        if (lane == 0) {
+            if (e < experts) { logits[(int64) e] = tot; }
+            Barrier.deviceMemory(MemoryOrder.Release);
+            int32 old = counter.atomicAdd(0L, 1, MemoryOrder.AcqRel);
+            ticket = (uint32) old;
+        }
+        uint32 last = Wave.reduceMax(ticket);
+        if (last != experts - 1) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        // Up to 128 experts in four registers per lane: lane holds
+        // experts lane, lane+32, lane+64, lane+96.
+        float32 neg = 0.0f - 340282346638528859811704183484516925440.0f;
+        float32 l0 = neg; float32 l1 = neg; float32 l2 = neg; float32 l3 = neg;
+        if (lane < experts) { l0 = logits[(int64) lane]; }
+        if (lane + 32 < experts) { l1 = logits[(int64) (lane + 32)]; }
+        if (lane + 64 < experts) { l2 = logits[(int64) (lane + 64)]; }
+        if (lane + 96 < experts) { l3 = logits[(int64) (lane + 96)]; }
+        float32 lm = l0;
+        if (l1 > lm) { lm = l1; }
+        if (l2 > lm) { lm = l2; }
+        if (l3 > lm) { lm = l3; }
+        float32 mx = Wave.reduceMaxF32(lm);
+        float32 p0 = 0.0f; float32 p1 = 0.0f; float32 p2 = 0.0f; float32 p3 = 0.0f;
+        if (lane < experts) { p0 = Math.exp(l0 - mx); }
+        if (lane + 32 < experts) { p1 = Math.exp(l1 - mx); }
+        if (lane + 64 < experts) { p2 = Math.exp(l2 - mx); }
+        if (lane + 96 < experts) { p3 = Math.exp(l3 - mx); }
+        float32 sum = Wave.reduceSumF32(p0 + p1 + p2 + p3);
+        float32 vLast = 340282346638528859811704183484516925440.0f;
+        uint32 iLast = experts;
+        uint32 k = 0;
+        while (k < used) {
+            float32 bv = 0.0f - 1.0f;
+            boolean ok0 = lane < experts && (p0 < vLast || (p0 == vLast && lane > iLast));
+            boolean ok1 = lane + 32 < experts && (p1 < vLast || (p1 == vLast && lane + 32 > iLast));
+            boolean ok2 = lane + 64 < experts && (p2 < vLast || (p2 == vLast && lane + 64 > iLast));
+            boolean ok3 = lane + 96 < experts && (p3 < vLast || (p3 == vLast && lane + 96 > iLast));
+            if (ok0 && p0 > bv) { bv = p0; }
+            if (ok1 && p1 > bv) { bv = p1; }
+            if (ok2 && p2 > bv) { bv = p2; }
+            if (ok3 && p3 > bv) { bv = p3; }
+            float32 vk = Wave.reduceMaxF32(bv);
+            uint32 bi = experts;
+            if (ok3 && p3 == vk) { bi = lane + 96; }
+            if (ok2 && p2 == vk) { bi = lane + 64; }
+            if (ok1 && p1 == vk) { bi = lane + 32; }
+            if (ok0 && p0 == vk) { bi = lane; }
+            uint32 ik = Wave.reduceMin(bi);
+            if (lane == 0) {
+                sel[(int64) k] = (int32) ik;
+                w[(int64) k] = vk / sum;
+            }
+            vLast = vk;
+            iLast = ik;
+            k = k + 1;
+        }
+        if (lane == 0) {
+            if (normTopk != 0) {
+                float32 ws = 0.0f;
+                k = 0;
+                while (k < used) { ws = ws + w[(int64) k]; k = k + 1; }
+                if (ws < 0.00006103515625f) { ws = 0.00006103515625f; }
+                k = 0;
+                while (k < used) {
+                    w[(int64) k] = w[(int64) k] / ws;
+                    k = k + 1;
+                }
+            }
+            if (wScale != 0.0f && wScale != 1.0f) {
+                k = 0;
+                while (k < used) {
+                    w[(int64) k] = w[(int64) k] * wScale;
+                    k = k + 1;
+                }
+            }
+            counter[0L] = 0;
+        }
+    }
+
+    public static void routerTopKWaveLaunchNoSync(KernelBuffer<int32> sel,
+            KernelBuffer<float32> w, KernelBuffer<float32> logits,
+            KernelBuffer<float32> wRouter, KernelBuffer<float32> x,
+            KernelBuffer<int32> counter, int64 experts, int64 cols,
+            int64 used, boolean normTopk, float32 wScale) {
+        KernelStream s = QuantKernel.stream();
+        uint32 nt = 0;
+        if (normTopk) { nt = 1; }
+        routerTopKWaveKernel.launch(s, grid: [(uint32) experts], block: [32])
+            (sel, w, logits, wRouter, x, counter, (uint32) experts,
+             (uint32) cols, (uint32) used, nt, wScale);
+        return;
+    }
+
     public static void routerTopKLaunchNoSync(KernelBuffer<int32> sel,
             KernelBuffer<float32> w, KernelBuffer<float32> logits,
             KernelBuffer<float32> wRouter, KernelBuffer<float32> x,
