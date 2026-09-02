@@ -5763,138 +5763,303 @@ public final class QuantKernel {
         // Unit 47: four lanes per block, so a row shorter than eight
         // blocks would idle the rest of the wave (a 3-block row ran
         // at 92 GB/s where 8-block rows ran 277). Short rows pack
-        // rowsPerWave rows per wave in lane segments; 8+ block rows
-        // keep the one-row wave exactly as before.
+        // rowsPerWave rows per wave in lane segments.
+        //
+        // Unit 58/60: rows of eight or more blocks take FOUR rows per
+        // wave, in slots — the q6k kernel's shape. A lane's block index
+        // and sub-block pair are fixed by its lane number, so its 64
+        // bytes of x are the same for every row: loaded once per block
+        // trip they serve all four slots, where one row per wave paid
+        // the x loads and the wave's whole fixed cost per row (4096
+        // one-row waves on a 4.7 MB launch measured 134 GB/s where the
+        // four-slot q6k measured 156 for MORE bytes). All four slots'
+        // loads are in flight together; out-of-range slots clamp to the
+        // last row and weigh zero, so every load is unconditional.
         uint32 lpr = 4 * (uint32) blocksPerRow;
         uint32 rpw = 1;
         uint32 rl = lane;
         uint32 sub = 0;
-        if (lpr < 32) { rpw = 32 / lpr; sub = lane / lpr; rl = lane - sub * lpr; }
-        uint32 row = wave * rpw + sub;
+        uint32 R = 4;
+        if (lpr < 32) { rpw = 32 / lpr; sub = lane / lpr; rl = lane - sub * lpr; R = 1; }
+        uint32 row0 = wave * R * rpw + sub;
         int64 rowBytes = blocksPerRow * 144L;
-        float32 acc = 0.0f;
-        if (sub < rpw && row < rows) {
-            int64 i = (int64) row;
+        float32 acc0 = 0.0f;
+        float32 acc1 = 0.0f;
+        float32 acc2 = 0.0f;
+        float32 acc3 = 0.0f;
+        if (sub < rpw && row0 < rows) {
+            uint32 last = rows - 1;
+            uint32 r1 = row0 + 1; if (r1 > last) { r1 = last; }
+            uint32 r2 = row0 + 2; if (r2 > last) { r2 = last; }
+            uint32 r3 = row0 + 3; if (r3 > last) { r3 = last; }
+            float32 w1 = 0.0f; if (R > 1 && row0 + 1 < rows) { w1 = 1.0f; }
+            float32 w2 = 0.0f; if (R > 1 && row0 + 2 < rows) { w2 = 1.0f; }
+            float32 w3 = 0.0f; if (R > 1 && row0 + 3 < rows) { w3 = 1.0f; }
+            int64 i0 = (int64) row0;
+            int64 i1 = (int64) r1;
+            int64 i2 = (int64) r2;
+            int64 i3 = (int64) r3;
             int32 g = (int32) (rl % 4);
             int64 b = (int64) (rl / 4);
+            int32 sh0 = 16 * (g & 1);
+            int32 sh1 = sh0 + 8;
             Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
             while (b < blocksPerRow) {
-                int64 ro = i * rowBytes + b * 144L;
-
-                // The header — { f16 d; f16 dmin; u8 scales[12] } = 16 bytes.
-                // Read by all four lanes of the block; it is 16 bytes and it
-                // is in cache after the first.
-                Vector<int8,16> hv = packed.vload<16>(ro);
-                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
-                    | (((int32) hv[1] & 255) << 8));
-                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
-                    | (((int32) hv[3] & 255) << 8));
-                // Only THIS lane's two sub-blocks are unpacked, where the
-                // serial kernel unpacks all eight — and the two forms are
-                // NOT interchangeable. Q4_K packs sub-blocks 0-3 and 4-7 in
-                // different fields, and a lane owning `g` needs sub-blocks
-                // 2g and 2g+1, so g < 2 lands entirely in the first field
-                // and g >= 2 entirely in the second. Reading field `g`
-                // instead of sub-block `2g` is the shape of the first
-                // version of this kernel, which was wrong on every row.
-                int32 sc0 = 0;
-                int32 sc1 = 0;
-                int32 mn0 = 0;
-                int32 mn1 = 0;
-                if (g < 2) {
-                    int32 j = 2 * g;
-                    sc0 = (int32) hv[4 + j] & 63;
-                    sc1 = (int32) hv[5 + j] & 63;
-                    mn0 = (int32) hv[8 + j] & 63;
-                    mn1 = (int32) hv[9 + j] & 63;
-                } else {
-                    int32 j = 2 * g - 4;
-                    int32 k0 = (int32) hv[12 + j] & 255;
-                    int32 k1 = (int32) hv[13 + j] & 255;
-                    int32 d0 = (int32) hv[4 + j] & 255;
-                    int32 d1 = (int32) hv[5 + j] & 255;
-                    int32 m0 = (int32) hv[8 + j] & 255;
-                    int32 m1 = (int32) hv[9 + j] & 255;
-                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
-                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
-                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
-                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
-                }
-
-                Vector<uint8,32> raw = packed.vload<32>(
-                    ro + 16L + (int64) (32 * g)).asUnsigned();
-                Vector<uint8,32> lo = raw & 15;
-                Vector<uint8,32> hi = (raw >> 4) & 15;
+                // The header — { f16 d; f16 dmin; u8 scales[12] } = 16 bytes,
+                // and this lane's 32 bytes of quants (sub-blocks 2g, 2g+1:
+                // Q4_K packs sub-blocks 0-3 and 4-7 in different fields,
+                // and reading field `g` instead of sub-block `2g` was the
+                // shape of the first version, wrong on every row).
                 int64 xb = b * 320L + (int64) (64 * g);
                 Vector<int8,32> a0 = xp.vload<32>(xb);
                 Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
-                Vector<int32,8> tot = lo.dotAccum(a0, zv) * sc0
-                                    + hi.dotAccum(a1, zv) * sc1;
-                int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
-                           + tot[4] + tot[5] + tot[6] + tot[7];
-
-                // The dmin term needs the sum of THIS LANE's activations,
-                // and the packed block's precomputed sums are per 32-element
-                // sub-block — which only helps a lane that owns a whole one.
-                // llama.cpp does not read a precomputed sum at all: it takes
-                // `dp4a(0x01010101, u)`, so any lane granularity is free.
-                // Same trick here, and it drops a 32-byte load per lane per
-                // block as well.
-                Vector<uint8,32> ones = (lo ^ lo) | 1;
-                Vector<int32,8> tot2 = ones.dotAccum(a0, zv) * mn0
-                                     + ones.dotAccum(a1, zv) * mn1;
-                int32 dmins = tot2[0] + tot2[1] + tot2[2] + tot2[3]
-                            + tot2[4] + tot2[5] + tot2[6] + tot2[7];
-
                 Vector<int8,4> dv = xp.vload<4>(b * 320L + 288L);
+                int64 ro0 = i0 * rowBytes + b * 144L;
+                Vector<int8,16> hv0 = packed.vload<16>(ro0);
+                Vector<uint8,32> raw0 = packed.vload<32>(
+                    ro0 + 16L + (int64) (32 * g)).asUnsigned();
+                int64 ro1 = i1 * rowBytes + b * 144L;
+                Vector<int8,16> hv1 = packed.vload<16>(ro1);
+                Vector<uint8,32> raw1 = packed.vload<32>(
+                    ro1 + 16L + (int64) (32 * g)).asUnsigned();
+                int64 ro2 = i2 * rowBytes + b * 144L;
+                Vector<int8,16> hv2 = packed.vload<16>(ro2);
+                Vector<uint8,32> raw2 = packed.vload<32>(
+                    ro2 + 16L + (int64) (32 * g)).asUnsigned();
+                int64 ro3 = i3 * rowBytes + b * 144L;
+                Vector<int8,16> hv3 = packed.vload<16>(ro3);
+                Vector<uint8,32> raw3 = packed.vload<32>(
+                    ro3 + 16L + (int64) (32 * g)).asUnsigned();
                 float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
                     | (((int32) dv[1] & 255) << 8)
                     | (((int32) dv[2] & 255) << 16)
                     | (((int32) dv[3] & 255) << 24));
-
-                acc = acc + d * xs * (float32) sumi
-                          - dmin * xs * (float32) dmins;
+                // The dmin term needs the sum of THIS LANE's activations:
+                // llama.cpp's `dp4a(0x01010101, u)`, any lane granularity.
+                Vector<uint8,32> ones = (a0 ^ a0).asUnsigned() | 1;
+                float32 d0 = GgufFile.halfBitsToF32(((int32) hv0[0] & 255)
+                    | (((int32) hv0[1] & 255) << 8));
+                float32 dmin0 = GgufFile.halfBitsToF32(((int32) hv0[2] & 255)
+                    | (((int32) hv0[3] & 255) << 8));
+                // Unit 60: the scale bytes by WORD and runtime SHIFT, not by
+                // runtime lane index — `hv[4 + j]` with j from the lane
+                // number lowered to a 16-way compare/select chain per
+                // byte (600 v_cndmask_b16 in the kernel), and both g
+                // branches executed. Words 1..3 of the header are the
+                // scale, min and high fields; the lane's two bytes sit at
+                // shift 8j, 8j + 8 with j = 2 (g & 1) in EITHER branch.
+                Vector<int32,4> hw0 = hv0.asWords();
+                int32 scw0 = hw0[1];
+                int32 mnw0 = hw0[2];
+                int32 hiw0 = hw0[3];
+                int32 sA0 = (scw0 >> sh0) & 255;
+                int32 sB0 = (scw0 >> sh1) & 255;
+                int32 mC0 = (mnw0 >> sh0) & 255;
+                int32 mD0 = (mnw0 >> sh1) & 255;
+                int32 sc0_0 = sA0 & 63;
+                int32 sc1_0 = sB0 & 63;
+                int32 mn0_0 = mC0 & 63;
+                int32 mn1_0 = mD0 & 63;
+                if (g >= 2) {
+                    int32 k0 = (hiw0 >> sh0) & 255;
+                    int32 k1 = (hiw0 >> sh1) & 255;
+                    sc0_0 = (k0 & 15) | ((sA0 >> 2) & 48);
+                    sc1_0 = (k1 & 15) | ((sB0 >> 2) & 48);
+                    mn0_0 = (k0 >> 4) | ((mC0 >> 2) & 48);
+                    mn1_0 = (k1 >> 4) | ((mD0 >> 2) & 48);
+                }
+                Vector<int32,8> rw0 = raw0.asWords();
+                Vector<uint8,32> lo0 = (rw0 & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi0 = ((rw0 >> 4) & 252645135).asBytes().asUnsigned();
+                Vector<int32,8> tot0 = lo0.dotAccum(a0, zv) * sc0_0
+                                    + hi0.dotAccum(a1, zv) * sc1_0;
+                int32 sumi0 = tot0[0] + tot0[1] + tot0[2] + tot0[3]
+                           + tot0[4] + tot0[5] + tot0[6] + tot0[7];
+                Vector<int32,8> tot20 = ones.dotAccum(a0, zv) * mn0_0
+                                     + ones.dotAccum(a1, zv) * mn1_0;
+                int32 dmins0 = tot20[0] + tot20[1] + tot20[2] + tot20[3]
+                            + tot20[4] + tot20[5] + tot20[6] + tot20[7];
+                acc0 = acc0 + d0 * xs * (float32) sumi0
+                          - dmin0 * xs * (float32) dmins0;
+                float32 d1 = GgufFile.halfBitsToF32(((int32) hv1[0] & 255)
+                    | (((int32) hv1[1] & 255) << 8));
+                float32 dmin1 = GgufFile.halfBitsToF32(((int32) hv1[2] & 255)
+                    | (((int32) hv1[3] & 255) << 8));
+                // Unit 60: the scale bytes by WORD and runtime SHIFT, not by
+                // runtime lane index — `hv[4 + j]` with j from the lane
+                // number lowered to a 16-way compare/select chain per
+                // byte (600 v_cndmask_b16 in the kernel), and both g
+                // branches executed. Words 1..3 of the header are the
+                // scale, min and high fields; the lane's two bytes sit at
+                // shift 8j, 8j + 8 with j = 2 (g & 1) in EITHER branch.
+                Vector<int32,4> hw1 = hv1.asWords();
+                int32 scw1 = hw1[1];
+                int32 mnw1 = hw1[2];
+                int32 hiw1 = hw1[3];
+                int32 sA1 = (scw1 >> sh0) & 255;
+                int32 sB1 = (scw1 >> sh1) & 255;
+                int32 mC1 = (mnw1 >> sh0) & 255;
+                int32 mD1 = (mnw1 >> sh1) & 255;
+                int32 sc0_1 = sA1 & 63;
+                int32 sc1_1 = sB1 & 63;
+                int32 mn0_1 = mC1 & 63;
+                int32 mn1_1 = mD1 & 63;
+                if (g >= 2) {
+                    int32 k0 = (hiw1 >> sh0) & 255;
+                    int32 k1 = (hiw1 >> sh1) & 255;
+                    sc0_1 = (k0 & 15) | ((sA1 >> 2) & 48);
+                    sc1_1 = (k1 & 15) | ((sB1 >> 2) & 48);
+                    mn0_1 = (k0 >> 4) | ((mC1 >> 2) & 48);
+                    mn1_1 = (k1 >> 4) | ((mD1 >> 2) & 48);
+                }
+                Vector<int32,8> rw1 = raw1.asWords();
+                Vector<uint8,32> lo1 = (rw1 & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi1 = ((rw1 >> 4) & 252645135).asBytes().asUnsigned();
+                Vector<int32,8> tot1 = lo1.dotAccum(a0, zv) * sc0_1
+                                    + hi1.dotAccum(a1, zv) * sc1_1;
+                int32 sumi1 = tot1[0] + tot1[1] + tot1[2] + tot1[3]
+                           + tot1[4] + tot1[5] + tot1[6] + tot1[7];
+                Vector<int32,8> tot21 = ones.dotAccum(a0, zv) * mn0_1
+                                     + ones.dotAccum(a1, zv) * mn1_1;
+                int32 dmins1 = tot21[0] + tot21[1] + tot21[2] + tot21[3]
+                            + tot21[4] + tot21[5] + tot21[6] + tot21[7];
+                acc1 = acc1 + d1 * xs * (float32) sumi1
+                          - dmin1 * xs * (float32) dmins1;
+                float32 d2 = GgufFile.halfBitsToF32(((int32) hv2[0] & 255)
+                    | (((int32) hv2[1] & 255) << 8));
+                float32 dmin2 = GgufFile.halfBitsToF32(((int32) hv2[2] & 255)
+                    | (((int32) hv2[3] & 255) << 8));
+                // Unit 60: the scale bytes by WORD and runtime SHIFT, not by
+                // runtime lane index — `hv[4 + j]` with j from the lane
+                // number lowered to a 16-way compare/select chain per
+                // byte (600 v_cndmask_b16 in the kernel), and both g
+                // branches executed. Words 1..3 of the header are the
+                // scale, min and high fields; the lane's two bytes sit at
+                // shift 8j, 8j + 8 with j = 2 (g & 1) in EITHER branch.
+                Vector<int32,4> hw2 = hv2.asWords();
+                int32 scw2 = hw2[1];
+                int32 mnw2 = hw2[2];
+                int32 hiw2 = hw2[3];
+                int32 sA2 = (scw2 >> sh0) & 255;
+                int32 sB2 = (scw2 >> sh1) & 255;
+                int32 mC2 = (mnw2 >> sh0) & 255;
+                int32 mD2 = (mnw2 >> sh1) & 255;
+                int32 sc0_2 = sA2 & 63;
+                int32 sc1_2 = sB2 & 63;
+                int32 mn0_2 = mC2 & 63;
+                int32 mn1_2 = mD2 & 63;
+                if (g >= 2) {
+                    int32 k0 = (hiw2 >> sh0) & 255;
+                    int32 k1 = (hiw2 >> sh1) & 255;
+                    sc0_2 = (k0 & 15) | ((sA2 >> 2) & 48);
+                    sc1_2 = (k1 & 15) | ((sB2 >> 2) & 48);
+                    mn0_2 = (k0 >> 4) | ((mC2 >> 2) & 48);
+                    mn1_2 = (k1 >> 4) | ((mD2 >> 2) & 48);
+                }
+                Vector<int32,8> rw2 = raw2.asWords();
+                Vector<uint8,32> lo2 = (rw2 & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi2 = ((rw2 >> 4) & 252645135).asBytes().asUnsigned();
+                Vector<int32,8> tot2 = lo2.dotAccum(a0, zv) * sc0_2
+                                    + hi2.dotAccum(a1, zv) * sc1_2;
+                int32 sumi2 = tot2[0] + tot2[1] + tot2[2] + tot2[3]
+                           + tot2[4] + tot2[5] + tot2[6] + tot2[7];
+                Vector<int32,8> tot22 = ones.dotAccum(a0, zv) * mn0_2
+                                     + ones.dotAccum(a1, zv) * mn1_2;
+                int32 dmins2 = tot22[0] + tot22[1] + tot22[2] + tot22[3]
+                            + tot22[4] + tot22[5] + tot22[6] + tot22[7];
+                acc2 = acc2 + d2 * xs * (float32) sumi2
+                          - dmin2 * xs * (float32) dmins2;
+                float32 d3 = GgufFile.halfBitsToF32(((int32) hv3[0] & 255)
+                    | (((int32) hv3[1] & 255) << 8));
+                float32 dmin3 = GgufFile.halfBitsToF32(((int32) hv3[2] & 255)
+                    | (((int32) hv3[3] & 255) << 8));
+                // Unit 60: the scale bytes by WORD and runtime SHIFT, not by
+                // runtime lane index — `hv[4 + j]` with j from the lane
+                // number lowered to a 16-way compare/select chain per
+                // byte (600 v_cndmask_b16 in the kernel), and both g
+                // branches executed. Words 1..3 of the header are the
+                // scale, min and high fields; the lane's two bytes sit at
+                // shift 8j, 8j + 8 with j = 2 (g & 1) in EITHER branch.
+                Vector<int32,4> hw3 = hv3.asWords();
+                int32 scw3 = hw3[1];
+                int32 mnw3 = hw3[2];
+                int32 hiw3 = hw3[3];
+                int32 sA3 = (scw3 >> sh0) & 255;
+                int32 sB3 = (scw3 >> sh1) & 255;
+                int32 mC3 = (mnw3 >> sh0) & 255;
+                int32 mD3 = (mnw3 >> sh1) & 255;
+                int32 sc0_3 = sA3 & 63;
+                int32 sc1_3 = sB3 & 63;
+                int32 mn0_3 = mC3 & 63;
+                int32 mn1_3 = mD3 & 63;
+                if (g >= 2) {
+                    int32 k0 = (hiw3 >> sh0) & 255;
+                    int32 k1 = (hiw3 >> sh1) & 255;
+                    sc0_3 = (k0 & 15) | ((sA3 >> 2) & 48);
+                    sc1_3 = (k1 & 15) | ((sB3 >> 2) & 48);
+                    mn0_3 = (k0 >> 4) | ((mC3 >> 2) & 48);
+                    mn1_3 = (k1 >> 4) | ((mD3 >> 2) & 48);
+                }
+                Vector<int32,8> rw3 = raw3.asWords();
+                Vector<uint8,32> lo3 = (rw3 & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi3 = ((rw3 >> 4) & 252645135).asBytes().asUnsigned();
+                Vector<int32,8> tot3 = lo3.dotAccum(a0, zv) * sc0_3
+                                    + hi3.dotAccum(a1, zv) * sc1_3;
+                int32 sumi3 = tot3[0] + tot3[1] + tot3[2] + tot3[3]
+                           + tot3[4] + tot3[5] + tot3[6] + tot3[7];
+                Vector<int32,8> tot23 = ones.dotAccum(a0, zv) * mn0_3
+                                     + ones.dotAccum(a1, zv) * mn1_3;
+                int32 dmins3 = tot23[0] + tot23[1] + tot23[2] + tot23[3]
+                            + tot23[4] + tot23[5] + tot23[6] + tot23[7];
+                acc3 = acc3 + d3 * xs * (float32) sumi3
+                          - dmin3 * xs * (float32) dmins3;
                 b = b + 8L;
             }
+            acc1 = acc1 * w1;
+            acc2 = acc2 * w2;
+            acc3 = acc3 * w3;
         }
-        // The wave reduction, as a shared-memory tree.
-        //
-        // llama.cpp uses a shuffle butterfly (warp_reduce_sum) here and this
-        // was written that way first. Two things came back: the shuffle form
-        // was WRONG on every row, and it was exactly as FAST — 89.1 against
-        // 88.5 GB/s at 1024 rows, 128.5 against 127.9 at 14336. So the
-        // reduction is not what this kernel spends its time on, and the
-        // correct-and-simple form is kept until something says otherwise.
-        // 2026-08-26: ONE subgroup reduction, not a five-barrier LDS
-        // tree. The workgroup IS one wave, so the tree moved through
-        // memory what the hardware reduces across lanes — cheap when the
-        // k-loop is long, and it is not: at K=4096 a wave runs TWO
-        // iterations and then pays the whole tail. Measured on the two
-        // formats that carry 95% of this model's decode traffic, cold
-        // pool, interleaved min-of-5, GiB/s:
-        //   q4_K 14336x4096  180.9 -> 193.8      q4_K 4096x14336 171.6 -> 177.2
-        //   q4_K  4096x4096  155.2 -> 157.1      q4_K 1024x4096  129.4 -> 131.4
-        //   q6_K  4096x14336 136.5 -> 137.5      q6_K 1024x4096  124.8 -> 127.5
-        //   q6_K 128256x4096 158.7 -> 161.0
-        // A hand-written shuffle butterfly was tried in 2026-08 and was
-        // both wrong and exactly as fast — but at half this kernel's
-        // current rate, where the tail was half the share it is now.
-        uint32 r = 0;
-        while (r < rpw) {
-            float32 part = 0.0f;
-            if (sub == r) { part = acc; }
-            float32 tot = Wave.reduceSumF32(part);
-            if (lane == 0 && wave * rpw + r < rows) {
-                // Unit 48: accumulate form — the decode o-projection
-                // folds its residual add into the store.
+        // ONE subgroup reduction per row slot (2026-08-26: a five-barrier
+        // LDS tree moved through memory what the hardware reduces across
+        // lanes; the shuffle butterfly tried in 2026-08 was wrong and no
+        // faster).
+        if (R > 1) {
+            float32 t0 = Wave.reduceSumF32(acc0);
+            float32 t1 = Wave.reduceSumF32(acc1);
+            float32 t2 = Wave.reduceSumF32(acc2);
+            float32 t3 = Wave.reduceSumF32(acc3);
+            if (lane == 0) {
+                int64 o = yOff + (int64) row0;
                 if (accum != 0) {
-                    y[yOff + (int64) (wave * rpw + r)] =
-                        y[yOff + (int64) (wave * rpw + r)] + tot;
+                    if (row0 < rows) { y[o] = y[o] + t0; }
+                    if (row0 + 1 < rows) { y[o + 1L] = y[o + 1L] + t1; }
+                    if (row0 + 2 < rows) { y[o + 2L] = y[o + 2L] + t2; }
+                    if (row0 + 3 < rows) { y[o + 3L] = y[o + 3L] + t3; }
                 } else {
-                    y[yOff + (int64) (wave * rpw + r)] = tot;
+                    if (row0 < rows) { y[o] = t0; }
+                    if (row0 + 1 < rows) { y[o + 1L] = t1; }
+                    if (row0 + 2 < rows) { y[o + 2L] = t2; }
+                    if (row0 + 3 < rows) { y[o + 3L] = t3; }
                 }
             }
-            r = r + 1;
+        } else {
+            uint32 r = 0;
+            while (r < rpw) {
+                float32 part = 0.0f;
+                if (sub == r) { part = acc0; }
+                float32 tot = Wave.reduceSumF32(part);
+                if (lane == 0 && wave * rpw + r < rows) {
+                    // Unit 48: accumulate form — the decode o-projection
+                    // folds its residual add into the store.
+                    if (accum != 0) {
+                        y[yOff + (int64) (wave * rpw + r)] =
+                            y[yOff + (int64) (wave * rpw + r)] + tot;
+                    } else {
+                        y[yOff + (int64) (wave * rpw + r)] = tot;
+                    }
+                }
+                r = r + 1;
+            }
         }
     }
 
@@ -5933,6 +6098,8 @@ public final class QuantKernel {
             int64 rowBytes = blocksPerRow * 144L;
             int64 i = (int64) row;
             int32 g = (int32) (rl % 4);
+            int32 sh0 = 16 * (g & 1);
+            int32 sh1 = sh0 + 8;
             int64 b = (int64) (rl / 4);
             Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
             while (b < blocksPerRow) {
@@ -5954,34 +6121,31 @@ public final class QuantKernel {
                 // and g >= 2 entirely in the second. Reading field `g`
                 // instead of sub-block `2g` is the shape of the first
                 // version of this kernel, which was wrong on every row.
-                int32 sc0 = 0;
-                int32 sc1 = 0;
-                int32 mn0 = 0;
-                int32 mn1 = 0;
-                if (g < 2) {
-                    int32 j = 2 * g;
-                    sc0 = (int32) hv[4 + j] & 63;
-                    sc1 = (int32) hv[5 + j] & 63;
-                    mn0 = (int32) hv[8 + j] & 63;
-                    mn1 = (int32) hv[9 + j] & 63;
-                } else {
-                    int32 j = 2 * g - 4;
-                    int32 k0 = (int32) hv[12 + j] & 255;
-                    int32 k1 = (int32) hv[13 + j] & 255;
-                    int32 d0 = (int32) hv[4 + j] & 255;
-                    int32 d1 = (int32) hv[5 + j] & 255;
-                    int32 m0 = (int32) hv[8 + j] & 255;
-                    int32 m1 = (int32) hv[9 + j] & 255;
-                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
-                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
-                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
-                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                // Unit 60: scale bytes by word and runtime shift (no runtime
+                // lane index — that lowered to a 16-way select chain per byte).
+                Vector<int32,4> hvw = hv.asWords();
+                int32 hvsA = (hvw[1] >> sh0) & 255;
+                int32 hvsB = (hvw[1] >> sh1) & 255;
+                int32 hvmC = (hvw[2] >> sh0) & 255;
+                int32 hvmD = (hvw[2] >> sh1) & 255;
+                int32 sc0 = hvsA & 63;
+                int32 sc1 = hvsB & 63;
+                int32 mn0 = hvmC & 63;
+                int32 mn1 = hvmD & 63;
+                if (g >= 2) {
+                    int32 k0 = (hvw[3] >> sh0) & 255;
+                    int32 k1 = (hvw[3] >> sh1) & 255;
+                    sc0 = (k0 & 15) | ((hvsA >> 2) & 48);
+                    sc1 = (k1 & 15) | ((hvsB >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((hvmC >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((hvmD >> 2) & 48);
                 }
 
                 Vector<uint8,32> raw = wq.vload<32>(
                     ro + 16L + (int64) (32 * g)).asUnsigned();
-                Vector<uint8,32> lo = raw & 15;
-                Vector<uint8,32> hi = (raw >> 4) & 15;
+                Vector<int32,8> raww = raw.asWords();
+                Vector<uint8,32> lo = (raww & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi = ((raww >> 4) & 252645135).asBytes().asUnsigned();
                 int64 xb = b * 320L + (int64) (64 * g);
                 Vector<int8,32> a0 = xp.vload<32>(xb);
                 Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
@@ -6018,6 +6182,8 @@ public final class QuantKernel {
             int64 rowBytes = blocksPerRow * 144L;
             int64 i = (int64) row;
             int32 g = (int32) (rl % 4);
+            int32 sh0 = 16 * (g & 1);
+            int32 sh1 = sh0 + 8;
             int64 b = (int64) (rl / 4);
             Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
             while (b < blocksPerRow) {
@@ -6039,34 +6205,31 @@ public final class QuantKernel {
                 // and g >= 2 entirely in the second. Reading field `g`
                 // instead of sub-block `2g` is the shape of the first
                 // version of this kernel, which was wrong on every row.
-                int32 sc0 = 0;
-                int32 sc1 = 0;
-                int32 mn0 = 0;
-                int32 mn1 = 0;
-                if (g < 2) {
-                    int32 j = 2 * g;
-                    sc0 = (int32) hv[4 + j] & 63;
-                    sc1 = (int32) hv[5 + j] & 63;
-                    mn0 = (int32) hv[8 + j] & 63;
-                    mn1 = (int32) hv[9 + j] & 63;
-                } else {
-                    int32 j = 2 * g - 4;
-                    int32 k0 = (int32) hv[12 + j] & 255;
-                    int32 k1 = (int32) hv[13 + j] & 255;
-                    int32 d0 = (int32) hv[4 + j] & 255;
-                    int32 d1 = (int32) hv[5 + j] & 255;
-                    int32 m0 = (int32) hv[8 + j] & 255;
-                    int32 m1 = (int32) hv[9 + j] & 255;
-                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
-                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
-                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
-                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                // Unit 60: scale bytes by word and runtime shift (no runtime
+                // lane index — that lowered to a 16-way select chain per byte).
+                Vector<int32,4> hvw = hv.asWords();
+                int32 hvsA = (hvw[1] >> sh0) & 255;
+                int32 hvsB = (hvw[1] >> sh1) & 255;
+                int32 hvmC = (hvw[2] >> sh0) & 255;
+                int32 hvmD = (hvw[2] >> sh1) & 255;
+                int32 sc0 = hvsA & 63;
+                int32 sc1 = hvsB & 63;
+                int32 mn0 = hvmC & 63;
+                int32 mn1 = hvmD & 63;
+                if (g >= 2) {
+                    int32 k0 = (hvw[3] >> sh0) & 255;
+                    int32 k1 = (hvw[3] >> sh1) & 255;
+                    sc0 = (k0 & 15) | ((hvsA >> 2) & 48);
+                    sc1 = (k1 & 15) | ((hvsB >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((hvmC >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((hvmD >> 2) & 48);
                 }
 
                 Vector<uint8,32> raw = wk.vload<32>(
                     ro + 16L + (int64) (32 * g)).asUnsigned();
-                Vector<uint8,32> lo = raw & 15;
-                Vector<uint8,32> hi = (raw >> 4) & 15;
+                Vector<int32,8> raww = raw.asWords();
+                Vector<uint8,32> lo = (raww & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi = ((raww >> 4) & 252645135).asBytes().asUnsigned();
                 int64 xb = b * 320L + (int64) (64 * g);
                 Vector<int8,32> a0 = xp.vload<32>(xb);
                 Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
@@ -6103,6 +6266,8 @@ public final class QuantKernel {
             int64 rowBytes = blocksPerRow * 144L;
             int64 i = (int64) row;
             int32 g = (int32) (rl % 4);
+            int32 sh0 = 16 * (g & 1);
+            int32 sh1 = sh0 + 8;
             int64 b = (int64) (rl / 4);
             Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
             while (b < blocksPerRow) {
@@ -6124,34 +6289,31 @@ public final class QuantKernel {
                 // and g >= 2 entirely in the second. Reading field `g`
                 // instead of sub-block `2g` is the shape of the first
                 // version of this kernel, which was wrong on every row.
-                int32 sc0 = 0;
-                int32 sc1 = 0;
-                int32 mn0 = 0;
-                int32 mn1 = 0;
-                if (g < 2) {
-                    int32 j = 2 * g;
-                    sc0 = (int32) hv[4 + j] & 63;
-                    sc1 = (int32) hv[5 + j] & 63;
-                    mn0 = (int32) hv[8 + j] & 63;
-                    mn1 = (int32) hv[9 + j] & 63;
-                } else {
-                    int32 j = 2 * g - 4;
-                    int32 k0 = (int32) hv[12 + j] & 255;
-                    int32 k1 = (int32) hv[13 + j] & 255;
-                    int32 d0 = (int32) hv[4 + j] & 255;
-                    int32 d1 = (int32) hv[5 + j] & 255;
-                    int32 m0 = (int32) hv[8 + j] & 255;
-                    int32 m1 = (int32) hv[9 + j] & 255;
-                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
-                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
-                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
-                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                // Unit 60: scale bytes by word and runtime shift (no runtime
+                // lane index — that lowered to a 16-way select chain per byte).
+                Vector<int32,4> hvw = hv.asWords();
+                int32 hvsA = (hvw[1] >> sh0) & 255;
+                int32 hvsB = (hvw[1] >> sh1) & 255;
+                int32 hvmC = (hvw[2] >> sh0) & 255;
+                int32 hvmD = (hvw[2] >> sh1) & 255;
+                int32 sc0 = hvsA & 63;
+                int32 sc1 = hvsB & 63;
+                int32 mn0 = hvmC & 63;
+                int32 mn1 = hvmD & 63;
+                if (g >= 2) {
+                    int32 k0 = (hvw[3] >> sh0) & 255;
+                    int32 k1 = (hvw[3] >> sh1) & 255;
+                    sc0 = (k0 & 15) | ((hvsA >> 2) & 48);
+                    sc1 = (k1 & 15) | ((hvsB >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((hvmC >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((hvmD >> 2) & 48);
                 }
 
                 Vector<uint8,32> raw = wv.vload<32>(
                     ro + 16L + (int64) (32 * g)).asUnsigned();
-                Vector<uint8,32> lo = raw & 15;
-                Vector<uint8,32> hi = (raw >> 4) & 15;
+                Vector<int32,8> raww = raw.asWords();
+                Vector<uint8,32> lo = (raww & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi = ((raww >> 4) & 252645135).asBytes().asUnsigned();
                 int64 xb = b * 320L + (int64) (64 * g);
                 Vector<int8,32> a0 = xp.vload<32>(xb);
                 Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
@@ -6207,9 +6369,7 @@ public final class QuantKernel {
                     ro + (int64) (64 * g + 32 + 16 * a));
                 Vector<int8,16> qh16 = wv.vload<16>(
                     ro + (int64) (128 + 32 * g + 16 * a));
-                Vector<int8,16> lo_0 = (qlA >> 0) & 15;
-                Vector<int8,16> hi_0 = (qh16 >> 0) & 3;
-                Vector<uint8,16> qu_0 = (lo_0 | (hi_0 << 4)).asUnsigned();
+                Vector<uint8,16> qu_0 = ((qlA.asWords() & 252645135) | ((qh16.asWords() << 4) & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_0 = xp.vload<16>(xb + (int64) (16 * (8 * g + a)));
                 Vector<uint8,16> on_0 = (qu_0 ^ qu_0) | 1;
                 Vector<int32,4> dv_0 = qu_0.dotAccum(a_0, z4);
@@ -6219,9 +6379,7 @@ public final class QuantKernel {
                 int32 sc_0 = (int32) wv[ro + (int64) (192 + (8 * g + a))];
                 acc = acc + d * xs
                     * (float32) (sc_0 * (dot_0 - 32 * as_0));
-                Vector<int8,16> lo_1 = (qlB >> 0) & 15;
-                Vector<int8,16> hi_1 = (qh16 >> 2) & 3;
-                Vector<uint8,16> qu_1 = (lo_1 | (hi_1 << 4)).asUnsigned();
+                Vector<uint8,16> qu_1 = ((qlB.asWords() & 252645135) | ((qh16.asWords() << 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_1 = xp.vload<16>(xb + (int64) (16 * (8 * g + 2 + a)));
                 Vector<uint8,16> on_1 = (qu_1 ^ qu_1) | 1;
                 Vector<int32,4> dv_1 = qu_1.dotAccum(a_1, z4);
@@ -6231,9 +6389,7 @@ public final class QuantKernel {
                 int32 sc_1 = (int32) wv[ro + (int64) (192 + (8 * g + 2 + a))];
                 acc = acc + d * xs
                     * (float32) (sc_1 * (dot_1 - 32 * as_1));
-                Vector<int8,16> lo_2 = (qlA >> 4) & 15;
-                Vector<int8,16> hi_2 = (qh16 >> 4) & 3;
-                Vector<uint8,16> qu_2 = (lo_2 | (hi_2 << 4)).asUnsigned();
+                Vector<uint8,16> qu_2 = (((qlA.asWords() >> 4) & 252645135) | (qh16.asWords() & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_2 = xp.vload<16>(xb + (int64) (16 * (8 * g + 4 + a)));
                 Vector<uint8,16> on_2 = (qu_2 ^ qu_2) | 1;
                 Vector<int32,4> dv_2 = qu_2.dotAccum(a_2, z4);
@@ -6243,9 +6399,7 @@ public final class QuantKernel {
                 int32 sc_2 = (int32) wv[ro + (int64) (192 + (8 * g + 4 + a))];
                 acc = acc + d * xs
                     * (float32) (sc_2 * (dot_2 - 32 * as_2));
-                Vector<int8,16> lo_3 = (qlB >> 4) & 15;
-                Vector<int8,16> hi_3 = (qh16 >> 6) & 3;
-                Vector<uint8,16> qu_3 = (lo_3 | (hi_3 << 4)).asUnsigned();
+                Vector<uint8,16> qu_3 = (((qlB.asWords() >> 4) & 252645135) | ((qh16.asWords() >> 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_3 = xp.vload<16>(xb + (int64) (16 * (8 * g + 6 + a)));
                 Vector<uint8,16> on_3 = (qu_3 ^ qu_3) | 1;
                 Vector<int32,4> dv_3 = qu_3.dotAccum(a_3, z4);
@@ -6350,6 +6504,7 @@ public final class QuantKernel {
             int64 rows, int64 cols, int64 yOff) {
         uint32 ur = (uint32) rows;
         int64 rpw = QuantKernel.rowsPerWave(cols / 256L);
+        if (rpw == 1L) { rpw = 4L; }   // unit 60: four row slots per wave
         uint32 waves = (uint32) ((rows + rpw - 1L) / rpw);
         KernelStream s = QuantKernel.stream();
         q4kQ8WaveMatVecKernel.launch(s, grid: [waves], block: [32])
@@ -6363,6 +6518,7 @@ public final class QuantKernel {
             KernelBuffer<int8> xp, int64 rows, int64 cols, int64 yOff) {
         uint32 ur = (uint32) rows;
         int64 rpw = QuantKernel.rowsPerWave(cols / 256L);
+        if (rpw == 1L) { rpw = 4L; }   // unit 60: four row slots per wave
         uint32 waves = (uint32) ((rows + rpw - 1L) / rpw);
         KernelStream s = QuantKernel.stream();
         q4kQ8WaveMatVecKernel.launch(s, grid: [waves], block: [32])
@@ -6517,10 +6673,18 @@ public final class QuantKernel {
                     s2_0 = (int32) scv0[5];
                     s3_0 = (int32) scv0[7];
                 }
-                Vector<uint8,16> q0_0 = (((qlA0 >> 0) & 15) | (((qh0 >> 0) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q1_0 = (((qlB0 >> 0) & 15) | (((qh0 >> 2) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q2_0 = (((qlA0 >> 4) & 15) | (((qh0 >> 4) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q3_0 = (((qlB0 >> 4) & 15) | (((qh0 >> 6) & 3) << 4)).asUnsigned();
+                // Unit 60: the nibble/crumb assembly on 32-bit WORDS (four
+                // bytes per op). As byte vectors the compiler legalized
+                // every op to one v_and/v_or/v_lsh*_b16 PER BYTE — 1300
+                // of them per block trip, the kernel's real floor (a
+                // cached run of this shape took as long as the DRAM run).
+                Vector<int32,4> wA0 = qlA0.asWords();
+                Vector<int32,4> wB0 = qlB0.asWords();
+                Vector<int32,4> wH0 = qh0.asWords();
+                Vector<uint8,16> q0_0 = ((wA0 & 252645135) | ((wH0 << 4) & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q1_0 = ((wB0 & 252645135) | ((wH0 << 2) & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q2_0 = (((wA0 >> 4) & 252645135) | (wH0 & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q3_0 = (((wB0 >> 4) & 252645135) | ((wH0 >> 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int32,4> dv0_0 = q0_0.dotAccum(a_0, z4);
                 Vector<int32,4> dv1_0 = q1_0.dotAccum(a_1, z4);
                 Vector<int32,4> dv2_0 = q2_0.dotAccum(a_2, z4);
@@ -6545,10 +6709,18 @@ public final class QuantKernel {
                     s2_1 = (int32) scv1[5];
                     s3_1 = (int32) scv1[7];
                 }
-                Vector<uint8,16> q0_1 = (((qlA1 >> 0) & 15) | (((qh1 >> 0) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q1_1 = (((qlB1 >> 0) & 15) | (((qh1 >> 2) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q2_1 = (((qlA1 >> 4) & 15) | (((qh1 >> 4) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q3_1 = (((qlB1 >> 4) & 15) | (((qh1 >> 6) & 3) << 4)).asUnsigned();
+                // Unit 60: the nibble/crumb assembly on 32-bit WORDS (four
+                // bytes per op). As byte vectors the compiler legalized
+                // every op to one v_and/v_or/v_lsh*_b16 PER BYTE — 1300
+                // of them per block trip, the kernel's real floor (a
+                // cached run of this shape took as long as the DRAM run).
+                Vector<int32,4> wA1 = qlA1.asWords();
+                Vector<int32,4> wB1 = qlB1.asWords();
+                Vector<int32,4> wH1 = qh1.asWords();
+                Vector<uint8,16> q0_1 = ((wA1 & 252645135) | ((wH1 << 4) & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q1_1 = ((wB1 & 252645135) | ((wH1 << 2) & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q2_1 = (((wA1 >> 4) & 252645135) | (wH1 & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q3_1 = (((wB1 >> 4) & 252645135) | ((wH1 >> 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int32,4> dv0_1 = q0_1.dotAccum(a_0, z4);
                 Vector<int32,4> dv1_1 = q1_1.dotAccum(a_1, z4);
                 Vector<int32,4> dv2_1 = q2_1.dotAccum(a_2, z4);
@@ -6573,10 +6745,18 @@ public final class QuantKernel {
                     s2_2 = (int32) scv2[5];
                     s3_2 = (int32) scv2[7];
                 }
-                Vector<uint8,16> q0_2 = (((qlA2 >> 0) & 15) | (((qh2 >> 0) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q1_2 = (((qlB2 >> 0) & 15) | (((qh2 >> 2) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q2_2 = (((qlA2 >> 4) & 15) | (((qh2 >> 4) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q3_2 = (((qlB2 >> 4) & 15) | (((qh2 >> 6) & 3) << 4)).asUnsigned();
+                // Unit 60: the nibble/crumb assembly on 32-bit WORDS (four
+                // bytes per op). As byte vectors the compiler legalized
+                // every op to one v_and/v_or/v_lsh*_b16 PER BYTE — 1300
+                // of them per block trip, the kernel's real floor (a
+                // cached run of this shape took as long as the DRAM run).
+                Vector<int32,4> wA2 = qlA2.asWords();
+                Vector<int32,4> wB2 = qlB2.asWords();
+                Vector<int32,4> wH2 = qh2.asWords();
+                Vector<uint8,16> q0_2 = ((wA2 & 252645135) | ((wH2 << 4) & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q1_2 = ((wB2 & 252645135) | ((wH2 << 2) & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q2_2 = (((wA2 >> 4) & 252645135) | (wH2 & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q3_2 = (((wB2 >> 4) & 252645135) | ((wH2 >> 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int32,4> dv0_2 = q0_2.dotAccum(a_0, z4);
                 Vector<int32,4> dv1_2 = q1_2.dotAccum(a_1, z4);
                 Vector<int32,4> dv2_2 = q2_2.dotAccum(a_2, z4);
@@ -6601,10 +6781,18 @@ public final class QuantKernel {
                     s2_3 = (int32) scv3[5];
                     s3_3 = (int32) scv3[7];
                 }
-                Vector<uint8,16> q0_3 = (((qlA3 >> 0) & 15) | (((qh3 >> 0) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q1_3 = (((qlB3 >> 0) & 15) | (((qh3 >> 2) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q2_3 = (((qlA3 >> 4) & 15) | (((qh3 >> 4) & 3) << 4)).asUnsigned();
-                Vector<uint8,16> q3_3 = (((qlB3 >> 4) & 15) | (((qh3 >> 6) & 3) << 4)).asUnsigned();
+                // Unit 60: the nibble/crumb assembly on 32-bit WORDS (four
+                // bytes per op). As byte vectors the compiler legalized
+                // every op to one v_and/v_or/v_lsh*_b16 PER BYTE — 1300
+                // of them per block trip, the kernel's real floor (a
+                // cached run of this shape took as long as the DRAM run).
+                Vector<int32,4> wA3 = qlA3.asWords();
+                Vector<int32,4> wB3 = qlB3.asWords();
+                Vector<int32,4> wH3 = qh3.asWords();
+                Vector<uint8,16> q0_3 = ((wA3 & 252645135) | ((wH3 << 4) & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q1_3 = ((wB3 & 252645135) | ((wH3 << 2) & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q2_3 = (((wA3 >> 4) & 252645135) | (wH3 & 808464432)).asBytes().asUnsigned();
+                Vector<uint8,16> q3_3 = (((wB3 >> 4) & 252645135) | ((wH3 >> 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int32,4> dv0_3 = q0_3.dotAccum(a_0, z4);
                 Vector<int32,4> dv1_3 = q1_3.dotAccum(a_1, z4);
                 Vector<int32,4> dv2_3 = q2_3.dotAccum(a_2, z4);
@@ -6739,6 +6927,8 @@ public final class QuantKernel {
                      + (int64) row;
             int64 xbase = (int64) kk * xRowBlocks;
             int32 g = (int32) (rl % 4);
+            int32 sh0 = 16 * (g & 1);
+            int32 sh1 = sh0 + 8;
             int64 b = (int64) (rl / 4);
             Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
             while (b < blocksPerRow) {
@@ -6760,34 +6950,31 @@ public final class QuantKernel {
                 // and g >= 2 entirely in the second. Reading field `g`
                 // instead of sub-block `2g` is the shape of the first
                 // version of this kernel, which was wrong on every row.
-                int32 sc0 = 0;
-                int32 sc1 = 0;
-                int32 mn0 = 0;
-                int32 mn1 = 0;
-                if (g < 2) {
-                    int32 j = 2 * g;
-                    sc0 = (int32) hv[4 + j] & 63;
-                    sc1 = (int32) hv[5 + j] & 63;
-                    mn0 = (int32) hv[8 + j] & 63;
-                    mn1 = (int32) hv[9 + j] & 63;
-                } else {
-                    int32 j = 2 * g - 4;
-                    int32 k0 = (int32) hv[12 + j] & 255;
-                    int32 k1 = (int32) hv[13 + j] & 255;
-                    int32 d0 = (int32) hv[4 + j] & 255;
-                    int32 d1 = (int32) hv[5 + j] & 255;
-                    int32 m0 = (int32) hv[8 + j] & 255;
-                    int32 m1 = (int32) hv[9 + j] & 255;
-                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
-                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
-                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
-                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                // Unit 60: scale bytes by word and runtime shift (no runtime
+                // lane index — that lowered to a 16-way select chain per byte).
+                Vector<int32,4> hvw = hv.asWords();
+                int32 hvsA = (hvw[1] >> sh0) & 255;
+                int32 hvsB = (hvw[1] >> sh1) & 255;
+                int32 hvmC = (hvw[2] >> sh0) & 255;
+                int32 hvmD = (hvw[2] >> sh1) & 255;
+                int32 sc0 = hvsA & 63;
+                int32 sc1 = hvsB & 63;
+                int32 mn0 = hvmC & 63;
+                int32 mn1 = hvmD & 63;
+                if (g >= 2) {
+                    int32 k0 = (hvw[3] >> sh0) & 255;
+                    int32 k1 = (hvw[3] >> sh1) & 255;
+                    sc0 = (k0 & 15) | ((hvsA >> 2) & 48);
+                    sc1 = (k1 & 15) | ((hvsB >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((hvmC >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((hvmD >> 2) & 48);
                 }
 
                 Vector<uint8,32> raw = packed.vload<32>(
                     ro + 16L + (int64) (32 * g)).asUnsigned();
-                Vector<uint8,32> lo = raw & 15;
-                Vector<uint8,32> hi = (raw >> 4) & 15;
+                Vector<int32,8> raww = raw.asWords();
+                Vector<uint8,32> lo = (raww & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi = ((raww >> 4) & 252645135).asBytes().asUnsigned();
                 int64 xb = (xbase + b) * 320L + (int64) (64 * g);
                 Vector<int8,32> a0 = xp.vload<32>(xb);
                 Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
@@ -6899,9 +7086,7 @@ public final class QuantKernel {
                     ro + (int64) (64 * g + 32 + 16 * a));
                 Vector<int8,16> qh16 = packed.vload<16>(
                     ro + (int64) (128 + 32 * g + 16 * a));
-                Vector<int8,16> lo_0 = (qlA >> 0) & 15;
-                Vector<int8,16> hi_0 = (qh16 >> 0) & 3;
-                Vector<uint8,16> qu_0 = (lo_0 | (hi_0 << 4)).asUnsigned();
+                Vector<uint8,16> qu_0 = ((qlA.asWords() & 252645135) | ((qh16.asWords() << 4) & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_0 = xp.vload<16>(xb + (int64) (16 * (8 * g + a)));
                 Vector<uint8,16> on_0 = (qu_0 ^ qu_0) | 1;
                 Vector<int32,4> dv_0 = qu_0.dotAccum(a_0, z4);
@@ -6911,9 +7096,7 @@ public final class QuantKernel {
                 int32 sc_0 = (int32) packed[ro + (int64) (192 + (8 * g + a))];
                 acc = acc + d * xs
                     * (float32) (sc_0 * (dot_0 - 32 * as_0));
-                Vector<int8,16> lo_1 = (qlB >> 0) & 15;
-                Vector<int8,16> hi_1 = (qh16 >> 2) & 3;
-                Vector<uint8,16> qu_1 = (lo_1 | (hi_1 << 4)).asUnsigned();
+                Vector<uint8,16> qu_1 = ((qlB.asWords() & 252645135) | ((qh16.asWords() << 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_1 = xp.vload<16>(xb + (int64) (16 * (8 * g + 2 + a)));
                 Vector<uint8,16> on_1 = (qu_1 ^ qu_1) | 1;
                 Vector<int32,4> dv_1 = qu_1.dotAccum(a_1, z4);
@@ -6923,9 +7106,7 @@ public final class QuantKernel {
                 int32 sc_1 = (int32) packed[ro + (int64) (192 + (8 * g + 2 + a))];
                 acc = acc + d * xs
                     * (float32) (sc_1 * (dot_1 - 32 * as_1));
-                Vector<int8,16> lo_2 = (qlA >> 4) & 15;
-                Vector<int8,16> hi_2 = (qh16 >> 4) & 3;
-                Vector<uint8,16> qu_2 = (lo_2 | (hi_2 << 4)).asUnsigned();
+                Vector<uint8,16> qu_2 = (((qlA.asWords() >> 4) & 252645135) | (qh16.asWords() & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_2 = xp.vload<16>(xb + (int64) (16 * (8 * g + 4 + a)));
                 Vector<uint8,16> on_2 = (qu_2 ^ qu_2) | 1;
                 Vector<int32,4> dv_2 = qu_2.dotAccum(a_2, z4);
@@ -6935,9 +7116,7 @@ public final class QuantKernel {
                 int32 sc_2 = (int32) packed[ro + (int64) (192 + (8 * g + 4 + a))];
                 acc = acc + d * xs
                     * (float32) (sc_2 * (dot_2 - 32 * as_2));
-                Vector<int8,16> lo_3 = (qlB >> 4) & 15;
-                Vector<int8,16> hi_3 = (qh16 >> 6) & 3;
-                Vector<uint8,16> qu_3 = (lo_3 | (hi_3 << 4)).asUnsigned();
+                Vector<uint8,16> qu_3 = (((qlB.asWords() >> 4) & 252645135) | ((qh16.asWords() >> 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_3 = xp.vload<16>(xb + (int64) (16 * (8 * g + 6 + a)));
                 Vector<uint8,16> on_3 = (qu_3 ^ qu_3) | 1;
                 Vector<int32,4> dv_3 = qu_3.dotAccum(a_3, z4);
@@ -7001,6 +7180,8 @@ public final class QuantKernel {
                      + (int64) row;
             int64 xbase = (int64) kk * xRowBlocks;
             int32 g = (int32) (rl % 4);
+            int32 sh0 = 16 * (g & 1);
+            int32 sh1 = sh0 + 8;
             int64 b = (int64) (rl / 4);
             Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
             while (b < blocksPerRow) {
@@ -7024,33 +7205,30 @@ public final class QuantKernel {
                     | (((int32) hv[1] & 255) << 8));
                 float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
                     | (((int32) hv[3] & 255) << 8));
-                int32 sc0 = 0;
-                int32 sc1 = 0;
-                int32 mn0 = 0;
-                int32 mn1 = 0;
-                if (g < 2) {
-                    int32 j = 2 * g;
-                    sc0 = (int32) hv[4 + j] & 63;
-                    sc1 = (int32) hv[5 + j] & 63;
-                    mn0 = (int32) hv[8 + j] & 63;
-                    mn1 = (int32) hv[9 + j] & 63;
-                } else {
-                    int32 j = 2 * g - 4;
-                    int32 k0 = (int32) hv[12 + j] & 255;
-                    int32 k1 = (int32) hv[13 + j] & 255;
-                    int32 d0 = (int32) hv[4 + j] & 255;
-                    int32 d1 = (int32) hv[5 + j] & 255;
-                    int32 m0 = (int32) hv[8 + j] & 255;
-                    int32 m1 = (int32) hv[9 + j] & 255;
-                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
-                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
-                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
-                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                // Unit 60: scale bytes by word and runtime shift (no runtime
+                // lane index — that lowered to a 16-way select chain per byte).
+                Vector<int32,4> hvw = hv.asWords();
+                int32 hvsA = (hvw[1] >> sh0) & 255;
+                int32 hvsB = (hvw[1] >> sh1) & 255;
+                int32 hvmC = (hvw[2] >> sh0) & 255;
+                int32 hvmD = (hvw[2] >> sh1) & 255;
+                int32 sc0 = hvsA & 63;
+                int32 sc1 = hvsB & 63;
+                int32 mn0 = hvmC & 63;
+                int32 mn1 = hvmD & 63;
+                if (g >= 2) {
+                    int32 k0 = (hvw[3] >> sh0) & 255;
+                    int32 k1 = (hvw[3] >> sh1) & 255;
+                    sc0 = (k0 & 15) | ((hvsA >> 2) & 48);
+                    sc1 = (k1 & 15) | ((hvsB >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((hvmC >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((hvmD >> 2) & 48);
                 }
                 Vector<uint8,32> raw = packedG.vload<32>(
                     ro + 16L + (int64) (32 * g)).asUnsigned();
-                Vector<uint8,32> lo = raw & 15;
-                Vector<uint8,32> hi = (raw >> 4) & 15;
+                Vector<int32,8> raww = raw.asWords();
+                Vector<uint8,32> lo = (raww & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi = ((raww >> 4) & 252645135).asBytes().asUnsigned();
                 Vector<int32,8> tot = lo.dotAccum(a0, zv) * sc0
                                     + hi.dotAccum(a1, zv) * sc1;
                 int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
@@ -7067,33 +7245,30 @@ public final class QuantKernel {
                     | (((int32) hvU[1] & 255) << 8));
                 float32 dminU = GgufFile.halfBitsToF32(((int32) hvU[2] & 255)
                     | (((int32) hvU[3] & 255) << 8));
-                int32 sc0U = 0;
-                int32 sc1U = 0;
-                int32 mn0U = 0;
-                int32 mn1U = 0;
-                if (g < 2) {
-                    int32 j = 2 * g;
-                    sc0U = (int32) hvU[4 + j] & 63;
-                    sc1U = (int32) hvU[5 + j] & 63;
-                    mn0U = (int32) hvU[8 + j] & 63;
-                    mn1U = (int32) hvU[9 + j] & 63;
-                } else {
-                    int32 j = 2 * g - 4;
-                    int32 k0 = (int32) hvU[12 + j] & 255;
-                    int32 k1 = (int32) hvU[13 + j] & 255;
-                    int32 d0 = (int32) hvU[4 + j] & 255;
-                    int32 d1 = (int32) hvU[5 + j] & 255;
-                    int32 m0 = (int32) hvU[8 + j] & 255;
-                    int32 m1 = (int32) hvU[9 + j] & 255;
-                    sc0U = (k0 & 15) | ((d0 >> 2) & 48);
-                    sc1U = (k1 & 15) | ((d1 >> 2) & 48);
-                    mn0U = (k0 >> 4) | ((m0 >> 2) & 48);
-                    mn1U = (k1 >> 4) | ((m1 >> 2) & 48);
+                // Unit 60: scale bytes by word and runtime shift (no runtime
+                // lane index — that lowered to a 16-way select chain per byte).
+                Vector<int32,4> hvUw = hvU.asWords();
+                int32 hvUsA = (hvUw[1] >> sh0) & 255;
+                int32 hvUsB = (hvUw[1] >> sh1) & 255;
+                int32 hvUmC = (hvUw[2] >> sh0) & 255;
+                int32 hvUmD = (hvUw[2] >> sh1) & 255;
+                int32 sc0U = hvUsA & 63;
+                int32 sc1U = hvUsB & 63;
+                int32 mn0U = hvUmC & 63;
+                int32 mn1U = hvUmD & 63;
+                if (g >= 2) {
+                    int32 k0 = (hvUw[3] >> sh0) & 255;
+                    int32 k1 = (hvUw[3] >> sh1) & 255;
+                    sc0U = (k0 & 15) | ((hvUsA >> 2) & 48);
+                    sc1U = (k1 & 15) | ((hvUsB >> 2) & 48);
+                    mn0U = (k0 >> 4) | ((hvUmC >> 2) & 48);
+                    mn1U = (k1 >> 4) | ((hvUmD >> 2) & 48);
                 }
                 Vector<uint8,32> rawU = packedU.vload<32>(
                     ro + 16L + (int64) (32 * g)).asUnsigned();
-                Vector<uint8,32> loU = rawU & 15;
-                Vector<uint8,32> hiU = (rawU >> 4) & 15;
+                Vector<int32,8> rawUw = rawU.asWords();
+                Vector<uint8,32> loU = (rawUw & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hiU = ((rawUw >> 4) & 252645135).asBytes().asUnsigned();
                 Vector<int32,8> totU = loU.dotAccum(a0, zv) * sc0U
                                      + hiU.dotAccum(a1, zv) * sc1U;
                 int32 sumiU = totU[0] + totU[1] + totU[2] + totU[3]
@@ -7176,6 +7351,8 @@ public final class QuantKernel {
         float32 acc = 0.0f;
         if (row < rowsPerExpert) {
             int32 g = (int32) (lane % 4);
+            int32 sh0 = 16 * (g & 1);
+            int32 sh1 = sh0 + 8;
             Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
             int64 total = (int64) used * blocksPerRow;
             int64 kb = (int64) (lane / 4);
@@ -7204,34 +7381,31 @@ public final class QuantKernel {
                 // and g >= 2 entirely in the second. Reading field `g`
                 // instead of sub-block `2g` is the shape of the first
                 // version of this kernel, which was wrong on every row.
-                int32 sc0 = 0;
-                int32 sc1 = 0;
-                int32 mn0 = 0;
-                int32 mn1 = 0;
-                if (g < 2) {
-                    int32 j = 2 * g;
-                    sc0 = (int32) hv[4 + j] & 63;
-                    sc1 = (int32) hv[5 + j] & 63;
-                    mn0 = (int32) hv[8 + j] & 63;
-                    mn1 = (int32) hv[9 + j] & 63;
-                } else {
-                    int32 j = 2 * g - 4;
-                    int32 k0 = (int32) hv[12 + j] & 255;
-                    int32 k1 = (int32) hv[13 + j] & 255;
-                    int32 d0 = (int32) hv[4 + j] & 255;
-                    int32 d1 = (int32) hv[5 + j] & 255;
-                    int32 m0 = (int32) hv[8 + j] & 255;
-                    int32 m1 = (int32) hv[9 + j] & 255;
-                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
-                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
-                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
-                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                // Unit 60: scale bytes by word and runtime shift (no runtime
+                // lane index — that lowered to a 16-way select chain per byte).
+                Vector<int32,4> hvw = hv.asWords();
+                int32 hvsA = (hvw[1] >> sh0) & 255;
+                int32 hvsB = (hvw[1] >> sh1) & 255;
+                int32 hvmC = (hvw[2] >> sh0) & 255;
+                int32 hvmD = (hvw[2] >> sh1) & 255;
+                int32 sc0 = hvsA & 63;
+                int32 sc1 = hvsB & 63;
+                int32 mn0 = hvmC & 63;
+                int32 mn1 = hvmD & 63;
+                if (g >= 2) {
+                    int32 k0 = (hvw[3] >> sh0) & 255;
+                    int32 k1 = (hvw[3] >> sh1) & 255;
+                    sc0 = (k0 & 15) | ((hvsA >> 2) & 48);
+                    sc1 = (k1 & 15) | ((hvsB >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((hvmC >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((hvmD >> 2) & 48);
                 }
 
                 Vector<uint8,32> raw = packed.vload<32>(
                     ro + 16L + (int64) (32 * g)).asUnsigned();
-                Vector<uint8,32> lo = raw & 15;
-                Vector<uint8,32> hi = (raw >> 4) & 15;
+                Vector<int32,8> raww = raw.asWords();
+                Vector<uint8,32> lo = (raww & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi = ((raww >> 4) & 252645135).asBytes().asUnsigned();
                 int64 xb = (xbase + b) * 320L + (int64) (64 * g);
                 Vector<int8,32> a0 = xp.vload<32>(xb);
                 Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
@@ -7448,9 +7622,7 @@ public final class QuantKernel {
                     ro + (int64) (64 * g + 32 + 16 * a));
                 Vector<int8,16> qh16 = packed.vload<16>(
                     ro + (int64) (128 + 32 * g + 16 * a));
-                Vector<int8,16> lo_0 = (qlA >> 0) & 15;
-                Vector<int8,16> hi_0 = (qh16 >> 0) & 3;
-                Vector<uint8,16> qu_0 = (lo_0 | (hi_0 << 4)).asUnsigned();
+                Vector<uint8,16> qu_0 = ((qlA.asWords() & 252645135) | ((qh16.asWords() << 4) & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_0 = xp.vload<16>(xb + (int64) (16 * (8 * g + a)));
                 Vector<uint8,16> on_0 = (qu_0 ^ qu_0) | 1;
                 Vector<int32,4> dv_0 = qu_0.dotAccum(a_0, z4);
@@ -7460,9 +7632,7 @@ public final class QuantKernel {
                 int32 sc_0 = (int32) packed[ro + (int64) (192 + (8 * g + a))];
                 acc = acc + wk * d * xs
                     * (float32) (sc_0 * (dot_0 - 32 * as_0));
-                Vector<int8,16> lo_1 = (qlB >> 0) & 15;
-                Vector<int8,16> hi_1 = (qh16 >> 2) & 3;
-                Vector<uint8,16> qu_1 = (lo_1 | (hi_1 << 4)).asUnsigned();
+                Vector<uint8,16> qu_1 = ((qlB.asWords() & 252645135) | ((qh16.asWords() << 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_1 = xp.vload<16>(xb + (int64) (16 * (8 * g + 2 + a)));
                 Vector<uint8,16> on_1 = (qu_1 ^ qu_1) | 1;
                 Vector<int32,4> dv_1 = qu_1.dotAccum(a_1, z4);
@@ -7472,9 +7642,7 @@ public final class QuantKernel {
                 int32 sc_1 = (int32) packed[ro + (int64) (192 + (8 * g + 2 + a))];
                 acc = acc + wk * d * xs
                     * (float32) (sc_1 * (dot_1 - 32 * as_1));
-                Vector<int8,16> lo_2 = (qlA >> 4) & 15;
-                Vector<int8,16> hi_2 = (qh16 >> 4) & 3;
-                Vector<uint8,16> qu_2 = (lo_2 | (hi_2 << 4)).asUnsigned();
+                Vector<uint8,16> qu_2 = (((qlA.asWords() >> 4) & 252645135) | (qh16.asWords() & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_2 = xp.vload<16>(xb + (int64) (16 * (8 * g + 4 + a)));
                 Vector<uint8,16> on_2 = (qu_2 ^ qu_2) | 1;
                 Vector<int32,4> dv_2 = qu_2.dotAccum(a_2, z4);
@@ -7484,9 +7652,7 @@ public final class QuantKernel {
                 int32 sc_2 = (int32) packed[ro + (int64) (192 + (8 * g + 4 + a))];
                 acc = acc + wk * d * xs
                     * (float32) (sc_2 * (dot_2 - 32 * as_2));
-                Vector<int8,16> lo_3 = (qlB >> 4) & 15;
-                Vector<int8,16> hi_3 = (qh16 >> 6) & 3;
-                Vector<uint8,16> qu_3 = (lo_3 | (hi_3 << 4)).asUnsigned();
+                Vector<uint8,16> qu_3 = (((qlB.asWords() >> 4) & 252645135) | ((qh16.asWords() >> 2) & 808464432)).asBytes().asUnsigned();
                 Vector<int8,16> a_3 = xp.vload<16>(xb + (int64) (16 * (8 * g + 6 + a)));
                 Vector<uint8,16> on_3 = (qu_3 ^ qu_3) | 1;
                 Vector<int32,4> dv_3 = qu_3.dotAccum(a_3, z4);
