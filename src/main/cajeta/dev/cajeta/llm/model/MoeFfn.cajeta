@@ -64,6 +64,15 @@ public final class MoeFfn extends InfModule {
     KernelBuffer<float32> beDev;       // down outputs, [np x hidden]
     KernelBuffer<float32> obDev;       // combined output, [rows x hidden]
     int64 devBatchCap;                 // np the buffers are sized for
+    // ── Unit 41d: the indirected one-launch-per-bank GEMM. ──
+    int32[] mapEH;
+    int32[] mapT0H;
+    int32[] mapM1H;
+    KernelBuffer<int32> mapEDev;
+    KernelBuffer<int32> mapT0Dev;
+    KernelBuffer<int32> mapM1Dev;
+    KernelBuffer<int8> xpBxDev;        // packed batch activations
+    KernelBuffer<int8> xpBgDev;        // packed GLU'd middle
 
     // ── forwardRow phase split (parity attribution, decode). ──
     static int64 mtRouteNs;    // router matvec + softmax + top-k
@@ -866,15 +875,29 @@ public final class MoeFfn extends InfModule {
         if (this.devBatchCap >= np) { return; }
         int64 wid = (int64) this.widthN;
         int64 h = (int64) this.hidden;
+        // +16 rows of slack everywhere the id-GEMM's padded tiles may
+        // READ past the last group (their stores are guarded).
+        int64 npp = np + 16L;
         this.gRowDev #= heap KernelBuffer<int32>((uint64) np);
         this.gWDev #= heap KernelBuffer<float32>((uint64) np);
         this.rowSlotDev #= heap KernelBuffer<int32>((uint64) np);
-        this.bxDev #= heap KernelBuffer<float32>((uint64) (np * h));
-        this.bgDev #= heap KernelBuffer<float32>((uint64) (np * wid));
-        this.buDev #= heap KernelBuffer<float32>((uint64) (np * wid));
-        this.beDev #= heap KernelBuffer<float32>((uint64) (np * h));
+        this.bxDev #= heap KernelBuffer<float32>((uint64) (npp * h));
+        this.bgDev #= heap KernelBuffer<float32>((uint64) (npp * wid));
+        this.buDev #= heap KernelBuffer<float32>((uint64) (npp * wid));
+        this.beDev #= heap KernelBuffer<float32>((uint64) (npp * h));
         this.obDev #= heap KernelBuffer<float32>(
             (uint64) ((int64) rows * h));
+        int32 tiles = (int32) (np / 16L) + this.expertsN + 1;
+        this.mapEH #= heap int32[tiles];
+        this.mapT0H #= heap int32[tiles];
+        this.mapM1H #= heap int32[tiles];
+        this.mapEDev #= heap KernelBuffer<int32>((uint64) tiles);
+        this.mapT0Dev #= heap KernelBuffer<int32>((uint64) tiles);
+        this.mapM1Dev #= heap KernelBuffer<int32>((uint64) tiles);
+        this.xpBxDev #= heap KernelBuffer<int8>(
+            (uint64) ((npp * h / 256L) * 320L));
+        this.xpBgDev #= heap KernelBuffer<int8>(
+            (uint64) ((npp * wid / 256L) * 320L));
         this.devBatchCap = np;
         return;
     }
@@ -942,43 +965,103 @@ public final class MoeFfn extends InfModule {
             e = e + 1;
         }
         this.ensureDevBatch(rows);
+        // Pre-grow the shared batch stage to the largest PADDED group
+        // (gemmKeepAt pads rows to the WMMA tile): growth mid-loop
+        // would invalidate a staged window under a queued GEMM.
+        int32 mMax = 0;
+        e = 0;
+        while (e < this.expertsN) {
+            int32 gm = this.sc.gOff[e + 1] - this.sc.gOff[e];
+            if (gm > mMax) { mMax = gm; }
+            e = e + 1;
+        }
+        Linear.ensureBatchStage((mMax + 15) / 16 * 16, this.hidden);
         this.gRowDev.upload(this.sc.gRow, (int64) np);
         this.gWDev.upload(this.sc.gW, (int64) np);
         this.rowSlotDev.upload(this.rowSlotH, (int64) np);
         QuantKernel.gatherRowsF32LaunchNoSync(this.bxDev, xDev,
             this.gRowDev, (int64) np, h);
-        e = 0;
-        while (e < this.expertsN) {
-            int32 g0 = this.sc.gOff[e];
-            int32 m = this.sc.gOff[e + 1] - g0;
-            if (m > 0) {
-                KernelBuffer<float32> gx #= this.bxDev.slice(
-                    (uint64) ((int64) g0 * h),
-                    (uint64) ((int64) m * h));
-                Linear.stageBatchFromDevice(gx, m, this.hidden,
-                    Linear.nextStageTag());
-                this.gateB.gemmKeepAt(e, m, this.bgDev,
-                    (int64) g0 * wid);
-                this.upB.gemmKeepAt(e, m, this.buDev,
-                    (int64) g0 * wid);
+        // Unit 41d: ONE indirected GEMM per bank when the slabs and
+        // the WMMA id kernels are here — the mul_mat_id shape. The
+        // per-group loop below stays as the fallback (vulkan, exotic
+        // formats), and hundreds of serialized small GEMMs are exactly
+        // what it costs.
+        boolean idPath = Linear.wmmaOn && !Linear.backendIsVulkan()
+            && this.gateB.idGemmReady() && this.upB.idGemmReady()
+            && this.downB.idGemmReady();
+        int32 nT = 0;
+        int32 groups = 0;
+        if (idPath) {
+            e = 0;
+            while (e < this.expertsN) {
+                int32 g0 = this.sc.gOff[e];
+                int32 m = this.sc.gOff[e + 1] - g0;
+                if (m > 0) {
+                    groups = groups + 1;
+                    int32 tw = 0;
+                    while (tw * 16 < m) {
+                        this.mapEH[nT] = e;
+                        this.mapT0H[nT] = g0 + tw * 16;
+                        this.mapM1H[nT] = g0 + m;
+                        nT = nT + 1;
+                        tw = tw + 1;
+                    }
+                }
+                e = e + 1;
             }
-            e = e + 1;
+            this.mapEDev.upload(this.mapEH, (int64) nT);
+            this.mapT0Dev.upload(this.mapT0H, (int64) nT);
+            this.mapM1Dev.upload(this.mapM1H, (int64) nT);
+            QuantKernel.q8kPackLaunchNoSync(this.xpBxDev, this.bxDev,
+                (int64) np * h);
+            this.gateB.gemmIdBatch(this.bgDev, this.xpBxDev,
+                this.mapEDev, this.mapT0Dev, this.mapM1Dev, nT,
+                groups);
+            this.upB.gemmIdBatch(this.buDev, this.xpBxDev,
+                this.mapEDev, this.mapT0Dev, this.mapM1Dev, nT,
+                groups);
+        } else {
+            e = 0;
+            while (e < this.expertsN) {
+                int32 g0 = this.sc.gOff[e];
+                int32 m = this.sc.gOff[e + 1] - g0;
+                if (m > 0) {
+                    KernelBuffer<float32> gx #= this.bxDev.slice(
+                        (uint64) ((int64) g0 * h),
+                        (uint64) ((int64) m * h));
+                    Linear.stageBatchFromDevice(gx, m, this.hidden,
+                        Linear.nextStageTag());
+                    this.gateB.gemmKeepAt(e, m, this.bgDev,
+                        (int64) g0 * wid);
+                    this.upB.gemmKeepAt(e, m, this.buDev,
+                        (int64) g0 * wid);
+                }
+                e = e + 1;
+            }
         }
         Prim.gluDevice(this.bgDev, this.buDev, (int64) np * wid, act);
-        e = 0;
-        while (e < this.expertsN) {
-            int32 g0 = this.sc.gOff[e];
-            int32 m = this.sc.gOff[e + 1] - g0;
-            if (m > 0) {
-                KernelBuffer<float32> gg #= this.bgDev.slice(
-                    (uint64) ((int64) g0 * wid),
-                    (uint64) ((int64) m * wid));
-                Linear.stageBatchFromDevice(gg, m, this.widthN,
-                    Linear.nextStageTag());
-                this.downB.gemmKeepAt(e, m, this.beDev,
-                    (int64) g0 * h);
+        if (idPath) {
+            QuantKernel.q8kPackLaunchNoSync(this.xpBgDev, this.bgDev,
+                (int64) np * wid);
+            this.downB.gemmIdBatch(this.beDev, this.xpBgDev,
+                this.mapEDev, this.mapT0Dev, this.mapM1Dev, nT,
+                groups);
+        } else {
+            e = 0;
+            while (e < this.expertsN) {
+                int32 g0 = this.sc.gOff[e];
+                int32 m = this.sc.gOff[e + 1] - g0;
+                if (m > 0) {
+                    KernelBuffer<float32> gg #= this.bgDev.slice(
+                        (uint64) ((int64) g0 * wid),
+                        (uint64) ((int64) m * wid));
+                    Linear.stageBatchFromDevice(gg, m, this.widthN,
+                        Linear.nextStageTag());
+                    this.downB.gemmKeepAt(e, m, this.beDev,
+                        (int64) g0 * h);
+                }
+                e = e + 1;
             }
-            e = e + 1;
         }
         QuantKernel.moeScatterCombineLaunchNoSync(this.obDev,
             this.beDev, this.rowSlotDev, this.gWDev, (int64) rows,

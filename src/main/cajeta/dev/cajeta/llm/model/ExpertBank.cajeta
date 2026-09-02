@@ -9,6 +9,7 @@ import cajeta.math.Tensor;
 import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
 
 /**
  * One projection's bank of experts (spec 15.2): a merged rank-3 GGUF
@@ -495,7 +496,13 @@ public final class ExpertBank {
         if (!this.isAdmitted(e)) { return false; }
         Linear sl = this.slotFor(e);
         ExpertBank.resHits = ExpertBank.resHits + 1L;
-        sl.matmulBatchKeep(m);
+        // Rows padded to the WMMA tile (unit 41c): arbitrary group
+        // sizes kept every expert GEMM on the dotAccum fallback
+        // (fits() wants rows % 16). Pad rows compute garbage from
+        // stale stage bytes and are never copied out; the caller
+        // pre-grew the stage so the padded reads stay in capacity.
+        int32 m16 = (m + 15) / 16 * 16;
+        sl.matmulBatchKeep(m16);
         int64 n = (int64) m * (int64) this.rowsN;
         KernelBuffer<float32> dv #= dst.slice((uint64) dstOff,
             (uint64) n);
@@ -510,6 +517,42 @@ public final class ExpertBank {
                 ExpertBank.resAdmissionBytes + d;
         }
         return true;
+    }
+
+    /**
+     * Unit 41d: ONE indirected WMMA GEMM covers every expert group of
+     * this bank — the mul_mat_id shape at batch width. `y` and `xp`
+     * are group-major over the whole batch; the maps carry each
+     * M-tile's (expert, row base, row end). Every covered group counts
+     * its hit. False = no slab or no id GEMM for the format (caller
+     * keeps the per-group path).
+     */
+    public boolean gemmIdBatch(KernelBuffer<float32> y,
+            KernelBuffer<int8> xp, KernelBuffer<int32> mapE,
+            KernelBuffer<int32> mapT0, KernelBuffer<int32> mapM1,
+            int32 nTilesM, int32 groups) {
+        if (this.slabDev == null) { return false; }
+        if (this.packedTy == 12) {
+            WmmaKernel.q4kWmmaIdLaunchNoSync(y, this.slabDev, xp,
+                mapE, mapT0, mapM1, (int64) nTilesM,
+                (int64) this.rowsN, (int64) this.colsN,
+                (int64) this.rowsN);
+        } else if (this.packedTy == 14) {
+            WmmaKernel.q6kWmmaIdLaunchNoSync(y, this.slabDev, xp,
+                mapE, mapT0, mapM1, (int64) nTilesM,
+                (int64) this.rowsN, (int64) this.colsN,
+                (int64) this.rowsN);
+        } else {
+            return false;
+        }
+        ExpertBank.resHits = ExpertBank.resHits + (int64) groups;
+        return true;
+    }
+
+    /** Whether {@link #gemmIdBatch} can serve this bank. */
+    public boolean idGemmReady() {
+        if (this.slabDev == null) { return false; }
+        return this.packedTy == 12 || this.packedTy == 14;
     }
 
     /** Whether an indirected id-kernel exists for this bank's format
