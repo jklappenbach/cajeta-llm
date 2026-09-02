@@ -123,6 +123,189 @@ public class MoeIdKernelTest {
         }
     }
 
+    /** 45.1.1 — the device counting sort vs the host groupPicks
+     *  algorithm on synthetic picks: gRow/gW/rowSlot IDENTICAL (the
+     *  order within a group is pick order on both sides), the 64-row
+     *  chunk maps identical, and meta[0] the host's chunk count. The
+     *  picks are skewed (one hot expert, several empty) so both the
+     *  multi-chunk and the empty-group arms run. */
+    @Test
+    public void deviceGroupingMatchesHostCountingSort() {
+        if (!Linear.residentEnabled()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 E = 128;
+        int32 K = 8;
+        int32 rows = 300;
+        int32 np = rows * K;
+        int32[] sel = heap int32[np];
+        float32[] w = heap float32[np];
+        int32 i = 0;
+        while (i < np) {
+            // Skewed: a third of the picks land on expert 5, none on
+            // experts 100..127.
+            int32 e = (i * 37 + 11) % 100;
+            if (i % 3 == 0) { e = 5; }
+            sel[i] = e;
+            w[i] = (float32) ((i * 7) % 13) / 13.0f;
+            i = i + 1;
+        }
+        // HOST twin — groupPicks verbatim.
+        int32[] cnt = heap int32[E];
+        int32[] off = heap int32[E + 1];
+        int32[] cur = heap int32[E];
+        int32[] hRow = heap int32[np];
+        float32[] hW = heap float32[np];
+        int32[] hSlot = heap int32[np];
+        i = 0;
+        while (i < np) { cnt[sel[i]] = cnt[sel[i]] + 1; i = i + 1; }
+        int32 e2 = 0;
+        int32 nC = 0;
+        while (e2 < E) {
+            off[e2 + 1] = off[e2] + cnt[e2];
+            cur[e2] = off[e2];
+            nC = nC + (cnt[e2] + 63) / 64;
+            e2 = e2 + 1;
+        }
+        int32[] hE = heap int32[nC];
+        int32[] hT0 = heap int32[nC];
+        int32[] hM1 = heap int32[nC];
+        int32 ci = 0;
+        e2 = 0;
+        while (e2 < E) {
+            int32 tw = 0;
+            while (tw * 64 < cnt[e2]) {
+                hE[ci] = e2;
+                hT0[ci] = off[e2] + tw * 64;
+                hM1[ci] = off[e2] + cnt[e2];
+                ci = ci + 1;
+                tw = tw + 1;
+            }
+            e2 = e2 + 1;
+        }
+        i = 0;
+        while (i < np) {
+            int32 slot = cur[sel[i]];
+            cur[sel[i]] = slot + 1;
+            hRow[slot] = i / K;
+            hW[slot] = w[i];
+            hSlot[i] = slot;
+            i = i + 1;
+        }
+        // DEVICE arm.
+        KernelBuffer<int32> selDev #= heap KernelBuffer<int32>((uint64) np);
+        KernelBuffer<float32> wDev #= heap KernelBuffer<float32>((uint64) np);
+        selDev.upload(sel, (int64) np);
+        wDev.upload(w, (int64) np);
+        KernelBuffer<int32> gRow #= heap KernelBuffer<int32>((uint64) np);
+        KernelBuffer<float32> gW #= heap KernelBuffer<float32>((uint64) np);
+        KernelBuffer<int32> rowSlot #= heap KernelBuffer<int32>((uint64) np);
+        int32 cap = np / 64 + E + 1;
+        KernelBuffer<int32> mE #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> mT0 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> mM1 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> meta #= heap KernelBuffer<int32>((uint64) 4);
+        QuantKernel.moeGroupLaunchNoSync(gRow, gW, rowSlot, mE, mT0, mM1,
+            meta, selDev, wDev, (int64) np, (int64) E, (int64) K);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int32[] dRow = heap int32[np];
+        float32[] dW = heap float32[np];
+        int32[] dSlot = heap int32[np];
+        int32[] dMeta = heap int32[4];
+        gRow.download(dRow, (int64) np);
+        gW.download(dW, (int64) np);
+        rowSlot.download(dSlot, (int64) np);
+        meta.download(dMeta, 1L);
+        Assert.equals((int64) nC, (int64) dMeta[0]);
+        int32[] dE = heap int32[nC];
+        int32[] dT0 = heap int32[nC];
+        int32[] dM1 = heap int32[nC];
+        mE.download(dE, (int64) nC);
+        mT0.download(dT0, (int64) nC);
+        mM1.download(dM1, (int64) nC);
+        i = 0;
+        while (i < np) {
+            Assert.equals((int64) hRow[i], (int64) dRow[i]);
+            Assert.isTrue(hW[i] == dW[i]);
+            Assert.equals((int64) hSlot[i], (int64) dSlot[i]);
+            i = i + 1;
+        }
+        ci = 0;
+        while (ci < nC) {
+            Assert.equals((int64) hE[ci], (int64) dE[ci]);
+            Assert.equals((int64) hT0[ci], (int64) dT0[ci]);
+            Assert.equals((int64) hM1[ci], (int64) dM1[ci]);
+            ci = ci + 1;
+        }
+        // Vacuity: the hot expert really spans several chunks.
+        Assert.isTrue((cnt[5] + 63) / 64 >= 2);
+    }
+
+    /** 45.1.2 — the batched top-k vs the per-row kernel on the same
+     *  logits: identical picks and weights row for row (the per-row
+     *  kernel is itself pinned to the host algorithm by 40.1.1). */
+    @Test
+    public void batchedTopKMatchesPerRowKernel() {
+        if (!Linear.residentEnabled()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 E = 128;
+        int32 K = 8;
+        int32 rows = 37;
+        float32[] lg = heap float32[rows * E];
+        int32 i = 0;
+        while (i < rows * E) {
+            lg[i] = (float32) ((i * 37 + 11) % 128) / 16.0f
+                + (float32) (i % 5) * 0.25f;
+            i = i + 1;
+        }
+        // An exact tie inside row 3.
+        lg[3 * E + 7] = 9.5f;
+        lg[3 * E + 23] = 9.5f;
+        KernelBuffer<float32> lgDev #= heap KernelBuffer<float32>(
+            (uint64) (rows * E));
+        lgDev.upload(lg, (int64) (rows * E));
+        KernelBuffer<int32> selB #= heap KernelBuffer<int32>(
+            (uint64) (rows * K));
+        KernelBuffer<float32> wB #= heap KernelBuffer<float32>(
+            (uint64) (rows * K));
+        QuantKernel.moeTopKBatchLaunchNoSync(selB, wB, lgDev, (int64) rows,
+            (int64) E, (int64) K, true, 0.0f);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int32[] dSel = heap int32[rows * K];
+        float32[] dW = heap float32[rows * K];
+        selB.download(dSel, (int64) (rows * K));
+        wB.download(dW, (int64) (rows * K));
+        int32 r = 0;
+        while (r < rows) {
+            KernelBuffer<float32> one #= lgDev.slice((uint64) (r * E),
+                (uint64) E);
+            KernelBuffer<int32> s1 #= heap KernelBuffer<int32>((uint64) K);
+            KernelBuffer<float32> w1 #= heap KernelBuffer<float32>((uint64) K);
+            QuantKernel.moeTopKLaunchNoSync(s1, w1, one, null, (int64) E,
+                (int64) K, true, 0.0f);
+            s.sync();
+            int32[] rs = heap int32[K];
+            float32[] rw = heap float32[K];
+            s1.download(rs, (int64) K);
+            w1.download(rw, (int64) K);
+            int32 k = 0;
+            while (k < K) {
+                Assert.equals((int64) rs[k], (int64) dSel[r * K + k]);
+                Assert.isTrue(rw[k] == dW[r * K + k]);
+                k = k + 1;
+            }
+            r = r + 1;
+        }
+        // The tie in row 3: 7 before 23.
+        Assert.equals(7L, (int64) dSel[3 * K]);
+        Assert.equals(23L, (int64) dSel[3 * K + 1]);
+    }
+
     /** 40.1.2 — the indirected launch vs per-expert wave launches on
      *  the SAME slab bytes and the SAME staged activation. The two
      *  decompositions run an identical per-row dot loop, so the

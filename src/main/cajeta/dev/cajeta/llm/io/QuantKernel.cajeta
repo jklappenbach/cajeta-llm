@@ -6545,6 +6545,215 @@ public final class QuantKernel {
         return;
     }
 
+    /**
+     * Unit 45: {@link #moeTopKKernel} over EVERY row of a batch — one
+     * wave per row, the same threshold-chained selection (the host
+     * routeFromLogits tie rule, lower index first), writing
+     * `selAll[row*used + k]` / `wAll[...]`. The body is the per-row
+     * kernel's with a row base on the three buffers.
+     */
+    @Kernel
+    public static void moeTopKBatchKernel(KernelBuffer<int32> selAll,
+            KernelBuffer<float32> wAll, KernelBuffer<float32> logits,
+            uint32 rows, uint32 experts, uint32 used, uint32 normTopk,
+            float32 wScale) {
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 32;
+        if (row >= rows) { return; }
+        int64 lb = (int64) row * (int64) experts;
+        int64 sb = (int64) row * (int64) used;
+        float32 lm = 0.0f - 340282346638528859811704183484516925440.0f;
+        uint32 e = lane;
+        while (e < experts) {
+            float32 v = logits[lb + (int64) e];
+            if (v > lm) { lm = v; }
+            e = e + 32;
+        }
+        float32 mx = Wave.reduceMaxF32(lm);
+        float32 ls = 0.0f;
+        e = lane;
+        while (e < experts) {
+            ls = ls + Math.exp(logits[lb + (int64) e] - mx);
+            e = e + 32;
+        }
+        float32 sum = Wave.reduceSumF32(ls);
+        float32 vLast = 340282346638528859811704183484516925440.0f;
+        uint32 iLast = experts;
+        uint32 k = 0;
+        while (k < used) {
+            float32 bv = 0.0f - 1.0f;
+            e = lane;
+            while (e < experts) {
+                float32 p = Math.exp(logits[lb + (int64) e] - mx);
+                boolean ok = p < vLast
+                    || (p == vLast && e > iLast);
+                if (ok && p > bv) { bv = p; }
+                e = e + 32;
+            }
+            float32 vk = Wave.reduceMaxF32(bv);
+            uint32 bi = experts;
+            e = lane;
+            while (e < experts) {
+                float32 p = Math.exp(logits[lb + (int64) e] - mx);
+                boolean ok = p < vLast
+                    || (p == vLast && e > iLast);
+                if (ok && p == vk && e < bi) { bi = e; }
+                e = e + 32;
+            }
+            uint32 ik = Wave.reduceMin(bi);
+            if (lane == 0) {
+                selAll[sb + (int64) k] = (int32) ik;
+                wAll[sb + (int64) k] = vk / sum;
+            }
+            vLast = vk;
+            iLast = ik;
+            k = k + 1;
+        }
+        if (lane == 0) {
+            if (normTopk != 0) {
+                float32 ws = 0.0f;
+                k = 0;
+                while (k < used) { ws = ws + wAll[sb + (int64) k]; k = k + 1; }
+                if (ws < 0.00006103515625f) { ws = 0.00006103515625f; }
+                k = 0;
+                while (k < used) {
+                    wAll[sb + (int64) k] = wAll[sb + (int64) k] / ws;
+                    k = k + 1;
+                }
+            }
+            if (wScale != 0.0f && wScale != 1.0f) {
+                k = 0;
+                while (k < used) {
+                    wAll[sb + (int64) k] = wAll[sb + (int64) k] * wScale;
+                    k = k + 1;
+                }
+            }
+        }
+    }
+
+    public static void moeTopKBatchLaunchNoSync(KernelBuffer<int32> selAll,
+            KernelBuffer<float32> wAll, KernelBuffer<float32> logits,
+            int64 rows, int64 experts, int64 used, boolean normTopk,
+            float32 wScale) {
+        KernelStream s = QuantKernel.stream();
+        uint32 nt = 0;
+        if (normTopk) { nt = 1; }
+        moeTopKBatchKernel.launch(s, grid: [(uint32) rows], block: [32])
+            (selAll, wAll, logits, (uint32) rows, (uint32) experts,
+             (uint32) used, nt, wScale);
+        return;
+    }
+
+    /**
+     * Unit 45: the counting sort that groups a batch's picks by
+     * expert, ON THE DEVICE, in ONE workgroup — the host groupPicks
+     * reproduced exactly, including its order: picks land in their
+     * group in pick order, so the result is deterministic. Thread e
+     * owns expert e: it counts its picks, thread 0 prefix-sums the
+     * group offsets and the 64-row chunk offsets, then thread e walks
+     * the picks again to place its own, and writes its chunk map
+     * entries. `meta[0]` receives the chunk count for the id-GEMMs.
+     * np <= 4096 picks stage in LDS; larger batches take a second
+     * pass over global.
+     */
+    @Kernel
+    public static void moeGroupKernel(KernelBuffer<int32> gRow,
+            KernelBuffer<float32> gW, KernelBuffer<int32> rowSlot,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, KernelBuffer<int32> meta,
+            KernelBuffer<int32> selAll, KernelBuffer<float32> wAll,
+            uint32 np, uint32 experts, uint32 used) {
+        Shared<int32> selL = shared int32[4096];
+        Shared<int32> cnt = shared int32[256];
+        Shared<int32> off = shared int32[257];
+        Shared<int32> coff = shared int32[257];
+        uint32 t = KernelThread.x();
+        uint32 staged = np;
+        if (staged > 4096) { staged = 4096; }
+        uint32 i = t;
+        while (i < staged) {
+            selL[i] = selAll[(int64) i];
+            i = i + 256;
+        }
+        Barrier.workgroup();
+        if (t < experts) {
+            int32 c = 0;
+            i = 0;
+            while (i < staged) {
+                if ((uint32) selL[i] == t) { c = c + 1; }
+                i = i + 1;
+            }
+            i = staged;
+            while (i < np) {
+                if ((uint32) selAll[(int64) i] == t) { c = c + 1; }
+                i = i + 1;
+            }
+            cnt[t] = c;
+        }
+        Barrier.workgroup();
+        if (t == 0) {
+            int32 o = 0;
+            int32 co = 0;
+            uint32 e = 0;
+            while (e < experts) {
+                off[e] = o;
+                coff[e] = co;
+                o = o + cnt[e];
+                co = co + (cnt[e] + 63) / 64;
+                e = e + 1;
+            }
+            off[experts] = o;
+            coff[experts] = co;
+            meta[0L] = co;
+        }
+        Barrier.workgroup();
+        if (t < experts) {
+            int32 slot = off[t];
+            i = 0;
+            while (i < staged) {
+                if ((uint32) selL[i] == t) {
+                    gRow[(int64) slot] = (int32) (i / used);
+                    gW[(int64) slot] = wAll[(int64) i];
+                    rowSlot[(int64) i] = slot;
+                    slot = slot + 1;
+                }
+                i = i + 1;
+            }
+            i = staged;
+            while (i < np) {
+                if ((uint32) selAll[(int64) i] == t) {
+                    gRow[(int64) slot] = (int32) (i / used);
+                    gW[(int64) slot] = wAll[(int64) i];
+                    rowSlot[(int64) i] = slot;
+                    slot = slot + 1;
+                }
+                i = i + 1;
+            }
+            int32 c = cnt[t];
+            int32 tw = 0;
+            while (tw * 64 < c) {
+                int64 mi = (int64) (coff[t] + tw);
+                mapE[mi] = (int32) t;
+                mapT0[mi] = off[t] + tw * 64;
+                mapM1[mi] = off[t] + c;
+                tw = tw + 1;
+            }
+        }
+    }
+
+    public static void moeGroupLaunchNoSync(KernelBuffer<int32> gRow,
+            KernelBuffer<float32> gW, KernelBuffer<int32> rowSlot,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, KernelBuffer<int32> meta,
+            KernelBuffer<int32> selAll, KernelBuffer<float32> wAll,
+            int64 np, int64 experts, int64 used) {
+        KernelStream s = QuantKernel.stream();
+        moeGroupKernel.launch(s, grid: [1], block: [256])
+            (gRow, gW, rowSlot, mapE, mapT0, mapM1, meta, selAll, wAll,
+             (uint32) np, (uint32) experts, (uint32) used);
+        return;
+    }
+
 
     /** As {@link #moeCombineKernel} but ACCUMULATING into `out` —
      *  the residual add fused into the combine, one launch fewer per

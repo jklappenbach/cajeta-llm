@@ -60,9 +60,11 @@ public final class MoeFfn extends InfModule {
     // the layer's output folds into the residual. Per-layer copies
     // measured 48 first-use allocations in the pass after admission
     // (229 ms of a 1206 ms pass) and held ~5 GB of device scratch for
-    // the 30B. The re-use is safe ONLY because routeBatchCore drains
-    // the stream before the next layer's uploads touch these — a
-    // device-side router that removes that sync must fence them.
+    // the 30B. Re-use is safe because every writer is either a launch
+    // on the one in-order stream (the unit-45 device-routed path) or
+    // a host upload that follows routeBatchCore's drain (the host-
+    // routed path); an upload on a path with no sync would race the
+    // previous layer's queued readers.
     static KernelBuffer<int32> gRowDev;       // group slot -> source row
     static KernelBuffer<float32> gWDev;       // group slot -> combine weight
     static KernelBuffer<int32> rowSlotDev;
@@ -89,6 +91,14 @@ public final class MoeFfn extends InfModule {
     static KernelBuffer<int32> map64EDev;
     static KernelBuffer<int32> map64T0Dev;
     static KernelBuffer<int32> map64M1Dev;
+    // Unit 45: the device-routed batch — picks, weights and the chunk
+    // count never come to the host.
+    static KernelBuffer<int32> selAllDev;
+    static KernelBuffer<float32> wAllDev;
+    static KernelBuffer<int32> metaDev;
+    static int32[] metaH;
+    static int64 fbZeroSyncRoutes;   // batches routed fully on the device
+    public static int64 batchZeroSyncRoutes() { return MoeFfn.fbZeroSyncRoutes; }
     static KernelBuffer<int8> xpBxDev;        // packed batch activations
     static KernelBuffer<int8> xpBgDev;        // packed GLU'd middle
 
@@ -930,7 +940,7 @@ public final class MoeFfn extends InfModule {
             KernelBuffer<int8> xp, int32 nT, int32 nC, int32 groups) {
         if (bank.idMwReady()) {
             bank.gemmIdBatchMw(y, xp, MoeFfn.map64EDev, MoeFfn.map64T0Dev,
-                MoeFfn.map64M1Dev, nC, groups);
+                MoeFfn.map64M1Dev, MoeFfn.metaDev, nC, groups);
         } else {
             bank.gemmIdBatch(y, xp, MoeFfn.mapEDev, MoeFfn.mapT0Dev,
                 MoeFfn.mapM1Dev, nT, groups);
@@ -981,6 +991,10 @@ public final class MoeFfn extends InfModule {
         MoeFfn.map64EDev #= heap KernelBuffer<int32>((uint64) tiles);
         MoeFfn.map64T0Dev #= heap KernelBuffer<int32>((uint64) tiles);
         MoeFfn.map64M1Dev #= heap KernelBuffer<int32>((uint64) tiles);
+        MoeFfn.selAllDev #= heap KernelBuffer<int32>((uint64) np);
+        MoeFfn.wAllDev #= heap KernelBuffer<float32>((uint64) np);
+        MoeFfn.metaDev #= heap KernelBuffer<int32>((uint64) 4);
+        MoeFfn.metaH #= heap int32[4];
         MoeFfn.xpBxDev #= heap KernelBuffer<int8>(
             (uint64) ((npp * h / 256L) * 320L));
         MoeFfn.xpBgDev #= heap KernelBuffer<int8>(
@@ -1036,6 +1050,70 @@ public final class MoeFfn extends InfModule {
             this.lgBatchCap = (int64) rows;
         }
         int64 fbr0 = Clock.nanoTime();
+        int32 np = rows * this.usedN;
+        // Unit 45: when every bank takes the multi-wave id-GEMM, the
+        // whole layer is stream launches — router GEMM, batched
+        // top-k, the one-workgroup counting sort that writes the
+        // group maps and the chunk count, gather, pack, three GEMMs,
+        // GLU, pack, scatter-combine. No sync, no download, no
+        // upload; the host sees nothing until the logits.
+        boolean zeroSync = Linear.wmmaOn && !Linear.backendIsVulkan()
+            && this.gateB.idMwReady() && this.upB.idMwReady()
+            && this.downB.idMwReady();
+        if (zeroSync) {
+            this.ensureDevBatch(rows);
+            QuantKernel.routerBatchF32LaunchNoSync(this.lgBatchDev,
+                this.routerWDev, xDev, (int64) rows, en, h);
+            QuantKernel.moeTopKBatchLaunchNoSync(MoeFfn.selAllDev,
+                MoeFfn.wAllDev, this.lgBatchDev, (int64) rows, en,
+                (int64) this.usedN, this.normTopk, this.wScale);
+            QuantKernel.moeGroupLaunchNoSync(MoeFfn.gRowDev, MoeFfn.gWDev,
+                MoeFfn.rowSlotDev, MoeFfn.map64EDev, MoeFfn.map64T0Dev,
+                MoeFfn.map64M1Dev, MoeFfn.metaDev, MoeFfn.selAllDev,
+                MoeFfn.wAllDev, (int64) np, en, (int64) this.usedN);
+            MoeFfn.fbDevRoutes = MoeFfn.fbDevRoutes + 1L;
+            MoeFfn.fbZeroSyncRoutes = MoeFfn.fbZeroSyncRoutes + 1L;
+            int64 fbrz = Clock.nanoTime();
+            MoeFfn.fbRouteNs = MoeFfn.fbRouteNs + (fbrz - fbr0);
+            int32 nCMax = np / 64 + this.expertsN;
+            int64 fbg10 = Clock.nanoTime();
+            MoeFfn.fbPreNs = MoeFfn.fbPreNs + (fbg10 - fbrz);
+            QuantKernel.gatherRowsF32LaunchNoSync(MoeFfn.bxDev, xDev,
+                MoeFfn.gRowDev, (int64) np, h);
+            QuantKernel.q8kPackLaunchNoSync(MoeFfn.xpBxDev, MoeFfn.bxDev,
+                (int64) np * h);
+            // Every expert is resident by construction (the slabs), and
+            // the host no longer knows which were selected: a launch
+            // counts the bank.
+            this.gateB.gemmIdBatchMw(MoeFfn.bgDev, MoeFfn.xpBxDev,
+                MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
+                MoeFfn.metaDev, nCMax, this.expertsN);
+            this.upB.gemmIdBatchMw(MoeFfn.buDev, MoeFfn.xpBxDev,
+                MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
+                MoeFfn.metaDev, nCMax, this.expertsN);
+            MoeFfn.phaseSync();
+            MoeFfn.fbGemm1Ns = MoeFfn.fbGemm1Ns
+                + (Clock.nanoTime() - fbg10);
+            int64 fbg20 = Clock.nanoTime();
+            Prim.gluDevice(MoeFfn.bgDev, MoeFfn.buDev, (int64) np * wid,
+                act);
+            QuantKernel.q8kPackLaunchNoSync(MoeFfn.xpBgDev, MoeFfn.bgDev,
+                (int64) np * wid);
+            this.downB.gemmIdBatchMw(MoeFfn.beDev, MoeFfn.xpBgDev,
+                MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
+                MoeFfn.metaDev, nCMax, this.expertsN);
+            MoeFfn.phaseSync();
+            MoeFfn.fbGemm2Ns = MoeFfn.fbGemm2Ns
+                + (Clock.nanoTime() - fbg20);
+            int64 fbt0 = Clock.nanoTime();
+            QuantKernel.moeScatterCombineLaunchNoSync(MoeFfn.obDev,
+                MoeFfn.beDev, MoeFfn.rowSlotDev, MoeFfn.gWDev,
+                (int64) rows, (int64) this.usedN, h);
+            MoeFfn.phaseSync();
+            MoeFfn.fbTailNs = MoeFfn.fbTailNs + (Clock.nanoTime() - fbt0);
+            this.emitCacheRecord("batch", h0, w0, a0, b0);
+            return true;
+        }
         this.routeBatchCore(xDev, rows, this.sc.selAll, this.sc.wAll);
         MoeFfn.fbDevRoutes = MoeFfn.fbDevRoutes + 1L;
         int64 gp0 = Clock.nanoTime();
@@ -1044,7 +1122,6 @@ public final class MoeFfn extends InfModule {
             + (Clock.nanoTime() - gp0);
         int64 fbr1 = Clock.nanoTime();
         MoeFfn.fbRouteNs = MoeFfn.fbRouteNs + (fbr1 - fbr0);
-        int32 np = rows * this.usedN;
         // Every selected expert must serve from the device (slabs or
         // slices); one refusal sends the whole layer to the host path.
         int32 e = 0;
@@ -1139,6 +1216,8 @@ public final class MoeFfn extends InfModule {
                 MoeFfn.map64EDev.upload(MoeFfn.map64EH, (int64) nC);
                 MoeFfn.map64T0Dev.upload(MoeFfn.map64T0H, (int64) nC);
                 MoeFfn.map64M1Dev.upload(MoeFfn.map64M1H, (int64) nC);
+                MoeFfn.metaH[0] = nC;
+                MoeFfn.metaDev.upload(MoeFfn.metaH, 1L);
             }
             QuantKernel.q8kPackLaunchNoSync(MoeFfn.xpBxDev, MoeFfn.bxDev,
                 (int64) np * h);
