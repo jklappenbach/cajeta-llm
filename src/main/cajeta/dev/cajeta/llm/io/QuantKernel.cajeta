@@ -40,7 +40,13 @@ public final class QuantKernel {
     static KernelStream curStream;
     public static KernelStream stream() {
         if (QuantKernel.curStream == null) {
-            QuantKernel.curStream #= KernelStream.current();
+            // Unit 55: a CREATED stream, not the default one. HIP's
+            // legacy null stream synchronizes with every blocking
+            // stream, so a second stream (the weight prefetch) could
+            // never overlap it; two created streams are independent.
+            // Host copies stay on the null stream, which HIP orders
+            // against blocking streams' queued work.
+            QuantKernel.curStream #= KernelStream.create();
         }
         return QuantKernel.curStream;
     }
@@ -6272,6 +6278,59 @@ public final class QuantKernel {
         qkvWaveMatVecKernel.launch(s, grid: [waves], block: [32])
             (yq, yk, yv, wq, wk, wv, xp, (uint32) rowsQ, (uint32) rowsKv,
              cols / 256L, v6);
+        return;
+    }
+
+    /**
+     * Unit 55: the prefetch touch — one load per 64-byte line of a
+     * buffer, on a second stream, so a weight that a dependent launch
+     * will stream in a moment is already in the last-level cache when
+     * it does. The value feeds a store nothing can take, so the load
+     * survives; the store never happens.
+     */
+    @Kernel
+    public static void touchLinesKernel(KernelBuffer<int8> w,
+            KernelBuffer<int32> sink, uint32 lines, int32 needle) {
+        // FEW waves, many loads each: a wave per 1024 lines (64 KB),
+        // lane l walking lines l, l+32, ... — 32 independent loads in
+        // flight per lane and almost no CU occupancy, so the kernel
+        // that runs beside it keeps its slots. The first form gave a
+        // thread a line — 73K threads that hogged the CUs for 40 us and
+        // delayed the very chain it was hiding behind.
+        uint32 lane = KernelThread.x();
+        uint32 wave = KernelThread.globalIdX() / 32;
+        uint32 l0 = wave * 1024 + lane;
+        int32 acc = 0;
+        uint32 k = 0;
+        while (k < 32) {
+            uint32 li = l0 + k * 32;
+            if (li < lines) { acc = acc + (int32) w[(int64) li * 64L]; }
+            k = k + 1;
+        }
+        // `needle` is a runtime value the sum is steered never to hit;
+        // a literal folded the loads away (a 1 us prefetch of nothing).
+        if (acc == needle) { sink[0L] = acc; }
+    }
+
+    static KernelBuffer<int32> pfSink;
+
+    /** The touch on the main stream — HeadProbe's cache oracle
+     *  (unit 55). Measured: a 4.7 MB weight touched then read runs the
+     *  mat-vec in 19 us where an untouched one takes 27; the bytes
+     *  survive an intervening 4.7 MB read (21.7) — the large last-level
+     *  cache allocates on reads. In situ, serial before the o-proj:
+     *  25.3 -> 17.7 us. On a SECOND stream the hardware interleaved
+     *  the touch with the DRAM-heavy q|k|v instead of the idle
+     *  attention chain, and the o-proj saw nothing; the ceiling of the
+     *  idea is the o-proj's 7.6 us a layer. Not wired in. */
+    public static void touchLinesMainNoSync(KernelBuffer<int8> w, int64 bytes) {
+        if (QuantKernel.pfSink == null) {
+            QuantKernel.pfSink #= heap KernelBuffer<int32>((uint64) 4);
+        }
+        uint32 lines = (uint32) (bytes / 64L);
+        touchLinesKernel.launch(QuantKernel.stream(),
+            grid: [(lines + 1023) / 1024], block: [32])
+            (w, QuantKernel.pfSink, lines, 1234567);
         return;
     }
 
