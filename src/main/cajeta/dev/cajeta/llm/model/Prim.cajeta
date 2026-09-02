@@ -9,6 +9,7 @@ import cajeta.time.Clock;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.Shared;
+import cajeta.xpu.Wave;
 import cajeta.xpu.KernelThread;
 
 /**
@@ -357,10 +358,19 @@ public final class Prim {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             KernelBuffer<float32> w, uint32 dim, float32 eps,
             int32 form) {
-        Shared<float32> part = shared float32[256];
-        Shared<float32> amx = shared float32[256];
+        // Unit 54: three barriers, not fifteen. The sum of squares is
+        // one wave reduction per wave and an 8-way LDS sum; a wave IS a
+        // 256-element pack block (32 lanes x 8), so the block max is a
+        // wave reduction; a sub-block is 4 lanes, so the sub-block sums
+        // go through LDS once. Same striding for the sum of squares as
+        // rmsnormRowF32 within a wave — but the 8 wave partials sum in
+        // a different order than the 256-tree, so the scale may differ
+        // in the last bit; the pack's bytes then follow the same math.
+        Shared<float32> part = shared float32[8];
         Shared<int32> psum = shared int32[256];
         uint32 lane = KernelThread.x();
+        uint32 wid = lane / 32;
+        uint32 wl = lane % 32;
         float32 ss = 0.0f;
         uint32 i = lane;
         while (i < dim) {
@@ -368,77 +378,81 @@ public final class Prim {
             ss = ss + v * v;
             i = i + 256;
         }
-        part[lane] = ss;
+        float32 ws = Wave.reduceSumF32(ss);
+        if (wl == 0) { part[wid] = ws; }
         Barrier.workgroup();
-        uint32 s = 128;
-        while (s > 0) {
-            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
-            Barrier.workgroup();
-            s = s / 2;
-        }
-        float32 scale = 1.0f / Math.sqrt(part[0] / (float32) dim + eps);
-        // The normed row, f32.
-        uint32 j = lane;
-        while (j < dim) {
-            float32 wi = w[j];
-            if (form == 1) { wi = 1.0f + wi; }
-            out[j] = x[j] * scale * wi;
-            j = j + 256;
-        }
-        Barrier.workgroup();
-        // The pack: block blk = lane/32 of the row, 8 elements a thread.
+        float32 tot = part[0] + part[1] + part[2] + part[3]
+            + part[4] + part[5] + part[6] + part[7];
+        float32 scale = 1.0f / Math.sqrt(tot / (float32) dim + eps);
+        // This thread's eight elements: block wid, lanes wl*8..wl*8+7 —
+        // the pack kernel's mapping. Normed values kept in registers.
         uint32 blocks = dim / 256;
-        uint32 blk = lane / 32;
-        uint32 bl = lane % 32;
-        int64 e0 = (int64) (blk * 256 + bl * 8);
-        int64 ob = (int64) blk * 320L;
+        float32 v0 = 0.0f; float32 v1 = 0.0f; float32 v2 = 0.0f; float32 v3 = 0.0f;
+        float32 v4 = 0.0f; float32 v5 = 0.0f; float32 v6 = 0.0f; float32 v7 = 0.0f;
+        uint32 e0 = wid * 256 + wl * 8;
+        if (wid < blocks) {
+            float32 w0 = w[e0]; float32 w1 = w[e0 + 1]; float32 w2 = w[e0 + 2];
+            float32 w3 = w[e0 + 3]; float32 w4 = w[e0 + 4]; float32 w5 = w[e0 + 5];
+            float32 w6 = w[e0 + 6]; float32 w7 = w[e0 + 7];
+            if (form == 1) {
+                w0 = 1.0f + w0; w1 = 1.0f + w1; w2 = 1.0f + w2; w3 = 1.0f + w3;
+                w4 = 1.0f + w4; w5 = 1.0f + w5; w6 = 1.0f + w6; w7 = 1.0f + w7;
+            }
+            v0 = x[e0] * scale * w0;
+            v1 = x[e0 + 1] * scale * w1;
+            v2 = x[e0 + 2] * scale * w2;
+            v3 = x[e0 + 3] * scale * w3;
+            v4 = x[e0 + 4] * scale * w4;
+            v5 = x[e0 + 5] * scale * w5;
+            v6 = x[e0 + 6] * scale * w6;
+            v7 = x[e0 + 7] * scale * w7;
+            out[e0] = v0; out[e0 + 1] = v1; out[e0 + 2] = v2; out[e0 + 3] = v3;
+            out[e0 + 4] = v4; out[e0 + 5] = v5; out[e0 + 6] = v6; out[e0 + 7] = v7;
+        }
+        // Rows wider than 8 blocks: the remaining elements are normed
+        // by the striding loop (no pack for them here — the caller
+        // gates dim <= 2048 for the fused form).
         float32 amax = 0.0f;
-        if (blk < blocks) {
-            int32 t = 0;
-            while (t < 8) {
-                float32 v = out[e0 + (int64) t];
-                float32 av = v;
-                if (v < 0.0f) { av = 0.0f - v; }
-                if (av > amax) { amax = av; }
-                t = t + 1;
-            }
-        }
-        amx[lane] = amax;
-        Barrier.workgroup();
-        uint32 st = 16;
-        while (st > 0) {
-            if (bl < st) {
-                float32 o = amx[lane + st];
-                if (o > amx[lane]) { amx[lane] = o; }
-            }
-            Barrier.workgroup();
-            st = st / 2;
-        }
-        float32 bmax = amx[blk * 32];
+        float32 av = v0; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v1; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v2; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v3; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v4; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v5; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v6; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v7; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        float32 bmax = Wave.reduceMaxF32(amax);
         float32 inv = 0.0f;
         if (bmax > 0.0f) { inv = 127.0f / bmax; }
+        int64 ob = (int64) wid * 320L;
         int32 sm = 0;
-        if (blk < blocks) {
-            int32 k = 0;
-            while (k < 8) {
-                float32 fv = out[e0 + (int64) k] * inv;
-                int32 qi = (int32) Math.round(fv);
-                packed[ob + (int64) (bl * 8) + (int64) k] = (int8) qi;
-                sm = sm + qi;
-                k = k + 1;
-            }
+        if (wid < blocks) {
+            int32 q0 = (int32) Math.round(v0 * inv);
+            int32 q1 = (int32) Math.round(v1 * inv);
+            int32 q2 = (int32) Math.round(v2 * inv);
+            int32 q3 = (int32) Math.round(v3 * inv);
+            int32 q4 = (int32) Math.round(v4 * inv);
+            int32 q5 = (int32) Math.round(v5 * inv);
+            int32 q6 = (int32) Math.round(v6 * inv);
+            int32 q7 = (int32) Math.round(v7 * inv);
+            int64 qo = ob + (int64) (wl * 8);
+            packed[qo] = (int8) q0; packed[qo + 1L] = (int8) q1;
+            packed[qo + 2L] = (int8) q2; packed[qo + 3L] = (int8) q3;
+            packed[qo + 4L] = (int8) q4; packed[qo + 5L] = (int8) q5;
+            packed[qo + 6L] = (int8) q6; packed[qo + 7L] = (int8) q7;
+            sm = q0 + q1 + q2 + q3 + q4 + q5 + q6 + q7;
         }
         psum[lane] = sm;
         Barrier.workgroup();
-        if (blk < blocks && bl < 8) {
-            uint32 base = blk * 32 + bl * 4;
-            int32 tot = psum[base] + psum[base + 1]
-                      + psum[base + 2] + psum[base + 3];
-            int64 so = ob + 256L + (int64) (bl * 4);
-            int32 b0 = tot & 255;
-            int32 b1 = (tot >> 8) & 255;
-            int32 b2 = (tot >> 16) & 255;
-            int32 b3 = (tot >> 24) & 255;
+        if (wid < blocks && wl < 8) {
+            uint32 base = wid * 32 + wl * 4;
+            int32 tsum = psum[base] + psum[base + 1]
+                       + psum[base + 2] + psum[base + 3];
+            int64 so = ob + 256L + (int64) (wl * 4);
+            int32 b0 = tsum & 255;
+            int32 b1 = (tsum >> 8) & 255;
+            int32 b2 = (tsum >> 16) & 255;
+            int32 b3 = (tsum >> 24) & 255;
             if (b0 > 127) { b0 = b0 - 256; }
             if (b1 > 127) { b1 = b1 - 256; }
             if (b2 > 127) { b2 = b2 - 256; }
@@ -448,7 +462,7 @@ public final class Prim {
             packed[so + 2L] = (int8) b2;
             packed[so + 3L] = (int8) b3;
         }
-        if (blk < blocks && bl == 0) {
+        if (wid < blocks && wl == 0) {
             float32 dsc = bmax / 127.0f;
             int32 db = Cajeta.f32ToBits(dsc);
             int32 e1 = db & 255;
