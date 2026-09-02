@@ -12,6 +12,7 @@ import dev.cajeta.llm.model.CausalLM;
 import dev.cajeta.llm.model.ExpertBank;
 import dev.cajeta.llm.model.Linear;
 import dev.cajeta.llm.model.MoeFfn;
+import dev.cajeta.llm.model.Prim;
 
 /**
  * cajeta-llm plan 40.1 — the zero-sync route's device kernels against
@@ -304,6 +305,73 @@ public class MoeIdKernelTest {
         // The tie in row 3: 7 before 23.
         Assert.equals(7L, (int64) dSel[3 * K]);
         Assert.equals(23L, (int64) dSel[3 * K + 1]);
+    }
+
+    /** 48.1.2 — the fused gate+up+GLU launch vs gate-id, up-id and the
+     *  GLU kernel: each bank's dot is the id kernel's math and the GLU
+     *  is the same formula on the same floats, so the middle must be
+     *  BIT-identical. */
+    @Test
+    public void fusedGateUpGluMatchesTheChain() {
+        if (!Linear.residentEnabled()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        CausalLM m #= ResidentMoeDecodeTest.mk();
+        MoeFfn moe = m.moeAt(0);
+        ExpertBank gb = moe.gate();
+        ExpertBank ub = moe.upBank();
+        Assert.isTrue(gb.ensureSlab());
+        Assert.isTrue(ub.ensureSlab());
+        int64 rows = (int64) gb.rows();
+        int64 cols = (int64) gb.cols();
+        int32 used = 2;
+        int32[] ids = heap int32[used];
+        ids[0] = 3;
+        ids[1] = 0;
+        float32[] xv = heap float32[cols];
+        int64 j = 0;
+        while (j < cols) {
+            xv[j] = (float32) ((j % 25) - 12) / 64.0f;
+            j = j + 1;
+        }
+        KernelBuffer<float32> xf #= heap KernelBuffer<float32>(
+            (uint64) cols);
+        xf.upload(xv, cols);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) ((cols / 256L) * 320L));
+        QuantKernel.q8kPackLaunchNoSync(xp, xf, cols);
+        KernelBuffer<int32> sel #= heap KernelBuffer<int32>(
+            (uint64) used);
+        sel.upload(ids, (int64) used);
+        int64 n = (int64) used * rows;
+        KernelBuffer<float32> gy #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> uy #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> fy #= heap KernelBuffer<float32>((uint64) n);
+        Assert.isTrue(gb.idLaunch(gy, xp, sel, used, 0L));
+        Assert.isTrue(ub.idLaunch(uy, xp, sel, used, 0L));
+        Prim.gluDevice(gy, uy, n, 0);
+        Assert.isTrue(ExpertBank.idGateUpGlu(gb, ub, fy, xp, sel, used, 0));
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a = heap float32[n];
+        float32[] b = heap float32[n];
+        gy.download(a, n);
+        fy.download(b, n);
+        int64 i = 0;
+        int64 diff = 0L;
+        boolean nz = false;
+        while (i < n) {
+            if (a[i] != b[i]) { diff = diff + 1L; }
+            if (a[i] != 0.0f) { nz = true; }
+            i = i + 1;
+        }
+        Assert.equals(0L, diff);
+        Assert.isTrue(nz);
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
     }
 
     /** 40.1.2 — the indirected launch vs per-expert wave launches on

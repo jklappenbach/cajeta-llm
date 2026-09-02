@@ -95,6 +95,128 @@ public final class AttnKernel {
         }
     }
 
+    // ── the fused decode prep (unit 48) ────────────────────────────────
+
+    /**
+     * QK-norm, RoPE and the K/V append in ONE launch: a workgroup per
+     * head (q heads first, then k heads), 128 threads. A q block norms
+     * its head in place (when `norm` != 0), then rotates it; a k block
+     * does the same and writes the rotated row into the K plane at
+     * `row`, and copies its slice of V into the V plane. Four launches
+     * of a few microseconds each were three too many per decode layer
+     * (unit 48's profile: ~1150 launches per token, 3.4 ms of gaps).
+     * Thread d < half owns the rotation pair (d, d + half); the norm
+     * reduction is a shared-memory tree over the block. Values match
+     * the separate kernels bit for bit: the same norm formula, the same
+     * rotation, the same order of operations per element.
+     */
+    @Kernel
+    public static void qkPrepKernel(KernelBuffer<float32> q,
+            KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
+            KernelBuffer<float32> qw, KernelBuffer<float32> kw,
+            KernelBuffer<float32> invFreq, uint32 nH, uint32 nKv,
+            uint32 hd, uint32 norm, float32 eps, int32 form,
+            uint32 row, float32 pos) {
+        Shared<float32> part = shared float32[128];
+        uint32 lane = KernelThread.x();
+        uint32 head = KernelThread.globalIdX() / 128;
+        if (head >= nH + nKv) { return; }
+        boolean isQ = head < nH;
+        uint32 kh = head - nH;
+        uint32 base = 0;
+        if (isQ) { base = head * hd; } else { base = kh * hd; }
+        uint32 half = hd / 2;
+        if (norm != 0) {
+            float32 ss = 0.0f;
+            uint32 i = lane;
+            while (i < hd) {
+                float32 x = 0.0f;
+                if (isQ) { x = q[(int64) (base + i)]; }
+                else { x = k[(int64) (base + i)]; }
+                ss = ss + x * x;
+                i = i + 128;
+            }
+            part[lane] = ss;
+            Barrier.workgroup();
+            uint32 sred = 64;
+            while (sred > 0) {
+                if (lane < sred) {
+                    part[lane] = part[lane] + part[lane + sred];
+                }
+                Barrier.workgroup();
+                sred = sred / 2;
+            }
+            float32 scale = 1.0f
+                / Math.sqrt(part[0] / (float32) hd + eps);
+            uint32 j = lane;
+            while (j < hd) {
+                float32 wi = 0.0f;
+                if (isQ) { wi = qw[(int64) j]; } else { wi = kw[(int64) j]; }
+                if (form == 1) { wi = 1.0f + wi; }
+                if (isQ) {
+                    q[(int64) (base + j)] = q[(int64) (base + j)]
+                        * scale * wi;
+                } else {
+                    k[(int64) (base + j)] = k[(int64) (base + j)]
+                        * scale * wi;
+                }
+                j = j + 128;
+            }
+            Barrier.workgroup();
+        }
+        // RoPE: thread d < half owns the pair.
+        uint32 d = lane;
+        while (d < half) {
+            float32 ang = pos * invFreq[(int64) d];
+            float32 c = Math.cos(ang);
+            float32 sn = Math.sin(ang);
+            float32 a = 0.0f;
+            float32 b = 0.0f;
+            if (isQ) {
+                a = q[(int64) (base + d)];
+                b = q[(int64) (base + d + half)];
+                q[(int64) (base + d)] = a * c - b * sn;
+                q[(int64) (base + d + half)] = a * sn + b * c;
+            } else {
+                a = k[(int64) (base + d)];
+                b = k[(int64) (base + d + half)];
+                float32 ra = a * c - b * sn;
+                float32 rb = a * sn + b * c;
+                k[(int64) (base + d)] = ra;
+                k[(int64) (base + d + half)] = rb;
+                uint32 o = row * (nKv * hd) + base;
+                kPool[(int64) (o + d)] = ra;
+                kPool[(int64) (o + d + half)] = rb;
+            }
+            d = d + 128;
+        }
+        if (!isQ) {
+            uint32 o2 = row * (nKv * hd) + base;
+            uint32 e = lane;
+            while (e < hd) {
+                vPool[(int64) (o2 + e)] = v[(int64) (base + e)];
+                e = e + 128;
+            }
+        }
+    }
+
+    public static void qkPrepLaunchNoSync(KernelBuffer<float32> q,
+            KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float32> kPool, KernelBuffer<float32> vPool,
+            KernelBuffer<float32> qw, KernelBuffer<float32> kw,
+            KernelBuffer<float32> invFreq, int32 nH, int32 nKv, int32 hd,
+            boolean norm, float32 eps, int32 form, int32 row, int32 pos) {
+        KernelStream s = QuantKernel.stream();
+        uint32 nn = 0;
+        if (norm) { nn = 1; }
+        qkPrepKernel.launch(s, grid: [(uint32) (nH + nKv)], block: [128])
+            (q, k, v, kPool, vPool, qw, kw, invFreq, (uint32) nH,
+             (uint32) nKv, (uint32) hd, nn, eps, form, (uint32) row,
+             (float32) pos);
+        return;
+    }
+
     // ── KV append (6.1) ─────────────────────────────────────────────────
 
     /**
