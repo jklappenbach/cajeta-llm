@@ -1,0 +1,173 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.DiagCallback;
+import dev.cajeta.llm.DiagRecord;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.model.MoeFfn;
+import dev.cajeta.llm.sched.Request;
+import dev.cajeta.llm.sched.Scheduler;
+
+/**
+ * Unit 30 — router observability records (spec 15.20, on 11.8's seam).
+ *
+ * A request's routing is emitted when the request COMPLETES, as one
+ * `route`/`layer` record per MoE layer (which experts fired, how
+ * concentrated) and one `route`/`request` summary. The counts are
+ * accumulated where the routing happens — a per-slot histogram on
+ * the device for the device routers, host counters for the host
+ * router — and read back once per request, so an observed decode
+ * pays no per-token download. With no callback registered nothing
+ * is counted, allocated, or built (21.1.2's rule, applied here).
+ *
+ * The arithmetic identity every record must satisfy: each routed
+ * token fires exactly `used` experts per layer, so a layer's hits are
+ * tokens x used, and the request's total is that times the layers.
+ */
+public class RouteRecordTest {
+
+    public RouteRecordTest() { return; }
+
+    static #CausalLM mk(int32 maxSeqs) {
+        Checkpoint ck #= Checkpoint.open(MoeForwardTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, maxSeqs, 0);
+        m.bind(ck, false);
+        return #m;
+    }
+
+    /** 30.1.1 — a completed request emits its per-layer records and
+     *  the summary, each obeying tokens x used, attributed to the
+     *  request's session; a second request starts from zero. */
+    @Test
+    public void completedRequestEmitsPerLayerRoutesAndASummary() {
+        CausalLM m #= RouteRecordTest.mk(2);
+        int32 layers = m.layerCount();
+        MoeFfn moe = m.moeAt(0);
+        int64 used = (int64) moe.used();
+        int64 experts = (int64) moe.experts();
+        Scheduler sch #= heap Scheduler(m, 8);
+        RouteCapture cap = heap RouteCapture();
+        Diag.register(cap);
+        int32[] pr #= SchedulerTest.promptOf(6, 3);
+        int32 id = sch.submit(pr, 6, 4);
+        sch.runAll(64);
+        Diag.register(null);
+        Request r = sch.request(id);
+        Assert.equals(4L, (int64) r.generatedCount());
+        // 6 prompt positions + 3 decode steps route (the 4th generated
+        // token is sampled from the 3rd step's logits; nothing routes
+        // after it).
+        int64 tokens = 6L + 3L;
+        Assert.equals((int64) layers, (int64) cap.layerN);
+        Assert.equals(1L, (int64) cap.requestN);
+        Assert.equals((int64) id, (int64) cap.session);
+        int32 l = 0;
+        while (l < layers) {
+            Assert.equals((int64) l, cap.layer[l]);
+            Assert.equals(tokens, cap.layerTokens[l]);
+            Assert.isTrue(cap.distinct[l] >= used && cap.distinct[l] <= experts);
+            Assert.isTrue(cap.k90[l] >= 1L && cap.k90[l] <= cap.distinct[l]);
+            Assert.isTrue(cap.top[l] >= 0L && cap.top[l] < experts);
+            Assert.isTrue(cap.topHits[l] >= 1L && cap.topHits[l] <= tokens);
+            l = l + 1;
+        }
+        Assert.equals(tokens, cap.reqTokens);
+        Assert.equals((int64) layers, cap.reqLayers);
+        Assert.equals(experts, cap.reqExperts);
+        Assert.equals(tokens * used * (int64) layers, cap.reqHits);
+
+        // A second request: its own counts, not the first's carried on.
+        RouteCapture cap2 = heap RouteCapture();
+        Diag.register(cap2);
+        int32[] pr2 #= SchedulerTest.promptOf(4, 5);
+        int32 id2 = sch.submit(pr2, 4, 2);
+        sch.runAll(64);
+        Diag.register(null);
+        Assert.equals((int64) id2, (int64) cap2.session);
+        Assert.equals(4L + 1L, cap2.reqTokens);
+        Assert.equals((4L + 1L) * used * (int64) layers, cap2.reqHits);
+    }
+
+    /** 30.1.1's negative half — no callback, nothing counted or built:
+     *  the record counter stands still and no histogram exists. */
+    @Test
+    public void unobservedGenerationCountsNothing() {
+        Diag.register(null);
+        MoeFfn.resetRouteObservation();
+        CausalLM m #= RouteRecordTest.mk(1);
+        Scheduler sch #= heap Scheduler(m, 8);
+        int64 b0 = Diag.builtCount();
+        int64 l0 = MoeFfn.routeHistLaunchCount();
+        int32[] pr #= SchedulerTest.promptOf(6, 3);
+        sch.submit(pr, 6, 3);
+        sch.runAll(64);
+        Assert.equals(b0, Diag.builtCount());
+        Assert.equals(l0, MoeFfn.routeHistLaunchCount());
+        Assert.isFalse(MoeFfn.routeHistogramAllocated());
+    }
+}
+
+/** Copies each `route` record's fields (valid only during the call,
+ *  11.8.3). `layer`: v0 layer, v1 tokens, v2 distinct experts, v3 the
+ *  experts covering 90% of hits, v4 top expert, v5 its hits.
+ *  `request`: v0 tokens, v1 layers, v2 experts, v3 distinct
+ *  (layer, expert) pairs, v4 mean k90, v5 total hits. */
+final class RouteCapture implements DiagCallback {
+    public int32 layerN;
+    public int32 requestN;
+    public int32 session;
+    public int64[] layer;
+    public int64[] layerTokens;
+    public int64[] distinct;
+    public int64[] k90;
+    public int64[] top;
+    public int64[] topHits;
+    public int64 reqTokens;
+    public int64 reqLayers;
+    public int64 reqExperts;
+    public int64 reqDistinct;
+    public int64 reqK90;
+    public int64 reqHits;
+    public RouteCapture() {
+        this.layerN = 0;
+        this.requestN = 0;
+        this.session = 0 - 1;
+        this.layer #= heap int64[64];
+        this.layerTokens #= heap int64[64];
+        this.distinct #= heap int64[64];
+        this.k90 #= heap int64[64];
+        this.top #= heap int64[64];
+        this.topHits #= heap int64[64];
+    }
+    public void onRecord(DiagRecord r) {
+        if (!r.category.equals("route")) { return; }
+        this.session = r.session;
+        if (r.name.equals("layer")) {
+            if (this.layerN >= 64) { return; }
+            this.layer[this.layerN] = r.v0;
+            this.layerTokens[this.layerN] = r.v1;
+            this.distinct[this.layerN] = r.v2;
+            this.k90[this.layerN] = r.v3;
+            this.top[this.layerN] = r.v4;
+            this.topHits[this.layerN] = r.v5;
+            this.layerN = this.layerN + 1;
+            return;
+        }
+        if (r.name.equals("request")) {
+            this.requestN = this.requestN + 1;
+            this.reqTokens = r.v0;
+            this.reqLayers = r.v1;
+            this.reqExperts = r.v2;
+            this.reqDistinct = r.v3;
+            this.reqK90 = r.v4;
+            this.reqHits = r.v5;
+        }
+        return;
+    }
+}

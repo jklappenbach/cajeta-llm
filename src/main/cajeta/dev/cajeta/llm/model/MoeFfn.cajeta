@@ -314,6 +314,7 @@ public final class MoeFfn extends InfModule {
         this.router.matvecInto(x, xOff, this.sc.logits, 0L);
         this.routeFromLogits(this.sc.logits.hostBuffer(),
             this.sc.logits.hostBase(), selOut, wOut);
+        this.noteRoutesHost(selOut, 1);
         return;
     }
 
@@ -468,6 +469,7 @@ public final class MoeFfn extends InfModule {
         while (r < rows) {
             this.routeFromLogits(this.lgBatchH, (int64) r * en,
                 this.sc.sel, this.sc.w);
+            this.noteRoutesHost(this.sc.sel, 1);
             int32 k = 0;
             while (k < this.usedN) {
                 selAll[r * this.usedN + k] = this.sc.sel[k];
@@ -803,6 +805,7 @@ public final class MoeFfn extends InfModule {
             hid, eps, form, this.selDev, this.wSelDev, this.logitsDev,
             this.routerWDev, this.rtCounter, (int64) this.expertsN,
             (int64) this.usedN, this.normTopk, this.wScale);
+        this.noteRoutesDev(this.selDev, 1L);
         return true;
     }
 
@@ -853,6 +856,7 @@ public final class MoeFfn extends InfModule {
                 this.logitsDev, this.probsDev, (int64) this.expertsN,
                 (int64) this.usedN, this.normTopk, this.wScale);
         }
+        if (!preRouted) { this.noteRoutesDev(this.selDev, 1L); }
         MoeFfn.phaseSync();
         MoeFfn.mtRouteNs = MoeFfn.mtRouteNs + (Clock.nanoTime() - tr0);
         int64 tg0 = Clock.nanoTime();
@@ -1213,6 +1217,7 @@ public final class MoeFfn extends InfModule {
             QuantKernel.moeTopKBatchLaunchNoSync(MoeFfn.selAllDev,
                 MoeFfn.wAllDev, this.lgBatchDev, (int64) rows, en,
                 (int64) this.usedN, this.normTopk, this.wScale);
+            this.noteRoutesDev(MoeFfn.selAllDev, (int64) rows);
             QuantKernel.moeGroupLaunchNoSync(MoeFfn.gRowDev, MoeFfn.gWDev,
                 MoeFfn.rowSlotDev, MoeFfn.map64EDev, MoeFfn.map64T0Dev,
                 MoeFfn.map64M1Dev, MoeFfn.metaDev, MoeFfn.selAllDev,
@@ -1603,6 +1608,148 @@ public final class MoeFfn extends InfModule {
         return this.gateB.devRoutableFor(m)
             && this.upB.devRoutableFor(m)
             && this.downB.devRoutableFor(m);
+    }
+
+    // ── Unit 30: routing observability (spec 15.20) ──────────────────
+    //
+    // Which experts fired, per request, without a per-token download.
+    // The counts accumulate WHERE the routing happens: a per-slot
+    // device histogram [layers x experts] for the device routers (one
+    // tiny launch after each selection, only while observed) and a
+    // host array for the host router. `CausalLM.stepSeq` sets the slot
+    // and the observe flag per step; the scheduler reads a slot back
+    // ONCE when its request completes and zeroes it at admission. With
+    // no callback registered none of this allocates (21.1.2).
+    static boolean observeRoutes;
+    static int32 histSlot;
+    static int32 histLayers;
+    static int32 histExperts;
+    static KernelBuffer<int32>[] routeHistDev;   // per slot, lazily
+    static int32[][] routeHistHost;              // per slot, lazily
+    static int64 routeHistLaunches;              // the cost, counted
+
+    /** Whether any histogram has been allocated — the test hook for
+     *  "unobserved generation counts nothing". */
+    public static boolean routeHistogramAllocated() {
+        return MoeFfn.routeHistDev != null || MoeFfn.routeHistHost != null;
+    }
+
+    /** Per-step arming (called by the model): the slot the routes
+     *  belong to, and whether anyone is listening. */
+    public static void armRouteObservation(int32 slot, int32 layers,
+            int32 experts, int32 maxSlots, boolean on) {
+        MoeFfn.observeRoutes = on;
+        MoeFfn.histSlot = slot;
+        MoeFfn.histLayers = layers;
+        MoeFfn.histExperts = experts;
+        if (on && MoeFfn.routeHistDev == null) {
+            MoeFfn.routeHistDev #= heap KernelBuffer<int32>[maxSlots];
+            MoeFfn.routeHistHost #= heap int32[maxSlots][];
+        }
+        return;
+    }
+
+    static int64 histCells() {
+        return (int64) MoeFfn.histLayers * (int64) MoeFfn.histExperts;
+    }
+
+    static KernelBuffer<int32> histDevFor(int32 slot) {
+        if (MoeFfn.routeHistDev[slot] == null) {
+            int64 cells = MoeFfn.histCells();
+            KernelBuffer<int32> b #= heap KernelBuffer<int32>((uint64) cells);
+            int32[] z #= heap int32[cells];
+            b.upload(z, cells);
+            MoeFfn.routeHistDev[slot] #= #b;
+        }
+        return MoeFfn.routeHistDev[slot];
+    }
+
+    static int32[] histHostFor(int32 slot) {
+        if (MoeFfn.routeHistHost[slot] == null) {
+            MoeFfn.routeHistHost[slot] #= heap int32[MoeFfn.histCells()];
+        }
+        return MoeFfn.routeHistHost[slot];
+    }
+
+    /** A device selection landed in `sel` (rows x used entries):
+     *  count it, if observed. */
+    void noteRoutesDev(KernelBuffer<int32> sel, int64 rows) {
+        if (!MoeFfn.observeRoutes) { return; }
+        KernelBuffer<int32> h = MoeFfn.histDevFor(MoeFfn.histSlot);
+        QuantKernel.routeHistLaunchNoSync(h, sel, rows * (int64) this.usedN,
+            (int64) this.layerIdx * (int64) this.expertsN);
+        MoeFfn.routeHistLaunches = MoeFfn.routeHistLaunches + 1L;
+        return;
+    }
+
+    /** A host selection landed in `sel` (rows x used entries). */
+    void noteRoutesHost(int32[] sel, int32 rows) {
+        if (!MoeFfn.observeRoutes) { return; }
+        int32[] h = MoeFfn.histHostFor(MoeFfn.histSlot);
+        int64 base = (int64) this.layerIdx * (int64) this.expertsN;
+        int32 n = rows * this.usedN;
+        int32 i = 0;
+        while (i < n) {
+            int64 at = base + (int64) sel[i];
+            h[at] = h[at] + 1;
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** The slot's histogram, device + host merged, as int64 cells
+     *  [layers x experts]; null when nothing was ever counted for it.
+     *  Reads the device back (one sync). */
+    public static #int64[] routeHistogram(int32 slot) {
+        if (MoeFfn.routeHistDev == null) { return null; }
+        int64 cells = MoeFfn.histCells();
+        int64[] out #= heap int64[cells];
+        boolean any = false;
+        if (MoeFfn.routeHistDev[slot] != null) {
+            int32[] d #= heap int32[cells];
+            MoeFfn.routeHistDev[slot].download(d, cells);
+            int64 i = 0L;
+            while (i < cells) { out[i] = (int64) d[i]; i = i + 1L; }
+            any = true;
+        }
+        if (MoeFfn.routeHistHost[slot] != null) {
+            int32[] hh = MoeFfn.routeHistHost[slot];
+            int64 i = 0L;
+            while (i < cells) { out[i] = out[i] + (int64) hh[i]; i = i + 1L; }
+            any = true;
+        }
+        if (!any) { return null; }
+        return #out;
+    }
+
+    /** Zero a slot's histogram (at admission, and after a read). */
+    public static void clearRouteHistogram(int32 slot) {
+        if (MoeFfn.routeHistDev == null) { return; }
+        int64 cells = MoeFfn.histCells();
+        if (MoeFfn.routeHistDev[slot] != null) {
+            int32[] z #= heap int32[cells];
+            MoeFfn.routeHistDev[slot].upload(z, cells);
+        }
+        if (MoeFfn.routeHistHost[slot] != null) {
+            int32[] hh = MoeFfn.routeHistHost[slot];
+            int64 i = 0L;
+            while (i < cells) { hh[i] = 0; i = i + 1L; }
+        }
+        return;
+    }
+
+    /** How many histogram launches an observed run cost (30.2.1). */
+    public static int64 routeHistLaunchCount() {
+        return MoeFfn.routeHistLaunches;
+    }
+
+    /** Drop the histograms (a test hook: the statics outlive a test,
+     *  and "nothing allocated" must be about THIS run). */
+    public static void resetRouteObservation() {
+        MoeFfn.observeRoutes = false;
+        MoeFfn.routeHistDev = null;
+        MoeFfn.routeHistHost = null;
+        return;
     }
 
     public int32 experts() {

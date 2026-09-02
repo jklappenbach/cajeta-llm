@@ -94,6 +94,100 @@ public final class CausalLM extends InfModule {
         return this.maxSeqsN;
     }
 
+    /** Unit 30: arm the routing histogram for this step (spec 15.20) —
+     *  the slot the routes belong to, and whether anyone listens. A
+     *  dense model has nothing to arm. */
+    void armRoutes(int32 seq) {
+        if (this.cfg.expertCount <= 0) { return; }
+        MoeFfn.armRouteObservation(seq, this.cfg.numLayers,
+            this.cfg.expertCount, this.maxSeqsN, Diag.on());
+        return;
+    }
+
+    /** Unit 30: zero a slot's routing histogram — at admission, so a
+     *  new occupant starts from nothing. */
+    public void clearRoutes(int32 seq) {
+        if (this.cfg.expertCount <= 0) { return; }
+        MoeFfn.clearRouteHistogram(seq);
+        return;
+    }
+
+    /**
+     * Unit 30: emit the request's routing records (spec 15.20) and
+     * clear its slot. One `route`/`layer` record per MoE layer —
+     * v0 layer, v1 tokens routed, v2 distinct experts fired, v3 the
+     * experts covering 90% of the layer's hits (its concentration: k90
+     * = `used` means every token picked the same set), v4 the top
+     * expert, v5 its hits — then one `route`/`request` summary: v0
+     * tokens, v1 layers, v2 experts, v3 distinct (layer, expert) pairs,
+     * v4 mean k90, v5 total hits. Reads the device histogram back once.
+     */
+    public void emitRouteRecords(int32 seq, int32 session) {
+        if (this.cfg.expertCount <= 0 || !Diag.on()) { return; }
+        int64[] h #= MoeFfn.routeHistogram(seq);
+        if (h == null) { return; }
+        int32 layers = this.cfg.numLayers;
+        int32 experts = this.cfg.expertCount;
+        int64 used = 1L;
+        MoeFfn m0 = this.moeAt(0);
+        if (m0 != null) { used = (int64) m0.used(); }
+        int64 totalHits = 0L;
+        int64 distinctPairs = 0L;
+        int64 k90Sum = 0L;
+        int64 tokens = 0L;
+        int64[] sorted #= heap int64[experts];
+        int32 l = 0;
+        while (l < layers) {
+            int64 base = (int64) l * (int64) experts;
+            int64 hits = 0L;
+            int64 distinct = 0L;
+            int64 top = 0L;
+            int64 topHits = 0L;
+            int32 e = 0;
+            while (e < experts) {
+                int64 c = h[base + (int64) e];
+                sorted[e] = c;
+                hits = hits + c;
+                if (c > 0L) { distinct = distinct + 1L; }
+                if (c > topHits) { topHits = c; top = (int64) e; }
+                e = e + 1;
+            }
+            // k90: the fewest experts whose hits reach 90% of the
+            // layer's — a selection sort over the (small) expert count.
+            int64 k90 = 0L;
+            if (hits > 0L) {
+                int64 need = (hits * 9L + 9L) / 10L;
+                int64 got = 0L;
+                int32 taken = 0;
+                while (got < need && taken < experts) {
+                    int32 bi = 0;
+                    int32 j = 1;
+                    while (j < experts) {
+                        if (sorted[j] > sorted[bi]) { bi = j; }
+                        j = j + 1;
+                    }
+                    got = got + sorted[bi];
+                    sorted[bi] = 0L - 1L;
+                    taken = taken + 1;
+                }
+                k90 = (int64) taken;
+            }
+            int64 lt = hits / used;
+            Diag.emit("route", session, "layer", (int64) l, lt, distinct,
+                k90, top, topHits);
+            totalHits = totalHits + hits;
+            distinctPairs = distinctPairs + distinct;
+            k90Sum = k90Sum + k90;
+            if (lt > tokens) { tokens = lt; }
+            l = l + 1;
+        }
+        int64 meanK90 = layers > 0 ? k90Sum / (int64) layers : 0L;
+        Diag.emit("route", session, "request", tokens, (int64) layers,
+            (int64) experts, distinctPairs, meanK90, totalHits);
+        MoeFfn.clearRouteHistogram(seq);
+        return;
+    }
+
     /**
      * Build the prefill-weight state OFF the prefill clock (the
      * profiling audit): under `prefillWeights = "int8"` the per-tensor
@@ -260,6 +354,7 @@ public final class CausalLM extends InfModule {
         if (n <= 0) {
             throw heap LlmException("step: token count must be positive");
         }
+        this.armRoutes(seq);
         int32 seqPos = this.seqLength(seq);
         if (seqPos + n > this.maxSeq) {
             throw heap LlmException("step: " + n
