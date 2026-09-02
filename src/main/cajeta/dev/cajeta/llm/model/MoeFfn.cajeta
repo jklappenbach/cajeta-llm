@@ -55,24 +55,35 @@ public final class MoeFfn extends InfModule {
     float32[] xRowsH;                  // staging copy (pooled x bases)
     // ── Unit 41b: the fully device-resident batch FFN. ──
     int32[] rowSlotH;                  // pick k of row r -> group slot
-    KernelBuffer<int32> gRowDev;       // group slot -> source row
-    KernelBuffer<float32> gWDev;       // group slot -> combine weight
-    KernelBuffer<int32> rowSlotDev;
-    KernelBuffer<float32> bxDev;       // gathered rows, [np x hidden]
-    KernelBuffer<float32> bgDev;       // gate outputs, [np x width]
-    KernelBuffer<float32> buDev;       // up outputs, [np x width]
-    KernelBuffer<float32> beDev;       // down outputs, [np x hidden]
-    KernelBuffer<float32> obDev;       // combined output, [rows x hidden]
-    int64 devBatchCap;                 // np the buffers are sized for
+    // ONE set for the whole process, not one per layer (unit 43):
+    // layers run in stream order and every buffer here is dead once
+    // the layer's output folds into the residual. Per-layer copies
+    // measured 48 first-use allocations in the pass after admission
+    // (229 ms of a 1206 ms pass) and held ~5 GB of device scratch for
+    // the 30B. The re-use is safe ONLY because routeBatchCore drains
+    // the stream before the next layer's uploads touch these — a
+    // device-side router that removes that sync must fence them.
+    static KernelBuffer<int32> gRowDev;       // group slot -> source row
+    static KernelBuffer<float32> gWDev;       // group slot -> combine weight
+    static KernelBuffer<int32> rowSlotDev;
+    static KernelBuffer<float32> bxDev;       // gathered rows, [np x hidden]
+    static KernelBuffer<float32> bgDev;       // gate outputs, [np x width]
+    static KernelBuffer<float32> buDev;       // up outputs, [np x width]
+    static KernelBuffer<float32> beDev;       // down outputs, [np x hidden]
+    static KernelBuffer<float32> obDev;       // combined output, [rows x hidden]
+    static int64 devBatchCap;                 // np the buffers are sized for
+    static int64 devBatchH;                   // ... and the hidden width
+    static int64 devBatchW;                   // ... and the expert width
+    static int32 devBatchE;                   // ... and the expert count
     // ── Unit 41d: the indirected one-launch-per-bank GEMM. ──
-    int32[] mapEH;
-    int32[] mapT0H;
-    int32[] mapM1H;
-    KernelBuffer<int32> mapEDev;
-    KernelBuffer<int32> mapT0Dev;
-    KernelBuffer<int32> mapM1Dev;
-    KernelBuffer<int8> xpBxDev;        // packed batch activations
-    KernelBuffer<int8> xpBgDev;        // packed GLU'd middle
+    static int32[] mapEH;
+    static int32[] mapT0H;
+    static int32[] mapM1H;
+    static KernelBuffer<int32> mapEDev;
+    static KernelBuffer<int32> mapT0Dev;
+    static KernelBuffer<int32> mapM1Dev;
+    static KernelBuffer<int8> xpBxDev;        // packed batch activations
+    static KernelBuffer<int8> xpBgDev;        // packed GLU'd middle
 
     // ── forwardRow phase split (parity attribution, decode). ──
     static int64 mtRouteNs;    // router matvec + softmax + top-k
@@ -88,13 +99,38 @@ public final class MoeFfn extends InfModule {
     static int64 fbGemm1Ns;    // 41d probe: gather+pack+gate+up (GPU-incl under phaseSync)
     static int64 fbGemm2Ns;    // 41d probe: glu+pack+down
     static int64 fbTailNs;     // 41d probe: scatter-combine
+    static int64 fbPreNs;      // route end -> g1 stamp (ensure*, uploads)
+    static int64 fbUplNs;      // ... of which the three map uploads
+    static int64 fbPreA; static int64 fbPreB; static int64 fbPreC; static int64 fbPreD;
+    static int64 fbEdbAllocs;
+    public static int64 batchEdbAllocs() { return MoeFfn.fbEdbAllocs; }
+    public static int64 batchPreA() { return MoeFfn.fbPreA; }
+    public static int64 batchPreB() { return MoeFfn.fbPreB; }
+    public static int64 batchPreC() { return MoeFfn.fbPreC; }
+    public static int64 batchPreD() { return MoeFfn.fbPreD; }
+    public static int64 batchUplNs()   { return MoeFfn.fbUplNs; }
+    public static int64 batchPreNs()   { return MoeFfn.fbPreNs; }
     public static int64 batchGemm1Ns() { return MoeFfn.fbGemm1Ns; }
     public static int64 batchGemm2Ns() { return MoeFfn.fbGemm2Ns; }
     public static int64 batchTailNs()  { return MoeFfn.fbTailNs; }
     static int64 fbRouteNs;    // unit 41: forwardBatch routing span
+    static int64 fbRouteHostNs;// ... its host part: after the sync
     static int64 fbDevRoutes;  // batched device router engagements
     static int64 fbHostRoutes; // per-row host fallbacks
     public static int64 batchRouteNs()   { return MoeFfn.fbRouteNs; }
+    public static int64 batchRouteHostNs() { return MoeFfn.fbRouteHostNs; }
+    /** Zeroes the forwardBatch phase timers (bench windows). */
+    public static void resetBatchTimers() {
+        MoeFfn.fbGemm1Ns = 0L;
+        MoeFfn.fbGemm2Ns = 0L;
+        MoeFfn.fbTailNs = 0L;
+        MoeFfn.fbPreNs = 0L;
+        MoeFfn.fbUplNs = 0L;
+        MoeFfn.fbPreA = 0L; MoeFfn.fbPreB = 0L; MoeFfn.fbPreC = 0L; MoeFfn.fbPreD = 0L;
+        MoeFfn.fbRouteNs = 0L;
+        MoeFfn.fbRouteHostNs = 0L;
+        return;
+    }
     public static int64 batchDevRoutes() { return MoeFfn.fbDevRoutes; }
     public static int64 batchHostRoutes(){ return MoeFfn.fbHostRoutes; }
     static int64 mtPreANs;     // ... zeroSyncReady
@@ -402,6 +438,7 @@ public final class MoeFfn extends InfModule {
             this.routerWDev, xDev, (int64) rows, en, h);
         KernelStream rs = QuantKernel.stream();
         rs.sync();
+        int64 rh0 = Clock.nanoTime();
         this.lgBatchDev.download(this.lgBatchH, (int64) rows * en);
         int32 r = 0;
         while (r < rows) {
@@ -415,6 +452,8 @@ public final class MoeFfn extends InfModule {
             }
             r = r + 1;
         }
+        MoeFfn.fbRouteHostNs = MoeFfn.fbRouteHostNs
+            + (Clock.nanoTime() - rh0);
         return;
     }
 
@@ -880,33 +919,48 @@ public final class MoeFfn extends InfModule {
 
     void ensureDevBatch(int32 rows) {
         int64 np = (int64) rows * (int64) this.usedN;
-        if (this.devBatchCap >= np) { return; }
         int64 wid = (int64) this.widthN;
         int64 h = (int64) this.hidden;
+        if (MoeFfn.devBatchCap >= np && MoeFfn.devBatchH >= h
+                && MoeFfn.devBatchW >= wid
+                && MoeFfn.devBatchE >= this.expertsN) {
+            return;
+        }
+        if (MoeFfn.devBatchCap > np) { np = MoeFfn.devBatchCap; }
+        if (MoeFfn.devBatchH > h) { h = MoeFfn.devBatchH; }
+        if (MoeFfn.devBatchW > wid) { wid = MoeFfn.devBatchW; }
+        int32 en = this.expertsN;
+        if (MoeFfn.devBatchE > en) { en = MoeFfn.devBatchE; }
+        // A queued launch from the previous owner may still read the
+        // old set.
+        QuantKernel.stream().sync();
+        MoeFfn.fbEdbAllocs = MoeFfn.fbEdbAllocs + 1L;
         // +16 rows of slack everywhere the id-GEMM's padded tiles may
         // READ past the last group (their stores are guarded).
         int64 npp = np + 16L;
-        this.gRowDev #= heap KernelBuffer<int32>((uint64) np);
-        this.gWDev #= heap KernelBuffer<float32>((uint64) np);
-        this.rowSlotDev #= heap KernelBuffer<int32>((uint64) np);
-        this.bxDev #= heap KernelBuffer<float32>((uint64) (npp * h));
-        this.bgDev #= heap KernelBuffer<float32>((uint64) (npp * wid));
-        this.buDev #= heap KernelBuffer<float32>((uint64) (npp * wid));
-        this.beDev #= heap KernelBuffer<float32>((uint64) (npp * h));
-        this.obDev #= heap KernelBuffer<float32>(
-            (uint64) ((int64) rows * h));
-        int32 tiles = (int32) (np / 16L) + this.expertsN + 1;
-        this.mapEH #= heap int32[tiles];
-        this.mapT0H #= heap int32[tiles];
-        this.mapM1H #= heap int32[tiles];
-        this.mapEDev #= heap KernelBuffer<int32>((uint64) tiles);
-        this.mapT0Dev #= heap KernelBuffer<int32>((uint64) tiles);
-        this.mapM1Dev #= heap KernelBuffer<int32>((uint64) tiles);
-        this.xpBxDev #= heap KernelBuffer<int8>(
+        MoeFfn.gRowDev #= heap KernelBuffer<int32>((uint64) np);
+        MoeFfn.gWDev #= heap KernelBuffer<float32>((uint64) np);
+        MoeFfn.rowSlotDev #= heap KernelBuffer<int32>((uint64) np);
+        MoeFfn.bxDev #= heap KernelBuffer<float32>((uint64) (npp * h));
+        MoeFfn.bgDev #= heap KernelBuffer<float32>((uint64) (npp * wid));
+        MoeFfn.buDev #= heap KernelBuffer<float32>((uint64) (npp * wid));
+        MoeFfn.beDev #= heap KernelBuffer<float32>((uint64) (npp * h));
+        MoeFfn.obDev #= heap KernelBuffer<float32>((uint64) (np * h));
+        int32 tiles = (int32) (np / 16L) + en + 1;
+        MoeFfn.mapEH #= heap int32[tiles];
+        MoeFfn.mapT0H #= heap int32[tiles];
+        MoeFfn.mapM1H #= heap int32[tiles];
+        MoeFfn.mapEDev #= heap KernelBuffer<int32>((uint64) tiles);
+        MoeFfn.mapT0Dev #= heap KernelBuffer<int32>((uint64) tiles);
+        MoeFfn.mapM1Dev #= heap KernelBuffer<int32>((uint64) tiles);
+        MoeFfn.xpBxDev #= heap KernelBuffer<int8>(
             (uint64) ((npp * h / 256L) * 320L));
-        this.xpBgDev #= heap KernelBuffer<int8>(
+        MoeFfn.xpBgDev #= heap KernelBuffer<int8>(
             (uint64) ((npp * wid / 256L) * 320L));
-        this.devBatchCap = np;
+        MoeFfn.devBatchCap = np;
+        MoeFfn.devBatchH = h;
+        MoeFfn.devBatchW = wid;
+        MoeFfn.devBatchE = en;
         return;
     }
 
@@ -914,7 +968,7 @@ public final class MoeFfn extends InfModule {
      *  returned true — [rows x hidden] on the device, valid until the
      *  next forward. */
     public KernelBuffer<float32> batchObDev() {
-        return this.obDev;
+        return MoeFfn.obDev;
     }
 
     /**
@@ -956,8 +1010,12 @@ public final class MoeFfn extends InfModule {
         int64 fbr0 = Clock.nanoTime();
         this.routeBatchCore(xDev, rows, this.sc.selAll, this.sc.wAll);
         MoeFfn.fbDevRoutes = MoeFfn.fbDevRoutes + 1L;
+        int64 gp0 = Clock.nanoTime();
         this.groupPicks(rows);
-        MoeFfn.fbRouteNs = MoeFfn.fbRouteNs + (Clock.nanoTime() - fbr0);
+        MoeFfn.fbRouteHostNs = MoeFfn.fbRouteHostNs
+            + (Clock.nanoTime() - gp0);
+        int64 fbr1 = Clock.nanoTime();
+        MoeFfn.fbRouteNs = MoeFfn.fbRouteNs + (fbr1 - fbr0);
         int32 np = rows * this.usedN;
         // Every selected expert must serve from the device (slabs or
         // slices); one refusal sends the whole layer to the host path.
@@ -972,7 +1030,11 @@ public final class MoeFfn extends InfModule {
             }
             e = e + 1;
         }
+        int64 fbp1 = Clock.nanoTime();
+        MoeFfn.fbPreA = MoeFfn.fbPreA + (fbp1 - fbr1);
         this.ensureDevBatch(rows);
+        int64 fbp2 = Clock.nanoTime();
+        MoeFfn.fbPreB = MoeFfn.fbPreB + (fbp2 - fbp1);
         // Pre-grow the shared batch stage to the largest PADDED group
         // (gemmKeepAt pads rows to the WMMA tile): growth mid-loop
         // would invalidate a staged window under a queued GEMM.
@@ -983,13 +1045,19 @@ public final class MoeFfn extends InfModule {
             if (gm > mMax) { mMax = gm; }
             e = e + 1;
         }
+        int64 fbp3 = Clock.nanoTime();
+        MoeFfn.fbPreC = MoeFfn.fbPreC + (fbp3 - fbp2);
         Linear.ensureBatchStage((mMax + 15) / 16 * 16, this.hidden);
-        this.gRowDev.upload(this.sc.gRow, (int64) np);
-        this.gWDev.upload(this.sc.gW, (int64) np);
-        this.rowSlotDev.upload(this.rowSlotH, (int64) np);
+        int64 fbu0 = Clock.nanoTime();
+        MoeFfn.fbPreD = MoeFfn.fbPreD + (fbu0 - fbp3);
+        MoeFfn.gRowDev.upload(this.sc.gRow, (int64) np);
+        MoeFfn.gWDev.upload(this.sc.gW, (int64) np);
+        MoeFfn.rowSlotDev.upload(this.rowSlotH, (int64) np);
         int64 fbg10 = Clock.nanoTime();
-        QuantKernel.gatherRowsF32LaunchNoSync(this.bxDev, xDev,
-            this.gRowDev, (int64) np, h);
+        MoeFfn.fbPreNs = MoeFfn.fbPreNs + (fbg10 - fbr1);
+        MoeFfn.fbUplNs = MoeFfn.fbUplNs + (fbg10 - fbu0);
+        QuantKernel.gatherRowsF32LaunchNoSync(MoeFfn.bxDev, xDev,
+            MoeFfn.gRowDev, (int64) np, h);
         // Unit 41d: ONE indirected GEMM per bank when the slabs and
         // the WMMA id kernels are here — the mul_mat_id shape. The
         // per-group loop below stays as the fallback (vulkan, exotic
@@ -1009,25 +1077,25 @@ public final class MoeFfn extends InfModule {
                     groups = groups + 1;
                     int32 tw = 0;
                     while (tw * 16 < m) {
-                        this.mapEH[nT] = e;
-                        this.mapT0H[nT] = g0 + tw * 16;
-                        this.mapM1H[nT] = g0 + m;
+                        MoeFfn.mapEH[nT] = e;
+                        MoeFfn.mapT0H[nT] = g0 + tw * 16;
+                        MoeFfn.mapM1H[nT] = g0 + m;
                         nT = nT + 1;
                         tw = tw + 1;
                     }
                 }
                 e = e + 1;
             }
-            this.mapEDev.upload(this.mapEH, (int64) nT);
-            this.mapT0Dev.upload(this.mapT0H, (int64) nT);
-            this.mapM1Dev.upload(this.mapM1H, (int64) nT);
-            QuantKernel.q8kPackLaunchNoSync(this.xpBxDev, this.bxDev,
+            MoeFfn.mapEDev.upload(MoeFfn.mapEH, (int64) nT);
+            MoeFfn.mapT0Dev.upload(MoeFfn.mapT0H, (int64) nT);
+            MoeFfn.mapM1Dev.upload(MoeFfn.mapM1H, (int64) nT);
+            QuantKernel.q8kPackLaunchNoSync(MoeFfn.xpBxDev, MoeFfn.bxDev,
                 (int64) np * h);
-            this.gateB.gemmIdBatch(this.bgDev, this.xpBxDev,
-                this.mapEDev, this.mapT0Dev, this.mapM1Dev, nT,
+            this.gateB.gemmIdBatch(MoeFfn.bgDev, MoeFfn.xpBxDev,
+                MoeFfn.mapEDev, MoeFfn.mapT0Dev, MoeFfn.mapM1Dev, nT,
                 groups);
-            this.upB.gemmIdBatch(this.buDev, this.xpBxDev,
-                this.mapEDev, this.mapT0Dev, this.mapM1Dev, nT,
+            this.upB.gemmIdBatch(MoeFfn.buDev, MoeFfn.xpBxDev,
+                MoeFfn.mapEDev, MoeFfn.mapT0Dev, MoeFfn.mapM1Dev, nT,
                 groups);
             MoeFfn.phaseSync();
             MoeFfn.fbGemm1Ns = MoeFfn.fbGemm1Ns
@@ -1038,26 +1106,26 @@ public final class MoeFfn extends InfModule {
                 int32 g0 = this.sc.gOff[e];
                 int32 m = this.sc.gOff[e + 1] - g0;
                 if (m > 0) {
-                    KernelBuffer<float32> gx #= this.bxDev.slice(
+                    KernelBuffer<float32> gx #= MoeFfn.bxDev.slice(
                         (uint64) ((int64) g0 * h),
                         (uint64) ((int64) m * h));
                     Linear.stageBatchFromDevice(gx, m, this.hidden,
                         Linear.nextStageTag());
-                    this.gateB.gemmKeepAt(e, m, this.bgDev,
+                    this.gateB.gemmKeepAt(e, m, MoeFfn.bgDev,
                         (int64) g0 * wid);
-                    this.upB.gemmKeepAt(e, m, this.buDev,
+                    this.upB.gemmKeepAt(e, m, MoeFfn.buDev,
                         (int64) g0 * wid);
                 }
                 e = e + 1;
             }
         }
         int64 fbg20 = Clock.nanoTime();
-        Prim.gluDevice(this.bgDev, this.buDev, (int64) np * wid, act);
+        Prim.gluDevice(MoeFfn.bgDev, MoeFfn.buDev, (int64) np * wid, act);
         if (idPath) {
-            QuantKernel.q8kPackLaunchNoSync(this.xpBgDev, this.bgDev,
+            QuantKernel.q8kPackLaunchNoSync(MoeFfn.xpBgDev, MoeFfn.bgDev,
                 (int64) np * wid);
-            this.downB.gemmIdBatch(this.beDev, this.xpBgDev,
-                this.mapEDev, this.mapT0Dev, this.mapM1Dev, nT,
+            this.downB.gemmIdBatch(MoeFfn.beDev, MoeFfn.xpBgDev,
+                MoeFfn.mapEDev, MoeFfn.mapT0Dev, MoeFfn.mapM1Dev, nT,
                 groups);
             MoeFfn.phaseSync();
             MoeFfn.fbGemm2Ns = MoeFfn.fbGemm2Ns
@@ -1068,20 +1136,20 @@ public final class MoeFfn extends InfModule {
                 int32 g0 = this.sc.gOff[e];
                 int32 m = this.sc.gOff[e + 1] - g0;
                 if (m > 0) {
-                    KernelBuffer<float32> gg #= this.bgDev.slice(
+                    KernelBuffer<float32> gg #= MoeFfn.bgDev.slice(
                         (uint64) ((int64) g0 * wid),
                         (uint64) ((int64) m * wid));
                     Linear.stageBatchFromDevice(gg, m, this.widthN,
                         Linear.nextStageTag());
-                    this.downB.gemmKeepAt(e, m, this.beDev,
+                    this.downB.gemmKeepAt(e, m, MoeFfn.beDev,
                         (int64) g0 * h);
                 }
                 e = e + 1;
             }
         }
         int64 fbt0 = Clock.nanoTime();
-        QuantKernel.moeScatterCombineLaunchNoSync(this.obDev,
-            this.beDev, this.rowSlotDev, this.gWDev, (int64) rows,
+        QuantKernel.moeScatterCombineLaunchNoSync(MoeFfn.obDev,
+            MoeFfn.beDev, MoeFfn.rowSlotDev, MoeFfn.gWDev, (int64) rows,
             (int64) this.usedN, h);
         MoeFfn.phaseSync();
         MoeFfn.fbTailNs = MoeFfn.fbTailNs + (Clock.nanoTime() - fbt0);
