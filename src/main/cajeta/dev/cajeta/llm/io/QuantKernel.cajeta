@@ -7,6 +7,7 @@ import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelThread;
 import cajeta.xpu.Shared;
 import cajeta.xpu.Wave;
+import cajeta.xpu.MemoryOrder;
 
 /**
  * The packed mat-vecs as XPU kernels (threaded-forward-path plan Unit 3;
@@ -7002,6 +7003,142 @@ public final class QuantKernel {
         if (lane == 0 && e < experts) {
             y[(int64) e] = part[0];
         }
+    }
+
+    /**
+     * Unit 50: the router mat-vec AND the top-k in ONE launch. Block e
+     * computes logit e exactly as routerF32MatVecKernel does, publishes
+     * it with a device-scope release fence and takes a ticket on
+     * `counter[0]`; the block whose ticket is the last acquires, runs
+     * the moeTopKKernel selection in its first wave over the complete
+     * logits, and resets the counter for the next launch (the stream
+     * orders it). The top-k was a launch whose whole cost was the
+     * dependency on the previous one; here it rides the router's.
+     */
+    @Kernel
+    public static void routerTopKKernel(KernelBuffer<int32> sel,
+            KernelBuffer<float32> w, KernelBuffer<float32> logits,
+            KernelBuffer<float32> wRouter, KernelBuffer<float32> x,
+            KernelBuffer<int32> counter, uint32 experts, uint32 cols,
+            uint32 used, uint32 normTopk, float32 wScale) {
+        Shared<float32> part = shared float32[256];
+        Shared<int32> lastFlag = shared int32[1];
+        uint32 lane = KernelThread.x();
+        uint32 e = KernelThread.globalIdX() / 256;
+        float32 acc = 0.0f;
+        if (e < experts) {
+            uint32 j = lane;
+            while (j < cols) {
+                acc = acc + wRouter[(int64) e * (int64) cols + (int64) j]
+                    * x[(int64) j];
+                j = j + 256;
+            }
+        }
+        part[lane] = acc;
+        Barrier.workgroup();
+        uint32 sred = 128;
+        while (sred > 0) {
+            if (lane < sred) {
+                part[lane] = part[lane] + part[lane + sred];
+            }
+            Barrier.workgroup();
+            sred = sred / 2;
+        }
+        if (lane == 0) {
+            if (e < experts) { logits[(int64) e] = part[0]; }
+            Barrier.deviceMemory(MemoryOrder.Release);
+            int32 old = counter.atomicAdd(0L, 1, MemoryOrder.AcqRel);
+            int32 fl = 0;
+            if ((uint32) old == experts - 1) { fl = 1; }
+            lastFlag[0] = fl;
+        }
+        Barrier.workgroup();
+        if (lastFlag[0] == 0) { return; }
+        // The last block: the first wave selects.
+        if (lane >= 32) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        float32 lm = 0.0f - 340282346638528859811704183484516925440.0f;
+        uint32 ee = lane;
+        while (ee < experts) {
+            float32 v = logits[(int64) ee];
+            if (v > lm) { lm = v; }
+            ee = ee + 32;
+        }
+        float32 mx = Wave.reduceMaxF32(lm);
+        float32 ls = 0.0f;
+        ee = lane;
+        while (ee < experts) {
+            ls = ls + Math.exp(logits[(int64) ee] - mx);
+            ee = ee + 32;
+        }
+        float32 sum = Wave.reduceSumF32(ls);
+        float32 vLast = 340282346638528859811704183484516925440.0f;
+        uint32 iLast = experts;
+        uint32 k = 0;
+        while (k < used) {
+            float32 bv = 0.0f - 1.0f;
+            ee = lane;
+            while (ee < experts) {
+                float32 p = Math.exp(logits[(int64) ee] - mx);
+                boolean ok = p < vLast
+                    || (p == vLast && ee > iLast);
+                if (ok && p > bv) { bv = p; }
+                ee = ee + 32;
+            }
+            float32 vk = Wave.reduceMaxF32(bv);
+            uint32 bi = experts;
+            ee = lane;
+            while (ee < experts) {
+                float32 p = Math.exp(logits[(int64) ee] - mx);
+                boolean ok = p < vLast
+                    || (p == vLast && ee > iLast);
+                if (ok && p == vk && ee < bi) { bi = ee; }
+                ee = ee + 32;
+            }
+            uint32 ik = Wave.reduceMin(bi);
+            if (lane == 0) {
+                sel[(int64) k] = (int32) ik;
+                w[(int64) k] = vk / sum;
+            }
+            vLast = vk;
+            iLast = ik;
+            k = k + 1;
+        }
+        if (lane == 0) {
+            if (normTopk != 0) {
+                float32 ws = 0.0f;
+                k = 0;
+                while (k < used) { ws = ws + w[(int64) k]; k = k + 1; }
+                if (ws < 0.00006103515625f) { ws = 0.00006103515625f; }
+                k = 0;
+                while (k < used) {
+                    w[(int64) k] = w[(int64) k] / ws;
+                    k = k + 1;
+                }
+            }
+            if (wScale != 0.0f && wScale != 1.0f) {
+                k = 0;
+                while (k < used) {
+                    w[(int64) k] = w[(int64) k] * wScale;
+                    k = k + 1;
+                }
+            }
+            counter[0L] = 0;
+        }
+    }
+
+    public static void routerTopKLaunchNoSync(KernelBuffer<int32> sel,
+            KernelBuffer<float32> w, KernelBuffer<float32> logits,
+            KernelBuffer<float32> wRouter, KernelBuffer<float32> x,
+            KernelBuffer<int32> counter, int64 experts, int64 cols,
+            int64 used, boolean normTopk, float32 wScale) {
+        KernelStream s = QuantKernel.stream();
+        uint32 nt = 0;
+        if (normTopk) { nt = 1; }
+        routerTopKKernel.launch(s, grid: [(uint32) experts], block: [256])
+            (sel, w, logits, wRouter, x, counter, (uint32) experts,
+             (uint32) cols, (uint32) used, nt, wScale);
+        return;
     }
 
     /** Unit 41: gather picked rows into group order —

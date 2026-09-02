@@ -45,6 +45,7 @@ public final class MoeFfn extends InfModule {
     KernelBuffer<float32> uyDev;       // up outputs, [used x width]
     KernelBuffer<float32> dyDev;       // down outputs, [used x hidden]
     KernelBuffer<int8> xpXnDev;        // staged activation, per token
+    KernelBuffer<int32> rtCounter;     // unit 50: the router's ticket counter
     KernelBuffer<int8> xpGyDev;        // staged GLU'd middle, [used rows]
     KernelBuffer<float32> routerWDev;  // router weight, f32 [in x E]
     boolean routerWUp;
@@ -98,6 +99,8 @@ public final class MoeFfn extends InfModule {
     static KernelBuffer<int32> metaDev;
     static int32[] metaH;
     static int64 fbZeroSyncRoutes;   // batches routed fully on the device
+    static boolean fusedRouterOn = true;   // unit 50 A/B arm
+    public static void setFusedRouter(boolean on) { MoeFfn.fusedRouterOn = on; }
     public static int64 batchZeroSyncRoutes() { return MoeFfn.fbZeroSyncRoutes; }
     static KernelBuffer<int8> xpBxDev;        // packed batch activations
     static KernelBuffer<int8> xpBgDev;        // packed GLU'd middle
@@ -747,11 +750,25 @@ public final class MoeFfn extends InfModule {
         this.ensureRouterDev();
         int64 tr0 = Clock.nanoTime();
         MoeFfn.mtPreNs = MoeFfn.mtPreNs + (tr0 - tpre0);
-        QuantKernel.routerF32MatVecLaunchNoSync(this.logitsDev,
-            this.routerWDev, xDev, (int64) this.expertsN, hid);
-        QuantKernel.moeTopKLaunchNoSync(this.selDev, this.wSelDev,
-            this.logitsDev, this.probsDev, (int64) this.expertsN,
-            (int64) this.usedN, this.normTopk, this.wScale);
+        // Unit 50: router + top-k in one launch (the last block to
+        // finish selects).
+        if (this.rtCounter == null) {
+            this.rtCounter #= heap KernelBuffer<int32>((uint64) 4);
+            int32[] z = heap int32[4];
+            this.rtCounter.upload(z, 4L);
+        }
+        if (MoeFfn.fusedRouterOn) {
+            QuantKernel.routerTopKLaunchNoSync(this.selDev, this.wSelDev,
+                this.logitsDev, this.routerWDev, xDev, this.rtCounter,
+                (int64) this.expertsN, hid, (int64) this.usedN,
+                this.normTopk, this.wScale);
+        } else {
+            QuantKernel.routerF32MatVecLaunchNoSync(this.logitsDev,
+                this.routerWDev, xDev, (int64) this.expertsN, hid);
+            QuantKernel.moeTopKLaunchNoSync(this.selDev, this.wSelDev,
+                this.logitsDev, this.probsDev, (int64) this.expertsN,
+                (int64) this.usedN, this.normTopk, this.wScale);
+        }
         MoeFfn.phaseSync();
         MoeFfn.mtRouteNs = MoeFfn.mtRouteNs + (Clock.nanoTime() - tr0);
         int64 tg0 = Clock.nanoTime();

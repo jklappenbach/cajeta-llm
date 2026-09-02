@@ -5,6 +5,9 @@ import cajeta.lang.System;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
 import dev.cajeta.llm.io.Checkpoint;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.model.AttnKernel;
 import dev.cajeta.llm.model.CausalLM;
 import dev.cajeta.llm.model.Linear;
@@ -52,6 +55,73 @@ public class Gqa8FlashDecodeTest {
 
     /** Resident x8 decode ENGAGES the flash kernel (counter advances)
      *  and matches the forced-host arm token-for-token. */
+    /** 50.1.2 — reduce + pack in one launch vs the two-launch pair
+     *  followed by the pack: the packed payload BYTE-identical (the
+     *  reduce is the reduce kernel's math, not FastMath, and the pack
+     *  the pack kernel's), at a 32-split context. */
+    @Test
+    public void reducePackMatchesReduceThenPack() {
+        if (!ResidentMoeDecodeTest.residentHere()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 nKv = 4;
+        int32 nH = 32;
+        int32 hd = 128;
+        int32 count = 540;
+        int32 cap = 600;
+        int64 kvd = (int64) (nKv * hd);
+        int64 qd = (int64) (nH * hd);
+        float32[] hq = heap float32[qd];
+        float32[] hk = heap float32[(int64) cap * kvd];
+        float32[] hv = heap float32[(int64) cap * kvd];
+        int64 i = 0;
+        while (i < qd) {
+            hq[i] = (float32) (((i * 7L) % 41L) - 20L) / 64.0f;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < (int64) cap * kvd) {
+            hk[i] = (float32) (((i * 13L + 5L) % 37L) - 18L) / 32.0f;
+            hv[i] = (float32) (((i * 11L + 3L) % 29L) - 14L) / 16.0f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> q #= heap KernelBuffer<float32>((uint64) qd);
+        KernelBuffer<float32> k #= heap KernelBuffer<float32>((uint64) ((int64) cap * kvd));
+        KernelBuffer<float32> v #= heap KernelBuffer<float32>((uint64) ((int64) cap * kvd));
+        q.upload(hq, qd);
+        k.upload(hk, (int64) cap * kvd);
+        v.upload(hv, (int64) cap * kvd);
+        KernelBuffer<float32> o1 #= heap KernelBuffer<float32>((uint64) qd);
+        int64 pb = (qd / 256L) * 320L;
+        KernelBuffer<int8> p1 #= heap KernelBuffer<int8>((uint64) pb);
+        KernelBuffer<int8> p2 #= heap KernelBuffer<int8>((uint64) pb);
+        AttnKernel.attendDecodePairLaunchNoSync(o1, q, k, v, nH, nKv, hd,
+            count, 0, cap, 0.0883883f);
+        QuantKernel.q8kPackLaunchNoSync(p1, o1, qd);
+        Assert.isTrue(AttnKernel.attendDecodePartialsLaunchNoSync(q, k, v,
+            nH, nKv, hd, count, 0, 0.0883883f));
+        AttnKernel.reducePackLaunchNoSync(p2, nH);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int8[] a = heap int8[pb];
+        int8[] b = heap int8[pb];
+        p1.download(a, pb);
+        p2.download(b, pb);
+        boolean nz = false;
+        i = 0;
+        while (i < pb) {
+            if (i % 320L >= 292L) { i = i + 1; continue; }
+            if (a[i] != b[i]) {
+                Assert.fail("packed byte differs at " + i + ": " + (int32) a[i]
+                    + " vs " + (int32) b[i]);
+            }
+            if (a[i] != (int8) 0) { nz = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(nz);
+    }
+
     @Test
     public void gqa8FlashDecodeEngagesAndMatchesHost() {
         if (!ResidentMoeDecodeTest.residentHere()) {
