@@ -339,6 +339,146 @@ public final class Prim {
         Prim.nNorm = 0L; Prim.nAdd = 0L; Prim.nGlu = 0L;
     }
 
+    /**
+     * Unit 48: RMSNorm and the Q8_K pack in ONE workgroup — the normed
+     * row lands in `out` (f32, for the router and the residual users)
+     * AND in `packed` (the mat-vec activation format), where the layer
+     * had a norm launch then a pack launch, twice. One block of 256
+     * threads owns the row: the sum of squares strides exactly as
+     * rmsnormRowF32 does (thread t: t, t+256, ...) so the tree and its
+     * scale are bit-identical; then thread t quantizes elements
+     * 8t..8t+7 — the pack kernel's lane mapping, block t/32, lane
+     * t%32 — with the per-block max, sums and scale bytes computed
+     * as q8kPackKernel computes them. Rows up to 8 blocks (2048
+     * elements); the caller falls back to the two launches beyond.
+     */
+    @Kernel
+    public static void rmsnormPackRowF32(KernelBuffer<float32> out,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            KernelBuffer<float32> w, uint32 dim, float32 eps,
+            int32 form) {
+        Shared<float32> part = shared float32[256];
+        Shared<float32> amx = shared float32[256];
+        Shared<int32> psum = shared int32[256];
+        uint32 lane = KernelThread.x();
+        float32 ss = 0.0f;
+        uint32 i = lane;
+        while (i < dim) {
+            float32 v = x[i];
+            ss = ss + v * v;
+            i = i + 256;
+        }
+        part[lane] = ss;
+        Barrier.workgroup();
+        uint32 s = 128;
+        while (s > 0) {
+            if (lane < s) { part[lane] = part[lane] + part[lane + s]; }
+            Barrier.workgroup();
+            s = s / 2;
+        }
+        float32 scale = 1.0f / Math.sqrt(part[0] / (float32) dim + eps);
+        // The normed row, f32.
+        uint32 j = lane;
+        while (j < dim) {
+            float32 wi = w[j];
+            if (form == 1) { wi = 1.0f + wi; }
+            out[j] = x[j] * scale * wi;
+            j = j + 256;
+        }
+        Barrier.workgroup();
+        // The pack: block blk = lane/32 of the row, 8 elements a thread.
+        uint32 blocks = dim / 256;
+        uint32 blk = lane / 32;
+        uint32 bl = lane % 32;
+        int64 e0 = (int64) (blk * 256 + bl * 8);
+        int64 ob = (int64) blk * 320L;
+        float32 amax = 0.0f;
+        if (blk < blocks) {
+            int32 t = 0;
+            while (t < 8) {
+                float32 v = out[e0 + (int64) t];
+                float32 av = v;
+                if (v < 0.0f) { av = 0.0f - v; }
+                if (av > amax) { amax = av; }
+                t = t + 1;
+            }
+        }
+        amx[lane] = amax;
+        Barrier.workgroup();
+        uint32 st = 16;
+        while (st > 0) {
+            if (bl < st) {
+                float32 o = amx[lane + st];
+                if (o > amx[lane]) { amx[lane] = o; }
+            }
+            Barrier.workgroup();
+            st = st / 2;
+        }
+        float32 bmax = amx[blk * 32];
+        float32 inv = 0.0f;
+        if (bmax > 0.0f) { inv = 127.0f / bmax; }
+        int32 sm = 0;
+        if (blk < blocks) {
+            int32 k = 0;
+            while (k < 8) {
+                float32 fv = out[e0 + (int64) k] * inv;
+                int32 qi = (int32) Math.round(fv);
+                packed[ob + (int64) (bl * 8) + (int64) k] = (int8) qi;
+                sm = sm + qi;
+                k = k + 1;
+            }
+        }
+        psum[lane] = sm;
+        Barrier.workgroup();
+        if (blk < blocks && bl < 8) {
+            uint32 base = blk * 32 + bl * 4;
+            int32 tot = psum[base] + psum[base + 1]
+                      + psum[base + 2] + psum[base + 3];
+            int64 so = ob + 256L + (int64) (bl * 4);
+            int32 b0 = tot & 255;
+            int32 b1 = (tot >> 8) & 255;
+            int32 b2 = (tot >> 16) & 255;
+            int32 b3 = (tot >> 24) & 255;
+            if (b0 > 127) { b0 = b0 - 256; }
+            if (b1 > 127) { b1 = b1 - 256; }
+            if (b2 > 127) { b2 = b2 - 256; }
+            if (b3 > 127) { b3 = b3 - 256; }
+            packed[so] = (int8) b0;
+            packed[so + 1L] = (int8) b1;
+            packed[so + 2L] = (int8) b2;
+            packed[so + 3L] = (int8) b3;
+        }
+        if (blk < blocks && bl == 0) {
+            float32 dsc = bmax / 127.0f;
+            int32 db = Cajeta.f32ToBits(dsc);
+            int32 e1 = db & 255;
+            int32 e2 = (db >> 8) & 255;
+            int32 e3 = (db >> 16) & 255;
+            int32 e4 = (db >> 24) & 255;
+            if (e1 > 127) { e1 = e1 - 256; }
+            if (e2 > 127) { e2 = e2 - 256; }
+            if (e3 > 127) { e3 = e3 - 256; }
+            if (e4 > 127) { e4 = e4 - 256; }
+            packed[ob + 288L] = (int8) e1;
+            packed[ob + 289L] = (int8) e2;
+            packed[ob + 290L] = (int8) e3;
+            packed[ob + 291L] = (int8) e4;
+        }
+    }
+
+    /** The fused norm + pack; false when the row is wider than the
+     *  one-workgroup kernel serves (the caller takes two launches). */
+    public static boolean rmsnormPackDevice(KernelBuffer<float32> out,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            KernelBuffer<float32> w, int64 dim, float32 eps, int32 form) {
+        if (dim % 256L != 0L || dim > 2048L) { return false; }
+        KernelStream s = QuantKernel.stream();
+        rmsnormPackRowF32.launch(s, grid: [1], block: [256])
+            (out, packed, x, w, (uint32) dim, eps, form);
+        Prim.nNorm = Prim.nNorm + 1L;
+        return true;
+    }
+
     public static void rmsnormDevice(KernelBuffer<float32> out,
             KernelBuffer<float32> x, KernelBuffer<float32> w,
             int64 dim, float32 eps, int32 form) {

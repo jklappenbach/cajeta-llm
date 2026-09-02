@@ -1,0 +1,111 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.Prim;
+
+/**
+ * cajeta-llm plan 48.1 — the fused RMSNorm + Q8_K pack against the
+ * norm launch followed by the pack launch: the f32 row and every
+ * packed byte identical, at the 30B's width and the toy's, both norm
+ * forms, and with an all-zero block (the guarded reciprocal).
+ */
+public class NormPackTest {
+
+    public NormPackTest() { return; }
+
+    static boolean skip() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) {
+            RoutableFixtureTest.saySkip();
+            return true;
+        }
+        return false;
+    }
+
+    static void run(int64 dim, int32 form, boolean zeroBlock) {
+        float32[] hx = heap float32[dim];
+        float32[] hw = heap float32[dim];
+        int64 i = 0;
+        while (i < dim) {
+            hx[i] = (float32) (((i * 53L + 7L) % 211L) - 105L) / 9.0f;
+            hw[i] = 1.0f + (float32) (i % 13) * 0.01f;
+            if (zeroBlock && i >= 256L && i < 512L) { hx[i] = 0.0f; }
+            i = i + 1;
+        }
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) dim);
+        KernelBuffer<float32> w #= heap KernelBuffer<float32>((uint64) dim);
+        x.upload(hx, dim);
+        w.upload(hw, dim);
+        int64 pb = (dim / 256L) * 320L;
+        KernelBuffer<float32> o1 #= heap KernelBuffer<float32>((uint64) dim);
+        KernelBuffer<float32> o2 #= heap KernelBuffer<float32>((uint64) dim);
+        KernelBuffer<int8> p1 #= heap KernelBuffer<int8>((uint64) pb);
+        KernelBuffer<int8> p2 #= heap KernelBuffer<int8>((uint64) pb);
+        float32 eps = 0.00001f;
+        Prim.rmsnormDevice(o1, x, w, dim, eps, form);
+        QuantKernel.q8kPackLaunchNoSync(p1, o1, dim);
+        Assert.isTrue(Prim.rmsnormPackDevice(o2, p2, x, w, dim, eps, form));
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a = heap float32[dim];
+        float32[] b = heap float32[dim];
+        o1.download(a, dim);
+        o2.download(b, dim);
+        i = 0;
+        while (i < dim) {
+            if (a[i] != b[i]) {
+                Assert.fail("normed row differs at " + i + ": " + a[i]
+                    + " vs " + b[i]);
+            }
+            i = i + 1;
+        }
+        int8[] qa = heap int8[pb];
+        int8[] qb = heap int8[pb];
+        p1.download(qa, pb);
+        p2.download(qb, pb);
+        i = 0;
+        boolean nz = false;
+        while (i < pb) {
+            // Bytes 292..319 of a block are padding neither kernel
+            // writes; only the 292-byte payload is the contract.
+            if (i % 320L >= 292L) { i = i + 1; continue; }
+            if (qa[i] != qb[i]) {
+                Assert.fail("packed byte differs at " + i + ": "
+                    + (int32) qa[i] + " vs " + (int32) qb[i]);
+            }
+            if (qa[i] != (int8) 0) { nz = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(nz);
+    }
+
+    /** 48.1.3 — the 30B's width, plain form. */
+    @Test
+    public void fusedNormPackMatchesTwoLaunchesAt2048() {
+        if (NormPackTest.skip()) { return; }
+        NormPackTest.run(2048L, 0, false);
+    }
+
+    /** 48.1.3 — the toy's width, the 1+w form, with a zero block. */
+    @Test
+    public void fusedNormPackMatchesTwoLaunchesAt512WithZeroBlock() {
+        if (NormPackTest.skip()) { return; }
+        NormPackTest.run(512L, 1, true);
+    }
+
+    /** 48.1.3 — beyond the fused kernel's width it declines, launching
+     *  nothing. */
+    @Test
+    public void fusedNormPackDeclinesWideRows() {
+        if (NormPackTest.skip()) { return; }
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) 4096);
+        KernelBuffer<int8> p #= heap KernelBuffer<int8>((uint64) (16 * 320));
+        Assert.isTrue(!Prim.rmsnormPackDevice(x, p, x, x, 4096L, 0.00001f, 0));
+    }
+}

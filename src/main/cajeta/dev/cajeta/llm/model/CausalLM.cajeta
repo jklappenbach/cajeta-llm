@@ -1882,10 +1882,16 @@ public final class CausalLM extends InfModule {
             int32 nH, int32 nKv, int32 hd, int32 p) {
         // Attention sublayer.
         int64 tra0 = Clock.nanoTime();
-        Prim.rmsnormDevice(this.xnDev, this.hsDev,
-            d.inputLayernorm.deviceWeight(), (int64) h,
-            d.inputLayernorm.eps, d.normForm);
-        Linear.stageDeviceActivation(this.xnDev, (int64) h);
+        boolean oAdded = false;
+        // Unit 48: norm + pack in one launch where the width allows.
+        if (!Linear.stageDeviceActivationNormed(this.xnDev, this.hsDev,
+                d.inputLayernorm.deviceWeight(), (int64) h,
+                d.inputLayernorm.eps, d.normForm)) {
+            Prim.rmsnormDevice(this.xnDev, this.hsDev,
+                d.inputLayernorm.deviceWeight(), (int64) h,
+                d.inputLayernorm.eps, d.normForm);
+            Linear.stageDeviceActivation(this.xnDev, (int64) h);
+        }
         CausalLM.aSync();
         int64 ta1 = Clock.nanoTime();
         CausalLM.raNormNs = CausalLM.raNormNs + (ta1 - tra0);
@@ -1936,7 +1942,12 @@ public final class CausalLM extends InfModule {
             int64 ta4 = Clock.nanoTime();
             CausalLM.raAttnNs = CausalLM.raAttnNs + (ta4 - ta3);
             Linear.stageDeviceActivation(dkv.out(), (int64) qd);
-            a.oProj.matvecStagedKeep();
+            // Unit 48: the residual add rides the o-projection's store.
+            if (a.oProj.matvecStagedAccum(this.hsDev)) {
+                oAdded = true;
+            } else {
+                a.oProj.matvecStagedKeep();
+            }
             CausalLM.raOutNs = CausalLM.raOutNs
                 + (Clock.nanoTime() - ta4);
         } else {
@@ -1971,7 +1982,9 @@ public final class CausalLM extends InfModule {
                 ao, 0L, nH, nKv, hd);
             a.oProj.matvecKeepOnDevice(ao, 0L);
         }
-        Prim.addDevice(this.hsDev, a.oProj.out(), (int64) h);
+        if (!oAdded) {
+            Prim.addDevice(this.hsDev, a.oProj.out(), (int64) h);
+        }
         this.sniffRow("attn", li, h);
         if (CausalLM.phaseSyncOn) {
             KernelStream ps = QuantKernel.stream();
@@ -1981,9 +1994,22 @@ public final class CausalLM extends InfModule {
         CausalLM.rlAttnNs = CausalLM.rlAttnNs + (trm0 - tra0);
 
         // MLP sublayer.
-        Prim.rmsnormDevice(this.xnDev, this.hsDev,
-            d.postAttentionLayernorm.deviceWeight(), (int64) h,
-            d.postAttentionLayernorm.eps, d.normForm);
+        // Unit 48: for the zero-sync MoE route the norm packs its
+        // output straight into the route's activation stage.
+        boolean normPacked = false;
+        if (d.moe != null) {
+            KernelBuffer<int8> zx = d.moe.zeroSyncPackedXn((int64) h);
+            if (zx != null) {
+                normPacked = Prim.rmsnormPackDevice(this.xnDev, zx,
+                    this.hsDev, d.postAttentionLayernorm.deviceWeight(),
+                    (int64) h, d.postAttentionLayernorm.eps, d.normForm);
+            }
+        }
+        if (!normPacked) {
+            Prim.rmsnormDevice(this.xnDev, this.hsDev,
+                d.postAttentionLayernorm.deviceWeight(), (int64) h,
+                d.postAttentionLayernorm.eps, d.normForm);
+        }
         if (d.moe != null) {
             // MoE FFN via the HOST CROSSING (unit 38; unit 39 keeps
             // the chain on the device): the normed activation comes
@@ -1998,7 +2024,7 @@ public final class CausalLM extends InfModule {
             // 41e: the zero-sync combine accumulates straight onto
             // the residual stream — hsDev is the accumulator.
             if (d.moe.forwardRowZeroSync(this.xnDev, this.hsDev,
-                    d.activation)) {
+                    d.activation, normPacked)) {
                 if (CausalLM.phaseSyncOn) {
                     KernelStream ps2 = QuantKernel.stream();
                     ps2.sync();
