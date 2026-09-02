@@ -7164,8 +7164,13 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             KernelBuffer<int32> sel, KernelBuffer<float32> wSel,
             uint32 rowsPerExpert, int64 blocksPerRow, int64 xRowBlocks,
-            uint32 used) {
-        uint32 lane = KernelThread.x();
+            uint32 used, KernelBuffer<float32> nOut, KernelBuffer<int8> pk,
+            KernelBuffer<float32> nw, uint32 dim, float32 eps, int32 form,
+            KernelBuffer<int32> counter, uint32 normTail) {
+        Shared<float32> part = shared float32[8];
+        Shared<int32> psum = shared int32[256];
+        Shared<int32> tk = shared int32[1];
+        uint32 lane = KernelThread.x() % 32;
         uint32 row = KernelThread.globalIdX() / 32;
         int64 rowBytes = blocksPerRow * 144L;
         float32 acc = 0.0f;
@@ -7263,6 +7268,129 @@ public final class QuantKernel {
         if (lane == 0 && row < rowsPerExpert) {
             hs[(int64) row] = hs[(int64) row] + tot;
         }
+        // ── Unit 59b: the NEXT layer's input norm + pack in this
+        // launch's tail. Every wave has added its row; the last block
+        // to arrive (ticket) norms the whole residual row and packs it
+        // for the next layer's q|k|v, so the norm launch and its CP
+        // gap are gone. The block is 256 threads (eight row waves) so
+        // the tail is rmsnormPackRowF32's body verbatim.
+        if (normTail == 0) { return; }
+        uint32 tid = KernelThread.x();
+        if (lane == 0) { Barrier.deviceMemory(MemoryOrder.Release); }
+        Barrier.workgroup();
+        if (tid == 0) {
+            int32 old = counter.atomicAdd(0L, 1, MemoryOrder.AcqRel);
+            tk[0] = old;
+        }
+        Barrier.workgroup();
+        uint32 nblk = (rowsPerExpert + 7) / 8;
+        if ((uint32) tk[0] != nblk - 1) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        if (tid == 0) { counter[0L] = 0; }
+        uint32 wid = tid / 32;
+        uint32 wl = tid % 32;
+        float32 ss = 0.0f;
+        uint32 i = tid;
+        while (i < dim) {
+            float32 v = hs[(int64) i];
+            ss = ss + v * v;
+            i = i + 256;
+        }
+        float32 wsum = Wave.reduceSumF32(ss);
+        if (wl == 0) { part[wid] = wsum; }
+        Barrier.workgroup();
+        float32 tsq = part[0] + part[1] + part[2] + part[3]
+            + part[4] + part[5] + part[6] + part[7];
+        float32 scale = 1.0f / Math.sqrt(tsq / (float32) dim + eps);
+        uint32 blocks = dim / 256;
+        float32 v0 = 0.0f; float32 v1 = 0.0f; float32 v2 = 0.0f; float32 v3 = 0.0f;
+        float32 v4 = 0.0f; float32 v5 = 0.0f; float32 v6 = 0.0f; float32 v7 = 0.0f;
+        uint32 e0 = wid * 256 + wl * 8;
+        if (wid < blocks) {
+            float32 w0 = nw[e0]; float32 w1 = nw[e0 + 1]; float32 w2 = nw[e0 + 2];
+            float32 w3 = nw[e0 + 3]; float32 w4 = nw[e0 + 4]; float32 w5 = nw[e0 + 5];
+            float32 w6 = nw[e0 + 6]; float32 w7 = nw[e0 + 7];
+            if (form == 1) {
+                w0 = 1.0f + w0; w1 = 1.0f + w1; w2 = 1.0f + w2; w3 = 1.0f + w3;
+                w4 = 1.0f + w4; w5 = 1.0f + w5; w6 = 1.0f + w6; w7 = 1.0f + w7;
+            }
+            v0 = hs[(int64) e0] * scale * w0;
+            v1 = hs[(int64) (e0 + 1)] * scale * w1;
+            v2 = hs[(int64) (e0 + 2)] * scale * w2;
+            v3 = hs[(int64) (e0 + 3)] * scale * w3;
+            v4 = hs[(int64) (e0 + 4)] * scale * w4;
+            v5 = hs[(int64) (e0 + 5)] * scale * w5;
+            v6 = hs[(int64) (e0 + 6)] * scale * w6;
+            v7 = hs[(int64) (e0 + 7)] * scale * w7;
+            nOut[e0] = v0; nOut[e0 + 1] = v1; nOut[e0 + 2] = v2; nOut[e0 + 3] = v3;
+            nOut[e0 + 4] = v4; nOut[e0 + 5] = v5; nOut[e0 + 6] = v6; nOut[e0 + 7] = v7;
+        }
+        float32 amax = 0.0f;
+        float32 av = v0; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v1; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v2; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v3; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v4; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v5; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v6; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v7; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        float32 bmax = Wave.reduceMaxF32(amax);
+        float32 inv = 0.0f;
+        if (bmax > 0.0f) { inv = 127.0f / bmax; }
+        int64 ob = (int64) wid * 320L;
+        int32 sm = 0;
+        if (wid < blocks) {
+            int32 q0 = (int32) Math.round(v0 * inv);
+            int32 q1 = (int32) Math.round(v1 * inv);
+            int32 q2 = (int32) Math.round(v2 * inv);
+            int32 q3 = (int32) Math.round(v3 * inv);
+            int32 q4 = (int32) Math.round(v4 * inv);
+            int32 q5 = (int32) Math.round(v5 * inv);
+            int32 q6 = (int32) Math.round(v6 * inv);
+            int32 q7 = (int32) Math.round(v7 * inv);
+            int64 qo = ob + (int64) (wl * 8);
+            pk[qo] = (int8) q0; pk[qo + 1L] = (int8) q1;
+            pk[qo + 2L] = (int8) q2; pk[qo + 3L] = (int8) q3;
+            pk[qo + 4L] = (int8) q4; pk[qo + 5L] = (int8) q5;
+            pk[qo + 6L] = (int8) q6; pk[qo + 7L] = (int8) q7;
+            sm = q0 + q1 + q2 + q3 + q4 + q5 + q6 + q7;
+        }
+        psum[tid] = sm;
+        Barrier.workgroup();
+        if (wid < blocks && wl < 8) {
+            uint32 base = wid * 32 + wl * 4;
+            int32 tsum = psum[base] + psum[base + 1]
+                       + psum[base + 2] + psum[base + 3];
+            int64 so = ob + 256L + (int64) (wl * 4);
+            int32 b0 = tsum & 255;
+            int32 b1 = (tsum >> 8) & 255;
+            int32 b2 = (tsum >> 16) & 255;
+            int32 b3 = (tsum >> 24) & 255;
+            if (b0 > 127) { b0 = b0 - 256; }
+            if (b1 > 127) { b1 = b1 - 256; }
+            if (b2 > 127) { b2 = b2 - 256; }
+            if (b3 > 127) { b3 = b3 - 256; }
+            pk[so] = (int8) b0;
+            pk[so + 1L] = (int8) b1;
+            pk[so + 2L] = (int8) b2;
+            pk[so + 3L] = (int8) b3;
+        }
+        if (wid < blocks && wl == 0) {
+            float32 dsc = bmax / 127.0f;
+            int32 db = Cajeta.f32ToBits(dsc);
+            int32 e1 = db & 255;
+            int32 e2 = (db >> 8) & 255;
+            int32 e3 = (db >> 16) & 255;
+            int32 e4 = (db >> 24) & 255;
+            if (e1 > 127) { e1 = e1 - 256; }
+            if (e2 > 127) { e2 = e2 - 256; }
+            if (e3 > 127) { e3 = e3 - 256; }
+            if (e4 > 127) { e4 = e4 - 256; }
+            pk[ob + 288L] = (int8) e1;
+            pk[ob + 289L] = (int8) e2;
+            pk[ob + 290L] = (int8) e3;
+            pk[ob + 291L] = (int8) e4;
+        }
     }
 
     /**
@@ -7282,8 +7410,13 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             KernelBuffer<int32> sel, KernelBuffer<float32> wSel,
             uint32 rowsPerExpert, int64 blocksPerRow, int64 xRowBlocks,
-            uint32 used) {
-        uint32 lane = KernelThread.x();
+            uint32 used, KernelBuffer<float32> nOut, KernelBuffer<int8> pk,
+            KernelBuffer<float32> nw, uint32 dim, float32 eps, int32 form,
+            KernelBuffer<int32> counter, uint32 normTail) {
+        Shared<float32> part = shared float32[8];
+        Shared<int32> psum = shared int32[256];
+        Shared<int32> tk = shared int32[1];
+        uint32 lane = KernelThread.x() % 32;
         uint32 row = KernelThread.globalIdX() / 32;
         int64 rowBytes = blocksPerRow * 210L;
         float32 acc = 0.0f;
@@ -7370,6 +7503,129 @@ public final class QuantKernel {
         if (lane == 0 && row < rowsPerExpert) {
             hs[(int64) row] = hs[(int64) row] + tot;
         }
+        // ── Unit 59b: the NEXT layer's input norm + pack in this
+        // launch's tail. Every wave has added its row; the last block
+        // to arrive (ticket) norms the whole residual row and packs it
+        // for the next layer's q|k|v, so the norm launch and its CP
+        // gap are gone. The block is 256 threads (eight row waves) so
+        // the tail is rmsnormPackRowF32's body verbatim.
+        if (normTail == 0) { return; }
+        uint32 tid = KernelThread.x();
+        if (lane == 0) { Barrier.deviceMemory(MemoryOrder.Release); }
+        Barrier.workgroup();
+        if (tid == 0) {
+            int32 old = counter.atomicAdd(0L, 1, MemoryOrder.AcqRel);
+            tk[0] = old;
+        }
+        Barrier.workgroup();
+        uint32 nblk = (rowsPerExpert + 7) / 8;
+        if ((uint32) tk[0] != nblk - 1) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        if (tid == 0) { counter[0L] = 0; }
+        uint32 wid = tid / 32;
+        uint32 wl = tid % 32;
+        float32 ss = 0.0f;
+        uint32 i = tid;
+        while (i < dim) {
+            float32 v = hs[(int64) i];
+            ss = ss + v * v;
+            i = i + 256;
+        }
+        float32 wsum = Wave.reduceSumF32(ss);
+        if (wl == 0) { part[wid] = wsum; }
+        Barrier.workgroup();
+        float32 tsq = part[0] + part[1] + part[2] + part[3]
+            + part[4] + part[5] + part[6] + part[7];
+        float32 scale = 1.0f / Math.sqrt(tsq / (float32) dim + eps);
+        uint32 blocks = dim / 256;
+        float32 v0 = 0.0f; float32 v1 = 0.0f; float32 v2 = 0.0f; float32 v3 = 0.0f;
+        float32 v4 = 0.0f; float32 v5 = 0.0f; float32 v6 = 0.0f; float32 v7 = 0.0f;
+        uint32 e0 = wid * 256 + wl * 8;
+        if (wid < blocks) {
+            float32 w0 = nw[e0]; float32 w1 = nw[e0 + 1]; float32 w2 = nw[e0 + 2];
+            float32 w3 = nw[e0 + 3]; float32 w4 = nw[e0 + 4]; float32 w5 = nw[e0 + 5];
+            float32 w6 = nw[e0 + 6]; float32 w7 = nw[e0 + 7];
+            if (form == 1) {
+                w0 = 1.0f + w0; w1 = 1.0f + w1; w2 = 1.0f + w2; w3 = 1.0f + w3;
+                w4 = 1.0f + w4; w5 = 1.0f + w5; w6 = 1.0f + w6; w7 = 1.0f + w7;
+            }
+            v0 = hs[(int64) e0] * scale * w0;
+            v1 = hs[(int64) (e0 + 1)] * scale * w1;
+            v2 = hs[(int64) (e0 + 2)] * scale * w2;
+            v3 = hs[(int64) (e0 + 3)] * scale * w3;
+            v4 = hs[(int64) (e0 + 4)] * scale * w4;
+            v5 = hs[(int64) (e0 + 5)] * scale * w5;
+            v6 = hs[(int64) (e0 + 6)] * scale * w6;
+            v7 = hs[(int64) (e0 + 7)] * scale * w7;
+            nOut[e0] = v0; nOut[e0 + 1] = v1; nOut[e0 + 2] = v2; nOut[e0 + 3] = v3;
+            nOut[e0 + 4] = v4; nOut[e0 + 5] = v5; nOut[e0 + 6] = v6; nOut[e0 + 7] = v7;
+        }
+        float32 amax = 0.0f;
+        float32 av = v0; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v1; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v2; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v3; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v4; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v5; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v6; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v7; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        float32 bmax = Wave.reduceMaxF32(amax);
+        float32 inv = 0.0f;
+        if (bmax > 0.0f) { inv = 127.0f / bmax; }
+        int64 ob = (int64) wid * 320L;
+        int32 sm = 0;
+        if (wid < blocks) {
+            int32 q0 = (int32) Math.round(v0 * inv);
+            int32 q1 = (int32) Math.round(v1 * inv);
+            int32 q2 = (int32) Math.round(v2 * inv);
+            int32 q3 = (int32) Math.round(v3 * inv);
+            int32 q4 = (int32) Math.round(v4 * inv);
+            int32 q5 = (int32) Math.round(v5 * inv);
+            int32 q6 = (int32) Math.round(v6 * inv);
+            int32 q7 = (int32) Math.round(v7 * inv);
+            int64 qo = ob + (int64) (wl * 8);
+            pk[qo] = (int8) q0; pk[qo + 1L] = (int8) q1;
+            pk[qo + 2L] = (int8) q2; pk[qo + 3L] = (int8) q3;
+            pk[qo + 4L] = (int8) q4; pk[qo + 5L] = (int8) q5;
+            pk[qo + 6L] = (int8) q6; pk[qo + 7L] = (int8) q7;
+            sm = q0 + q1 + q2 + q3 + q4 + q5 + q6 + q7;
+        }
+        psum[tid] = sm;
+        Barrier.workgroup();
+        if (wid < blocks && wl < 8) {
+            uint32 base = wid * 32 + wl * 4;
+            int32 tsum = psum[base] + psum[base + 1]
+                       + psum[base + 2] + psum[base + 3];
+            int64 so = ob + 256L + (int64) (wl * 4);
+            int32 b0 = tsum & 255;
+            int32 b1 = (tsum >> 8) & 255;
+            int32 b2 = (tsum >> 16) & 255;
+            int32 b3 = (tsum >> 24) & 255;
+            if (b0 > 127) { b0 = b0 - 256; }
+            if (b1 > 127) { b1 = b1 - 256; }
+            if (b2 > 127) { b2 = b2 - 256; }
+            if (b3 > 127) { b3 = b3 - 256; }
+            pk[so] = (int8) b0;
+            pk[so + 1L] = (int8) b1;
+            pk[so + 2L] = (int8) b2;
+            pk[so + 3L] = (int8) b3;
+        }
+        if (wid < blocks && wl == 0) {
+            float32 dsc = bmax / 127.0f;
+            int32 db = Cajeta.f32ToBits(dsc);
+            int32 e1 = db & 255;
+            int32 e2 = (db >> 8) & 255;
+            int32 e3 = (db >> 16) & 255;
+            int32 e4 = (db >> 24) & 255;
+            if (e1 > 127) { e1 = e1 - 256; }
+            if (e2 > 127) { e2 = e2 - 256; }
+            if (e3 > 127) { e3 = e3 - 256; }
+            if (e4 > 127) { e4 = e4 - 256; }
+            pk[ob + 288L] = (int8) e1;
+            pk[ob + 289L] = (int8) e2;
+            pk[ob + 290L] = (int8) e3;
+            pk[ob + 291L] = (int8) e4;
+        }
     }
 
     /** Unit 51: `hs += sum_k wSel[k] * W_sel[k] x_k` — the down id
@@ -7379,18 +7635,49 @@ public final class QuantKernel {
             KernelBuffer<int8> xp, KernelBuffer<int32> sel,
             KernelBuffer<float32> wSel, int32 used, int64 rowsPerExpert,
             int64 cols, int64 xRowBlocks) {
-        uint32 wgs = (uint32) rowsPerExpert;
+        return QuantKernel.idDownCombineTailLaunchNoSync(ggmlType, hs, slab,
+            xp, sel, wSel, used, rowsPerExpert, cols, xRowBlocks,
+            null, null, null, 0L, 0.0f, 0, null);
+    }
+
+    /** Unit 59b: as {@link #idDownCombineLaunchNoSync}, with the next
+     *  layer's input norm + Q8_K pack of the residual `hs` in the
+     *  launch's tail when `nOut` is given (dim <= 2048, a multiple of
+     *  256; `counter` a zeroed int32[4] the tail resets). Blocks of
+     *  eight row waves either way. */
+    public static boolean idDownCombineTailLaunchNoSync(int32 ggmlType,
+            KernelBuffer<float32> hs, KernelBuffer<int8> slab,
+            KernelBuffer<int8> xp, KernelBuffer<int32> sel,
+            KernelBuffer<float32> wSel, int32 used, int64 rowsPerExpert,
+            int64 cols, int64 xRowBlocks, KernelBuffer<float32> nOut,
+            KernelBuffer<int8> pk, KernelBuffer<float32> nw, int64 dim,
+            float32 eps, int32 form, KernelBuffer<int32> counter) {
+        uint32 wgs = (uint32) ((rowsPerExpert + 7L) / 8L);
+        uint32 tailOn = 0;
+        KernelBuffer<float32> o = nOut;
+        KernelBuffer<int8> p = pk;
+        KernelBuffer<float32> w = nw;
+        KernelBuffer<int32> c = counter;
+        if (nOut != null) {
+            tailOn = 1;
+        } else {
+            // The kernel takes every buffer; hand it live ones it will
+            // not touch (normTail = 0 returns before the tail).
+            o = hs; p = xp; w = wSel; c = sel;
+        }
         KernelStream s = QuantKernel.stream();
         if (ggmlType == 12) {
-            q4kQ8IdDownCombineKernel.launch(s, grid: [wgs], block: [32])
+            q4kQ8IdDownCombineKernel.launch(s, grid: [wgs], block: [256])
                 (hs, slab, xp, sel, wSel, (uint32) rowsPerExpert,
-                 cols / 256L, xRowBlocks, (uint32) used);
+                 cols / 256L, xRowBlocks, (uint32) used,
+                 o, p, w, (uint32) dim, eps, form, c, tailOn);
             return true;
         }
         if (ggmlType == 14) {
-            q6kQ8IdDownCombineKernel.launch(s, grid: [wgs], block: [32])
+            q6kQ8IdDownCombineKernel.launch(s, grid: [wgs], block: [256])
                 (hs, slab, xp, sel, wSel, (uint32) rowsPerExpert,
-                 cols / 256L, xRowBlocks, (uint32) used);
+                 cols / 256L, xRowBlocks, (uint32) used,
+                 o, p, w, (uint32) dim, eps, form, c, tailOn);
             return true;
         }
         return false;

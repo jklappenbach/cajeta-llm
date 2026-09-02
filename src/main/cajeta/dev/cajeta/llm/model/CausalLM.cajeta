@@ -731,6 +731,9 @@ public final class CausalLM extends InfModule {
     KernelBuffer<int32> pfPosDev;
     int32[] pfPosHost;
     int32 pfPosCap;
+    /** Unit 59b: the next layer's input norm + pack already ran in
+     *  the previous layer's down-combine tail. */
+    boolean preNormedNext;
     float32[] pfKScr;
     float32[] pfVScr;
     int64 pfKvCap;
@@ -1884,7 +1887,11 @@ public final class CausalLM extends InfModule {
         int64 tra0 = Clock.nanoTime();
         boolean oAdded = false;
         // Unit 48: norm + pack in one launch where the width allows.
-        if (!Linear.stageDeviceActivationNormed(this.xnDev, this.hsDev,
+        // Unit 59b: or already done by the previous layer's down tail.
+        if (this.preNormedNext) {
+            this.preNormedNext = false;
+            Linear.stageDeviceActivationPreNormed(this.xnDev, (int64) h);
+        } else if (!Linear.stageDeviceActivationNormed(this.xnDev, this.hsDev,
                 d.inputLayernorm.deviceWeight(), (int64) h,
                 d.inputLayernorm.eps, d.normForm)) {
             Prim.rmsnormDevice(this.xnDev, this.hsDev,
@@ -2048,8 +2055,17 @@ public final class CausalLM extends InfModule {
             // the stream, so the layer needs NO sync and NO download.
             // 41e: the zero-sync combine accumulates straight onto
             // the residual stream — hsDev is the accumulator.
+            // Unit 59b: arm the down-combine tail with the NEXT layer's
+            // input norm, so its norm + pack launch is gone.
+            if (li + 1 < this.model.numLayers) {
+                DecoderLayer dn = this.model.layerArr[li + 1];
+                d.moe.armDownNormTail(this.xnDev, Linear.stagedPacked((int64) h),
+                    dn.inputLayernorm.deviceWeight(), dn.inputLayernorm.eps,
+                    dn.normForm);
+            }
             if (d.moe.forwardRowZeroSync(this.xnDev, this.hsDev,
                     d.activation, normPacked, routed)) {
+                this.preNormedNext = d.moe.downTailRan();
                 if (CausalLM.phaseSyncOn) {
                     KernelStream ps2 = QuantKernel.stream();
                     ps2.sync();
