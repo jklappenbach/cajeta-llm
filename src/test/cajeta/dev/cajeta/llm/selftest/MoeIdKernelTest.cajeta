@@ -414,6 +414,144 @@ public class MoeIdKernelTest {
         Assert.equals(0L, (int64) cnt[0]);
     }
 
+    /** 59.1.1 — norm + pack + router + top-k in ONE launch vs the
+     *  rmsnormPack launch followed by the wave router: the f32 normed
+     *  row and the packed bytes BYTE-identical (the norm's math is the
+     *  same wave partials in the same order), the logits to 1e-5
+     *  absolute (a block of eight waves sums the dot where the wave
+     *  router's block of four did), the picks identical including the
+     *  tie rule, the counter back at zero. The routing fixture is the
+     *  wave test's, on the normed row. */
+    @Test
+    public void fusedNormRouterTopKMatchesTheTwoLaunches() {
+        if (!Linear.residentEnabled()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 E = 128;
+        int32 H = 2048;
+        int32 K = 8;
+        float32[] wr = heap float32[E * H];
+        float32[] xh = heap float32[H];
+        float32[] nwh = heap float32[H];
+        int32 i = 0;
+        while (i < H) {
+            xh[i] = (float32) ((i % 17) - 8) / 8.0f + 0.37f;
+            nwh[i] = 1.0f + (float32) (i % 5) * 0.05f;
+            i = i + 1;
+        }
+        // The normed row the router sees, host-side, for the fixture.
+        float32 ssq = 0.0f;
+        i = 0;
+        while (i < H) { ssq = ssq + xh[i] * xh[i]; i = i + 1; }
+        float32 rs = 1.0f / Math.sqrt(ssq / (float32) H + 0.000001f);
+        int32 e2 = 0;
+        while (e2 < E) {
+            float32 sc = 0.002f * (float32) e2;
+            int32 en = e2;
+            // Rows 7 and 23 IDENTICAL (noise included): an exact tie,
+            // so the tie rule decides in both arms, not a last bit.
+            if (e2 == 7 || e2 == 23) { sc = 0.5f; en = 7; }
+            i = 0;
+            while (i < H) {
+                float32 nz = (float32) (((en * 31 + i * 7) % 11) - 5) * 0.0001f;
+                wr[e2 * H + i] = xh[i] * rs * nwh[i] * sc + nz;
+                i = i + 1;
+            }
+            e2 = e2 + 1;
+        }
+        KernelBuffer<float32> wDev #= heap KernelBuffer<float32>((uint64) (E * H));
+        KernelBuffer<float32> hs #= heap KernelBuffer<float32>((uint64) H);
+        KernelBuffer<float32> nw #= heap KernelBuffer<float32>((uint64) H);
+        wDev.upload(wr, (int64) (E * H));
+        hs.upload(xh, (int64) H);
+        nw.upload(nwh, (int64) H);
+        int64 pb = (int64) (H / 256) * 320L;
+        KernelBuffer<float32> out1 #= heap KernelBuffer<float32>((uint64) H);
+        KernelBuffer<float32> out2 #= heap KernelBuffer<float32>((uint64) H);
+        KernelBuffer<int8> p1 #= heap KernelBuffer<int8>((uint64) pb);
+        KernelBuffer<int8> p2 #= heap KernelBuffer<int8>((uint64) pb);
+        KernelBuffer<float32> lg1 #= heap KernelBuffer<float32>((uint64) E);
+        KernelBuffer<float32> lg2 #= heap KernelBuffer<float32>((uint64) E);
+        KernelBuffer<int32> s1 #= heap KernelBuffer<int32>((uint64) K);
+        KernelBuffer<int32> s2 #= heap KernelBuffer<int32>((uint64) K);
+        KernelBuffer<float32> w1 #= heap KernelBuffer<float32>((uint64) K);
+        KernelBuffer<float32> w2 #= heap KernelBuffer<float32>((uint64) K);
+        KernelBuffer<int32> counter #= heap KernelBuffer<int32>((uint64) 4);
+        int32[] z = heap int32[4];
+        counter.upload(z, 4L);
+        KernelStream s = QuantKernel.stream();
+        Assert.isTrue(Prim.rmsnormPackDevice(out1, p1, hs, nw, (int64) H,
+            0.000001f, 0));
+        QuantKernel.routerTopKWaveLaunchNoSync(s1, w1, lg1, wDev, out1,
+            counter, (int64) E, (int64) H, (int64) K, true, 0.0f);
+        QuantKernel.rmsnormRouterTopKLaunchNoSync(out2, p2, hs, nw, (int64) H,
+            0.000001f, 0, s2, w2, lg2, wDev, counter, (int64) E, (int64) K,
+            true, 0.0f);
+        s.sync();
+        float32[] o1 = heap float32[H];
+        float32[] o2 = heap float32[H];
+        out1.download(o1, (int64) H);
+        out2.download(o2, (int64) H);
+        boolean live = false;
+        i = 0;
+        while (i < H) {
+            if (o1[i] != o2[i]) {
+                Assert.fail("normed " + i + ": " + o1[i] + " vs fused " + o2[i]);
+            }
+            if (o2[i] != 0.0f) { live = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(live);
+        int8[] b1 = heap int8[pb];
+        int8[] b2 = heap int8[pb];
+        p1.download(b1, pb);
+        p2.download(b2, pb);
+        int64 j = 0;
+        while (j < pb) {
+            if (j % 320L < 292L && b1[j] != b2[j]) {
+                Assert.fail("packed byte " + j + ": " + (int32) b1[j]
+                    + " vs fused " + (int32) b2[j]);
+            }
+            j = j + 1;
+        }
+        float32[] a = heap float32[E];
+        float32[] b = heap float32[E];
+        lg1.download(a, (int64) E);
+        lg2.download(b, (int64) E);
+        i = 0;
+        while (i < E) {
+            float32 d = a[i] - b[i];
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 mag = a[i] < 0.0f ? 0.0f - a[i] : a[i];
+            if (d > mag * 0.00001f + 0.00001f) {
+                Assert.fail("logit " + i + ": wave " + a[i] + " fused " + b[i]);
+            }
+            i = i + 1;
+        }
+        int32[] sa = heap int32[K];
+        int32[] sb = heap int32[K];
+        float32[] wa = heap float32[K];
+        float32[] wb = heap float32[K];
+        s1.download(sa, (int64) K);
+        s2.download(sb, (int64) K);
+        w1.download(wa, (int64) K);
+        w2.download(wb, (int64) K);
+        int32 k = 0;
+        while (k < K) {
+            Assert.equals((int64) sa[k], (int64) sb[k]);
+            float32 d = wa[k] - wb[k];
+            if (d < 0.0f) { d = 0.0f - d; }
+            Assert.isTrue(d <= wa[k] * 0.00001f + 0.000001f);
+            k = k + 1;
+        }
+        Assert.equals(7L, (int64) sb[0]);
+        Assert.equals(23L, (int64) sb[1]);
+        int32[] cnt = heap int32[4];
+        counter.download(cnt, 4L);
+        Assert.equals(0L, (int64) cnt[0]);
+    }
+
     /** 51.1.1 — down + combine in one launch vs down-id then
      *  combineAdd: hs identical to a relative 1e-5 (the weight rides
      *  each partial, so the association differs), on the toy's Q4_K

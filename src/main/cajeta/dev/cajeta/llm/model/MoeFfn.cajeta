@@ -101,8 +101,10 @@ public final class MoeFfn extends InfModule {
     static int64 fbZeroSyncRoutes;   // batches routed fully on the device
     static boolean fusedRouterOn = true;   // unit 50 A/B arm
     static boolean fusedDownOn = true;     // unit 51 A/B arm
+    static boolean fusedNormRouterOn = true;   // unit 59 A/B arm
     public static void setFusedDown(boolean on) { MoeFfn.fusedDownOn = on; }
     public static void setFusedRouter(boolean on) { MoeFfn.fusedRouterOn = on; }
+    public static void setFusedNormRouter(boolean on) { MoeFfn.fusedNormRouterOn = on; }
     public static int64 batchZeroSyncRoutes() { return MoeFfn.fbZeroSyncRoutes; }
     static KernelBuffer<int8> xpBxDev;        // packed batch activations
     static KernelBuffer<int8> xpBgDev;        // packed GLU'd middle
@@ -735,8 +737,47 @@ public final class MoeFfn extends InfModule {
         return this.xpXnDev;
     }
 
+    void ensureRtCounter() {
+        if (this.rtCounter == null) {
+            this.rtCounter #= heap KernelBuffer<int32>((uint64) 4);
+            int32[] z = heap int32[4];
+            this.rtCounter.upload(z, 4L);
+        }
+        return;
+    }
+
+    /**
+     * Unit 59: the post-attention norm, its pack, the router and the
+     * top-k as ONE launch — `xn` receives the normed f32 row, the
+     * route's packed stage its Q8_K form, and sel/w are selected on
+     * the device. The caller then runs {@link #forwardRowZeroSync}
+     * with prePacked AND preRouted. False = shape not served (the
+     * caller norms and routes separately).
+     */
+    boolean normRouteZeroSync(KernelBuffer<float32> xn, KernelBuffer<float32> hs,
+            KernelBuffer<float32> nw, float32 eps, int32 form) {
+        if (!MoeFfn.fusedRouterOn || !MoeFfn.fusedNormRouterOn) { return false; }
+        if (!this.zeroSyncReady()) { return false; }
+        int64 hid = (int64) this.hidden;
+        if (hid % 256L != 0L || hid > 2048L || this.expertsN > 128) { return false; }
+        this.ensureZeroSyncBufs();
+        this.ensureRouterDev();
+        this.ensureRtCounter();
+        QuantKernel.rmsnormRouterTopKLaunchNoSync(xn, this.xpXnDev, hs, nw,
+            hid, eps, form, this.selDev, this.wSelDev, this.logitsDev,
+            this.routerWDev, this.rtCounter, (int64) this.expertsN,
+            (int64) this.usedN, this.normTopk, this.wScale);
+        return true;
+    }
+
     boolean forwardRowZeroSync(KernelBuffer<float32> xDev,
             KernelBuffer<float32> acc, int32 act, boolean prePacked) {
+        return this.forwardRowZeroSync(xDev, acc, act, prePacked, false);
+    }
+
+    boolean forwardRowZeroSync(KernelBuffer<float32> xDev,
+            KernelBuffer<float32> acc, int32 act, boolean prePacked,
+            boolean preRouted) {
         int64 tpre0 = Clock.nanoTime();
         if (!this.zeroSyncReady()) { return false; }
         int64 tpa = Clock.nanoTime();
@@ -754,12 +795,10 @@ public final class MoeFfn extends InfModule {
         MoeFfn.mtPreNs = MoeFfn.mtPreNs + (tr0 - tpre0);
         // Unit 50: router + top-k in one launch (the last block to
         // finish selects).
-        if (this.rtCounter == null) {
-            this.rtCounter #= heap KernelBuffer<int32>((uint64) 4);
-            int32[] z = heap int32[4];
-            this.rtCounter.upload(z, 4L);
-        }
-        if (MoeFfn.fusedRouterOn && this.expertsN <= 128
+        this.ensureRtCounter();
+        if (preRouted) {
+            // Unit 59: sel/w already selected by the fused norm+router.
+        } else if (MoeFfn.fusedRouterOn && this.expertsN <= 128
                 && hid % 128 == 0) {
             // Unit 53: the wave form (registers, no LDS tree).
             QuantKernel.routerTopKWaveLaunchNoSync(this.selDev, this.wSelDev,

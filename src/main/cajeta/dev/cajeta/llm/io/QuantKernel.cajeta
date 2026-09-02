@@ -7600,30 +7600,56 @@ public final class QuantKernel {
             KernelBuffer<float32> wRouter, KernelBuffer<float32> x,
             KernelBuffer<int32> counter, uint32 experts, uint32 cols,
             uint32 used, uint32 normTopk, float32 wScale) {
-        uint32 lane = KernelThread.x();
-        uint32 e = KernelThread.globalIdX() / 32;
+        // Unit 59: a BLOCK of four waves per expert, each lane with
+        // its four 16-byte loads of the row issued together. The
+        // one-wave form looped 16 times over a 2048-wide row with a
+        // vmcnt(0) per trip (ISA): 128 waves x 16 serialized DRAM
+        // round trips = 14.4 us for 1 MB. The tail (top-k) is wave 0
+        // of the last block to arrive.
+        Shared<float32> part = shared float32[4];
+        Shared<int32> tk = shared int32[1];
+        uint32 tid = KernelThread.x();
+        uint32 lane = tid % 32;
+        uint32 wv4 = tid / 32;
+        uint32 e = KernelThread.globalIdX() / 128;
         float32 acc = 0.0f;
         if (e < experts) {
             int64 rb = (int64) e * (int64) cols;
-            uint32 j = lane * 4;
+            uint32 j = tid * 4;
             while (j < cols) {
-                Vector<float32,4> wv = wRouter.vload<4>(rb + (int64) j);
-                Vector<float32,4> xv = x.vload<4>((int64) j);
-                acc = acc + wv[0] * xv[0] + wv[1] * xv[1]
-                    + wv[2] * xv[2] + wv[3] * xv[3];
-                j = j + 128;
+                uint32 j1 = j + 512;
+                uint32 j2 = j + 1024;
+                uint32 j3 = j + 1536;
+                Vector<float32,4> w0 = wRouter.vload<4>(rb + (int64) j);
+                Vector<float32,4> x0 = x.vload<4>((int64) j);
+                Vector<float32,4> w1 = w0;
+                Vector<float32,4> x1 = x0 * 0.0f;
+                Vector<float32,4> w2 = w0;
+                Vector<float32,4> x2 = x1;
+                Vector<float32,4> w3 = w0;
+                Vector<float32,4> x3 = x1;
+                if (j1 < cols) { w1 = wRouter.vload<4>(rb + (int64) j1); x1 = x.vload<4>((int64) j1); }
+                if (j2 < cols) { w2 = wRouter.vload<4>(rb + (int64) j2); x2 = x.vload<4>((int64) j2); }
+                if (j3 < cols) { w3 = wRouter.vload<4>(rb + (int64) j3); x3 = x.vload<4>((int64) j3); }
+                Vector<float32,4> pv = w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3;
+                acc = acc + pv[0] + pv[1] + pv[2] + pv[3];
+                j = j + 2048;
             }
         }
         float32 tot = Wave.reduceSumF32(acc);
-        uint32 ticket = 0;
-        if (lane == 0) {
-            if (e < experts) { logits[(int64) e] = tot; }
+        if (lane == 0) { part[wv4] = tot; }
+        Barrier.workgroup();
+        if (tid == 0) {
+            float32 t4 = part[0] + part[1] + part[2] + part[3];
+            if (e < experts) { logits[(int64) e] = t4; }
             Barrier.deviceMemory(MemoryOrder.Release);
             int32 old = counter.atomicAdd(0L, 1, MemoryOrder.AcqRel);
-            ticket = (uint32) old;
+            tk[0] = old;
         }
-        uint32 last = Wave.reduceMax(ticket);
+        Barrier.workgroup();
+        uint32 last = (uint32) tk[0];
         if (last != experts - 1) { return; }
+        if (wv4 != 0) { return; }
         Barrier.deviceMemory(MemoryOrder.Acquire);
         // Up to 128 experts in four registers per lane: lane holds
         // experts lane, lane+32, lane+64, lane+96.
@@ -7695,6 +7721,254 @@ public final class QuantKernel {
         }
     }
 
+    /**
+     * Unit 59: the post-attention RMSNorm, its Q8_K pack AND the router
+     * + top-k in ONE launch. A block per expert: every block norms the
+     * row redundantly (8 KB from L2 — the sum of squares is a wave
+     * reduction and an 8-way LDS sum, the thread's eight normed values
+     * stay in registers exactly as rmsnormPackRowF32 computes them),
+     * block 0 alone stores the f32 row and the pack, every block dots
+     * its expert's router row against its registers, and the last
+     * block to arrive selects (routerTopKWaveKernel's tail). Two
+     * launches and their gap become one launch whose extra work is a
+     * few microseconds of L2 reads spread over 128 blocks.
+     */
+    @Kernel
+    public static void rmsnormRouterTopKKernel(KernelBuffer<float32> out,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            KernelBuffer<float32> nw, uint32 dim, float32 eps, int32 form,
+            KernelBuffer<int32> sel, KernelBuffer<float32> w,
+            KernelBuffer<float32> logits, KernelBuffer<float32> wRouter,
+            KernelBuffer<int32> counter, uint32 experts, uint32 used,
+            uint32 normTopk, float32 wScale) {
+        Shared<float32> part = shared float32[8];
+        Shared<float32> rpart = shared float32[8];
+        Shared<int32> psum = shared int32[256];
+        Shared<int32> tk = shared int32[1];
+        uint32 tid = KernelThread.x();
+        uint32 lane = tid % 32;
+        uint32 wid = tid / 32;
+        uint32 wl = lane;
+        uint32 e = KernelThread.globalIdX() / 256;
+        // ── the norm, as rmsnormPackRowF32 ──
+        float32 ss = 0.0f;
+        uint32 i = tid;
+        while (i < dim) {
+            float32 v = x[i];
+            ss = ss + v * v;
+            i = i + 256;
+        }
+        float32 ws = Wave.reduceSumF32(ss);
+        if (wl == 0) { part[wid] = ws; }
+        Barrier.workgroup();
+        float32 tot = part[0] + part[1] + part[2] + part[3]
+            + part[4] + part[5] + part[6] + part[7];
+        float32 scale = 1.0f / Math.sqrt(tot / (float32) dim + eps);
+        uint32 blocks = dim / 256;
+        float32 v0 = 0.0f; float32 v1 = 0.0f; float32 v2 = 0.0f; float32 v3 = 0.0f;
+        float32 v4 = 0.0f; float32 v5 = 0.0f; float32 v6 = 0.0f; float32 v7 = 0.0f;
+        uint32 e0 = wid * 256 + wl * 8;
+        if (wid < blocks) {
+            float32 w0 = nw[e0]; float32 w1 = nw[e0 + 1]; float32 w2 = nw[e0 + 2];
+            float32 w3 = nw[e0 + 3]; float32 w4 = nw[e0 + 4]; float32 w5 = nw[e0 + 5];
+            float32 w6 = nw[e0 + 6]; float32 w7 = nw[e0 + 7];
+            if (form == 1) {
+                w0 = 1.0f + w0; w1 = 1.0f + w1; w2 = 1.0f + w2; w3 = 1.0f + w3;
+                w4 = 1.0f + w4; w5 = 1.0f + w5; w6 = 1.0f + w6; w7 = 1.0f + w7;
+            }
+            v0 = x[e0] * scale * w0;
+            v1 = x[e0 + 1] * scale * w1;
+            v2 = x[e0 + 2] * scale * w2;
+            v3 = x[e0 + 3] * scale * w3;
+            v4 = x[e0 + 4] * scale * w4;
+            v5 = x[e0 + 5] * scale * w5;
+            v6 = x[e0 + 6] * scale * w6;
+            v7 = x[e0 + 7] * scale * w7;
+            if (e == 0) {
+                out[e0] = v0; out[e0 + 1] = v1; out[e0 + 2] = v2; out[e0 + 3] = v3;
+                out[e0 + 4] = v4; out[e0 + 5] = v5; out[e0 + 6] = v6; out[e0 + 7] = v7;
+            }
+        }
+        // ── this expert's router dot against the registers ──
+        float32 rd = 0.0f;
+        if (wid < blocks && e < experts) {
+            int64 rb = (int64) e * (int64) dim + (int64) e0;
+            Vector<float32,4> ra = wRouter.vload<4>(rb);
+            Vector<float32,4> rb4 = wRouter.vload<4>(rb + 4L);
+            rd = ra[0] * v0 + ra[1] * v1 + ra[2] * v2 + ra[3] * v3
+               + rb4[0] * v4 + rb4[1] * v5 + rb4[2] * v6 + rb4[3] * v7;
+        }
+        float32 rws = Wave.reduceSumF32(rd);
+        if (wl == 0) { rpart[wid] = rws; }
+        // ── the pack (block 0 stores; every block runs the same code) ──
+        float32 amax = 0.0f;
+        float32 av = v0; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v1; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v2; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v3; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v4; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v5; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v6; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v7; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        float32 bmax = Wave.reduceMaxF32(amax);
+        float32 inv = 0.0f;
+        if (bmax > 0.0f) { inv = 127.0f / bmax; }
+        int64 ob = (int64) wid * 320L;
+        int32 sm = 0;
+        if (wid < blocks) {
+            int32 q0 = (int32) Math.round(v0 * inv);
+            int32 q1 = (int32) Math.round(v1 * inv);
+            int32 q2 = (int32) Math.round(v2 * inv);
+            int32 q3 = (int32) Math.round(v3 * inv);
+            int32 q4 = (int32) Math.round(v4 * inv);
+            int32 q5 = (int32) Math.round(v5 * inv);
+            int32 q6 = (int32) Math.round(v6 * inv);
+            int32 q7 = (int32) Math.round(v7 * inv);
+            if (e == 0) {
+                int64 qo = ob + (int64) (wl * 8);
+                packed[qo] = (int8) q0; packed[qo + 1L] = (int8) q1;
+                packed[qo + 2L] = (int8) q2; packed[qo + 3L] = (int8) q3;
+                packed[qo + 4L] = (int8) q4; packed[qo + 5L] = (int8) q5;
+                packed[qo + 6L] = (int8) q6; packed[qo + 7L] = (int8) q7;
+            }
+            sm = q0 + q1 + q2 + q3 + q4 + q5 + q6 + q7;
+        }
+        psum[tid] = sm;
+        Barrier.workgroup();
+        if (e == 0 && wid < blocks && wl < 8) {
+            uint32 base = wid * 32 + wl * 4;
+            int32 tsum = psum[base] + psum[base + 1]
+                       + psum[base + 2] + psum[base + 3];
+            int64 so = ob + 256L + (int64) (wl * 4);
+            int32 b0 = tsum & 255;
+            int32 b1 = (tsum >> 8) & 255;
+            int32 b2 = (tsum >> 16) & 255;
+            int32 b3 = (tsum >> 24) & 255;
+            if (b0 > 127) { b0 = b0 - 256; }
+            if (b1 > 127) { b1 = b1 - 256; }
+            if (b2 > 127) { b2 = b2 - 256; }
+            if (b3 > 127) { b3 = b3 - 256; }
+            packed[so] = (int8) b0;
+            packed[so + 1L] = (int8) b1;
+            packed[so + 2L] = (int8) b2;
+            packed[so + 3L] = (int8) b3;
+        }
+        if (e == 0 && wid < blocks && wl == 0) {
+            float32 dsc = bmax / 127.0f;
+            int32 db = Cajeta.f32ToBits(dsc);
+            int32 e1 = db & 255;
+            int32 e2 = (db >> 8) & 255;
+            int32 e3 = (db >> 16) & 255;
+            int32 e4 = (db >> 24) & 255;
+            if (e1 > 127) { e1 = e1 - 256; }
+            if (e2 > 127) { e2 = e2 - 256; }
+            if (e3 > 127) { e3 = e3 - 256; }
+            if (e4 > 127) { e4 = e4 - 256; }
+            packed[ob + 288L] = (int8) e1;
+            packed[ob + 289L] = (int8) e2;
+            packed[ob + 290L] = (int8) e3;
+            packed[ob + 291L] = (int8) e4;
+        }
+        // ── the ticket ──
+        if (tid == 0) {
+            float32 t8 = rpart[0] + rpart[1] + rpart[2] + rpart[3]
+                + rpart[4] + rpart[5] + rpart[6] + rpart[7];
+            if (e < experts) { logits[(int64) e] = t8; }
+            Barrier.deviceMemory(MemoryOrder.Release);
+            int32 old = counter.atomicAdd(0L, 1, MemoryOrder.AcqRel);
+            tk[0] = old;
+        }
+        Barrier.workgroup();
+        uint32 last = (uint32) tk[0];
+        if (last != experts - 1) { return; }
+        if (wid != 0) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        // Up to 128 experts in four registers per lane: lane holds
+        // experts lane, lane+32, lane+64, lane+96.
+        float32 neg = 0.0f - 340282346638528859811704183484516925440.0f;
+        float32 l0 = neg; float32 l1 = neg; float32 l2 = neg; float32 l3 = neg;
+        if (lane < experts) { l0 = logits[(int64) lane]; }
+        if (lane + 32 < experts) { l1 = logits[(int64) (lane + 32)]; }
+        if (lane + 64 < experts) { l2 = logits[(int64) (lane + 64)]; }
+        if (lane + 96 < experts) { l3 = logits[(int64) (lane + 96)]; }
+        float32 lm = l0;
+        if (l1 > lm) { lm = l1; }
+        if (l2 > lm) { lm = l2; }
+        if (l3 > lm) { lm = l3; }
+        float32 mx = Wave.reduceMaxF32(lm);
+        float32 p0 = 0.0f; float32 p1 = 0.0f; float32 p2 = 0.0f; float32 p3 = 0.0f;
+        if (lane < experts) { p0 = Math.exp(l0 - mx); }
+        if (lane + 32 < experts) { p1 = Math.exp(l1 - mx); }
+        if (lane + 64 < experts) { p2 = Math.exp(l2 - mx); }
+        if (lane + 96 < experts) { p3 = Math.exp(l3 - mx); }
+        float32 sum = Wave.reduceSumF32(p0 + p1 + p2 + p3);
+        float32 vLast = 340282346638528859811704183484516925440.0f;
+        uint32 iLast = experts;
+        uint32 k = 0;
+        while (k < used) {
+            float32 bv = 0.0f - 1.0f;
+            boolean ok0 = lane < experts && (p0 < vLast || (p0 == vLast && lane > iLast));
+            boolean ok1 = lane + 32 < experts && (p1 < vLast || (p1 == vLast && lane + 32 > iLast));
+            boolean ok2 = lane + 64 < experts && (p2 < vLast || (p2 == vLast && lane + 64 > iLast));
+            boolean ok3 = lane + 96 < experts && (p3 < vLast || (p3 == vLast && lane + 96 > iLast));
+            if (ok0 && p0 > bv) { bv = p0; }
+            if (ok1 && p1 > bv) { bv = p1; }
+            if (ok2 && p2 > bv) { bv = p2; }
+            if (ok3 && p3 > bv) { bv = p3; }
+            float32 vk = Wave.reduceMaxF32(bv);
+            uint32 bi = experts;
+            if (ok3 && p3 == vk) { bi = lane + 96; }
+            if (ok2 && p2 == vk) { bi = lane + 64; }
+            if (ok1 && p1 == vk) { bi = lane + 32; }
+            if (ok0 && p0 == vk) { bi = lane; }
+            uint32 ik = Wave.reduceMin(bi);
+            if (lane == 0) {
+                sel[(int64) k] = (int32) ik;
+                w[(int64) k] = vk / sum;
+            }
+            vLast = vk;
+            iLast = ik;
+            k = k + 1;
+        }
+        if (lane == 0) {
+            if (normTopk != 0) {
+                float32 ws = 0.0f;
+                k = 0;
+                while (k < used) { ws = ws + w[(int64) k]; k = k + 1; }
+                if (ws < 0.00006103515625f) { ws = 0.00006103515625f; }
+                k = 0;
+                while (k < used) {
+                    w[(int64) k] = w[(int64) k] / ws;
+                    k = k + 1;
+                }
+            }
+            if (wScale != 0.0f && wScale != 1.0f) {
+                k = 0;
+                while (k < used) {
+                    w[(int64) k] = w[(int64) k] * wScale;
+                    k = k + 1;
+                }
+            }
+            counter[0L] = 0;
+        }
+    }
+
+    public static void rmsnormRouterTopKLaunchNoSync(KernelBuffer<float32> out,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            KernelBuffer<float32> nw, int64 dim, float32 eps, int32 form,
+            KernelBuffer<int32> sel, KernelBuffer<float32> w,
+            KernelBuffer<float32> logits, KernelBuffer<float32> wRouter,
+            KernelBuffer<int32> counter, int64 experts, int64 used,
+            boolean normTopk, float32 wScale) {
+        KernelStream s = QuantKernel.stream();
+        uint32 nt = 0;
+        if (normTopk) { nt = 1; }
+        rmsnormRouterTopKKernel.launch(s, grid: [(uint32) experts], block: [256])
+            (out, packed, x, nw, (uint32) dim, eps, form, sel, w, logits,
+             wRouter, counter, (uint32) experts, (uint32) used, nt, wScale);
+        return;
+    }
+
     public static void routerTopKWaveLaunchNoSync(KernelBuffer<int32> sel,
             KernelBuffer<float32> w, KernelBuffer<float32> logits,
             KernelBuffer<float32> wRouter, KernelBuffer<float32> x,
@@ -7703,7 +7977,7 @@ public final class QuantKernel {
         KernelStream s = QuantKernel.stream();
         uint32 nt = 0;
         if (normTopk) { nt = 1; }
-        routerTopKWaveKernel.launch(s, grid: [(uint32) experts], block: [32])
+        routerTopKWaveKernel.launch(s, grid: [(uint32) experts], block: [128])
             (sel, w, logits, wRouter, x, counter, (uint32) experts,
              (uint32) cols, (uint32) used, nt, wScale);
         return;
