@@ -1,0 +1,226 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.io.file.File;
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.process.Command;
+import cajeta.process.ProcessResult;
+
+/**
+ * Unit 58's instrument: what did the shader compiler BUILD for a kernel?
+ *
+ * Wall-clock cannot see a register spill or a serialized load chain,
+ * and both are the failure modes that most often make a hand-tuned
+ * kernel slow (compiler skill xpu-kernel-performance.md). The AMD
+ * code objects a cajeta exe launches are embedded in the exe itself,
+ * one ELF per kernel; this carves them out (an ELF whose e_machine is
+ * EM_AMDGPU), writes each to `tmp/hsaco/`, and asks llvm-readelf for
+ * the kernel descriptor — VGPRs, SGPRs, spills, scratch, LDS — and,
+ * with `--isa`, llvm-objdump for the disassembly, of which it counts
+ * the memory and wait instructions.
+ *
+ *   cajeta --emit=exe --release --xpu-backend=amdgpu --classpath=<deps> \
+ *       -o tmp/kernelisa dev.cajeta.llm.bench.KernelIsa.run src/main/cajeta
+ *   PATH=$ROCM_LLVM/bin:$PATH tmp/kernelisa <exe> [kernel-substring] [--isa]
+ *
+ * Read `Spilled/scratch 0` as an acceptance criterion, and a run of
+ * single loads each behind `s_waitcnt vmcnt(0)` as the thing to fix
+ * before anything else (it was worth 205 -> 224 GB/s on the q6k head).
+ */
+public class KernelIsa {
+
+    static final String OUT = "tmp/hsaco";
+    static final String READELF = "llvm-readelf";
+    static final String OBJDUMP = "llvm-objdump";
+
+    static int32 u16(int8[] d, int64 at) {
+        return ((int32) d[at] & 255) | (((int32) d[at + 1L] & 255) << 8);
+    }
+
+    static int64 u64(int8[] d, int64 at) {
+        int64 v = 0L;
+        int32 k = 7;
+        while (k >= 0) {
+            v = (v << 8) | (int64) ((int32) d[at + (int64) k] & 255);
+            k = k - 1;
+        }
+        return v;
+    }
+
+    /** Run argv, capture stdout; empty on a launch failure. */
+    static #String capture(String[] argv) {
+        Command cmd = heap Command(#argv);
+        cmd.captureStdout();
+        ProcessResult r #= cmd.run();
+        if (!r.launched()) {
+            System.stderr.println("kernelisa: could not launch " + argv[0]);
+            return #heap String();
+        }
+        int8[] out = r.stdout();
+        int8[] copy #= heap int8[(int64) out.count()];
+        int64 i = 0;
+        while (i < (int64) out.count()) { copy[i] = out[i]; i = i + 1; }
+        return #heap String(#copy, (int32) out.count());
+    }
+
+    /** The value after `key:` on a line, trimmed; null when absent. */
+    static #String valueOf(String line, String key) {
+        int64 at = line.indexOf(key);
+        if (at < 0L) { return null; }
+        int32 b = (int32) at + (int32) key.count();
+        String v #= line.substring(b, (int32) line.count());
+        return #v.trim();
+    }
+
+    /** One kernel's descriptor lines from the notes, printed. Every
+     *  field is OWNED by this frame (`#=` moves out of the per-line
+     *  owned values): a plain `name = v` would alias a String that
+     *  dies with its iteration, and flush would read freed bytes. */
+    static void describe(String notes, String path, String want, boolean isa) {
+        String name = null;
+        String vgpr = null; String sgpr = null; String vs = null; String ss = null;
+        String scratch = null; String lds = null; String wf = null;
+        int64 pos = 0L;
+        int64 n = notes.count();
+        while (pos <= n) {
+            int64 nl = notes.indexOfFrom("\n", pos);
+            if (nl < 0L) { nl = n; }
+            String line #= notes.substring((int32) pos, (int32) nl);
+            String t #= line.trim();
+            if (t.startsWith("- .args")) {
+                KernelIsa.flush(name, vgpr, sgpr, vs, ss, scratch, lds, wf,
+                    path, want, isa);
+                name = null;
+                vgpr = null; sgpr = null; vs = null; ss = null;
+                scratch = null; lds = null; wf = null;
+            }
+            String v0 #= KernelIsa.valueOf(t, ".name:");
+            if (v0 != null && !v0.endsWith(".kd")) { name #= v0; }
+            String v1 #= KernelIsa.valueOf(t, ".vgpr_count:");
+            if (v1 != null) { vgpr #= v1; }
+            String v2 #= KernelIsa.valueOf(t, ".sgpr_count:");
+            if (v2 != null) { sgpr #= v2; }
+            String v3 #= KernelIsa.valueOf(t, ".vgpr_spill_count:");
+            if (v3 != null) { vs #= v3; }
+            String v4 #= KernelIsa.valueOf(t, ".sgpr_spill_count:");
+            if (v4 != null) { ss #= v4; }
+            String v5 #= KernelIsa.valueOf(t, ".private_segment_fixed_size:");
+            if (v5 != null) { scratch #= v5; }
+            String v6 #= KernelIsa.valueOf(t, ".group_segment_fixed_size:");
+            if (v6 != null) { lds #= v6; }
+            String v7 #= KernelIsa.valueOf(t, ".wavefront_size:");
+            if (v7 != null) { wf #= v7; }
+            pos = nl + 1L;
+        }
+        KernelIsa.flush(name, vgpr, sgpr, vs, ss, scratch, lds, wf, path,
+            want, isa);
+        return;
+    }
+
+    static void flush(String name, String vgpr, String sgpr, String vs,
+            String ss, String scratch, String lds, String wf, String path,
+            String want, boolean isa) {
+        if (name == null) { return; }
+        if (want != null && !name.contains(want)) { return; }
+        System.stdout.println(name + ": vgpr " + KernelIsa.orQ(vgpr)
+            + " sgpr " + KernelIsa.orQ(sgpr)
+            + " vgpr_spill " + KernelIsa.orQ(vs) + " sgpr_spill " + KernelIsa.orQ(ss)
+            + " scratch " + KernelIsa.orQ(scratch) + " lds " + KernelIsa.orQ(lds)
+            + " wave " + KernelIsa.orQ(wf) + "  [" + path + "]");
+        if (isa) { KernelIsa.disassemble(name, path); }
+        return;
+    }
+
+    static String orQ(String v) {
+        if (v == null) { return "?"; }
+        return v;
+    }
+
+    static int32 countOf(String text, String needle) {
+        int32 c = 0;
+        int64 at = text.indexOf(needle);
+        while (at >= 0L) {
+            c = c + 1;
+            at = text.indexOfFrom(needle, at + (int64) needle.count());
+        }
+        return c;
+    }
+
+    static void disassemble(String name, String path) {
+        String[] argv = heap String[4];
+        argv[0] = KernelIsa.OBJDUMP;
+        argv[1] = "-d";
+        argv[2] = "--mcpu=gfx1151";
+        argv[3] = path;
+        String asm #= KernelIsa.capture(argv);
+        String sPath = KernelIsa.OUT + "/" + name + ".s";
+        int8[] ab #= asm.toBytes();
+        File.writeAllBytes(sPath, ab, (int64) ab.count());
+        System.stdout.println("    global_load_b128 " + KernelIsa.countOf(asm, "global_load_b128")
+            + ", global_load_b64 " + KernelIsa.countOf(asm, "global_load_b64")
+            + ", global_load_b32 " + KernelIsa.countOf(asm, "global_load_b32")
+            + ", global_load_u8/i8 " + (KernelIsa.countOf(asm, "global_load_u8")
+                + KernelIsa.countOf(asm, "global_load_i8"))
+            + ", global_load_d16 " + KernelIsa.countOf(asm, "global_load_d16")
+            + ", scratch_ " + KernelIsa.countOf(asm, "scratch_")
+            + ", ds_ " + KernelIsa.countOf(asm, "\tds_")
+            + ", s_waitcnt " + KernelIsa.countOf(asm, "s_waitcnt")
+            + ", vmcnt(0) " + KernelIsa.countOf(asm, "vmcnt(0)")
+            + ", v_dot4 " + KernelIsa.countOf(asm, "v_dot4"));
+        System.stdout.println("    ISA at " + sPath);
+        return;
+    }
+
+    public static void run(String[] args) {
+        if ((int32) args.count() < 1) {
+            System.stderr.println("usage: kernelisa <exe> [kernel-substring] [--isa]");
+            return;
+        }
+        String exe = args[0];
+        String want = null;
+        boolean isa = false;
+        int32 ai = 1;
+        while (ai < (int32) args.count()) {
+            if (args[ai].equals("--isa")) { isa = true; } else { want = args[ai]; }
+            ai = ai + 1;
+        }
+        Path outDir #= Path.of(KernelIsa.OUT);
+        outDir.mkdirs();
+        int8[] data #= File.readAllBytes(exe);
+        int64 n = (int64) data.count();
+        int64 i = 0L;
+        int32 found = 0;
+        while (i + 64L <= n) {
+            if (data[i] == (int8) 127 && data[i + 1L] == (int8) 69
+                    && data[i + 2L] == (int8) 76 && data[i + 3L] == (int8) 70
+                    && data[i + 4L] == (int8) 2 && data[i + 5L] == (int8) 1
+                    && KernelIsa.u16(data, i + 18L) == 224) {
+                int64 shoff = KernelIsa.u64(data, i + 40L);
+                int32 shentsize = KernelIsa.u16(data, i + 58L);
+                int32 shnum = KernelIsa.u16(data, i + 60L);
+                int64 size = shoff + (int64) shentsize * (int64) shnum;
+                if (size <= 0L || i + size > n) { i = i + 4L; continue; }
+                int8[] blob #= heap int8[size];
+                int64 k = 0L;
+                while (k < size) { blob[k] = data[i + k]; k = k + 1L; }
+                String path = KernelIsa.OUT + "/co" + found + ".hsaco";
+                File.writeAllBytes(path, blob, size);
+                String[] argv = heap String[3];
+                argv[0] = KernelIsa.READELF;
+                argv[1] = "--notes";
+                argv[2] = path;
+                String notes #= KernelIsa.capture(argv);
+                KernelIsa.describe(notes, path, want, isa);
+                found = found + 1;
+                i = i + size;
+            } else {
+                i = i + 1L;
+            }
+        }
+        if (found == 0) {
+            System.stdout.println("no AMD code objects in " + exe);
+        }
+        return;
+    }
+}
