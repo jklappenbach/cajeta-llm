@@ -55,10 +55,13 @@ public class Gqa8FlashDecodeTest {
 
     /** Resident x8 decode ENGAGES the flash kernel (counter advances)
      *  and matches the forced-host arm token-for-token. */
-    /** 50.1.2 — reduce + pack in one launch vs the two-launch pair
-     *  followed by the pack: the packed payload BYTE-identical (the
-     *  reduce is the reduce kernel's math, not FastMath, and the pack
-     *  the pack kernel's), at a 32-split context. */
+    /** 50.1.2 / 57.1.3 — reduce + pack in one launch vs the two-launch
+     *  pair followed by the pack, at a 64-split context. The unit-57
+     *  reduce sums the splits as four partials per head where the
+     *  reduce kernel walks them serially, so the bar is the DEQUANTIZED
+     *  value within one quantum (the scale) rather than byte identity;
+     *  the block sums are checked for self-consistency against the
+     *  quants they summarize, and the scales agree to f32 rounding. */
     @Test
     public void reducePackMatchesReduceThenPack() {
         if (!ResidentMoeDecodeTest.residentHere()) {
@@ -87,11 +90,13 @@ public class Gqa8FlashDecodeTest {
             i = i + 1;
         }
         KernelBuffer<float32> q #= heap KernelBuffer<float32>((uint64) qd);
-        KernelBuffer<float32> k #= heap KernelBuffer<float32>((uint64) ((int64) cap * kvd));
-        KernelBuffer<float32> v #= heap KernelBuffer<float32>((uint64) ((int64) cap * kvd));
+        KernelBuffer<float16> k #= heap KernelBuffer<float16>((uint64) ((int64) cap * kvd));
+        KernelBuffer<float16> v #= heap KernelBuffer<float16>((uint64) ((int64) cap * kvd));
         q.upload(hq, qd);
-        k.upload(hk, (int64) cap * kvd);
-        v.upload(hv, (int64) cap * kvd);
+        float16[] hk16 #= AttnKernel.halfOf(hk, (int64) cap * kvd);
+        float16[] hv16 #= AttnKernel.halfOf(hv, (int64) cap * kvd);
+        k.upload(hk16, (int64) cap * kvd);
+        v.upload(hv16, (int64) cap * kvd);
         KernelBuffer<float32> o1 #= heap KernelBuffer<float32>((uint64) qd);
         int64 pb = (qd / 256L) * 320L;
         KernelBuffer<int8> p1 #= heap KernelBuffer<int8>((uint64) pb);
@@ -109,17 +114,59 @@ public class Gqa8FlashDecodeTest {
         p1.download(a, pb);
         p2.download(b, pb);
         boolean nz = false;
-        i = 0;
-        while (i < pb) {
-            if (i % 320L >= 292L) { i = i + 1; continue; }
-            if (a[i] != b[i]) {
-                Assert.fail("packed byte differs at " + i + ": " + (int32) a[i]
-                    + " vs " + (int32) b[i]);
+        int64 blk = 0;
+        while (blk < qd / 256L) {
+            int64 ob = blk * 320L;
+            float32 sa = Gqa8FlashDecodeTest.scaleAt(a, ob + 288L);
+            float32 sb = Gqa8FlashDecodeTest.scaleAt(b, ob + 288L);
+            float32 ds = sa - sb;
+            if (ds < 0.0f) { ds = 0.0f - ds; }
+            if (ds > sa * 0.00001f) {
+                Assert.fail("block " + blk + " scale " + sa + " vs " + sb);
             }
-            if (a[i] != (int8) 0) { nz = true; }
-            i = i + 1;
+            float32 quantum = sa > sb ? sa : sb;
+            int64 j = 0;
+            while (j < 256L) {
+                float32 xa = (float32) a[ob + j] * sa;
+                float32 xb = (float32) b[ob + j] * sb;
+                float32 d = xa - xb;
+                if (d < 0.0f) { d = 0.0f - d; }
+                if (d > quantum * 1.01f + 0.000001f) {
+                    Assert.fail("block " + blk + " value " + j + ": "
+                        + (int32) a[ob + j] + " vs " + (int32) b[ob + j]
+                        + " (scale " + sa + ")");
+                }
+                if (a[ob + j] != (int8) 0) { nz = true; }
+                j = j + 1;
+            }
+            // Block sums: the 8 four-byte sums summarize the 8 sub-blocks
+            // of 32 quants — recompute them from b's own quants.
+            int64 g = 0;
+            while (g < 8L) {
+                int32 want = 0;
+                int64 t = 0;
+                while (t < 32L) {
+                    want = want + (int32) b[ob + g * 32L + t];
+                    t = t + 1;
+                }
+                int64 so = ob + 256L + g * 4L;
+                int32 got = ((int32) b[so] & 255) | (((int32) b[so + 1L] & 255) << 8)
+                    | (((int32) b[so + 2L] & 255) << 16) | (((int32) b[so + 3L] & 255) << 24);
+                if (got != want) {
+                    Assert.fail("block " + blk + " sub-block " + g + " sum "
+                        + got + ", its quants sum to " + want);
+                }
+                g = g + 1;
+            }
+            blk = blk + 1;
         }
         Assert.isTrue(nz);
+    }
+
+    static float32 scaleAt(int8[] p, int64 at) {
+        int32 bits = ((int32) p[at] & 255) | (((int32) p[at + 1L] & 255) << 8)
+            | (((int32) p[at + 2L] & 255) << 16) | (((int32) p[at + 3L] & 255) << 24);
+        return Cajeta.bitsToF32(bits);
     }
 
     @Test

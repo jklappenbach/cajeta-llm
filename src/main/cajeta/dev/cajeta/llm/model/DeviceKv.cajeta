@@ -27,8 +27,12 @@ import dev.cajeta.llm.io.QuantKernel;
  * that whenever a token takes the non-resident path.
  */
 public final class DeviceKv {
-    KernelBuffer<float32>[] kDev;
-    KernelBuffer<float32>[] vDev;
+    /** The planes are HALF (unit 57, spec 15.21.6): llama.cpp's default
+     *  cache type, and half the bytes the decode flash kernel streams
+     *  per layer. Every kernel that reads them widens on load; the host
+     *  paged cache stays f32 and seed/writeback convert. */
+    KernelBuffer<float16>[] kDev;
+    KernelBuffer<float16>[] vDev;
     /** Per-layer RoPE frequencies. Per LAYER, not per model: `theta` and
      *  the scaling are layer state (spec §5 preamble), and sharing one
      *  buffer would be right for Llama and silently wrong elsewhere. */
@@ -38,9 +42,11 @@ public final class DeviceKv {
     /** `[nH x headDim]` attention output, consumed by `o_proj` in place. */
     KernelBuffer<float32> aoDev;
     /** Host staging for seeding and writeback: `[cap x kvDim]`, one plane
-     *  at a time. */
+     *  at a time — f32 for the paged cache's side, half for the plane's. */
     float32[] stageK;
     float32[] stageV;
+    float16[] stageK16;
+    float16[] stageV16;
 
     int32 cap;
     int32 kvDim;
@@ -96,14 +102,14 @@ public final class DeviceKv {
         this.hostLen = 0;
         this.seq = 0 - 1;
         int64 plane = (int64) cap * (int64) this.kvDim;
-        this.kDev #= heap KernelBuffer<float32>[(int64) this.layers];
-        this.vDev #= heap KernelBuffer<float32>[(int64) this.layers];
+        this.kDev #= heap KernelBuffer<float16>[(int64) this.layers];
+        this.vDev #= heap KernelBuffer<float16>[(int64) this.layers];
         this.invDev #= heap KernelBuffer<float32>[(int64) this.layers];
         int32 l = 0;
         while (l < this.layers) {
-            this.kDev[(int64) l] #= heap KernelBuffer<float32>(
+            this.kDev[(int64) l] #= heap KernelBuffer<float16>(
                 (uint64) plane);
-            this.vDev[(int64) l] #= heap KernelBuffer<float32>(
+            this.vDev[(int64) l] #= heap KernelBuffer<float16>(
                 (uint64) plane);
             l = l + 1;
         }
@@ -113,6 +119,8 @@ public final class DeviceKv {
             (uint64) ((int64) this.nH * (int64) this.hd));
         this.stageK #= heap float32[plane];
         this.stageV #= heap float32[plane];
+        this.stageK16 #= heap float16[plane];
+        this.stageV16 #= heap float16[plane];
     }
 
     /** Upload each layer's RoPE frequencies once. */
@@ -150,10 +158,11 @@ public final class DeviceKv {
             int32 n = cache.lengthOf(seq, l);
             if (n > 0) {
                 cache.copyRowsTo(seq, l, 0, n, this.stageK, this.stageV);
-                this.kDev[(int64) l].upload(this.stageK,
-                    (int64) n * (int64) this.kvDim);
-                this.vDev[(int64) l].upload(this.stageV,
-                    (int64) n * (int64) this.kvDim);
+                int64 cnt = (int64) n * (int64) this.kvDim;
+                DeviceKv.narrow(this.stageK, this.stageK16, cnt);
+                DeviceKv.narrow(this.stageV, this.stageV16, cnt);
+                this.kDev[(int64) l].upload(this.stageK16, cnt);
+                this.vDev[(int64) l].upload(this.stageV16, cnt);
             }
             l = l + 1;
         }
@@ -181,8 +190,7 @@ public final class DeviceKv {
         int32 l = 0;
         while (l < this.layers) {
             int64 n = (int64) this.len * (int64) this.kvDim;
-            this.kDev[(int64) l].download(this.stageK, n);
-            this.vDev[(int64) l].download(this.stageV, n);
+            this.readPlanes(l, this.stageK, this.stageV, n);
             int32 t = this.hostLen;
             while (t < this.len) {
                 int64 off = (int64) t * (int64) this.kvDim;
@@ -342,15 +350,34 @@ public final class DeviceKv {
         return this.preOut;
     }
 
-    /** The layer's persistent K plane — a view, for the deferred
-     *  cache-authority download (10.12.30). */
-    public KernelBuffer<float32> kPlane(int32 li) {
+    /** The layer's persistent K plane — a view, half. */
+    public KernelBuffer<float16> kPlane(int32 li) {
         return this.kDev[(int64) li];
     }
 
-    /** The layer's persistent V plane — a view (10.12.30). */
-    public KernelBuffer<float32> vPlane(int32 li) {
+    /** The layer's persistent V plane — a view, half. */
+    public KernelBuffer<float16> vPlane(int32 li) {
         return this.vDev[(int64) li];
+    }
+
+    /** The first `n` values of layer `li`'s planes, widened to f32 —
+     *  the deferred cache-authority download (10.12.30) and writeback
+     *  read through here. The caller has synced the stream. */
+    public void readPlanes(int32 li, float32[] k, float32[] v, int64 n) {
+        this.kDev[(int64) li].download(this.stageK16, n);
+        this.vDev[(int64) li].download(this.stageV16, n);
+        AttnKernel.widenHalf(this.stageK16, k, n);
+        AttnKernel.widenHalf(this.stageV16, v, n);
+        return;
+    }
+
+    static void narrow(float32[] src, float16[] dst, int64 n) {
+        int64 i = 0;
+        while (i < n) {
+            dst[i] = (float16) src[i];
+            i = i + 1;
+        }
+        return;
     }
 
     /**

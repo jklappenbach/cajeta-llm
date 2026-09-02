@@ -188,6 +188,8 @@ public class AttnKernelTest {
         float32[] q #= AttnKernelTest.spread((int64) (nH * hd), 3);
         float32[] k #= AttnKernelTest.spread((int64) count * kvDim, 5);
         float32[] v #= AttnKernelTest.spread((int64) count * kvDim, 9);
+        AttnKernel.roundHalf(k);
+        AttnKernel.roundHalf(v);
 
         float32[] want #= heap float32[(int64) (nH * hd)];
         AttnKernel.attendDecodeHost(want, q, k, v, nH, nKv, hd, count,
@@ -412,8 +414,10 @@ public class AttnKernelTest {
             while (l < layers) {
                 int32 d = 0;
                 while (d < kvDim) {
-                    kh[(int64) d] = (float32) (1000 * l + 10 * p + d);
-                    vh[(int64) d] = 0.0f - (float32) (1000 * l + 10 * p + d);
+                    // f16-exact (unit 57): integers below 2048; 512 l +
+                    // 128 p + d is unique for d < 128, p < 4.
+                    kh[(int64) d] = (float32) (512 * l + 128 * p + d);
+                    vh[(int64) d] = 0.0f - (float32) (512 * l + 128 * p + d);
                     d = d + 1;
                 }
                 kb.upload(kh);
@@ -447,7 +451,7 @@ public class AttnKernelTest {
             while (p2 < posCount) {
                 int32 d2 = 0;
                 while (d2 < kvDim) {
-                    float32 want = (float32) (1000 * l2 + 10 * p2 + d2);
+                    float32 want = (float32) (512 * l2 + 128 * p2 + d2);
                     float32 gotK = cache.kAt(0, l2, p2, d2);
                     float32 gotV = cache.vAt(0, l2, p2, d2);
                     if (gotK != want) {
@@ -515,15 +519,17 @@ public class AttnKernelTest {
         int64 span = (int64) n * (int64) kvDim;
         float32[] backK #= heap float32[span];
         float32[] backV #= heap float32[span];
-        dk.kPlane(0).download(backK, span);
-        dk.vPlane(0).download(backV, span);
+        dk.readPlanes(0, backK, backV, span);
         int32 p3 = 0;
         while (p3 < n) {
             int32 d3 = 0;
             while (d3 < kvDim) {
                 int64 at = (int64) p3 * (int64) kvDim + (int64) d3;
                 float32 wantK = (float32) (10 * p3 + d3) / 8.0f;
-                float32 wantV = (float32) (7 * p3 + 3 * d3) / 5.0f;
+                // The planes are half (unit 57): x/5 is not exact there,
+                // so the expectation is the f16-rounded value.
+                float32 wantV = (float32) (float16)
+                    ((float32) (7 * p3 + 3 * d3) / 5.0f);
                 if (backK[at] != wantK) {
                     Assert.fail("seeded K at position " + p3 + " dim " + d3
                         + " reads back " + backK[at] + ", expected " + wantK
@@ -537,6 +543,56 @@ public class AttnKernelTest {
                 d3 = d3 + 1;
             }
             p3 = p3 + 1;
+        }
+    }
+
+    /**
+     * 57.1.1 — the planes STORE HALF. Seed values f16 cannot hold and
+     * read the planes back: the bytes are the f16-rounded values, not
+     * the originals. This is the FIRES half of the unit's check — an
+     * f32 plane hands the originals back and fails here; the attend
+     * tolerance tests above cannot tell the two storages apart.
+     */
+    @Test
+    public void thePlanesStoreHalf() {
+        if (!AttnKernelTest.onDevice()) { return; }
+        ModelConfig cfg #= AttnKernelTest.kvCfg(1, 0);
+        int32 kvDim = cfg.kvDim();
+        PagedKvCache cache #= heap PagedKvCache(cfg, 32, 1, 32);
+        float32[] kh #= heap float32[(int64) kvDim];
+        float32[] vh #= heap float32[(int64) kvDim];
+        int32 d = 0;
+        while (d < kvDim) {
+            // 1.0001 (d + 1): every value has bits below the half mantissa.
+            kh[(int64) d] = 1.0001f * (float32) (d + 1);
+            vh[(int64) d] = 0.0f - 1.0001f * (float32) (d + 1);
+            d = d + 1;
+        }
+        if (!cache.appendRowRaw(0, 0, kh, 0L, vh, 0L, 0)) {
+            Assert.fail("host append failed");
+        }
+        DeviceKv dk #= heap DeviceKv(cfg, 32);
+        dk.seed(cache, 0);
+        float32[] backK #= heap float32[(int64) kvDim];
+        float32[] backV #= heap float32[(int64) kvDim];
+        dk.readPlanes(0, backK, backV, (int64) kvDim);
+        int32 rounded = 0;
+        d = 0;
+        while (d < kvDim) {
+            float32 wantK = (float32) (float16) kh[(int64) d];
+            float32 wantV = (float32) (float16) vh[(int64) d];
+            if (backK[(int64) d] != wantK || backV[(int64) d] != wantV) {
+                Assert.fail("plane at dim " + d + " reads back "
+                    + backK[(int64) d] + " / " + backV[(int64) d]
+                    + ", expected the half-rounded " + wantK + " / "
+                    + wantV);
+            }
+            if (backK[(int64) d] != kh[(int64) d]) { rounded = rounded + 1; }
+            d = d + 1;
+        }
+        if (rounded == 0) {
+            Assert.fail("every value came back exactly as seeded - the "
+                + "planes are not storing half");
         }
     }
 
@@ -569,6 +625,8 @@ public class AttnKernelTest {
         float32[] q #= AttnKernelTest.spread(qn, 61);
         float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 63);
         float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim, 67);
+        AttnKernel.roundHalf(k);
+        AttnKernel.roundHalf(v);
 
         float32[] want #= heap float32[qn];
         AttnKernel.attendPrefillHost(want, q, k, v, rows, nH, nKv, hd,
@@ -656,6 +714,8 @@ public class AttnKernelTest {
                     89);
                 float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim,
                     97);
+                AttnKernel.roundHalf(k);
+                AttnKernel.roundHalf(v);
                 float32[] want #= heap float32[qn];
                 AttnKernel.attendPrefillHost(want, q, k, v, rows, nH, nKv,
                     hd, sp, scale);
@@ -805,6 +865,8 @@ public class AttnKernelTest {
         float32[] q #= AttnKernelTest.spread(qn, 71);
         float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 73);
         float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim, 79);
+        AttnKernel.roundHalf(k);
+        AttnKernel.roundHalf(v);
         float32[] want #= heap float32[qn];
         AttnKernel.attendPrefillHost(want, q, k, v, rows, nH, nKv, hd,
             startPos, scale);
@@ -848,6 +910,8 @@ public class AttnKernelTest {
                 5 + ci);
             float32[] v #= AttnKernelTest.spread((int64) count * kvDim,
                 9 + ci);
+            AttnKernel.roundHalf(k);
+            AttnKernel.roundHalf(v);
             float32[] want #= heap float32[(int64) (nH * hd)];
             AttnKernel.attendDecodeHost(want, q, k, v, nH, nKv, hd, count,
                 scale);
