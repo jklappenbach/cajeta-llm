@@ -6318,6 +6318,74 @@ public final class QuantKernel {
         }
     }
 
+    /** Unit 41: gather picked rows into group order —
+     *  dst[i, :] = src[idx[i], :] over `total = picks * cols`
+     *  elements. One thread per element; the div/mod is cheap against
+     *  the bytes moved. */
+    @Kernel
+    public static void gatherRowsF32Kernel(KernelBuffer<float32> dst,
+            KernelBuffer<float32> src, KernelBuffer<int32> idx,
+            uint32 total, uint32 cols) {
+        uint32 t = KernelThread.globalIdX();
+        if (t < total) {
+            uint32 i = t / cols;
+            uint32 j = t - i * cols;
+            dst[(int64) t] = src[(int64) idx[(int64) i] * (int64) cols
+                + (int64) j];
+        }
+    }
+
+    public static void gatherRowsF32LaunchNoSync(KernelBuffer<float32> dst,
+            KernelBuffer<float32> src, KernelBuffer<int32> idx,
+            int64 picks, int64 cols) {
+        uint32 total = (uint32) (picks * cols);
+        KernelStream s = QuantKernel.stream();
+        gatherRowsF32Kernel.launch(s, grid: [(total + 255) / 256],
+            block: [256])(dst, src, idx, total, (uint32) cols);
+        return;
+    }
+
+    /** Unit 41: the weighted scatter-combine, deterministically — one
+     *  workgroup per OUTPUT row walks its own picks, so no atomics and
+     *  no ordering dependence: out[r, j] = sum_k gw[slot] *
+     *  be[slot, j] with slot = rowSlot[r*used + k]. */
+    @Kernel
+    public static void moeScatterCombineKernel(KernelBuffer<float32> out,
+            KernelBuffer<float32> be, KernelBuffer<int32> rowSlot,
+            KernelBuffer<float32> gw, uint32 rows, uint32 used,
+            uint32 cols) {
+        uint32 lane = KernelThread.x();
+        uint32 r = KernelThread.globalIdX() / 256;
+        if (r < rows) {
+            uint32 j = lane;
+            while (j < cols) {
+                float32 acc = 0.0f;
+                uint32 k = 0;
+                while (k < used) {
+                    int32 slot = rowSlot[(int64) r * (int64) used
+                        + (int64) k];
+                    acc = acc + gw[(int64) slot]
+                        * be[(int64) slot * (int64) cols + (int64) j];
+                    k = k + 1;
+                }
+                out[(int64) r * (int64) cols + (int64) j] = acc;
+                j = j + 256;
+            }
+        }
+    }
+
+    public static void moeScatterCombineLaunchNoSync(
+            KernelBuffer<float32> out, KernelBuffer<float32> be,
+            KernelBuffer<int32> rowSlot, KernelBuffer<float32> gw,
+            int64 rows, int64 used, int64 cols) {
+        uint32 ur = (uint32) rows;
+        KernelStream s = QuantKernel.stream();
+        moeScatterCombineKernel.launch(s, grid: [ur * 256],
+            block: [256])(out, be, rowSlot, gw, ur, (uint32) used,
+            (uint32) cols);
+        return;
+    }
+
     /**
      * Batched router (unit 41): logits[r, e] = W[e] . x[r] over the
      * row-major [E, H] router copy, one workgroup per token row with a
