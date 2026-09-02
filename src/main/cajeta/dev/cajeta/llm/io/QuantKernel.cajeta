@@ -5891,6 +5891,389 @@ public final class QuantKernel {
         }
     }
 
+
+    /**
+     * Unit 49: the decode q, k and v projections in ONE launch. Waves
+     * 0..rowsQ-1 own q rows, the next rowsKv own k rows, the next
+     * rowsKv own v rows — all against the one staged activation, each
+     * from its own packed weight; v may be Q6_K (`vQ6`), the Q4_K_M
+     * recipe's half. k and v are ~0.6 MB each and paid a launch's
+     * latency floor apiece; here they ride q's launch. The bodies are
+     * the wave kernels' (bit-identical per row), one copy per weight
+     * parameter: the lowering knows buffer PARAMETERS only — a
+     * KernelBuffer local is "index on non-buffer" and the kernel is
+     * skipped, which the first build of this learned from a launch
+     * that silently did nothing. Rows are 8+ blocks, one per wave;
+     * the caller falls back below that.
+     */
+    @Kernel
+    public static void qkvWaveMatVecKernel(KernelBuffer<float32> yq,
+            KernelBuffer<float32> yk, KernelBuffer<float32> yv,
+            KernelBuffer<int8> wq, KernelBuffer<int8> wk,
+            KernelBuffer<int8> wv, KernelBuffer<int8> xp,
+            uint32 rowsQ, uint32 rowsKv, int64 blocksPerRow, uint32 vQ6) {
+        uint32 lane = KernelThread.x();
+        uint32 rl = lane;
+        uint32 wave = KernelThread.globalIdX() / 32;
+        float32 acc = 0.0f;
+        uint32 which = 0;
+        uint32 row = wave;
+        if (wave >= rowsQ + rowsKv) { which = 2; row = wave - rowsQ - rowsKv; }
+        else if (wave >= rowsQ) { which = 1; row = wave - rowsQ; }
+        uint32 limit = rowsQ;
+        if (which != 0) { limit = rowsKv; }
+        if (row < limit && which == 0) {
+            int64 rowBytes = blocksPerRow * 144L;
+            int64 i = (int64) row;
+            int32 g = (int32) (rl % 4);
+            int64 b = (int64) (rl / 4);
+            Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 144L;
+
+                // The header — { f16 d; f16 dmin; u8 scales[12] } = 16 bytes.
+                // Read by all four lanes of the block; it is 16 bytes and it
+                // is in cache after the first.
+                Vector<int8,16> hv = wq.vload<16>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                // Only THIS lane's two sub-blocks are unpacked, where the
+                // serial kernel unpacks all eight — and the two forms are
+                // NOT interchangeable. Q4_K packs sub-blocks 0-3 and 4-7 in
+                // different fields, and a lane owning `g` needs sub-blocks
+                // 2g and 2g+1, so g < 2 lands entirely in the first field
+                // and g >= 2 entirely in the second. Reading field `g`
+                // instead of sub-block `2g` is the shape of the first
+                // version of this kernel, which was wrong on every row.
+                int32 sc0 = 0;
+                int32 sc1 = 0;
+                int32 mn0 = 0;
+                int32 mn1 = 0;
+                if (g < 2) {
+                    int32 j = 2 * g;
+                    sc0 = (int32) hv[4 + j] & 63;
+                    sc1 = (int32) hv[5 + j] & 63;
+                    mn0 = (int32) hv[8 + j] & 63;
+                    mn1 = (int32) hv[9 + j] & 63;
+                } else {
+                    int32 j = 2 * g - 4;
+                    int32 k0 = (int32) hv[12 + j] & 255;
+                    int32 k1 = (int32) hv[13 + j] & 255;
+                    int32 d0 = (int32) hv[4 + j] & 255;
+                    int32 d1 = (int32) hv[5 + j] & 255;
+                    int32 m0 = (int32) hv[8 + j] & 255;
+                    int32 m1 = (int32) hv[9 + j] & 255;
+                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
+                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                }
+
+                Vector<uint8,32> raw = wq.vload<32>(
+                    ro + 16L + (int64) (32 * g)).asUnsigned();
+                Vector<uint8,32> lo = raw & 15;
+                Vector<uint8,32> hi = (raw >> 4) & 15;
+                int64 xb = b * 320L + (int64) (64 * g);
+                Vector<int8,32> a0 = xp.vload<32>(xb);
+                Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
+                Vector<int32,8> tot = lo.dotAccum(a0, zv) * sc0
+                                    + hi.dotAccum(a1, zv) * sc1;
+                int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
+                           + tot[4] + tot[5] + tot[6] + tot[7];
+
+                // The dmin term needs the sum of THIS LANE's activations,
+                // and the packed block's precomputed sums are per 32-element
+                // sub-block — which only helps a lane that owns a whole one.
+                // llama.cpp does not read a precomputed sum at all: it takes
+                // `dp4a(0x01010101, u)`, so any lane granularity is free.
+                // Same trick here, and it drops a 32-byte load per lane per
+                // block as well.
+                Vector<uint8,32> ones = (lo ^ lo) | 1;
+                Vector<int32,8> tot2 = ones.dotAccum(a0, zv) * mn0
+                                     + ones.dotAccum(a1, zv) * mn1;
+                int32 dmins = tot2[0] + tot2[1] + tot2[2] + tot2[3]
+                            + tot2[4] + tot2[5] + tot2[6] + tot2[7];
+
+                Vector<int8,4> dv = xp.vload<4>(b * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+
+                acc = acc + d * xs * (float32) sumi
+                          - dmin * xs * (float32) dmins;
+                b = b + 8L;
+            }
+        }
+        if (row < limit && which == 1) {
+            int64 rowBytes = blocksPerRow * 144L;
+            int64 i = (int64) row;
+            int32 g = (int32) (rl % 4);
+            int64 b = (int64) (rl / 4);
+            Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 144L;
+
+                // The header — { f16 d; f16 dmin; u8 scales[12] } = 16 bytes.
+                // Read by all four lanes of the block; it is 16 bytes and it
+                // is in cache after the first.
+                Vector<int8,16> hv = wk.vload<16>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                // Only THIS lane's two sub-blocks are unpacked, where the
+                // serial kernel unpacks all eight — and the two forms are
+                // NOT interchangeable. Q4_K packs sub-blocks 0-3 and 4-7 in
+                // different fields, and a lane owning `g` needs sub-blocks
+                // 2g and 2g+1, so g < 2 lands entirely in the first field
+                // and g >= 2 entirely in the second. Reading field `g`
+                // instead of sub-block `2g` is the shape of the first
+                // version of this kernel, which was wrong on every row.
+                int32 sc0 = 0;
+                int32 sc1 = 0;
+                int32 mn0 = 0;
+                int32 mn1 = 0;
+                if (g < 2) {
+                    int32 j = 2 * g;
+                    sc0 = (int32) hv[4 + j] & 63;
+                    sc1 = (int32) hv[5 + j] & 63;
+                    mn0 = (int32) hv[8 + j] & 63;
+                    mn1 = (int32) hv[9 + j] & 63;
+                } else {
+                    int32 j = 2 * g - 4;
+                    int32 k0 = (int32) hv[12 + j] & 255;
+                    int32 k1 = (int32) hv[13 + j] & 255;
+                    int32 d0 = (int32) hv[4 + j] & 255;
+                    int32 d1 = (int32) hv[5 + j] & 255;
+                    int32 m0 = (int32) hv[8 + j] & 255;
+                    int32 m1 = (int32) hv[9 + j] & 255;
+                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
+                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                }
+
+                Vector<uint8,32> raw = wk.vload<32>(
+                    ro + 16L + (int64) (32 * g)).asUnsigned();
+                Vector<uint8,32> lo = raw & 15;
+                Vector<uint8,32> hi = (raw >> 4) & 15;
+                int64 xb = b * 320L + (int64) (64 * g);
+                Vector<int8,32> a0 = xp.vload<32>(xb);
+                Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
+                Vector<int32,8> tot = lo.dotAccum(a0, zv) * sc0
+                                    + hi.dotAccum(a1, zv) * sc1;
+                int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
+                           + tot[4] + tot[5] + tot[6] + tot[7];
+
+                // The dmin term needs the sum of THIS LANE's activations,
+                // and the packed block's precomputed sums are per 32-element
+                // sub-block — which only helps a lane that owns a whole one.
+                // llama.cpp does not read a precomputed sum at all: it takes
+                // `dp4a(0x01010101, u)`, so any lane granularity is free.
+                // Same trick here, and it drops a 32-byte load per lane per
+                // block as well.
+                Vector<uint8,32> ones = (lo ^ lo) | 1;
+                Vector<int32,8> tot2 = ones.dotAccum(a0, zv) * mn0
+                                     + ones.dotAccum(a1, zv) * mn1;
+                int32 dmins = tot2[0] + tot2[1] + tot2[2] + tot2[3]
+                            + tot2[4] + tot2[5] + tot2[6] + tot2[7];
+
+                Vector<int8,4> dv = xp.vload<4>(b * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+
+                acc = acc + d * xs * (float32) sumi
+                          - dmin * xs * (float32) dmins;
+                b = b + 8L;
+            }
+        }
+        if (row < limit && which == 2 && vQ6 == 0) {
+            int64 rowBytes = blocksPerRow * 144L;
+            int64 i = (int64) row;
+            int32 g = (int32) (rl % 4);
+            int64 b = (int64) (rl / 4);
+            Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 144L;
+
+                // The header — { f16 d; f16 dmin; u8 scales[12] } = 16 bytes.
+                // Read by all four lanes of the block; it is 16 bytes and it
+                // is in cache after the first.
+                Vector<int8,16> hv = wv.vload<16>(ro);
+                float32 d = GgufFile.halfBitsToF32(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                // Only THIS lane's two sub-blocks are unpacked, where the
+                // serial kernel unpacks all eight — and the two forms are
+                // NOT interchangeable. Q4_K packs sub-blocks 0-3 and 4-7 in
+                // different fields, and a lane owning `g` needs sub-blocks
+                // 2g and 2g+1, so g < 2 lands entirely in the first field
+                // and g >= 2 entirely in the second. Reading field `g`
+                // instead of sub-block `2g` is the shape of the first
+                // version of this kernel, which was wrong on every row.
+                int32 sc0 = 0;
+                int32 sc1 = 0;
+                int32 mn0 = 0;
+                int32 mn1 = 0;
+                if (g < 2) {
+                    int32 j = 2 * g;
+                    sc0 = (int32) hv[4 + j] & 63;
+                    sc1 = (int32) hv[5 + j] & 63;
+                    mn0 = (int32) hv[8 + j] & 63;
+                    mn1 = (int32) hv[9 + j] & 63;
+                } else {
+                    int32 j = 2 * g - 4;
+                    int32 k0 = (int32) hv[12 + j] & 255;
+                    int32 k1 = (int32) hv[13 + j] & 255;
+                    int32 d0 = (int32) hv[4 + j] & 255;
+                    int32 d1 = (int32) hv[5 + j] & 255;
+                    int32 m0 = (int32) hv[8 + j] & 255;
+                    int32 m1 = (int32) hv[9 + j] & 255;
+                    sc0 = (k0 & 15) | ((d0 >> 2) & 48);
+                    sc1 = (k1 & 15) | ((d1 >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((m0 >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((m1 >> 2) & 48);
+                }
+
+                Vector<uint8,32> raw = wv.vload<32>(
+                    ro + 16L + (int64) (32 * g)).asUnsigned();
+                Vector<uint8,32> lo = raw & 15;
+                Vector<uint8,32> hi = (raw >> 4) & 15;
+                int64 xb = b * 320L + (int64) (64 * g);
+                Vector<int8,32> a0 = xp.vload<32>(xb);
+                Vector<int8,32> a1 = xp.vload<32>(xb + 32L);
+                Vector<int32,8> tot = lo.dotAccum(a0, zv) * sc0
+                                    + hi.dotAccum(a1, zv) * sc1;
+                int32 sumi = tot[0] + tot[1] + tot[2] + tot[3]
+                           + tot[4] + tot[5] + tot[6] + tot[7];
+
+                // The dmin term needs the sum of THIS LANE's activations,
+                // and the packed block's precomputed sums are per 32-element
+                // sub-block — which only helps a lane that owns a whole one.
+                // llama.cpp does not read a precomputed sum at all: it takes
+                // `dp4a(0x01010101, u)`, so any lane granularity is free.
+                // Same trick here, and it drops a 32-byte load per lane per
+                // block as well.
+                Vector<uint8,32> ones = (lo ^ lo) | 1;
+                Vector<int32,8> tot2 = ones.dotAccum(a0, zv) * mn0
+                                     + ones.dotAccum(a1, zv) * mn1;
+                int32 dmins = tot2[0] + tot2[1] + tot2[2] + tot2[3]
+                            + tot2[4] + tot2[5] + tot2[6] + tot2[7];
+
+                Vector<int8,4> dv = xp.vload<4>(b * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+
+                acc = acc + d * xs * (float32) sumi
+                          - dmin * xs * (float32) dmins;
+                b = b + 8L;
+            }
+        }
+        if (row < limit && which == 2 && vQ6 != 0) {
+            int64 rowBytes = blocksPerRow * 210L;
+            int64 i = (int64) row;
+            int32 m = (int32) (rl % 4);
+            int32 g = m / 2;               // which 128-element half
+            int32 a = m - g * 2;           // which 16-lane slice of it
+            int64 b = (int64) (rl / 4);  // 8 blocks in flight
+            Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 210L;
+                float32 d = QuantKernel.f16AtDev(wv, ro + 208L);
+                int64 xb = b * 320L;
+                Vector<int8,4> dvs = xp.vload<4>(xb + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
+                    | (((int32) dvs[1] & 255) << 8)
+                    | (((int32) dvs[2] & 255) << 16)
+                    | (((int32) dvs[3] & 255) << 24));
+                Vector<int8,16> qlA = wv.vload<16>(
+                    ro + (int64) (64 * g + 16 * a));
+                Vector<int8,16> qlB = wv.vload<16>(
+                    ro + (int64) (64 * g + 32 + 16 * a));
+                Vector<int8,16> qh16 = wv.vload<16>(
+                    ro + (int64) (128 + 32 * g + 16 * a));
+                Vector<int8,16> lo_0 = (qlA >> 0) & 15;
+                Vector<int8,16> hi_0 = (qh16 >> 0) & 3;
+                Vector<uint8,16> qu_0 = (lo_0 | (hi_0 << 4)).asUnsigned();
+                Vector<int8,16> a_0 = xp.vload<16>(xb + (int64) (16 * (8 * g + a)));
+                Vector<uint8,16> on_0 = (qu_0 ^ qu_0) | 1;
+                Vector<int32,4> dv_0 = qu_0.dotAccum(a_0, z4);
+                Vector<int32,4> sv_0 = on_0.dotAccum(a_0, z4);
+                int32 dot_0 = dv_0[0] + dv_0[1] + dv_0[2] + dv_0[3];
+                int32 as_0 = sv_0[0] + sv_0[1] + sv_0[2] + sv_0[3];
+                int32 sc_0 = (int32) wv[ro + (int64) (192 + (8 * g + a))];
+                acc = acc + d * xs
+                    * (float32) (sc_0 * (dot_0 - 32 * as_0));
+                Vector<int8,16> lo_1 = (qlB >> 0) & 15;
+                Vector<int8,16> hi_1 = (qh16 >> 2) & 3;
+                Vector<uint8,16> qu_1 = (lo_1 | (hi_1 << 4)).asUnsigned();
+                Vector<int8,16> a_1 = xp.vload<16>(xb + (int64) (16 * (8 * g + 2 + a)));
+                Vector<uint8,16> on_1 = (qu_1 ^ qu_1) | 1;
+                Vector<int32,4> dv_1 = qu_1.dotAccum(a_1, z4);
+                Vector<int32,4> sv_1 = on_1.dotAccum(a_1, z4);
+                int32 dot_1 = dv_1[0] + dv_1[1] + dv_1[2] + dv_1[3];
+                int32 as_1 = sv_1[0] + sv_1[1] + sv_1[2] + sv_1[3];
+                int32 sc_1 = (int32) wv[ro + (int64) (192 + (8 * g + 2 + a))];
+                acc = acc + d * xs
+                    * (float32) (sc_1 * (dot_1 - 32 * as_1));
+                Vector<int8,16> lo_2 = (qlA >> 4) & 15;
+                Vector<int8,16> hi_2 = (qh16 >> 4) & 3;
+                Vector<uint8,16> qu_2 = (lo_2 | (hi_2 << 4)).asUnsigned();
+                Vector<int8,16> a_2 = xp.vload<16>(xb + (int64) (16 * (8 * g + 4 + a)));
+                Vector<uint8,16> on_2 = (qu_2 ^ qu_2) | 1;
+                Vector<int32,4> dv_2 = qu_2.dotAccum(a_2, z4);
+                Vector<int32,4> sv_2 = on_2.dotAccum(a_2, z4);
+                int32 dot_2 = dv_2[0] + dv_2[1] + dv_2[2] + dv_2[3];
+                int32 as_2 = sv_2[0] + sv_2[1] + sv_2[2] + sv_2[3];
+                int32 sc_2 = (int32) wv[ro + (int64) (192 + (8 * g + 4 + a))];
+                acc = acc + d * xs
+                    * (float32) (sc_2 * (dot_2 - 32 * as_2));
+                Vector<int8,16> lo_3 = (qlB >> 4) & 15;
+                Vector<int8,16> hi_3 = (qh16 >> 6) & 3;
+                Vector<uint8,16> qu_3 = (lo_3 | (hi_3 << 4)).asUnsigned();
+                Vector<int8,16> a_3 = xp.vload<16>(xb + (int64) (16 * (8 * g + 6 + a)));
+                Vector<uint8,16> on_3 = (qu_3 ^ qu_3) | 1;
+                Vector<int32,4> dv_3 = qu_3.dotAccum(a_3, z4);
+                Vector<int32,4> sv_3 = on_3.dotAccum(a_3, z4);
+                int32 dot_3 = dv_3[0] + dv_3[1] + dv_3[2] + dv_3[3];
+                int32 as_3 = sv_3[0] + sv_3[1] + sv_3[2] + sv_3[3];
+                int32 sc_3 = (int32) wv[ro + (int64) (192 + (8 * g + 6 + a))];
+                acc = acc + d * xs
+                    * (float32) (sc_3 * (dot_3 - 32 * as_3));
+                b = b + 8L;
+            }
+        }
+        float32 tot = Wave.reduceSumF32(acc);
+        if (lane == 0 && row < limit) {
+            if (which == 0) { yq[(int64) row] = tot; }
+            else if (which == 1) { yk[(int64) row] = tot; }
+            else { yv[(int64) row] = tot; }
+        }
+    }
+
+    public static void qkvWaveMatVecLaunchNoSync(KernelBuffer<float32> yq,
+            KernelBuffer<float32> yk, KernelBuffer<float32> yv,
+            KernelBuffer<int8> wq, KernelBuffer<int8> wk,
+            KernelBuffer<int8> wv, KernelBuffer<int8> xp, int64 rowsQ,
+            int64 rowsKv, int64 cols, boolean vQ6) {
+        uint32 waves = (uint32) (rowsQ + 2L * rowsKv);
+        uint32 v6 = 0;
+        if (vQ6) { v6 = 1; }
+        KernelStream s = QuantKernel.stream();
+        qkvWaveMatVecKernel.launch(s, grid: [waves], block: [32])
+            (yq, yk, yv, wq, wk, wv, xp, (uint32) rowsQ, (uint32) rowsKv,
+             cols / 256L, v6);
+        return;
+    }
+
     /** Rows one wave covers in the k-quant wave/id mat-vecs: four lanes
      *  per block, so rows shorter than eight blocks share a wave
      *  (unit 47). The kernels derive the same number in-kernel. */

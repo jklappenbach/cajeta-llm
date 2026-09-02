@@ -729,6 +729,91 @@ public class QuantKernelTest {
         }
     }
 
+    /** 49.1.1 — the fused q|k|v decode launch vs three wave launches
+     *  on the same staged activation: every output bit-identical, with
+     *  a Q4_K v and a Q6_K v. */
+    @Test
+    public void theFusedQkvLaunchMatchesThreeWaveLaunches() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one4 #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int8[] one6 #= File.readAllBytes(QuantKernelTest.DIR + "q6_k.bin");
+        // 8 blocks per row (the fused kernel's floor); q gets 4 rows,
+        // k and v 2 each.
+        int64 cols = 2048L;
+        int64 n4 = (int64) one4.count() / 144L;
+        int64 n6 = (int64) one6.count() / 210L;
+        // q: at least 4 rows of 8 blocks; k and v: at least 2. Whole
+        // rows only — a ragged tail of blocks is simply not launched.
+        int8[] wq #= QuantKernelTest.tiled(one4, (32L + n4 - 1L) / n4);
+        int8[] wk #= QuantKernelTest.tiled(one4, (16L + n4 - 1L) / n4);
+        int8[] wv6 #= QuantKernelTest.tiled(one6, (16L + n6 - 1L) / n6);
+        int64 rowsQ = ((int64) wq.count() / 144L) / 8L;
+        int64 rowsKv = 2L;
+        float32[] x #= QuantKernelTest.activations(cols);
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, 0L, cols, xp);
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        xpb.upload(xp);
+        KernelBuffer<int8> bq #= heap KernelBuffer<int8>((uint64) wq.count());
+        KernelBuffer<int8> bk #= heap KernelBuffer<int8>((uint64) wk.count());
+        KernelBuffer<int8> bv6 #= heap KernelBuffer<int8>((uint64) wv6.count());
+        bq.upload(wq);
+        bk.upload(wk);
+        bv6.upload(wv6);
+        int32 arm = 0;
+        while (arm < 2) {
+            boolean vQ6 = arm == 1;
+            KernelBuffer<float32> q1 #= heap KernelBuffer<float32>((uint64) rowsQ);
+            KernelBuffer<float32> k1 #= heap KernelBuffer<float32>((uint64) rowsKv);
+            KernelBuffer<float32> v1 #= heap KernelBuffer<float32>((uint64) rowsKv);
+            KernelBuffer<float32> q2 #= heap KernelBuffer<float32>((uint64) rowsQ);
+            KernelBuffer<float32> k2 #= heap KernelBuffer<float32>((uint64) rowsKv);
+            KernelBuffer<float32> v2 #= heap KernelBuffer<float32>((uint64) rowsKv);
+            QuantKernel.q4kQ8WaveMatVecLaunchNoSync(q1, bq, xpb, rowsQ, cols, 0L);
+            QuantKernel.q4kQ8WaveMatVecLaunchNoSync(k1, bk, xpb, rowsKv, cols, 0L);
+            if (vQ6) {
+                QuantKernel.q6kQ8WaveMatVecLaunchNoSync(v1, bv6, xpb, rowsKv, cols, 0L);
+                QuantKernel.qkvWaveMatVecLaunchNoSync(q2, k2, v2, bq, bk, bv6,
+                    xpb, rowsQ, rowsKv, cols, true);
+            } else {
+                QuantKernel.q4kQ8WaveMatVecLaunchNoSync(v1, bk, xpb, rowsKv, cols, 0L);
+                QuantKernel.qkvWaveMatVecLaunchNoSync(q2, k2, v2, bq, bk, bk,
+                    xpb, rowsQ, rowsKv, cols, false);
+            }
+            KernelStream s = QuantKernel.stream();
+            s.sync();
+            float32[] a #= heap float32[rowsQ];
+            float32[] b #= heap float32[rowsQ];
+            q1.download(a, rowsQ);
+            q2.download(b, rowsQ);
+            QuantKernelTest.assertLive(a, "q wave");
+            int64 r = 0;
+            while (r < rowsQ) {
+                if (a[r] != b[r]) { Assert.fail("q row " + r + " differs: wave " + a[r] + " fused " + b[r]); }
+                r = r + 1;
+            }
+            float32[] c #= heap float32[rowsKv];
+            float32[] d #= heap float32[rowsKv];
+            k1.download(c, rowsKv);
+            k2.download(d, rowsKv);
+            r = 0;
+            while (r < rowsKv) {
+                if (c[r] != d[r]) { Assert.fail("k row " + r + " differs"); }
+                r = r + 1;
+            }
+            v1.download(c, rowsKv);
+            v2.download(d, rowsKv);
+            QuantKernelTest.assertLive(c, "v wave");
+            r = 0;
+            while (r < rowsKv) {
+                if (c[r] != d[r]) { Assert.fail("v row " + r + " differs (vQ6=" + vQ6 + ")"); }
+                r = r + 1;
+            }
+            arm = arm + 1;
+        }
+    }
+
     /**
      * 11.1, the does-NOT-fire half: every row must be written.
      *
