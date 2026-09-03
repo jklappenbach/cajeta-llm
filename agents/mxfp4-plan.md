@@ -41,7 +41,7 @@ fixture; a green parity witness over real gpt-oss-20b MXFP4 tensors.
 - [x] 2.1.1 Hand-built block (known `e` + known nibbles) dequantizes to
       `kvalues_mxfp4[nibble] * 2^(e-128)` with the j / j+16 interleave.
 - [x] 2.1.2 `e < 2` denormal scale path matches llama.cpp's patterns.
-- [~] 2.1.3 A captured llama.cpp `dequantize_row_mxfp4` vector for a
+- [x] 2.1.3 A captured llama.cpp `dequantize_row_mxfp4` vector for a
       real tensor slice is reproduced **bit-exactly**.
 
 ### 2.2 Coding
@@ -50,7 +50,7 @@ fixture; a green parity witness over real gpt-oss-20b MXFP4 tensors.
       table as constants.
 
 ### 2.3 Acceptance
-- [~] 2.3.1 Bit-exact against the reference fixture (spec §3.3).
+- [x] 2.3.1 Bit-exact against the reference fixture (spec §3.3).
 
 ## Unit 3 — CPU packed matvec, fp32 scalar reference (spec §4.1, §4.4)
 
@@ -93,31 +93,31 @@ kernel is the correctness reference (like `q4kMatVecIntoScalar`); the
 ## Unit 5 — GGUF / Checkpoint wiring (spec §2.1)
 
 ### 5.1 TDD
-- [ ] 5.1.1 A fixture GGUF with an MXFP4 tensor loads: type recognized,
+- [x] 5.1.1 A fixture GGUF with an MXFP4 tensor loads: type recognized,
       byte size correct, dequant/stream path reached.
 
 ### 5.2 Coding
-- [ ] 5.2.1 Recognize type 39 in `GgufFile`/`Checkpoint` sizing and the
+- [x] 5.2.1 Recognize type 39 in `GgufFile`/`Checkpoint` sizing and the
       weight load/stream path; route to the Unit 2/3 kernels.
 
 ### 5.3 Acceptance
-- [ ] 5.3.1 The real gpt-oss-20b-MXFP4 file's MXFP4 tensors are read
+- [x] 5.3.1 The real gpt-oss-20b-MXFP4 file's MXFP4 tensors are read
       without error (type + size), independent of arch support.
 
 ## Unit 6 — Correctness witness (spec §6)
 
 ### 6.1 TDD
-- [ ] 6.1.1 A parity harness reads real MXFP4 tensors from the
+- [x] 6.1.1 A parity harness reads real MXFP4 tensors from the
       gpt-oss-20b file and asserts dequant (§3.3) and matvec (§4)
       parity against the checked-in llama.cpp fixture.
 
 ### 6.2 Coding
-- [ ] 6.2.1 Extract-once tool/step producing the reference fixture from
+- [x] 6.2.1 Extract-once tool/step producing the reference fixture from
       llama.cpp's MXFP4 path; check in a small, shape-varied fixture
       (spec §6.3 — at least one width ×32 but not ×256).
 
 ### 6.3 Acceptance
-- [ ] 6.3.1 The witness is green and self-contained (no live llama.cpp
+- [x] 6.3.1 The witness is green and self-contained (no live llama.cpp
       build needed at test time, spec §6.2). Correctness is
       deterministic (bit-exact) — a single run is definitive; the
       multi-run averaging discipline below is for PERFORMANCE only.
