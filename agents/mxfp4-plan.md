@@ -52,22 +52,28 @@ fixture; a green parity witness over real gpt-oss-20b MXFP4 tensors.
 ### 2.3 Acceptance
 - [~] 2.3.1 Bit-exact against the reference fixture (spec §3.3).
 
-## Unit 3 — CPU packed matvec (spec §4.1–4.2, §4.4)
+## Unit 3 — CPU packed matvec, fp32 scalar reference (spec §4.1, §4.4)
+
+Mirrors cajeta's convention: a bit-exact **fp32-activation scalar**
+kernel is the correctness reference (like `q4kMatVecIntoScalar`); the
+**Q8_0-activation fast path** (spec §4.2, matching llama.cpp's
+`mxfp4×q8_0` dot) is a performance optimization and moves to Unit 7.
 
 ### 3.1 TDD
-- [ ] 3.1.1 Packed MXFP4×Q8_0 matvec on a small fixture equals the
-      dequantize-then-dense reference (spec §4.4).
-- [ ] 3.1.2 A width that is a multiple of 32 but **not** 256 is correct
-      (spec §5.2).
+- [x] 3.1.1 Packed MXFP4 fp32 matvec equals the dequantize-then-dense
+      reference **bit-exactly** — same element order (0..31 per block,
+      blocks in order), so the float accumulation matches (spec §4.4).
+- [x] 3.1.2 A width that is a multiple of 32 but **not** 256 is correct
+      (multi-block rows, spec §5.2).
 
 ### 3.2 Coding
-- [ ] 3.2.1 Packed CPU matvec mirroring the `Q4_K`×q8 kernel shape;
-      activations quantized to Q8_0 (spec §4.2). Reduce-then-scale to
-      avoid the int64 overflow trap (spec §5.1).
+- [x] 3.2.1 `mxfp4MatVecIntoScalar(packed, rows, cols, x, xOff, y, yOff)`
+      mirroring `q4kMatVecIntoScalar`; accumulate elements in 0..31
+      order so it is bit-exact against dequant-then-dense.
 
 ### 3.3 Acceptance
-- [ ] 3.3.1 Matches the llama.cpp `vec_dot_mxfp4_q8_0` reference on the
-      fixture.
+- [x] 3.3.1 Bit-exact against dequant-then-dense on ≥2 row/col shapes
+      including one width ×32 but not ×256.
 
 ## Unit 4 — GPU packed matvec (spec §4.3)
 
