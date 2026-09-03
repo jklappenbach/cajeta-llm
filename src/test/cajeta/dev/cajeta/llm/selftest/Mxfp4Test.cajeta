@@ -1,0 +1,114 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import cajeta.lang.String;
+
+/**
+ * MXFP4 quant format (Unit 32, plan units 1-2).
+ *
+ * These exercise the format through Quant's PUBLIC surface only —
+ * geometry (§2) and dequantization (§3) — with hand-computed expected
+ * values, so they stand alone without a llama.cpp fixture. The
+ * real-tensor bit-exact witness (§6) and the matvec kernels (§4) land
+ * in later units.
+ *
+ * MXFP4 block = 17 bytes: byte 0 is the E8M0 scale, bytes 1..16 are 16
+ * packed bytes of two E2M1 nibbles each. The low nibble of byte j maps
+ * to element j, the high nibble to element j+16 (llama.cpp's ordering).
+ * E2M1 values: {0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12}.
+ */
+public class Mxfp4Test {
+
+    public Mxfp4Test() { return; }
+
+    /** Store `v`'s low 8 bits at `a[i]` — a runtime narrowing cast wraps
+     *  silently, so byte values above 127 need no awkward constants. */
+    static void setByte(int8[] a, int64 i, int32 v) {
+        a[i] = (int8) v;
+    }
+
+    /** Exact float equality (these are exact dyadic values — no
+     *  tolerance is wanted, and Assert has no float overload). */
+    static void eqF(float32 expected, float32 actual, String what) {
+        if (expected != actual) {
+            Assert.fail(what);
+        }
+    }
+
+    // ── Unit 1: format geometry (spec §2) ──────────────────────────────
+
+    @Test
+    public void geometryMatchesTheMxfp4Block() {
+        Assert.isTrue(Quant.supported(Quant.GG_MXFP4));
+        Assert.equals(32L, (int64) Quant.blockElems(Quant.GG_MXFP4));
+        Assert.equals(17L, (int64) Quant.blockBytes(Quant.GG_MXFP4));
+    }
+
+    @Test
+    public void widthGateAcceptsMultiplesOf32Only() {
+        Assert.isTrue(Quant.colsOk(Quant.GG_MXFP4, 32L));
+        Assert.isTrue(Quant.colsOk(Quant.GG_MXFP4, 64L));
+        Assert.isTrue(Quant.colsOk(Quant.GG_MXFP4, 2880L));   // x32, not x256
+        Assert.isFalse(Quant.colsOk(Quant.GG_MXFP4, 33L));
+        Assert.isFalse(Quant.colsOk(Quant.GG_MXFP4, 0L));
+    }
+
+    // ── Unit 2: dequantization (spec §3) ───────────────────────────────
+
+    /** Build one MXFP4 block with scale byte `e` and the first two qs
+     *  bytes set; the rest zero. Returns the 17-byte block. */
+    static #int8[] block(int32 e, int32 qs0, int32 qs1) {
+        int8[] raw #= heap int8[17];
+        Mxfp4Test.setByte(raw, 0L, e);
+        Mxfp4Test.setByte(raw, 1L, qs0);
+        Mxfp4Test.setByte(raw, 2L, qs1);
+        return #raw;
+    }
+
+    @Test
+    public void dequantMapsNibblesToTheTwoHalvesWithUnitScale() {
+        // e = 128 -> scale 2^(128-128) = 1.0
+        // qs[0]=0x21: lo=1 (val 1) -> elem 0; hi=2 (val 2) -> elem 16
+        // qs[1]=0x7F: lo=15 (val -12) -> elem 1; hi=7 (val 12) -> elem 17
+        int8[] raw #= Mxfp4Test.block(128, 0x21, 0x7F);
+        float32[] out #= heap float32[32];
+        Quant.dequantize(Quant.GG_MXFP4, raw, 0L, 1L, out, 0L);
+
+        Mxfp4Test.eqF(1.0f, out[0], "elem0 lo nibble");
+        Mxfp4Test.eqF(2.0f, out[16], "elem16 hi nibble");
+        Mxfp4Test.eqF(-12.0f, out[1], "elem1 lo nibble (neg)");
+        Mxfp4Test.eqF(12.0f, out[17], "elem17 hi nibble");
+        // Untouched nibbles decode to 0.
+        Mxfp4Test.eqF(0.0f, out[2], "elem2 zero");
+        Mxfp4Test.eqF(0.0f, out[31], "elem31 zero");
+    }
+
+    @Test
+    public void scaleIsAPowerOfTwoInTheExponentByte() {
+        // e = 129 -> scale 2.0, so the same nibbles double.
+        int8[] raw #= Mxfp4Test.block(129, 0x21, 0x7F);
+        float32[] out #= heap float32[32];
+        Quant.dequantize(Quant.GG_MXFP4, raw, 0L, 1L, out, 0L);
+        Mxfp4Test.eqF(2.0f, out[0], "elem0 x2");    // 1 * 2
+        Mxfp4Test.eqF(4.0f, out[16], "elem16 x2");  // 2 * 2
+        Mxfp4Test.eqF(-24.0f, out[1], "elem1 x2");  // -12 * 2
+        Mxfp4Test.eqF(24.0f, out[17], "elem17 x2"); // 12 * 2
+    }
+
+    @Test
+    public void denormalScalesForExponentBelowTwoKeepTheDoublingRatio() {
+        // e=0 -> 2^-128, e=1 -> 2^-127; both subnormal but exactly
+        // representable, and e=1 is exactly twice e=0.
+        int8[] b0 #= Mxfp4Test.block(0, 0x01, 0x00);   // lo=1 (val 1)
+        int8[] b1 #= Mxfp4Test.block(1, 0x01, 0x00);
+        float32[] o0 #= heap float32[32];
+        float32[] o1 #= heap float32[32];
+        Quant.dequantize(Quant.GG_MXFP4, b0, 0L, 1L, o0, 0L);
+        Quant.dequantize(Quant.GG_MXFP4, b1, 0L, 1L, o1, 0L);
+        Assert.isTrue(o0[0] > 0.0f);
+        Assert.isTrue(o1[0] > 0.0f);
+        Mxfp4Test.eqF(o1[0], o0[0] * 2.0f, "e=1 is twice e=0");
+    }
+}

@@ -45,6 +45,9 @@ public final class Quant {
     public static final int32 GG_Q4_K = 12;
     public static final int32 GG_Q5_K = 13;
     public static final int32 GG_Q6_K = 14;
+    // MXFP4 (OCP microscaling FP4): 32-elem blocks, one E8M0 scale byte
+    // + 16 packed-nibble bytes = 17 bytes. GGML tensor type 39.
+    public static final int32 GG_MXFP4 = 39;
 
     private Quant() { }
 
@@ -53,13 +56,15 @@ public final class Quant {
             || ty == Quant.GG_Q8_0
             || ty == Quant.GG_Q2_K || ty == Quant.GG_Q3_K
             || ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
-            || ty == Quant.GG_Q6_K;
+            || ty == Quant.GG_Q6_K
+            || ty == Quant.GG_MXFP4;
     }
 
     /** Elements per block for `ty`; -1 when unsupported. */
     public static int32 blockElems(int32 ty) {
         if (ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
-                || ty == Quant.GG_Q8_0) { return 32; }
+                || ty == Quant.GG_Q8_0
+                || ty == Quant.GG_MXFP4) { return 32; }
         if (Quant.supported(ty)) { return 256; }
         return -1;
     }
@@ -74,7 +79,20 @@ public final class Quant {
         if (ty == Quant.GG_Q4_K) { return 144; }
         if (ty == Quant.GG_Q5_K) { return 176; }
         if (ty == Quant.GG_Q6_K) { return 210; }
+        if (ty == Quant.GG_MXFP4) { return 17; }
         return -1;
+    }
+
+    /**
+     * True when a row of `cols` elements tiles evenly into `ty` blocks.
+     * The width gate spec §2.3 asks for: a tensor whose column count is
+     * not a multiple of the block's element count is rejected upstream
+     * rather than silently mis-sized. Unsupported `ty` is never ok.
+     */
+    public static boolean colsOk(int32 ty, int64 cols) {
+        int32 be = Quant.blockElems(ty);
+        if (be <= 0) { return false; }
+        return cols > 0L && (cols % (int64) be) == 0L;
     }
 
     static int32 u8(int8[] raw, int64 off) {
@@ -110,6 +128,7 @@ public final class Quant {
             else if (ty == Quant.GG_Q3_K) { Quant.q3kBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q4_K) { Quant.q4kBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q5_K) { Quant.q5kBlock(raw, ro, out, oo); }
+            else if (ty == Quant.GG_MXFP4) { Quant.mxfp4Block(raw, ro, out, oo); }
             else { Quant.q6kBlock(raw, ro, out, oo); }
             b = b + 1;
         }
@@ -122,6 +141,55 @@ public final class Quant {
         int32 j = 0;
         while (j < 32) {
             out[oo + (int64) j] = d * (float32) ((int32) raw[ro + 2L + (int64) j]);
+            j = j + 1;
+        }
+    }
+
+    // ── MXFP4: { u8 e (E8M0); u8 qs[16] (32 x E2M1 nibbles) } ───────────
+    //
+    // Layout and numerics are llama.cpp's (ggml-common.h block_mxfp4,
+    // ggml-quants.c dequantize_row_mxfp4, ggml-impl.h e8m0_to_fp32_half):
+    // the scale is E8M0 (a pure power of two), the "half" variant folds in
+    // the E2M1 doubling, and the two nibbles of byte j map to elements j
+    // and j+16 — the two halves of the 32-wide block, NOT j*2 / j*2+1.
+
+    /** E2M1 code (a 4-bit index) -> its signed integer value, matching
+     *  llama.cpp's kvalues_mxfp4 = {0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12}. */
+    static int32 mxfp4Code(int32 nib) {
+        int32 m = nib & 7;
+        int32 mag = 0;
+        if (m == 1) { mag = 1; }
+        else if (m == 2) { mag = 2; }
+        else if (m == 3) { mag = 3; }
+        else if (m == 4) { mag = 4; }
+        else if (m == 5) { mag = 6; }
+        else if (m == 6) { mag = 8; }
+        else if (m == 7) { mag = 12; }
+        if ((nib & 8) != 0) { return -mag; }
+        return mag;
+    }
+
+    /** E8M0 exponent byte -> the half-scale 2^(e-128) (denormal patterns
+     *  for e<2), reproducing ggml_e8m0_to_fp32_half exactly. */
+    static float32 mxfp4Scale(int32 e) {
+        int64 bits;
+        if (e < 2) {
+            bits = 0x00200000L << (int64) e;   // 2^-128 (e=0), 2^-127 (e=1)
+        } else {
+            bits = (int64) (e - 1) << 23;       // 2^(e-128)
+        }
+        return Cajeta.bitsToF32(bits);
+    }
+
+    static void mxfp4Block(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.mxfp4Scale(Quant.u8(raw, ro));
+        int32 j = 0;
+        while (j < 16) {
+            int32 b = Quant.u8(raw, ro + 1L + (int64) j);
+            out[oo + (int64) j] =
+                (float32) Quant.mxfp4Code(b & 15) * d;
+            out[oo + (int64) j + 16L] =
+                (float32) Quant.mxfp4Code((b >> 4) & 15) * d;
             j = j + 1;
         }
     }
