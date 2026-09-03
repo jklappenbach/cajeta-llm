@@ -8,6 +8,7 @@ import cajeta.xpu.KernelThread;
 import cajeta.xpu.Shared;
 import cajeta.xpu.Wave;
 import cajeta.xpu.MemoryOrder;
+import cajeta.lang.Cajeta;
 
 /**
  * The packed mat-vecs as XPU kernels (threaded-forward-path plan Unit 3;
@@ -10310,6 +10311,98 @@ public final class QuantKernel {
         return;
     }
 
+    // ── MXFP4 (Unit 32, unit 4) ──────────────────────────────────────────
+    //
+    // The device twin of Quant.mxfp4MatVecIntoScalar. One work item per
+    // output row; each 17-byte block decodes as on the host — an E8M0
+    // half-scale, then 32 E2M1 nibbles in 0..31 order (element k reads byte
+    // k&15's low nibble for k<16, high nibble for k>=16). Same element and
+    // accumulation order as the CPU scalar reference, so BackendParityTest
+    // holds within the standard tolerance. The Q8-activation fast path and
+    // any SIMD widening are Unit 7 (performance); this is the correct floor.
+
+    /** E2M1 code -> signed value, matching Quant.mxfp4Code / kvalues_mxfp4. */
+    @Device
+    static int32 mxfp4CodeDev(int32 nib) {
+        int32 m = nib & 7;
+        int32 mag = 0;
+        if (m == 1) { mag = 1; }
+        else if (m == 2) { mag = 2; }
+        else if (m == 3) { mag = 3; }
+        else if (m == 4) { mag = 4; }
+        else if (m == 5) { mag = 6; }
+        else if (m == 6) { mag = 8; }
+        else if (m == 7) { mag = 12; }
+        if ((nib & 8) != 0) { return -mag; }
+        return mag;
+    }
+
+    /** E8M0 exponent byte -> half-scale 2^(e-128), matching Quant.mxfp4Scale. */
+    @Device
+    static float32 mxfp4ScaleDev(int32 e) {
+        int64 bits;
+        if (e < 2) {
+            bits = 0x00200000L << (int64) e;
+        } else {
+            bits = (int64) (e - 1) << 23;
+        }
+        return Cajeta.bitsToF32(bits);
+    }
+
+    @Kernel
+    public static void mxfp4MatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 17L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 17L;
+                float32 d = QuantKernel.mxfp4ScaleDev(
+                    (int32) packed[ro] & 255);
+                int64 xb = xOff + b * 32L;
+                int32 k = 0;
+                while (k < 32) {
+                    int32 byteV =
+                        (int32) packed[ro + 1L + (int64) (k & 15)] & 255;
+                    int32 nib;
+                    if (k < 16) { nib = byteV & 15; }
+                    else { nib = (byteV >> 4) & 15; }
+                    acc = acc + (float32) QuantKernel.mxfp4CodeDev(nib) * d
+                        * x[xb + (int64) k];
+                    k = k + 1;
+                }
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
+    /** Launch {@link #mxfp4MatVecKernel} over device-resident buffers. */
+    public static void mxfp4MatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s = QuantKernel.stream();
+        mxfp4MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, x, ur, cols / 32L, xOff, yOff);
+        return;
+    }
+
+    public static void mxfp4MatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        QuantKernel.mxfp4MatVecLaunchNoSync(y, packed, x, rows, cols,
+            xOff, yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
     /** {@link #q4kMatVecLaunch} for Q5_K — 176-byte blocks, same grid. */
     public static void q5kMatVecLaunchNoSync(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
@@ -10808,6 +10901,8 @@ public final class QuantKernel {
             QuantKernel.q40MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else if (ty == Quant.GG_Q5_0) {
             QuantKernel.q50MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
+        } else if (ty == Quant.GG_MXFP4) {
+            QuantKernel.mxfp4MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else {
             // Same guard as the NoSync twin (10.12.45).
             throw heap LlmException("matVecLaunch: no device mat-vec "

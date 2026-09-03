@@ -78,17 +78,17 @@ kernel is the correctness reference (like `q4kMatVecIntoScalar`); the
 ## Unit 4 — GPU packed matvec (spec §4.3)
 
 ### 4.1 TDD
-- [ ] 4.1.1 `BackendParityTest`: GPU MXFP4 matvec equals the CPU kernel
+- [x] 4.1.1 `BackendParityTest`: GPU MXFP4 matvec equals the CPU kernel
       within the established tolerance.
-- [ ] 4.1.2 Lane/byte mapping is measured on device, not inferred from
+- [x] 4.1.2 Lane/byte mapping is measured on device, not inferred from
       CPU (spec §5.3–5.4): the amdgpu suite runs on the rebuilt compiler.
 
 ### 4.2 Coding
-- [ ] 4.2.1 `@Kernel` MXFP4 matvec mirroring the Q4_K/Q6_K device path;
+- [x] 4.2.1 `@Kernel` MXFP4 matvec mirroring the Q4_K/Q6_K device path;
       coalesced lane mapping (one wave per row).
 
 ### 4.3 Acceptance
-- [ ] 4.3.1 Green on the amdgpu backend suite (spec §5.4), not just CPU.
+- [x] 4.3.1 Green on the amdgpu backend suite (spec §5.4), not just CPU.
 
 ## Unit 5 — GGUF / Checkpoint wiring (spec §2.1)
 
