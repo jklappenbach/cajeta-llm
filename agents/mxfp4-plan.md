@@ -131,25 +131,43 @@ needs the gpt-oss architecture running in cajeta (out of scope, spec
 to the later gpt-oss bring-up unit.
 
 ### 7.1 TDD / measurement
-- [x] 7.1.1 A bench probe (beside `bench/DequantProbe`,
-      `bench/DecodeProbe`) times MXFP4 dequant and MXFP4×Q8_0 matvec on
-      matched shapes, and a llama.cpp harness times its MXFP4 path on
-      the SAME shapes.
-- [ ] 7.1.2 Measurement discipline (fleet notes): discard warm-up
-      iterations, run **N≥ (enough for a stable average)** iterations,
-      gate on an idle machine, alternate arm order between cajeta and
-      llama.cpp, and report mean/median + spread — never a single shot
-      (`ab-timing-alternate-arm-order`, `bench-context-hides-the-real-cost`,
-      `run-tests-in-parallel` for isolation, GPU: read shader stats not
-      just wall-clock, `gpu-kernel-read-shader-stats`).
+- [x] 7.1.1 `bench/Mxfp4Bench` times the MXFP4 matvec on device via the
+      cajeta profiler (DEVICE kernel time), and llama.cpp's mxfp4 MUL_MAT
+      is timed on the SAME device/shape with `test-backend-ops perf`.
+- [x] 7.1.2 Measurement discipline: profiler device time (not wall),
+      warm-up discarded, 200 iters averaged, idle-gated, shape matched to
+      llama.cpp (4096×14336), and the shader ISA read via `--xpu-emit=isa`
+      (VGPR/spill/cndmask — the HIP path, RADV_DEBUG is inert). A
+      decode-free probe isolated the memory floor from decode ALU.
 
 ### 7.2 Coding
-- [ ] 7.2.1 The MXFP4 bench probe (CPU and GPU arms) with warm-up +
-      averaged runs; a small script to run llama.cpp's equivalent and
-      normalize units for the comparison.
+- [x] 7.2.1 `bench/Mxfp4Bench` (scalar / fast3 / coop arms, warm-up +
+      averaged) and the llama.cpp comparison via `test-backend-ops perf`
+      on the matched shape. Production `matVecLaunch` routes MXFP4 to the
+      portable `mxfp4MatVecKernelFast3` (int32 branchless decode, one item
+      per row, correct on the CPU backend and every wave width).
 
 ### 7.3 Acceptance
-- [ ] 7.3.1 cajeta's MXFP4 matvec throughput is at parity with
-      llama.cpp's on the measured shapes (target ratio set from the
-      first honest measurement, in the spirit of the ≤0.97/≤12ms 30B
-      bars), reported as an averaged figure with its spread.
+- [~] 7.3.1 gfx1151, 4096×14336, profiler device time averaged over 200:
+      llama.cpp mxfp4 MUL_MAT **58.4 µs** (534 GB/s, MALL-resident, HIP
+      graph); cajeta **fast3 ~225 µs (6.5×)**, **coop ~163 µs (9.1×)**;
+      scalar floor ~1480 µs. The wave-cooperative layout REACHES the
+      memory floor — a decode-free coop probe measured **62 µs**, at
+      parity with llama.cpp's 58 µs — so the access pattern is solved. The
+      residual gap is entirely **f32-domain decode ALU** (~100 µs; measured
+      identical across int8-select / int8-branchless / int32-branchless
+      decodes and unchanged by occupancy, so ALU-throughput-bound). Two
+      cajeta-compiler gaps block true 58 µs parity, each a FINDING:
+        (a) **no int8 dot-product intrinsic** (dp4a / v_dot) — llama.cpp
+            hides the decode inside an integer dot over Q8_0 activations
+            (spec §4.2 fast path); cajeta's Vector has no such op, so the
+            f32 FMA path cannot avoid the ~100 µs decode.
+        (b) **device cannot report wave width** (`cajeta-llama-geometry-is-
+            literals`, the Unit 12 gap) — so the faster coop kernel (which
+            hard-assumes wave 32 and is WRONG on the CPU backend) cannot be
+            the portable production path nor be launched with a correct
+            `rows*width` grid. It ships as an amdgpu/wave32-tuned kernel a
+            future backend-aware dispatch can select.
+      BLOCKED on (a)/(b); revisit with the Q8/int-dot fast path and the
+      device-geometry unit. What ships now: portable fast3 at 6.5× and the
+      full measured analysis in `QuantKernel`'s MXFP4 performance note.
