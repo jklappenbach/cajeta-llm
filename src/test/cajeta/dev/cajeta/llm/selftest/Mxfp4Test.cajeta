@@ -9,6 +9,9 @@ import cajeta.lang.String;
 import cajeta.lang.Cajeta;
 import cajeta.io.file.File;
 import cajeta.io.file.Path;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.lang.Math;
 
 /**
  * MXFP4 quant format (Unit 32, plan units 1-2).
@@ -313,6 +316,146 @@ public class Mxfp4Test {
         int64 r = 0;
         while (r < rows) {
             Mxfp4Test.eqApprox(want[r], got[r], "gpu vs cpu matvec row");
+            r = r + 1;
+        }
+    }
+
+    // ── Unit 7: GPU Q8 fast path (lut4 + dp4a) vs an independent Q8 ──────
+    //
+    // coopQ8 is llama.cpp's mxfp4xq8 algorithm: lut4 decodes the nibbles to
+    // signed int8 and dotSum (v_dot4/sdot4) dots them against Q8-quantized
+    // activations, scaling the integer sum by d_w*d_x per 32-block. The
+    // right oracle is NOT the f32 scalar kernel (a different algorithm —
+    // f32 activations); it is the SAME integer algorithm on the host, so
+    // the two agree to a tight tolerance and a near-zero row does not flake.
+    // AMDGPU/NVIDIA (wave32) only; skips on the CPU backend, whose wave
+    // width the coop reduction cannot assume (the Unit 12 gap).
+
+    static boolean coopQ8Here() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return false; }
+        return Device.kernelAvailable("mxfp4MatVecKernelCoopQ8");
+    }
+
+    /** E2M1 nibble -> signed value; llama.cpp's kvalues_mxfp4. */
+    static int32 kvHost(int32 nib) {
+        int32 m = nib & 7;
+        int32 mag = 0;
+        if (m == 1) { mag = 1; }
+        else if (m == 2) { mag = 2; }
+        else if (m == 3) { mag = 3; }
+        else if (m == 4) { mag = 4; }
+        else if (m == 5) { mag = 6; }
+        else if (m == 6) { mag = 8; }
+        else if (m == 7) { mag = 12; }
+        if ((nib & 8) != 0) { return -mag; }
+        return mag;
+    }
+
+    /** E8M0 exponent byte -> half-scale 2^(e-128). */
+    static float32 scaleHost(int32 e) {
+        int64 bits;
+        if (e < 2) { bits = 0x00200000L << (int64) e; }
+        else { bits = (int64) (e - 1) << 23; }
+        return Cajeta.bitsToF32(bits);
+    }
+
+    /** Independent host twin of the device Q8 path: per-32 activation quant
+     *  (amax/127, round), integer dot against the decoded nibbles, scaled by
+     *  d_w*d_x per block. */
+    static void refQ8(int8[] packed, int64 rows, int64 cols,
+            float32[] x, float32[] out) {
+        int64 bpr = cols / 32L;
+        float32[] xd #= heap float32[bpr];
+        int32[] xq #= heap int32[cols];
+        int64 b = 0;
+        while (b < bpr) {
+            float32 amax = 0.0f;
+            int32 k = 0;
+            while (k < 32) {
+                float32 v = x[b * 32L + (int64) k];
+                if (v < 0.0f) { v = 0.0f - v; }
+                if (v > amax) { amax = v; }
+                k = k + 1;
+            }
+            float32 inv = 0.0f;
+            if (amax > 0.0f) { inv = 127.0f / amax; }
+            xd[b] = amax / 127.0f;
+            k = 0;
+            while (k < 32) {
+                xq[b * 32L + (int64) k] =
+                    (int32) Math.round(x[b * 32L + (int64) k] * inv);
+                k = k + 1;
+            }
+            b = b + 1;
+        }
+        int64 rowBytes = bpr * 17L;
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            b = 0;
+            while (b < bpr) {
+                int64 ro = i * rowBytes + b * 17L;
+                float32 dw = Mxfp4Test.scaleHost((int32) packed[ro] & 255);
+                int32 s = 0;
+                int32 k = 0;
+                while (k < 32) {
+                    int32 byteV =
+                        (int32) packed[ro + 1L + (int64) (k & 15)] & 255;
+                    int32 nib;
+                    if (k < 16) { nib = byteV & 15; }
+                    else { nib = (byteV >> 4) & 15; }
+                    s = s + Mxfp4Test.kvHost(nib) * xq[b * 32L + (int64) k];
+                    k = k + 1;
+                }
+                acc = acc + (float32) s * dw * xd[b];
+                b = b + 1;
+            }
+            out[i] = acc;
+            i = i + 1;
+        }
+    }
+
+    /** Tight relative tolerance for two runs of the SAME integer algorithm:
+     *  only f32 reduction order and a rare round-half tie can differ. */
+    static void eqQ8(float32 expected, float32 actual, String what) {
+        float32 diff = expected - actual;
+        if (diff < 0.0f) { diff = 0.0f - diff; }
+        float32 mag = expected;
+        if (mag < 0.0f) { mag = 0.0f - mag; }
+        if (diff > 0.02f * (1.0f + mag)) {
+            Assert.fail(what);
+        }
+    }
+
+    @Test
+    public void gpuCoopQ8MatchesTheHostQ8Reference() {
+        if (!Mxfp4Test.coopQ8Here()) {
+            System.stdout.println("  (skipped: backend "
+                + Device.activeBackend() + " has no coopQ8 kernel)");
+            return;
+        }
+        int64 rows = 8L;
+        int64 cols = 256L;   // 8 blocks per row; x32 not x256
+        int8[] packed #= Mxfp4Test.fillPacked(rows, cols / 32L);
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) {
+            x[c] = (float32) ((c % 5L) - 2L) * 0.5f + 0.25f;
+            c = c + 1;
+        }
+        float32[] want #= heap float32[rows];
+        Mxfp4Test.refQ8(packed, rows, cols, x, want);
+
+        float32[] got #= heap float32[rows];
+        QuantKernel.mxfp4MatVecCoopQ8IntoDevice(packed, rows, cols,
+            x, 0L, got, 0L);
+
+        Mxfp4Test.assertLive(want, "host Q8 reference");
+        Mxfp4Test.assertLive(got, "mxfp4 coopQ8 matvec");
+        int64 r = 0;
+        while (r < rows) {
+            Mxfp4Test.eqQ8(want[r], got[r], "coopQ8 vs host-Q8 matvec row");
             r = r + 1;
         }
     }

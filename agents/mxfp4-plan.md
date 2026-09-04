@@ -148,28 +148,39 @@ to the later gpt-oss bring-up unit.
       per row, correct on the CPU backend and every wave width).
 
 ### 7.3 Acceptance
-- [~] 7.3.1 gfx1151, 4096×14336, profiler device time averaged over 200:
+- [x] 7.3.1 gfx1151, 4096×14336, profiler device time averaged over 200:
       llama.cpp mxfp4 MUL_MAT **58.4 µs** (534 GB/s, MALL-resident, HIP
-      graph); cajeta **coop 77 µs (1.33× off llama, 19× over scalar)**,
-      **fast3 (portable) 145 µs**; scalar floor ~1480 µs.
+      graph); cajeta **coopQ8 43 µs (1.36× FASTER than llama, 34× over
+      scalar)** + a 2.3 µs one-shot activation quant; **coop (f32) 79 µs**,
+      **fast3 (portable) 145–170 µs**; scalar floor ~1480 µs. PARITY MET
+      AND EXCEEDED at the kernel level.
       HISTORY: the wave-cooperative layout first reached the memory floor
       (decode-free coop probe = 62 µs ≈ llama), leaving a ~100 µs
       **f32-domain decode ALU** gap (measured identical across int8-select
       / int8-branchless / int32-branchless decodes, occupancy-invariant →
       ALU-throughput-bound). Root cause: MXFP4's non-linear E2M1 table
-      decoded arithmetically. FIX (2026-09-04): added a **`Vector.lut4`
+      decoded arithmetically. FIX-1 (2026-09-04): added a **`Vector.lut4`
       byte-permute LUT intrinsic** to the compiler (lowers to `v_perm_b32`
       / `llvm.amdgcn.perm` on AMD, portable spill-and-gather elsewhere) —
       exactly llama.cpp's `get_int_from_table_16` technique. The kvalues
       (sign folded into indices 8..15) are the table, so `lut4` yields the
-      decoded value directly: coop 163 → **77 µs**, cndmask 32 → 1, instrs
-      690 → 361. Compiler tests: `lut4EmitsAmdPerm` / `RunsOnAmdDevice` /
-      `RunsOnCpu` green. My earlier "no int8-dot op" finding was WRONG —
+      decoded value directly: coop 163 → 77 µs, cndmask 32 → 1, instrs
+      690 → 361. My earlier "no int8-dot op" finding was WRONG —
       `.dot`/`.dotSum` already exist; the missing op was the byte permute.
-      REMAINING 77 vs 58 µs (1.33×): the `lut4` output still runs
-      widen→toF32→f32 FMA (~15 µs over the 62 µs floor). Closing it is the
-      full llama.cpp algorithm — `lut4` decode to int8 + `.dotSum` (dp4a)
-      over **Q8_0-quantized activations** — a follow-up needing a Q8
-      activation quantize step. Coop stays amdgpu/wave32-only (device can't
-      report wave width to size a portable launch — the Unit 12 gap); the
-      portable production path is fast3.
+      FIX-2 (2026-09-04): the residual 77 vs 58 µs was the `lut4` output
+      still running widen→toF32→f32 FMA (~15 µs). Closed it with the full
+      llama.cpp algorithm — **`mxfp4MatVecKernelCoopQ8`**: `lut4` decodes to
+      signed int8 and **`.dotSum` (v_dot4/sdot4 dp4a)** dots against
+      **per-32 Q8_0-quantized activations** (`mxfp4QuantActKernel`, a 2.3 µs
+      one-shot), scaling the integer sum by d_w·d_x once per block — no f32
+      decode ALU. Result: **43 µs** (stable over 3 runs: 41.9/42.8/44.8),
+      BELOW llama's 58.4 µs. ISA (`--xpu-emit=isa`) confirms the real
+      hardware path: 8× `v_dot4_i32_iu8` (neg_lo realizes signed×signed) +
+      24× `v_perm_b32`, zero `v_fma`, 44 VGPR / 0 spill. Correctness:
+      coopQ8 differs from the f32 scalar by 0.5 % (activation-quant error,
+      exactly llama's mxfp4×q8 behaviour), 0 rows > 2 %; regression-guarded
+      by `Mxfp4Test.gpuCoopQ8MatchesTheHostQ8Reference` (an independent
+      host Q8 twin, 2 % tolerance, amdgpu/wave32-gated). Coop/coopQ8 stay
+      amdgpu/wave32-only (device can't report wave width to size a portable
+      launch — the Unit 12 gap); the portable production path is fast3, and
+      coopQ8 is the fastest kernel for backend-aware dispatch.

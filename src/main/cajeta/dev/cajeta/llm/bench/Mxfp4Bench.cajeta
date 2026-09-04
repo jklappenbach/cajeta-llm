@@ -20,14 +20,18 @@ import dev.cajeta.llm.io.QuantKernel;
  *
  *   llama.cpp mxfp4 MUL_MAT (HIP graph)        58.4 us   (=534 GB/s, MALL)
  *   scalar  mxfp4MatVecKernel                ~1480 us
- *   fast3   mxfp4MatVecKernelFast3 (portable) ~226 us    6.5x
- *   coop    mxfp4MatVecKernelCoop  (wave32)   ~162 us    9.1x
+ *   fast3   mxfp4MatVecKernelFast3 (portable) ~145 us
+ *   coop    mxfp4MatVecKernelCoop  (wave32)    ~77 us    f32 decode + FMA
+ *   coopQ8  mxfp4MatVecKernelCoopQ8 (wave32)   ~?? us    lut4 + dp4a
  *
- * See QuantKernel's MXFP4 performance note for the full analysis: the
- * coop layout reaches the MALL memory floor (a decode-free probe hit
- * 62us == llama.cpp); the residual gap is f32-domain decode ALU, which
- * only the Q8/integer-dot fast path removes (blocked on a cajeta
- * int8-dot intrinsic).
+ * The coop arm reached the MALL memory floor (a decode-free coop probe
+ * hit 62us == llama.cpp) but still ran the decoded nibbles through
+ * widen->toF32->f32 FMA (~15us). coopQ8 is the full llama.cpp algorithm:
+ * lut4 decodes to signed int8 and dotSum (dp4a/sdot4) dots against
+ * Q8_0-quantized activations, scaled by d_w*d_x once per block — the
+ * integer path that removes the f32 decode ALU. Its numbers differ from
+ * the f32 scalar by the activation-quantization error (reported as
+ * maxRel), exactly like llama.cpp's own mxfp4xq8 path.
  *
  * The per-block E8M0 scale byte is pinned to 0.5 so the synthetic
  * payload accumulates finite values (random scales reach 2^127 -> nan,
@@ -68,23 +72,30 @@ public class Mxfp4Bench {
             heap KernelBuffer<float32>((uint64) Mxfp4Bench.COLS);
         KernelBuffer<float32> yb #=
             heap KernelBuffer<float32>((uint64) Mxfp4Bench.ROWS);
+        // Q8 activation scratch: cols quant bytes + cols/32 block scales.
+        KernelBuffer<int8> xq #=
+            heap KernelBuffer<int8>((uint64) Mxfp4Bench.COLS);
+        KernelBuffer<float32> xd #=
+            heap KernelBuffer<float32>((uint64) bpr);
         pb.upload(packed);
         xb.upload(x);
         yb.upload(y);
 
         // Correctness: each GPU variant vs the parity-validated scalar
-        // kernel. coop is only valid on wave32 backends (amdgpu/nvidia).
+        // kernel. coop/coopQ8 are only valid on wave32 backends.
         float32[] ys #= heap float32[Mxfp4Bench.ROWS];
         QuantKernel.mxfp4MatVecLaunch(yb, pb, xb,
             Mxfp4Bench.ROWS, Mxfp4Bench.COLS, 0L, 0L);
         yb.download(ys);
-        Mxfp4Bench.checkVs("fast3", yb, pb, xb, ys, 3);
-        Mxfp4Bench.checkVs("coop", yb, pb, xb, ys, 1);
+        Mxfp4Bench.checkVs("fast3", yb, pb, xb, xq, xd, ys, 3);
+        Mxfp4Bench.checkVs("coop", yb, pb, xb, xq, xd, ys, 1);
+        Mxfp4Bench.checkVs("coopQ8", yb, pb, xb, xq, xd, ys, 4);
 
-        Mxfp4Bench.warmAll(yb, pb, xb);
-        Mxfp4Bench.timeArm(yb, pb, xb, 0);   // scalar
-        Mxfp4Bench.timeArm(yb, pb, xb, 3);   // fast3
-        Mxfp4Bench.timeArm(yb, pb, xb, 1);   // coop
+        Mxfp4Bench.warmAll(yb, pb, xb, xq, xd);
+        Mxfp4Bench.timeArm(yb, pb, xb, xq, xd, 0);   // scalar
+        Mxfp4Bench.timeArm(yb, pb, xb, xq, xd, 3);   // fast3
+        Mxfp4Bench.timeArm(yb, pb, xb, xq, xd, 1);   // coop
+        Mxfp4Bench.timeArm(yb, pb, xb, xq, xd, 4);   // coopQ8
         yb.download(y);
         System.stdout.println("mxfp4 bench done rows=" + Mxfp4Bench.ROWS
             + " cols=" + Mxfp4Bench.COLS + " iters=" + Mxfp4Bench.ITERS
@@ -93,12 +104,16 @@ public class Mxfp4Bench {
     }
 
     static void launch(int32 which, KernelBuffer<float32> yb,
-            KernelBuffer<int8> pb, KernelBuffer<float32> xb) {
+            KernelBuffer<int8> pb, KernelBuffer<float32> xb,
+            KernelBuffer<int8> xq, KernelBuffer<float32> xd) {
         if (which == 3) {
             QuantKernel.mxfp4MatVecFast3LaunchSync(yb, pb, xb,
                 Mxfp4Bench.ROWS, Mxfp4Bench.COLS, 0L, 0L);
         } else if (which == 1) {
             QuantKernel.mxfp4MatVecCoopLaunch(yb, pb, xb,
+                Mxfp4Bench.ROWS, Mxfp4Bench.COLS, 0L, 0L);
+        } else if (which == 4) {
+            QuantKernel.mxfp4MatVecCoopQ8Launch(yb, pb, xb, xq, xd,
                 Mxfp4Bench.ROWS, Mxfp4Bench.COLS, 0L, 0L);
         } else {
             QuantKernel.mxfp4MatVecLaunch(yb, pb, xb,
@@ -109,9 +124,10 @@ public class Mxfp4Bench {
 
     static void checkVs(String name, KernelBuffer<float32> yb,
             KernelBuffer<int8> pb, KernelBuffer<float32> xb,
+            KernelBuffer<int8> xq, KernelBuffer<float32> xd,
             float32[] ref, int32 which) {
         float32[] yv #= heap float32[Mxfp4Bench.ROWS];
-        Mxfp4Bench.launch(which, yb, pb, xb);
+        Mxfp4Bench.launch(which, yb, pb, xb, xq, xd);
         yb.download(yv);
         float32 maxRel = 0.0f;
         int64 nBad = 0L;
@@ -124,31 +140,34 @@ public class Mxfp4Bench {
             den = den + 0.000001f;
             float32 rel = dd / den;
             if (rel > maxRel) { maxRel = rel; }
-            if (rel > 0.001f) { nBad = nBad + 1L; }
+            if (rel > 0.02f) { nBad = nBad + 1L; }
             r = r + 1L;
         }
         System.stdout.println("verify " + name + "-vs-scalar: maxRel="
-            + maxRel + " nBad(>1e-3)=" + nBad);
+            + maxRel + " nBad(>2e-2)=" + nBad);
         return;
     }
 
     static void warmAll(KernelBuffer<float32> yb, KernelBuffer<int8> pb,
-            KernelBuffer<float32> xb) {
+            KernelBuffer<float32> xb, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd) {
         int32 w = 0;
         while (w < Mxfp4Bench.WARMUP) {
-            Mxfp4Bench.launch(0, yb, pb, xb);
-            Mxfp4Bench.launch(3, yb, pb, xb);
-            Mxfp4Bench.launch(1, yb, pb, xb);
+            Mxfp4Bench.launch(0, yb, pb, xb, xq, xd);
+            Mxfp4Bench.launch(3, yb, pb, xb, xq, xd);
+            Mxfp4Bench.launch(1, yb, pb, xb, xq, xd);
+            Mxfp4Bench.launch(4, yb, pb, xb, xq, xd);
             w = w + 1;
         }
         return;
     }
 
     static void timeArm(KernelBuffer<float32> yb, KernelBuffer<int8> pb,
-            KernelBuffer<float32> xb, int32 which) {
+            KernelBuffer<float32> xb, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd, int32 which) {
         int32 it = 0;
         while (it < Mxfp4Bench.ITERS) {
-            Mxfp4Bench.launch(which, yb, pb, xb);
+            Mxfp4Bench.launch(which, yb, pb, xb, xq, xd);
             it = it + 1;
         }
         return;

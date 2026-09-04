@@ -10561,6 +10561,153 @@ public final class QuantKernel {
         s.sync();
         return;
     }
+    // ── MXFP4 Q8 fast path (Unit 32, unit 7 — parity close) ──────────────
+    //
+    // llama.cpp's vec_dot_mxfp4_q8_1 removes the f32-domain decode entirely:
+    // it decodes the nibbles to int8 with the byte-permute LUT and dots them
+    // against Q8-quantized ACTIVATIONS in the integer domain (dp4a), scaling
+    // the integer sum by d_w*d_x ONCE per 32-block. The lut4 output IS the
+    // signed int8 weight, so pairing it with dotSum (chained v_dot4/sdot4)
+    // drops the widen->toF32->f32-FMA the f32 coop kernel spent ~15 us on
+    // (the 77 vs 58 us residual). Activations quantize once per mat-vec (a
+    // tiny one-shot grid), at MXFP4's 32-element block granularity so every
+    // weight block has an exact partner scale.
+
+    /**
+     * Quantize activations to per-32 Q8_0 — one wave (32 lanes) per 32-block:
+     * amax over the wave, scale d = amax/127, quant = round(x/d). Writes int8
+     * quants to `xq` (0-based element index over the activation region that
+     * begins at `xOff`) and the block scale to `xd` (0-based block index).
+     * Runs once per distinct activation — a tiny grid, not a hot kernel.
+     */
+    @Kernel
+    public static void mxfp4QuantActKernel(KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd, KernelBuffer<float32> x,
+            uint32 blocks, int64 xOff) {
+        uint32 lane = KernelThread.globalIdX() & 31;
+        uint32 blk = KernelThread.globalIdX() / 32;
+        if (blk < blocks) {
+            int64 b = (int64) blk;
+            float32 v = x[xOff + b * 32L + (int64) lane];
+            float32 av = v;
+            if (v < 0.0f) { av = 0.0f - v; }
+            float32 bmax = Wave.reduceMaxF32(av);
+            float32 inv = 0.0f;
+            if (bmax > 0.0f) { inv = 127.0f / bmax; }
+            int32 qi = (int32) Math.round(v * inv);
+            xq[b * 32L + (int64) lane] = (int8) qi;
+            if (lane == 0) { xd[b] = bmax / 127.0f; }
+        }
+    }
+
+    /** Launch {@link #mxfp4QuantActKernel} over `cols` activations at `xOff`. */
+    public static void mxfp4QuantActLaunch(KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd, KernelBuffer<float32> x,
+            int64 cols, int64 xOff) {
+        uint32 nb = (uint32) (cols / 32L);
+        uint32 threads = nb * 32;
+        uint32 blk = (uint32) 256;
+        KernelStream s = QuantKernel.stream();
+        mxfp4QuantActKernel.launch(s,
+            grid: [(threads + blk - 1) / blk], block: [blk])
+            (xq, xd, x, nb, xOff);
+        return;
+    }
+
+    /**
+     * Wave-cooperative MXFP4 mat-vec over Q8-quantized activations (the
+     * llama.cpp mxfp4xq8 dot). Identical wave/row/block striding to
+     * {@link #mxfp4MatVecKernelCoop}, but the block dot is INTEGER: lut4
+     * decodes the nibbles to signed int8 and dotSum (sdot4/v_dot4) dots them
+     * against the block's Q8 activation bytes, scaled by d_w*d_x once. No
+     * widen/convert/f32-FMA in the loop. `xq`/`xd` are 0-based over the
+     * activation region (produced by {@link #mxfp4QuantActKernel}).
+     *
+     * AMDGPU/NVIDIA (wave width 32) ONLY — same Unit 12 launch-sizing gap as
+     * the f32 coop kernel; backend-aware dispatch, not the portable path.
+     */
+    @Kernel
+    public static void mxfp4MatVecKernelCoopQ8(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        uint32 gid = KernelThread.globalIdX();
+        uint32 row = gid / 32;
+        uint32 lane = gid & 31;
+        if (row < rows) {
+            int64 i = (int64) row;
+            int64 rowBytes = blocksPerRow * 17L;
+            Vector<int8,16> kv = QuantKernel.mxfp4Kv();
+            float32 acc = 0.0f;
+            int64 b = (int64) lane;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 17L;
+                float32 dw = QuantKernel.mxfp4ScaleDev(
+                    (int32) packed[ro] & 255);
+                float32 dx = xd[b];
+                Vector<int8,16> v = packed.vload<16>(ro + 1L);
+                Vector<int8,16> dl = (v & 15).lut4(kv);
+                Vector<int8,16> dh = ((v >> 4) & 15).lut4(kv);
+                int64 xb = b * 32L;
+                Vector<int8,16> aLo = xq.vload<16>(xb);
+                Vector<int8,16> aHi = xq.vload<16>(xb + 16L);
+                int32 s = 0;
+                s = dl.dotSum(aLo, s);
+                s = dh.dotSum(aHi, s);
+                acc = acc + (float32) s * dw * dx;
+                b = b + 32L;
+            }
+            float32 total = Wave.reduceSumF32(acc);
+            if (lane == 0) { y[yOff + i] = total; }
+        }
+    }
+
+    /**
+     * Launch the MXFP4 Q8 coop path: quantize activations once, then the
+     * integer coop mat-vec. `xq`/`xd` are caller-owned scratch sized to
+     * `cols` bytes and `cols/32` floats.
+     */
+    public static void mxfp4MatVecCoopQ8Launch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            KernelBuffer<int8> xq, KernelBuffer<float32> xd,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        QuantKernel.mxfp4QuantActLaunch(xq, xd, x, cols, xOff);
+        uint32 threads = (uint32) (rows * 32L);
+        uint32 blk = (uint32) 256;
+        KernelStream s = QuantKernel.stream();
+        mxfp4MatVecKernelCoopQ8.launch(s,
+            grid: [(threads + blk - 1) / blk], block: [blk])
+            (y, packed, xq, xd, (uint32) rows, cols / 32L, yOff);
+        s.sync();
+        return;
+    }
+
+    /**
+     * {@link #mxfp4MatVecCoopQ8Launch} over HOST arrays — allocates the
+     * weight/activation buffers and the Q8 scratch, uploads, launches,
+     * downloads. The shape a test (or a non-resident caller) invokes.
+     * AMDGPU/NVIDIA (wave32) only, like the kernel it wraps.
+     */
+    public static void mxfp4MatVecCoopQ8IntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
+            (uint64) packed.count());
+        KernelBuffer<float32> xb #= heap KernelBuffer<float32>(
+            (uint64) x.count());
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>(
+            (uint64) y.count());
+        KernelBuffer<int8> xq #= heap KernelBuffer<int8>((uint64) cols);
+        KernelBuffer<float32> xd #= heap KernelBuffer<float32>(
+            (uint64) (cols / 32L));
+        pb.upload(packed);
+        xb.upload(x);
+        yb.upload(y);
+        QuantKernel.mxfp4MatVecCoopQ8Launch(yb, pb, xb, xq, xd,
+            rows, cols, xOff, yOff);
+        yb.download(y);
+        return;
+    }
+
     /** {@link #q4kMatVecLaunch} for Q5_K — 176-byte blocks, same grid. */
     public static void q5kMatVecLaunchNoSync(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
