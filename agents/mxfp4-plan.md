@@ -131,7 +131,7 @@ needs the gpt-oss architecture running in cajeta (out of scope, spec
 to the later gpt-oss bring-up unit.
 
 ### 7.1 TDD / measurement
-- [ ] 7.1.1 A bench probe (beside `bench/DequantProbe`,
+- [x] 7.1.1 A bench probe (beside `bench/DequantProbe`,
       `bench/DecodeProbe`) times MXFP4 dequant and MXFP4×Q8_0 matvec on
       matched shapes, and a llama.cpp harness times its MXFP4 path on
       the SAME shapes.
