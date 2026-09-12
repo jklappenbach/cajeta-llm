@@ -473,6 +473,21 @@ byte-loads. (3) AsyncCopy prefetch NOT viable — inert on gfx1151 (no LDS-DMA i
 RDNA3 silicon, AmdgpuKernelLowering.cpp:106-113). (4) retry @Occupancy
 (minResident=2) after (1)/(2) lighten registers. (5) keep both K-halves' mbA
 resident.
+PROGRESS 2026-09-12 (e25805b): RANK 1 applied — q4kWmmaMwKernel B-feed is now
+`fromWords` from packed nibbles (bt tile/widen loops/widen barriers gone, flat
+j-loop, 2 barriers/block, LDS 12.5 KB, +KernelBuffer<int32> packedW param via
+ensurePackedW). 6.1.1 bit-gate PASSES. But prefill stayed 359 — three B-feeds
+(LDS widen 341 / two-k-half 357 / fromWords 359) all ~360 ⇒ the B-feed was
+NOT the packed bottleneck. LAUNCHER WAS: q4kWmmaMwLaunch was the only launcher
+slicing at dispatchBlocks(8)≈20 WGs (one wave/SIMD, under-fills); every tuned
+launcher uses partWgs=32. Switching to partWgs → 416 tok/s (+16%). RESIDUAL vs
+deq 637: fromWords = 8 scalar word-loads + ~12 ALU per B fragment vs deq's ONE
+wide <4 x i32> load ⇒ packed-mw is INSTRUCTION-bound at 4.5 bpw, deq is
+BANDWIDTH-bound at 8.5. NEXT: wide-load the 8 packed words per j-pair
+(Vector<int32,4>×2) and reuse across even/odd nibble + both halves (16× fewer
+B loads at 4.5 bpw); then RANK 2 (A-side LDS staging, literal stride).
+6.3.2 CAVEAT: the naive dispatchBlocks saturation law under-fills ~16%; the
+measured 32-WG slice needs a derivable oversubscription factor (test 2×).
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
