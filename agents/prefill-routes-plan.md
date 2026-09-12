@@ -434,8 +434,19 @@ Linear.cajeta:2089) and BIT-CORRECT (6.1.1 PASS, matches deq-Mw8 exactly).
 Measured 8B Q4_K_M prefill 512: 341 tok/s = 1.57x over single-wave 218
 (0.165→0.26x llama), packed memory. BELOW the deq path's 637 — occupancy-
 bound: the inline-widen `bt` is 32 KB LDS (~46 KB/wg → ~1 WG/CU) and the
-kernel spills 236 B (vgpr=192). NEXT (6.2.1 cont.): two-k-half widen → 16 KB
-LDS to raise occupancy; despill; re-measure toward 637+.
+kernel spills 236 B (vgpr=192).
+FINDING 2026-09-12: two-k-half widen (bt 32→16 KB, ~2 WG/CU, bit-gate still
+PASS) gave only 341→357 tok/s — the packed path is NOT occupancy-bound, it is
+COMPUTE-bound on the per-launch inline nibble-widen (the +2 barriers/block
+offset the occupancy gain). The deq path's 639 comes from NOT widening per
+launch (pre-dequantizes once at prewarm). So the packed path is capped near
+~639 by widen cost; closing it needs a cheaper widen (vectorized lut4/v_perm,
+cf [[mxfp4-kernel-perf-decode-bound]]), not more occupancy. PARITY ROADMAP:
+(1) multi-wave DONE (218→357 packed / 639 deq); (2) despill the DEQ kernel
+(4.2.1, 124 B; despill historically +55-70%) → ~1000+, the fastest parity
+lever; (3) vectorized packed widen → 357 toward 639 at packed memory; (4)
+deeper GEMM AI tuning toward 1320. Reaching true parity (1320, 6x) is
+multi-iteration.
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
