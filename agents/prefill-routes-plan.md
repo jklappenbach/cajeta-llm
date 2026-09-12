@@ -500,6 +500,16 @@ study's 0.53x ratio was coincidental. Roadmap: deq+A-staging is the SPEED
 base (no fromWords VALU), packed-mw the MEMORY base; next levers = partWgs
 sweep (32 caps WGs in flight <2/CU on 40 CUs) + @Occupancy(minResident=2),
 then port A-staging to deq-Mw8.
+PROGRESS 2026-09-12: RANK 2 FIXED, bit-gate PASS → 507 tok/s (+18% over 431;
+deq control 637 unchanged in the same alternating A/B, prompt=512). The
+bit-wrong cause was NOT the barrier: the LDS tile `Shared<int8> at` shadowed
+the deq template's `int64 at` (the rg-staging q8 partial-sum address) — blocks
+share the method scope map, so a differently-typed shadow ships corrupt IR
+silently (second instance of the known compiler defect). Renamed `aTile`; the
+explicit staging barrier is restored (5/block) until a fold is proven. Spill
+204 B at vgpr=192 (the LDS budget lowered the VGPR cap). Kernel now: B at 4.5
+bpw via fromWords + A staged once per block in LDS (30.5 KB, literal stride
+144, wide fragment loads). NEXT: partWgs sweep (32/40/64/80, both arms).
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
