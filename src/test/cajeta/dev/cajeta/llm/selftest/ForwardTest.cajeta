@@ -4,9 +4,14 @@ import dev.cajeta.unit.Assert;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.model.CausalLM;
 import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.QuantKernel;
 import cajeta.collection.ArrayList;
 import cajeta.lang.Cajeta;
 import cajeta.lang.String;
+import cajeta.lang.System;
 import cajeta.math.Tensor;
 
 /**
@@ -26,6 +31,8 @@ import cajeta.math.Tensor;
  * second pass).
  */
 public class ForwardTest {
+    static final String ROUTABLE = "src/test/fixtures/gguf/toy-routable.gguf";
+
 
     public ForwardTest() { return; }
 
@@ -267,4 +274,60 @@ public class ForwardTest {
         Assert.equals(b0, Cajeta.allocatedBytes());
         Assert.equals(l0, Cajeta.liveCount());
     }
+    // ── prefill-routes 2.1.4: the tail chunk ────────────────────────────
+
+    static #CausalLM routable() {
+        Checkpoint ck #= Checkpoint.open(ForwardTest.ROUTABLE);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m = heap CausalLM(#cfg, 256, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    /** prefill-routes 2.1.4 — a 200-token prompt as 128 + 72 prefills
+     *  batched end to end, nothing refuses the tail, and the last row's
+     *  logits match the host's one-pass answer. */
+    @Test
+    public void tailChunkPrefillsBatchedAndMatchesTheHost() {
+        CausalLM dev #= ForwardTest.routable();
+        if (!RoutableFixtureTest.deviceHere(dev)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32[] p #= RoutableFixtureTest.promptOf(200, 7);
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        dev.stepSeq(0, p, 0, 128);
+        dev.stepSeq(0, p, 128, 72);
+        Diag.register(null);
+        float32[] dl #= BackendParityTest.logitsOf(dev);
+
+        QuantKernel.setRoutingEnabled(false);
+        CausalLM host #= ForwardTest.routable();
+        host.prefill(p, 200);
+        float32[] hl #= BackendParityTest.logitsOf(host);
+        QuantKernel.setRoutingEnabled(true);
+
+        int32 vocab = dev.vocabSize();
+        float64 cos = Metrics.cosine(hl, dl, vocab);
+        float64 kl = Metrics.softmaxKl(hl, dl, vocab);
+        int32 hTop = Metrics.argmax(hl, vocab);
+        int32 dTop = Metrics.argmax(dl, vocab);
+        System.stdout.println("  2.1.4 tail logits: cosine " + cos
+            + "  softmaxKl " + kl + "  top1 host " + hTop
+            + " device " + dTop);
+        Assert.isTrue(cos >= 0.99999);
+        Assert.isTrue(kl <= 1.0e-6);
+        Assert.equals((int64) hTop, (int64) dTop);
+        if (!cap.saw("prefill-mode", "batched")) {
+            Assert.fail("prefill-mode: " + cap.namesOf("prefill-mode"));
+        }
+        if (cap.countOf("batch-refused") != 0) {
+            Assert.fail("the tail was refused: "
+                + cap.namesOf("batch-refused"));
+        }
+        return;
+    }
+
 }

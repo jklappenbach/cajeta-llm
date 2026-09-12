@@ -12,6 +12,7 @@ import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.io.WmmaKernel;
@@ -746,6 +747,22 @@ public final class Linear extends InfModule {
     /** True when this projection carries a bias to apply. */
     boolean hasBias() { return this.bias != null; }
 
+    /** Bind packed weight bytes directly; `p` must be exactly
+     *  `[outDim x inDim]` blocks of `pty`. */
+    void bindPacked(#int8[] p, int32 pty) {
+        int64 be = (int64) Quant.blockElems(pty);
+        int64 want = (int64) this.outDim * ((int64) this.inDim / be)
+            * (int64) Quant.blockBytes(pty);
+        if ((int64) p.count() != want) {
+            throw heap LlmException("weight binding: packed " + pty
+                + " is " + (int64) p.count() + " bytes; expected " + want
+                + " for [" + this.outDim + ", " + this.inDim + "]");
+        }
+        this.packed #= p;
+        this.packedTy = pty;
+        return;
+    }
+
     void bind(Checkpoint ckpt, String name, boolean toDevice) {
         // Packed path (spec §10): a Q8_0 weight stays in its block form and
         // is consumed as `d · Σ q·x` per 32 — no f32 weight tensor is ever
@@ -783,8 +800,7 @@ public final class Linear extends InfModule {
                     + " bytes; expected " + want + " for [" + this.outDim
                     + ", " + this.inDim + "]");
             }
-            this.packed #= p;
-            this.packedTy = pty;
+            this.bindPacked(#p, pty);
             return;
         }
         Tensor<float32> t #= ckpt.loadF32(name);
@@ -1134,13 +1150,6 @@ public final class Linear extends InfModule {
     static KernelBuffer<int32> btXpW;   // dword view, refreshed with btXp
     static boolean mmqOn = true;        // vulkan Q4_K batch -> mmq kernel
     static boolean coopOn = true;       // vulkan Q4_K batch -> f16 coopmat
-    // prefill-routes plan 2.1.1 (spike arm): open the coop f16 GEMM on
-    // EVERY backend for the formats without a native batch kernel
-    // (Q2_K/Q3_K/Q5_K/Q8_0/Q4_0/Q5_0), instead of the per-row path the
-    // 2026-09-06 sweep measured at 13–18 tok/s. Off until measured.
-    static boolean coopAllBackends = false;
-    public static void setCoopAllBackends(boolean on) { Linear.coopAllBackends = on; }
-    public static boolean coopAllBackendsOn() { return Linear.coopAllBackends; }
     // Race-bracket switches for the coop route on HIP (prefill-routes 2.1.1
     // spike): a stream sync after the f16 staging (1) and after the GEMM (2).
     static boolean coopSync1 = false;
@@ -1153,11 +1162,11 @@ public final class Linear extends InfModule {
     public static void setCoopSync(int32 which, boolean on) {
         if (which == 1) { Linear.coopSync1 = on; } else { Linear.coopSync2 = on; }
     }
-    /** The coop f16 GEMM is this weight's batched route on a non-vulkan
-     *  backend: the spike arm is on, no native batch kernel exists for
-     *  the format, and the tile divides the shape. */
+    /** The coop f16 GEMM is this weight's batched route off vulkan: no
+     *  native batch kernel exists for the format and the tile divides
+     *  the shape. */
     boolean coopRoutedHere() {
-        return Linear.coopAllBackends && Linear.coopOn
+        return Linear.coopOn
             && !Linear.backendIsVulkan()
             && !QuantKernel.hasBatchKernel(this.packedTy)
             && QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)
@@ -1545,7 +1554,8 @@ public final class Linear extends InfModule {
 
     static void ensureBatchStage(int32 rows, int32 n) {
         if (Linear.btCap >= rows && Linear.btDim >= n) { return; }
-        int32 wr = rows;
+        // Capacity rounds to the Mw8 tile: a padded launch reads that far.
+        int32 wr = (rows + 127) / 128 * 128;
         if (Linear.btCap > wr) { wr = Linear.btCap; }
         int32 wn = n;
         if (Linear.btDim > wn) { wn = Linear.btDim; }
@@ -1811,8 +1821,8 @@ public final class Linear extends InfModule {
             return this.packedTy == Quant.GG_Q4_K;
         }
         if (QuantKernel.hasBatchKernel(this.packedTy)) { return true; }
-        // prefill-routes 2.2.1: no native int8 batch kernel for this
-        // format — the coop f16 GEMM is the batched route when its arm is on.
+        // No native int8 batch kernel for this format: the coop f16 GEMM
+        // is the batched route where its tile divides the shape.
         return this.coopRoutedHere();
     }
 
@@ -1843,10 +1853,9 @@ public final class Linear extends InfModule {
         if (Linear.backendIsVulkan()) {
             return "vulkan: coop tile does not divide cols/outDim and no batch kernel";
         }
-        // Not vulkan and hasBatchKernel(ty) is false. With the coop arm
-        // on, the coop f16 GEMM would have taken it unless the tile does
-        // not divide the shape — say which.
-        if (Linear.coopAllBackends && Linear.coopOn) {
+        // Not vulkan and hasBatchKernel(ty) is false: the coop f16 GEMM
+        // would have taken it unless the tile does not divide the shape.
+        if (Linear.coopOn) {
             if (!QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)) {
                 return "coop GEMM: cols not a multiple of the tile (256 k-quant, 64 legacy)";
             }
@@ -1873,8 +1882,8 @@ public final class Linear extends InfModule {
             : this.packedTy == Quant.GG_Q2_K ? Linear.avQ2Mw8
             : Linear.avQ3Mw8;
         if (!mw8Avail) { return "Mw8 deq kernel not registered on this backend"; }
-        if (!WmmaKernel.fitsMw8(rows, (int64) this.outDim)) {
-            return "rows or outDim not a multiple of 128 (Mw8 tile)";
+        if ((int64) this.outDim % 128L != 0L) {
+            return "outDim not a multiple of 128 (Mw8 tile)";
         }
         return null;
     }
@@ -1924,6 +1933,8 @@ public final class Linear extends InfModule {
     // "the first Q6 batch kernel" and was wrong twice (the dotAccum route
     // hangs identically with every WMMA Q6 kernel gated off).
     static int32 routeSaid;
+    /** Forget every announced route, so the next launch names its route again. */
+    public static void resetRouteSaid() { Linear.routeSaid = 0; }
     void sayRoute(int32 bit, String name) {
         if ((Linear.routeSaid & bit) != 0) { return; }
         Linear.routeSaid = Linear.routeSaid | bit;
@@ -1986,18 +1997,23 @@ public final class Linear extends InfModule {
         // only at the Mw8 shape — isBatchRoutedFor gates the batched
         // entry on the same predicate, so reaching here with either
         // means the shape fits.
+        // The Mw8 deq GEMMs tile 128 rows and are these formats' only
+        // int8 route, so a shorter chunk launches over the padded count;
+        // only pad output rows read the pad rows, and matmulInto reads
+        // back `rows`.
+        int64 mw8Rows = ((int64) rows + 127L) / 128L * 128L;
         boolean useDeq5 = Linear.deqPrefill && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q5_K && Linear.avQ5Mw8
-            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
+            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
         boolean useDeq8 = Linear.deqPrefill && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q8_0 && Linear.avQ80Mw8
-            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
+            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
         boolean useDeq2 = Linear.deqPrefill && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q2_K && Linear.avQ2Mw8
-            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
+            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
         boolean useDeq3 = Linear.deqPrefill && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q3_K && Linear.avQ3Mw8
-            && WmmaKernel.fitsMw8((int64) rows, (int64) this.outDim);
+            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
         if (useDeq) {
             this.ensureDeq();
             if (Linear.q4Mw8On && Linear.avQ4Mw8
@@ -2085,85 +2101,103 @@ public final class Linear extends InfModule {
                     && WmmaKernel.fitsMw8((int64) rows,
                         (int64) this.outDim);
                 if (mw8 && Linear.part32On) {
+                    this.sayRoute(33554432, "q6 deqMw8Part");
                     WmmaKernel.q6kWmmaDeqMw8PartLaunch(this.yBatch,
                         this.packedDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else if (mw8) {
+                    this.sayRoute(33554432, "q6 deqMw8");
                     WmmaKernel.q6kWmmaDeqMw8Launch(this.yBatch,
                         this.packedDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else if (Linear.part32On) {
+                    this.sayRoute(67108864, "q6 deqMw4Part");
                     WmmaKernel.q6kWmmaDeqMw4PartLaunch(this.yBatch,
                         this.packedDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else {
+                    this.sayRoute(67108864, "q6 deqMw4");
                     WmmaKernel.q6kWmmaDeqMw4Launch(this.yBatch,
                         this.packedDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 }
             } else if (Linear.epiOn) {
+                this.sayRoute(134217728, "q6 epi");
                 WmmaKernel.q6kWmmaEpiLaunch(this.yBatch, this.packedDev,
                     Linear.btXp, (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
+                this.sayRoute(268435456, "q6 plain");
                 WmmaKernel.q6kWmmaLaunch(this.yBatch, this.packedDev,
                     Linear.btXp, (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
         } else if (useDeq5) {
             this.ensureDeq();
+            this.ensureBatchOut((int32) mw8Rows);
             if (Linear.part32On) {
+                this.sayRoute(2097152, "q5_k deqMw8Part");
                 WmmaKernel.q5kWmmaDeqMw8PartLaunch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
+                this.sayRoute(2097152, "q5_k deqMw8");
                 WmmaKernel.q5kWmmaDeqMw8Launch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
         } else if (useDeq8) {
             this.ensureDeq();
+            this.ensureBatchOut((int32) mw8Rows);
             if (Linear.part32On) {
+                this.sayRoute(4194304, "q8_0 deqMw8Part");
                 WmmaKernel.q80WmmaDeqMw8PartLaunch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
+                this.sayRoute(4194304, "q8_0 deqMw8");
                 WmmaKernel.q80WmmaDeqMw8Launch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
         } else if (useDeq2) {
             this.ensureDeq();
+            this.ensureBatchOut((int32) mw8Rows);
             if (Linear.part32On) {
+                this.sayRoute(8388608, "q2_k deqMw8Part");
                 WmmaKernel.q2kWmmaDeqMw8PartLaunch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
+                this.sayRoute(8388608, "q2_k deqMw8");
                 WmmaKernel.q2kWmmaDeqMw8Launch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
         } else if (useDeq3) {
             this.ensureDeq();
+            this.ensureBatchOut((int32) mw8Rows);
             if (Linear.part32On) {
+                this.sayRoute(16777216, "q3_k deqMw8Part");
                 WmmaKernel.q3kWmmaDeqMw8PartLaunch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
+                this.sayRoute(16777216, "q3_k deqMw8");
                 WmmaKernel.q3kWmmaDeqMw8Launch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
         } else if (Linear.coopOn
@@ -2177,8 +2211,9 @@ public final class Linear extends InfModule {
             // supports: the compute half is format-blind, so each type
             // is a staging body plus, where the ggml block stride is not
             // a multiple of four, a one-time device repack.
+            String coopTn #= GgufFile.typeName(this.packedTy);
             this.sayRoute(Linear.coopRouteBit(this.packedTy),
-                "coop ty=" + this.packedTy);
+                "coop " + coopTn);
             this.ensureCoopW();
             // 128, always: the BN=256 kernels the 256 pad existed for
             // were retired 2026-08-26 (they spilled 74 VGPRs), and the

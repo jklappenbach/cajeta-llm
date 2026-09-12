@@ -239,34 +239,34 @@ plan's acceptance and in the bench memory.
       the compiler as oracle. Consequence for the instrument: build the
       bench through run-tests.sh's enumeration (or fix the sweep first),
       with `--tree-shake=off` so the coop kernels survive.
-- [ ] 2.1.2 `LinearKernelRouteTest`: on gfx1151, a Q8_0 / Q2_K / Q3_K /
+- [x] 2.1.2 `LinearKernelRouteTest`: on gfx1151, a Q8_0 / Q2_K / Q3_K /
       Q5_K `Linear` built from the `kquant/` fixture blocks reports
       `isBatchRoutedFor(128) == true` with `prefillWeights=packed`, and the
       batched output matches the per-row (forced serial) output within the
       coop route's Vulkan tolerance, per format.
-- [ ] 2.1.3 `LinearKernelRouteTest`: Q4_K and Q6_K still take their native
+- [x] 2.1.3 `LinearKernelRouteTest`: Q4_K and Q6_K still take their native
       int8 routes (`batch-route q4 plain` / `mmq q6`); the coop route is not
       chosen where a native kernel exists.
-- [ ] 2.1.4 `ForwardTest`: a 200-token prompt (128 + 72 tail) prefills
+- [x] 2.1.4 `ForwardTest`: a 200-token prompt (128 + 72 tail) prefills
       `batched` end to end — the tail chunk is padded, not sent per-row —
       and the logits of the last real row equal the unpadded per-row
       logits within tolerance.
-- [ ] 2.1.5 `EngineTest`: `prefillWeights=int8` still selects the Mw8
+- [x] 2.1.5 `EngineTest`: `prefillWeights=int8` still selects the Mw8
       routes for the formats that have them (spec §3.4 — nothing regresses).
 
 ### 2.2 Coding
-- [ ] 2.2.1 `Linear.isBatchRouted`: open the coop branch on every backend
+- [x] 2.2.1 `Linear.isBatchRouted`: open the coop branch on every backend
       (not only Vulkan) for formats where `!hasBatchKernel(ty)`, behind
       `coopColsOk` and `outDim % 128`; `isBatchRoutedFor` stops requiring
       `deqPrefill` for those formats when the coop route is open.
-- [ ] 2.2.2 `matmulBatchKeep`: the coop branch is reachable on HIP;
+- [x] 2.2.2 `matmulBatchKeep`: the coop branch is reachable on HIP;
       `sayRoute` records `coop <fmt>`; the f32→f16 activation conversion and
       the coop scratch (`yBatch`, staging) are allocated on the HIP device
       path exactly as on Vulkan.
-- [ ] 2.2.3 Tail padding: `CausalLM.forwardRowsBatched` (or the chunk
+- [x] 2.2.3 Tail padding: `CausalLM.forwardRowsBatched` (or the chunk
       planner) rounds the last chunk's rows up to the route's tile
       (`fitsMw8`/coop tile) with zero rows, and the epilogue ignores them.
-- [ ] 2.2.4 `EngineOptions` doc: `packed` now batches every format; the
+- [x] 2.2.4 `EngineOptions` doc: `packed` now batches every format; the
       `int8` note names the Mw8 route as the alternative, not the only one.
 
 ### 2.3 Acceptance

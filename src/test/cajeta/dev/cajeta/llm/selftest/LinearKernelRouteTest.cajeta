@@ -2,6 +2,9 @@ package dev.cajeta.llm.selftest;
 
 import dev.cajeta.unit.Assert;
 import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.Diag;
+import cajeta.io.file.File;
+import cajeta.lang.System;
 import cajeta.xpu.Device;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
@@ -46,6 +49,10 @@ public class LinearKernelRouteTest {
     static final String Q6K_NAME = "model.layers.0.self_attn.v_proj.weight";
     static final String TOY = "src/test/fixtures/gguf/toy.gguf";
     static final String Q8_NAME = "model.layers.0.mlp.down_proj.weight";
+    static final String KQ = "src/test/fixtures/gguf/kquant/";
+    static final int32 CO = 128;     // outDim: one Mw8 / coop row tile
+    static final int32 CI = 256;     // inDim: one k-quant super-block
+
 
     public LinearKernelRouteTest() { return; }
 
@@ -704,6 +711,197 @@ public class LinearKernelRouteTest {
             Assert.fail("the Q6_K wave route matched the serial path "
                 + "EXACTLY - the activation quantization is not happening");
         }
+    }
+
+    // ── prefill-routes Unit 2: the batched route for every format ───────
+
+    /** A `[CO x CI]` weight tiled from a kquant fixture's real blocks. */
+    static #Linear tiled(int32 ty, String fixture) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be = (int64) Quant.blockElems(ty);
+        int64 nBlocks = (int64) LinearKernelRouteTest.CO
+            * ((int64) LinearKernelRouteTest.CI / be);
+        int8[] fix #= File.readAllBytes(LinearKernelRouteTest.KQ + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        Linear lin = heap Linear(LinearKernelRouteTest.CI,
+            LinearKernelRouteTest.CO);
+        lin.bindPacked(#raw, ty);
+        return #lin;
+    }
+
+    /** Batched `matmulInto` over `rows` ramp rows against the serial path
+     *  row by row: `tol` relative, with a 0.01 absolute floor. */
+    static void checkBatched(Linear lin, int32 rows, float64 tol,
+            String what) {
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ci, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L,
+            (int64) rows * co);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L,
+            (int64) rows * co);
+        QuantKernel.setRoutingEnabled(false);
+        int64 r = 0;
+        while (r < (int64) rows) {
+            lin.matvecInto(x, r * ci, want, r * co);
+            r = r + 1;
+        }
+        QuantKernel.setRoutingEnabled(true);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        lin.matmulInto(rows, got, 0L);
+        boolean live = false;
+        int64 i = 0;
+        while (i < (int64) rows * co) {
+            float32 g = got.flatGet(i);
+            float32 w = want.flatGet(i);
+            if (g != 0.0f) { live = true; }
+            float32 d = g - w;
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 m = w < 0.0f ? 0.0f - w : w;
+            if ((float64) d > (float64) m * tol + 0.01) {
+                Assert.fail(what + " at " + i + ": batched " + g
+                    + " vs serial " + w);
+            }
+            i = i + 1;
+        }
+        if (!live) {
+            Assert.fail(what + ": every batched output is zero");
+        }
+        return;
+    }
+
+    static boolean coopHereOrSay() {
+        if (CoopQuantGemmTest.coopHere()) { return true; }
+        System.stdout.println("  (skipped: backend " + Device.activeBackend()
+            + " has no coop kernel)");
+        return false;
+    }
+
+    /** prefill-routes 2.1.2 — under `packed`, the formats without a native
+     *  batch kernel batch through the coop f16 GEMM, and match serial. */
+    @Test
+    public void coopRouteBatchesTheFormatsWithoutANativeKernel() {
+        if (!LinearKernelRouteTest.coopHereOrSay()) { return; }
+        int32[] tys #= heap int32[4];
+        tys[0] = Quant.GG_Q8_0;
+        tys[1] = Quant.GG_Q2_K;
+        tys[2] = Quant.GG_Q3_K;
+        tys[3] = Quant.GG_Q5_K;
+        String[] fx #= heap String[4];
+        fx[0] = "q8_0.bin";
+        fx[1] = "q2_k.bin";
+        fx[2] = "q3_k.bin";
+        fx[3] = "q5_k.bin";
+        String[] nm #= heap String[4];
+        nm[0] = "q8_0";
+        nm[1] = "q2_k";
+        nm[2] = "q3_k";
+        nm[3] = "q5_k";
+        Linear.setDeqPrefill(false);
+        int32 f = 0;
+        while (f < 4) {
+            Linear lin #= LinearKernelRouteTest.tiled(tys[f], fx[f]);
+            String why = lin.batchRefusal(128L);
+            if (why != null) {
+                Assert.fail(nm[f] + " refused at 128 rows: " + why);
+            }
+            Linear.resetRouteSaid();
+            PrefillTap cap = heap PrefillTap();
+            Diag.register(cap);
+            LinearKernelRouteTest.checkBatched(lin, 128, 0.01, nm[f]);
+            Diag.register(null);
+            if (!cap.saw("batch-route", "coop " + nm[f])) {
+                Assert.fail(nm[f] + ": expected the coop route, saw "
+                    + cap.namesOf("batch-route"));
+            }
+            f = f + 1;
+        }
+        return;
+    }
+
+    /** prefill-routes 2.1.3 — Q4_K and Q6_K keep their native batch
+     *  routes; the coop GEMM is not chosen where a native kernel exists. */
+    @Test
+    public void nativeBatchKernelsStillWinOverTheCoopRoute() {
+        if (!LinearKernelRouteTest.coopHereOrSay()) { return; }
+        if (Linear.backendIsVulkan()) {
+            System.stdout.println("  (vulkan: the coop GEMM is every"
+                + " format's batch route there; nothing to prefer)");
+            return;
+        }
+        int32[] tys #= heap int32[2];
+        tys[0] = Quant.GG_Q4_K;
+        tys[1] = Quant.GG_Q6_K;
+        String[] fx #= heap String[2];
+        fx[0] = "q4_k.bin";
+        fx[1] = "q6_k.bin";
+        String[] nm #= heap String[2];
+        nm[0] = "q4_k";
+        nm[1] = "q6_k";
+        Linear.setDeqPrefill(false);
+        int32 f = 0;
+        while (f < 2) {
+            Linear lin #= LinearKernelRouteTest.tiled(tys[f], fx[f]);
+            Assert.isFalse(lin.coopRoutedHere());
+            String why = lin.batchRefusal(128L);
+            if (why != null) {
+                Assert.fail(nm[f] + " refused at 128 rows: " + why);
+            }
+            Linear.resetRouteSaid();
+            PrefillTap cap = heap PrefillTap();
+            Diag.register(cap);
+            LinearKernelRouteTest.checkBatched(lin, 128, 0.01, nm[f]);
+            Diag.register(null);
+            if (cap.sawStarting("batch-route", "coop")) {
+                Assert.fail(nm[f] + ": took the coop route: "
+                    + cap.namesOf("batch-route"));
+            }
+            if (cap.countOf("batch-route") == 0) {
+                Assert.fail(nm[f] + ": no batch route announced");
+            }
+            f = f + 1;
+        }
+        return;
+    }
+
+    /** prefill-routes 2.2.3 — under `int8`, a 72-row tail still takes the
+     *  Mw8 deq GEMM: rows pad to the 128 tile, and pad rows never reach
+     *  the caller. */
+    @Test
+    public void int8TailChunkIsPaddedOntoTheMw8Route() {
+        if (!Device.kernelAvailable("q80WmmaDeqMw8Kernel")) {
+            System.stdout.println("  (skipped: backend "
+                + Device.activeBackend()
+                + " has no coop kernel for the Mw8 route)");
+            return;
+        }
+        Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q8_0, "q8_0.bin");
+        Linear.setDeqPrefill(true);
+        String why = lin.batchRefusal(72L);
+        if (why != null) {
+            Linear.setDeqPrefill(false);
+            Assert.fail("q8_0 72-row tail refused: " + why);
+        }
+        Linear.resetRouteSaid();
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        LinearKernelRouteTest.checkBatched(lin, 72, 0.01, "q8_0 tail");
+        Diag.register(null);
+        Linear.setDeqPrefill(false);
+        if (!cap.sawContaining("batch-route", "q8_0 deqMw8")) {
+            Assert.fail("q8_0 tail: expected the Mw8 deq route, saw "
+                + cap.namesOf("batch-route"));
+        }
+        return;
     }
 
 }
