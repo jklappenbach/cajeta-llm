@@ -488,6 +488,18 @@ BANDWIDTH-bound at 8.5. NEXT: wide-load the 8 packed words per j-pair
 B loads at 4.5 bpw); then RANK 2 (A-side LDS staging, literal stride).
 6.3.2 CAVEAT: the naive dispatchBlocks saturation law under-fills ~16%; the
 measured 32-WG slice needs a derivable oversubscription factor (test 2×).
+PROGRESS 2026-09-12 (2b2fab4): vload B-feed (8× dwordx4/block, reuse across the
+j-pair) → 431 tok/s (+3.5%), bit-gate PASS. RANK 2 (A staged in LDS, literal
+stride 144, 4 barriers/block) WRITTEN and ran 512 (+19%, spill 204 B) but
+FAILS the bit-gate (element 0 = 1.4e6 vs 0.3 — a scale-sized error; prime
+suspect the folded staging barrier) → 512 is VOID; fix in flight, not
+committed. MODEL CORRECTION: measured on two BIT-CORRECT kernels, packed
+(4.5 bpw) 431 < deq (8.5 bpw) 637 — halving weight bytes gave ~0%, so the
+family is INSTRUCTION- and LATENCY/OCCUPANCY-bound, NOT bandwidth-bound; the
+study's 0.53x ratio was coincidental. Roadmap: deq+A-staging is the SPEED
+base (no fromWords VALU), packed-mw the MEMORY base; next levers = partWgs
+sweep (32 caps WGs in flight <2/CU on 40 CUs) + @Occupancy(minResident=2),
+then port A-staging to deq-Mw8.
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
