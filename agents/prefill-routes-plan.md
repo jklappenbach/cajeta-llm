@@ -360,10 +360,19 @@ plan's acceptance and in the bench memory.
       bit-for-bit (they are int8/f16 tile kernels with exact references).
 
 ### 4.2 Coding
-- [ ] 4.2.1 `q4kWmmaDeqMw8Kernel` (256 VGPR, 124 B): cut live registers —
+- [~] 4.2.1 `q4kWmmaDeqMw8Kernel` (256 VGPR, 124 B): cut live registers —
       the eight persistent f32 accumulators (~64 VGPRs) are the named
       price; drain half per chunk or narrow the N tile — ISA-verified
       (`cajeta --xpu-emit=isa`, `vgpr_spill_count = 0`).
+      FINDING 2026-09-12 (REVERTED): cutting int32 accumulators 4→2 (four
+      2-tile sub-chunks) DID reach spill=0, but REGRESSED prefill 639→581
+      tok/s (−9%): halving accumulators forced 2× more weight-fragment
+      reloads, which cost MORE than the spill traffic removed. For this
+      kernel the 124 B spill is CHEAPER than despilling — it is near its
+      register/reload optimum at 639. Reverted (kept the spilling 639
+      version). A tile-narrowing despill (fewer facc without more reloads)
+      would change the tile + launcher + the 6.1.1 reference — deferred.
+      Lesson: spill≠slow; the despill must not trade spill for reloads.
 - [ ] 4.2.2 `q2kWmmaDeqMw8Kernel` (256 VGPR, 108 B, 25 KB LDS): same
       treatment; LDS is its occupancy limiter, so the register cut must
       not move work into LDS.
