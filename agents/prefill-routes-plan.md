@@ -389,3 +389,68 @@ plan's acceptance and in the bench memory.
 - [ ] 5.3.1 The 2026-09-06 sweep recipe rerun: no `per-row` on any
       checkpoint; every prefill ratio ≥ 0.17x; decode within noise; load
       not worse. Table in this section.
+
+## Unit 6 — Multi-wave packed Q4_K GEMM for prefill parity
+
+NEW ARC opened by Julian 2026-09-12 ("optimize to reach parity or beat").
+This is the GEMM arithmetic-intensity work spec §1.3 deferred — now IN scope.
+Diagnosis (profiler, amdgpu/gfx1151): `q4kWmmaKernel` is 81% of Q4_K prefill
+device time (q6kWmmaEpiKernel 14.5%, attn 1.3%). Root cause: SINGLE-WAVE
+16×16 tile (32 threads/wg) with a per-sub-block barrier-bracketed scalar
+epilogue (~16 barriers/block) — the int8 matrix cores drain and idle on
+scalar f32 scaling, no sibling waves to hide it. llama `mul_mat_q` uses
+`MMQ_NWARPS 8` on a large tile, int32 in-register, scales folded. The code's
+own note (Linear.cajeta:1224) already defers the win to "multi-wave tiling";
+the register-accum epi variant (q4EpiOn) measured a wash. Q4_K_M 218 tok/s vs
+llama 1320 = 0.165x.
+
+Design decisions (Julian 2026-09-12):
+- PORTABLE GEOMETRY: kernel reads wave width via `Group.width()` (compile-time
+  fold, 32/64), never a literal 32 / `globalIdX()/32`. Launcher derives
+  block/grid from `Device.*` (waveSize/simdCount/dispatchBlocks/
+  sharedBytesPerBlock/maxThreadsPerBlock), mirroring `Linear.targetBlocks()`,
+  with a measured-literal fallback on any 0-return. Tile MATRIX shapes stay
+  compile-time type params (no device shape enumeration); the multi-wave tile
+  must be correct for both wave widths.
+- SCHEDULER DEPLOYMENT (shipped path): launcher reads `kernel.manifest()
+  .feasibleBlocks()[0]` (compiler occupancy-optimal block) + `occupancyLimiter`
+  /`residentGroupsPerCu` diagnostics; grid from `Device.dispatchBlocks`; routes
+  through `Scheduler.submit()`+`bind()` for forward-compat + access-set
+  validation. The auto-scheduler (submit→resolved launch) is unbuilt (9/135);
+  this is the shipped occupancy-resolution surface.
+
+### 6.1 TDD
+- [ ] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
+      output (a fixed shape, e.g. 512×4096×4096 on a routable fixture) as a
+      reference; the new multi-wave kernel matches it bit-for-bit (int8 MMA is
+      exact — no f16-noise tolerance). Host-parity check too.
+- [ ] 6.1.2 Portability: a GPU-free `LaunchGeometryTest`-style assertion that
+      the launcher's derived block == `Group.laneBlock()`-consistent value and
+      grid covers all tiles; and that no `block:[32]`/`/32` literal remains in
+      the new kernel+launcher (grep gate).
+- [ ] 6.1.3 Deployment: the launcher reads a non-null `manifest().feasibleBlocks()`
+      on gfx1151 and launches with `feasibleBlocks()[0]`; `Scheduler.submit`
+      access sets match the manifest (no refusal).
+
+### 6.2 Coding
+- [ ] 6.2.1 `q4kWmmaMwKernel` (packed route): multi-wave tile (N waves/wg
+      cooperating on a larger output tile), int32 in-register accumulation
+      across sub-blocks, Q4_K sub-block scales + dmin folded in the epilogue
+      WITHOUT per-sub-block LDS round-trips/barriers. Wave width via
+      `Group.width()`. ISA-verified zero spill (`--xpu-emit=isa`).
+- [ ] 6.2.2 Portable launcher `q4kWmmaMwLaunch`: manifest `feasibleBlocks` +
+      `Device` geometry → block/grid (measured-literal fallback); route through
+      `Scheduler.submit`; wire into Linear's packed Q4_K route behind a flag
+      (`setQ4Mw`), default off until 6.3 passes, then default on.
+- [ ] 6.2.3 Apply the same to the Q6_K packed route (`q6kWmmaEpiKernel`,
+      14.5%) if the technique transfers, or record why Q6_K differs.
+
+### 6.3 Acceptance
+- [ ] 6.3.1 Prefill parity (amdgpu/gfx1151, idle-gated A/B, announce first):
+      8B Q4_K_M prefill 512 ≥ 0.5x llama (first gate, from 0.165x), target
+      parity ≥ 1.0x (stretch). Re-profile: q4kWmmaMwKernel share + occupancy
+      (`residentGroupsPerCu` up vs the single-wave kernel). ppl unchanged
+      (6.1.1), decode within noise, no new spill.
+- [ ] 6.3.2 Portability re-derive: the launcher reproduces gfx1151's measured
+      block/grid from the profile (not a literal); note the NVIDIA-path
+      expectation (wave32, different simdCount) without a device to run it.
