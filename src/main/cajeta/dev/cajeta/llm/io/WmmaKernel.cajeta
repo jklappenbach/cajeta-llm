@@ -1476,12 +1476,17 @@ public final class WmmaKernel {
      * by 128-row output tile, eight register f32 accumulators (one per
      * 16-token sub-tile), cf/cg (d*sc, -dmin*mn) and rg (xs*ps) pre-folded
      * into LDS once per block, a barrier-free j-loop, and a rowBase
-     * grid-sweep window — but the weight operand is widened from the
-     * PACKED Q4_K nibbles into LDS once per block (q4kWmmaKernel's widen),
-     * not loaded from a pre-dequantized int8 copy. No 2x int8 weight
-     * buffer: each wave owns a [16 row x 256 k] slice of `bt` at
-     * `wid*4096`, laid out [row*256 + k] and read with `load(bt, ., 1, 256)`
-     * exactly as the single-wave kernel builds and reads it.
+     * grid-sweep window — but the weight operand is read at its NATIVE
+     * 4.5 bpw and expanded IN REGISTER, never through LDS and never from
+     * a pre-dequantized int8 copy (which costs 8.5 bpw of weight-read
+     * bandwidth — the measured 0.53x).
+     *
+     * The B feed is q4kWmmaIdMwKernel's: a K-slice of 16 Q4_K elements is
+     * 16 CONTIGUOUS bytes of the lane's own weight row — the even
+     * sub-block's low nibbles or the odd one's high nibbles — so the lane
+     * reads four words from `packedW`, masks, and presents the fragment.
+     * Four loads and four ALU ops per half, no LDS tile and no widen
+     * barriers.
      *
      * Wave width is Group.width() (a compile-time fold). The workgroup is
      * 8 waves, so the block is 8*Group.width() threads and the lane/wave
@@ -1490,9 +1495,9 @@ public final class WmmaKernel {
      */
     @Kernel @FastMath
     public static void q4kWmmaMwKernel(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
-            uint32 rows, uint32 outDim, uint32 tilesN8,
-            int64 blocksPerRow, uint32 rowBase) {
+            KernelBuffer<int8> packed, KernelBuffer<int32> packedW,
+            KernelBuffer<int8> xp, uint32 rows, uint32 outDim,
+            uint32 tilesN8, int64 blocksPerRow, uint32 rowBase) {
         Shared<float32> xsA = shared float32[16];
         Shared<float32> xsB = shared float32[16];
         Shared<float32> xsC = shared float32[16];
@@ -1504,12 +1509,6 @@ public final class WmmaKernel {
         Shared<float32> rgAll = shared float32[1024];
         Shared<float32> cfAll = shared float32[1024];
         Shared<float32> cgAll = shared float32[1024];
-        // Widened Q4_K nibbles for every wave's 16 rows, ONE k-half at a
-        // time: wave `wid` owns [wid*2048 .. wid*2048+2047], laid out
-        // [row*128 + kLocal] where kLocal is k within the current 128-k
-        // half. Half-sized (16 KB, not 32) to lift occupancy.
-        Shared<int8> bt = shared int8[16384];
-
         int32 wv = Group.width();
         uint32 wvu = (uint32) wv;
         uint32 tid = KernelThread.x();
@@ -1525,7 +1524,6 @@ public final class WmmaKernel {
             int64 rowBytes = blocksPerRow * 144L;
             int64 xRowBytes = blocksPerRow * 320L;
             int64 myRo = (int64) (i0 + lane16) * rowBytes;
-            uint32 wbase = wid * 2048;
 
             CooperativeMatrix<int8,16,16,0> ma;
             CooperativeMatrix<int8,16,16,1> mbA;
@@ -1635,127 +1633,119 @@ public final class WmmaKernel {
                         }
                     }
                 }
-                // Two-k-half widen (Unit 6.2.1 tuning): bt holds only 128
-                // k at a time, halving its LDS footprint. Half 0 covers
-                // k 0..127 (sub-blocks 0..3), half 1 covers k 128..255
-                // (4..7); facc0..7 persist across both halves, so the two
-                // k-ranges sum to the same output as one full-block pass —
-                // the int32 accumulation is exact and the j order is
-                // unchanged (0..7). Four workgroup barriers a block, two
-                // per half.
-                uint32 h = 0;
-                while (h < 2) {
-                    // Widen this half's 64 weight bytes per row (global
-                    // k = h*128 .. h*128+127) into bt at local k.
-                    uint32 wnib = lane;
-                    while (wnib < 1024) {
-                        uint32 ii = wnib / 64;
-                        uint32 bLocal = wnib % 64;
-                        uint32 byteIdx = h * 64 + bLocal;
-                        int64 ro3 = (int64) (i0 + ii) * rowBytes + b * 144L
-                            + 16L + (int64) byteIdx;
-                        int32 rb = (int32) packed[ro3] & 255;
-                        uint32 g = byteIdx / 32;
-                        uint32 t2 = byteIdx % 32;
-                        uint32 kLo = 64 * g + t2 - h * 128;
-                        uint32 kHi = 64 * g + 32 + t2 - h * 128;
-                        bt[wbase + ii * 128 + kLo] = (int8) (rb & 15);
-                        bt[wbase + ii * 128 + kHi] = (int8) ((rb >> 4) & 15);
-                        wnib = wnib + wvu;
-                    }
-                    Barrier.workgroup();
+                Barrier.workgroup();
 
-                    uint32 jl = 0;
-                    while (jl < 4) {
-                        uint32 jg = h * 4 + jl;
-                        float32 cfv = cfAll[(wid * 16 + lane16) * 8 + jg];
-                        float32 cgv = cgAll[(wid * 16 + lane16) * 8 + jg];
-                        uint32 kBaseG = 32 * jg;
-                        uint32 kBaseL = 32 * jl;
-                        int64 aOff = (int64) t0 * xRowBytes + b * 320L
-                            + (int64) kBaseG;
-                        uint32 bHalf0 = wbase + kBaseL;
-                        uint32 bHalf1 = wbase + kBaseL + 16;
-                        mc0.splat(0);
-                        mc1.splat(0);
-                        mc2.splat(0);
-                        mc3.splat(0);
-                        mbA.load(bt, bHalf0, 1, 128);
-                        ma.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
-                        mc0.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 16L), 0,
-                            (uint32) xRowBytes);
-                        mc1.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 32L), 0,
-                            (uint32) xRowBytes);
-                        mc2.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 48L), 0,
-                            (uint32) xRowBytes);
-                        mc3.mma(ma, mbA);
-                        mbA.load(bt, bHalf1, 1, 128);
-                        ma.load(xp, (uint32) (aOff + 16L), 0,
-                            (uint32) xRowBytes);
-                        mc0.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 16L + 16L),
-                            0, (uint32) xRowBytes);
-                        mc1.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 32L + 16L),
-                            0, (uint32) xRowBytes);
-                        mc2.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 48L + 16L),
-                            0, (uint32) xRowBytes);
-                        mc3.mma(ma, mbA);
-                        mc0.scaledAccumInto2S(facc0, xsA, cfv,
-                            rgAll[jg * 16], cgv);
-                        mc1.scaledAccumInto2S(facc1, xsB, cfv,
-                            rgAll[(8 + jg) * 16], cgv);
-                        mc2.scaledAccumInto2S(facc2, xsC, cfv,
-                            rgAll[(16 + jg) * 16], cgv);
-                        mc3.scaledAccumInto2S(facc3, xsD, cfv,
-                            rgAll[(24 + jg) * 16], cgv);
-                        mc0.splat(0);
-                        mc1.splat(0);
-                        mc2.splat(0);
-                        mc3.splat(0);
-                        mbA.load(bt, bHalf0, 1, 128);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 64L), 0,
-                            (uint32) xRowBytes);
-                        mc0.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 80L), 0,
-                            (uint32) xRowBytes);
-                        mc1.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 96L), 0,
-                            (uint32) xRowBytes);
-                        mc2.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 112L), 0,
-                            (uint32) xRowBytes);
-                        mc3.mma(ma, mbA);
-                        mbA.load(bt, bHalf1, 1, 128);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 64L + 16L),
-                            0, (uint32) xRowBytes);
-                        mc0.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 80L + 16L),
-                            0, (uint32) xRowBytes);
-                        mc1.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 96L + 16L),
-                            0, (uint32) xRowBytes);
-                        mc2.mma(ma, mbA);
-                        ma.load(xp, (uint32) (aOff + xRowBytes * 112L + 16L),
-                            0, (uint32) xRowBytes);
-                        mc3.mma(ma, mbA);
-                        mc0.scaledAccumInto2S(facc4, xsE, cfv,
-                            rgAll[(32 + jg) * 16], cgv);
-                        mc1.scaledAccumInto2S(facc5, xsF, cfv,
-                            rgAll[(40 + jg) * 16], cgv);
-                        mc2.scaledAccumInto2S(facc6, xsG, cfv,
-                            rgAll[(48 + jg) * 16], cgv);
-                        mc3.scaledAccumInto2S(facc7, xsH, cfv,
-                            rgAll[(56 + jg) * 16], cgv);
-                        jl = jl + 1;
-                    }
-                    Barrier.workgroup();
-                    h = h + 1;
+                uint32 j = 0;
+                while (j < 8) {
+                    float32 cfv = cfAll[(wid * 16 + lane16) * 8 + j];
+                    float32 cgv = cgAll[(wid * 16 + lane16) * 8 + j];
+                    uint32 kBase = 32 * j;
+                    int64 aOff = (int64) t0 * xRowBytes + b * 320L
+                        + (int64) kBase;
+                    // The lane's 32 packed bytes for sub-block j: bytes
+                    // 16 + 32*(j/2) .. +31 of its row block, low nibbles
+                    // for even j and high for odd. Half h takes the 16 at
+                    // +16h, as four words — the whole widen, in register.
+                    int64 nb = (myRo + b * 144L + 16L
+                        + (int64) (32 * (j / 2))) / 4L;
+                    int32 sh = (int32) ((j % 2) * 4);
+                    // Chunk 0: token tiles 0-3, half 0 then half 1.
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
+                    int32 q0 = (packedW[nb] >> sh) & 252645135;
+                    int32 q1 = (packedW[nb + 1L] >> sh) & 252645135;
+                    int32 q2 = (packedW[nb + 2L] >> sh) & 252645135;
+                    int32 q3 = (packedW[nb + 3L] >> sh) & 252645135;
+                    mbA.fromWords(q0, q1, q2, q3);
+                    ma.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
+                    mc0.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 16L), 0,
+                        (uint32) xRowBytes);
+                    mc1.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 32L), 0,
+                        (uint32) xRowBytes);
+                    mc2.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 48L), 0,
+                        (uint32) xRowBytes);
+                    mc3.mma(ma, mbA);
+                    q0 = (packedW[nb + 4L] >> sh) & 252645135;
+                    q1 = (packedW[nb + 5L] >> sh) & 252645135;
+                    q2 = (packedW[nb + 6L] >> sh) & 252645135;
+                    q3 = (packedW[nb + 7L] >> sh) & 252645135;
+                    mbA.fromWords(q0, q1, q2, q3);
+                    ma.load(xp, (uint32) (aOff + 16L), 0,
+                        (uint32) xRowBytes);
+                    mc0.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 16L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc1.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 32L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc2.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 48L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc3.mma(ma, mbA);
+                    mc0.scaledAccumInto2S(facc0, xsA, cfv,
+                        rgAll[j * 16], cgv);
+                    mc1.scaledAccumInto2S(facc1, xsB, cfv,
+                        rgAll[(8 + j) * 16], cgv);
+                    mc2.scaledAccumInto2S(facc2, xsC, cfv,
+                        rgAll[(16 + j) * 16], cgv);
+                    mc3.scaledAccumInto2S(facc3, xsD, cfv,
+                        rgAll[(24 + j) * 16], cgv);
+                    // Chunk 1: token tiles 4-7 — both halves rebuilt from
+                    // the same words (L0-hot) for the single fragment.
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
+                    q0 = (packedW[nb] >> sh) & 252645135;
+                    q1 = (packedW[nb + 1L] >> sh) & 252645135;
+                    q2 = (packedW[nb + 2L] >> sh) & 252645135;
+                    q3 = (packedW[nb + 3L] >> sh) & 252645135;
+                    mbA.fromWords(q0, q1, q2, q3);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 64L), 0,
+                        (uint32) xRowBytes);
+                    mc0.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 80L), 0,
+                        (uint32) xRowBytes);
+                    mc1.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 96L), 0,
+                        (uint32) xRowBytes);
+                    mc2.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 112L), 0,
+                        (uint32) xRowBytes);
+                    mc3.mma(ma, mbA);
+                    q0 = (packedW[nb + 4L] >> sh) & 252645135;
+                    q1 = (packedW[nb + 5L] >> sh) & 252645135;
+                    q2 = (packedW[nb + 6L] >> sh) & 252645135;
+                    q3 = (packedW[nb + 7L] >> sh) & 252645135;
+                    mbA.fromWords(q0, q1, q2, q3);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 64L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc0.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 80L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc1.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 96L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc2.mma(ma, mbA);
+                    ma.load(xp, (uint32) (aOff + xRowBytes * 112L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc3.mma(ma, mbA);
+                    mc0.scaledAccumInto2S(facc4, xsE, cfv,
+                        rgAll[(32 + j) * 16], cgv);
+                    mc1.scaledAccumInto2S(facc5, xsF, cfv,
+                        rgAll[(40 + j) * 16], cgv);
+                    mc2.scaledAccumInto2S(facc6, xsG, cfv,
+                        rgAll[(48 + j) * 16], cgv);
+                    mc3.scaledAccumInto2S(facc7, xsH, cfv,
+                        rgAll[(56 + j) * 16], cgv);
+                    j = j + 1;
                 }
+                Barrier.workgroup();
                 b = b + 1;
             }
 
@@ -1823,13 +1813,13 @@ public final class WmmaKernel {
      * passes.
      */
     public static void q4kWmmaMwLaunch(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
-            int64 rows, int64 outDim, int64 cols) {
+            KernelBuffer<int8> packed, KernelBuffer<int32> packedW,
+            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
         WmmaKernel.resolveMwGeom();
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
         uint32 blk = (uint32) WmmaKernel.mwBlock;
-        int64 sliceN8 = WmmaKernel.mwSat / tilesM8;
+        int64 sliceN8 = WmmaKernel.partWgs / tilesM8;
         if (sliceN8 < 1L) { sliceN8 = 1L; }
         KernelStream s = QuantKernel.stream();
         int64 base = 0L;
@@ -1838,7 +1828,7 @@ public final class WmmaKernel {
             if (base + n8 > tilesN8) { n8 = tilesN8 - base; }
             q4kWmmaMwKernel.launch(s,
                 grid: [(uint32) (tilesM8 * n8)], block: [blk])
-                (y, packed, xp, (uint32) rows, (uint32) outDim,
+                (y, packed, packedW, xp, (uint32) rows, (uint32) outDim,
                  (uint32) n8, cols / 256L, (uint32) (base * 128L));
             base = base + n8;
         }
