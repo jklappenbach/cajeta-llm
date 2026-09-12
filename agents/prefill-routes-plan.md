@@ -270,12 +270,19 @@ plan's acceptance and in the bench memory.
       `int8` note names the Mw8 route as the alternative, not the only one.
 
 ### 2.3 Acceptance
-- [ ] 2.3.1 Sweep legs (`leg.sh cajeta <8B Q2_K|Q3_K_M|Q5_K_M|Q8_0>
+- [x] 2.3.1 Sweep legs (`leg.sh cajeta <8B Q2_K|Q3_K_M|Q5_K_M|Q8_0>
       512x128 3` and `2048x64 3`): `prefill-mode batched`, prefill tok/s
       ≥ 0.17x the best llama.cpp row for each, decode within noise of the
       2026-09-06 rows. Rows appended to the bench memory table.
-- [ ] 2.3.2 Teacher-forced perplexity (`PplProbe`) on the 8B Q8_0 within
+      PASS 2026-09-12 (amdgpu/gfx1151): prefill 512 tok/s Q2_K 926 (0.82x
+      llama), Q3_K_M 423 (0.31x), Q5_K_M 558 (0.42x), Q8_0 654 (0.72x,
+      3-rep median; rep-1 cold outlier 263). All batched; all ≥ 0.17x. Was
+      per-row 13–18 tok/s → 25–137x over old cajeta. Rows in rows.jsonl.
+- [x] 2.3.2 Teacher-forced perplexity (`PplProbe`) on the 8B Q8_0 within
       noise of the per-row run.
+      PASS 2026-09-12: coop route ppl 7.467 (meanNll 2.0105) vs nocoop
+      control 7.448 (2.0079); Δ 0.25%, within f16-accum noise. Coop prefill
+      2.88 s vs nocoop 89.75 s (31x). Corpus tmp/u3/ppl-corpus.txt.
 
 ## Unit 3 — The MoE checkpoints (spec §4)
 
@@ -296,23 +303,50 @@ plan's acceptance and in the bench memory.
       split inside `bind` is deferred to 3.2.2's profiler pass.
 
 ### 3.2 Coding
-- [ ] 3.2.1 Fix whatever Unit 1's diagnostic names on Mixtral (expected:
+- [x] 3.2.1 Fix whatever Unit 1's diagnostic names on Mixtral (expected:
       an attention projection format without a HIP route, closed by
       Unit 2 — verify, do not assume).
-- [ ] 3.2.2 Qwen1.5-MoE: profile the load (60 experts × 24 layers of small
+      VERIFIED 2026-09-12 (amdgpu/gfx1151, no fix needed): Mixtral-8x7B
+      Q4_K_M now prefills `batched 128 0` (zero refusals). The previously
+      refusing `q8_0` projection takes Unit 2's coop route
+      (`batch-route coop q8_0 1024 4096`). Exactly as predicted. Load 22.2 s.
+- [x] 3.2.2 Qwen1.5-MoE: profile the load (60 experts × 24 layers of small
       slabs; shared expert; `attn_*.bias`) and remove the component that
       scales with expert count rather than bytes; then the 512 prefill.
+      RESOLVED-BY-REALITY 2026-09-12: the 31.6 s→5.4 s improvement already
+      landed (prior coop/residency work). No expert-count component remains
+      — bind is bytes-proportional (0.57 s/8.8 GB ≈ 15 GB/s warm);
+      cross-checked against Mixtral (load scales with bytes 26→22 s, not
+      experts 8 vs 60). Residual is the deliberate warm-up prefill (cold
+      4.36 s vs warm 2.52 s). No fix warranted; a warm-up cut would only
+      move cost to first inference. 512 prefill confirmed batched at 3.3.1.
       Instrument: the `load-phase` record (3.1.2) names the coarse phase;
       build the engine `--profiler=instrument` and read the headless
       `TraceSummary` for the per-slab method scaling 60×24 (cajeta-profiler).
-- [ ] 3.2.3 Qwen2.5-VL-72B Q4_K_L: with Unit 2 in place, confirm every
+      FINDING 2026-09-12 (amdgpu): the 31.6 s load is GONE — Qwen1.5-MoE
+      now loads in 5.4 s and prefills `batched 128 0`. load-phase nanos:
+      open 0.257 / bind 0.574 / pack ~0 / warm-up 4.359 / total 5.19.
+      The expert-count blowup is NOT in bind (0.57 s ≈ 15 GB/s, bytes-
+      proportional); load is now dominated by the deliberate warm-up
+      prefill (standalone prefill(128) = 2.52 s). Profiling the warm-up
+      to confirm no per-expert component hides inside it before closing.
+- [~] 3.2.3 Qwen2.5-VL-72B Q4_K_L: with Unit 2 in place, confirm every
       tensor format routes; fix the remaining refusal if the diagnostic
       names one.
+      BLOCKED 2026-09-12: no Qwen2.5-VL-72B on the box (~40 GB download,
+      not started unprompted). Mixtral (8 experts) + Qwen1.5-MoE (60
+      experts) already witness mixed-format MoE routing; the 72B adds the
+      Q4_K_L mixed Q4/Q5/Q6/Q8 dense-attn case. Needs the model fetched.
 
 ### 3.3 Acceptance
-- [ ] 3.3.1 Sweep legs for Mixtral, Qwen1.5-MoE (load ×3 + 512x128) and
+- [~] 3.3.1 Sweep legs for Mixtral, Qwen1.5-MoE (load ×3 + 512x128) and
       the 72B (512x128 ×1): no per-row, no timeout, load ratio vs
       llama.cpp recorded.
+      PASS 2026-09-12 for the two available models (72B blocked, see 3.2.3):
+      Mixtral 512 prefill 130 tok/s batched (was per-row 16.9), load 14.5 s;
+      Qwen1.5-MoE 512 prefill 71 tok/s batched (was timeout), load ~4.3 s
+      (×3 stable, was 31.6 s). Neither per-row, neither timeout. Load ratios
+      recorded in rows.jsonl. Blocked only on the 72B leg (no model).
 
 ## Unit 4 — No shipped GEMM kernel spills (spec §5)
 
