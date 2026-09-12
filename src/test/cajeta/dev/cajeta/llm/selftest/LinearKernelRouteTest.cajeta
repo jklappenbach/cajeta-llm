@@ -904,4 +904,101 @@ public class LinearKernelRouteTest {
         return;
     }
 
+    /**
+     * prefill-routes 6.1.1 — the multi-wave PACKED Q4_K GEMM
+     * (q4kWmmaMwKernel, the `q4 mw` route) is BIT-FOR-BIT identical to the
+     * int8-deq multi-wave kernel (q4kWmmaDeqMw8Kernel, the `q4 deqMw8`
+     * route) over the same weight and the same staged activation.
+     *
+     * Why deq-Mw8 and not the single-wave `q4 plain` kernel: the two
+     * multi-wave kernels share the EXACT arithmetic — the same pre-folded
+     * cf/cg (d*sc, -dmin*mn), the same rg (xs*ps), the same
+     * `scaledAccumInto2S` register fold and accumulation order — and
+     * differ ONLY in where the widened Q4_K nibbles come from (this
+     * kernel widens them inline into LDS; deq-Mw8 reads them from the
+     * pre-dequantized device copy). The widened int8 values are identical,
+     * so the outputs must be EXACTLY equal, which makes this a direct
+     * bit-gate on the inline widen — the only thing 6.2.1 changed. The
+     * single-wave `q4 plain` kernel, by contrast, folds the scales in a
+     * different f32 order (integer sc*mc cast to float, dmin subtracted
+     * separately), so it is only tolerance-equal to either multi-wave
+     * kernel, not bit-identical — see nativeBatchKernelsStillWinOverThe-
+     * CoopRoute, which compares q4_k against serial with a tolerance.
+     *
+     * Device-gated; skipped where either kernel is unavailable or the
+     * packed WMMA route is not taken (vulkan).
+     */
+    @Test
+    public void multiWavePackedQ4kMatchesDeqMw8BitForBit() {
+        if (!Device.kernelAvailable("q4kWmmaMwKernel")
+                || !Device.kernelAvailable("q4kWmmaDeqMw8Kernel")) {
+            System.stdout.println("  (skipped: backend "
+                + Device.activeBackend()
+                + " has no multi-wave Q4_K kernel pair)");
+            return;
+        }
+        if (Linear.backendIsVulkan()) {
+            System.stdout.println("  (skipped: the packed WMMA route is"
+                + " not taken on vulkan)");
+            return;
+        }
+        int32 rows = 256;
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q4_K, "q4_k.bin");
+        Linear.setQ4Epi(false);
+
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ci, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L,
+            (int64) rows * co);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L,
+            (int64) rows * co);
+        QuantKernel.setRoutingEnabled(true);
+
+        // Reference: the int8-deq multi-wave kernel (q4 deqMw8 / Part).
+        Linear.setQ4MwPacked(false);
+        Linear.setDeqPrefill(true);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap refTap = heap PrefillTap();
+        Diag.register(refTap);
+        lin.matmulInto(rows, want, 0L);
+        Diag.register(null);
+        Linear.setDeqPrefill(false);
+        if (!refTap.sawContaining("batch-route", "q4 deqMw8")) {
+            Assert.fail("reference did not take the q4 deqMw8 route, saw "
+                + refTap.namesOf("batch-route"));
+        }
+
+        // Under test: the multi-wave PACKED kernel (q4 mw), same weight,
+        // same activation staged afresh (the q8_K pack is deterministic).
+        Linear.setQ4MwPacked(true);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap mwTap = heap PrefillTap();
+        Diag.register(mwTap);
+        lin.matmulInto(rows, got, 0L);
+        Diag.register(null);
+        Linear.setQ4MwPacked(false);
+        if (!mwTap.saw("batch-route", "q4 mw")) {
+            Assert.fail("the multi-wave packed route was not taken, saw "
+                + mwTap.namesOf("batch-route"));
+        }
+
+        LinearKernelRouteTest.assertLive(want, (int64) rows * co, "q4 deqMw8");
+        LinearKernelRouteTest.assertLive(got, (int64) rows * co, "q4 mw");
+        int64 i = 0;
+        while (i < (int64) rows * co) {
+            float32 a = want.flatGet(i);
+            float32 b = got.flatGet(i);
+            if (a != b) {
+                Assert.fail("element " + i + ": packed multi-wave " + b
+                    + " vs int8-deq multi-wave " + a
+                    + " - the inline widen must be bit-for-bit identical");
+            }
+            i = i + 1;
+        }
+        return;
+    }
+
 }

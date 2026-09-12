@@ -428,8 +428,17 @@ PACKED route (inline nibble widen, no 2× int8 weight memory). Template =
 q4kWmmaDeqMw8Kernel (8 waves/wg, 128×128 tile, register accumulators facc0-7,
 pre-folded cf/cg, rowBase grid-sweep).
 
+PROGRESS 2026-09-12: `q4kWmmaMwKernel` + `q4kWmmaMwLaunch` + `setQ4MwPacked`
+flag (route bit 2^29 "q4 mw") written (WmmaKernel.cajeta:1492/1808,
+Linear.cajeta:2089) and BIT-CORRECT (6.1.1 PASS, matches deq-Mw8 exactly).
+Measured 8B Q4_K_M prefill 512: 341 tok/s = 1.57x over single-wave 218
+(0.165→0.26x llama), packed memory. BELOW the deq path's 637 — occupancy-
+bound: the inline-widen `bt` is 32 KB LDS (~46 KB/wg → ~1 WG/CU) and the
+kernel spills 236 B (vgpr=192). NEXT (6.2.1 cont.): two-k-half widen → 16 KB
+LDS to raise occupancy; despill; re-measure toward 637+.
+
 ### 6.1 TDD
-- [ ] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
+- [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
       output (a fixed shape, e.g. 512×4096×4096 on a routable fixture) as a
       reference; the new multi-wave kernel matches it bit-for-bit (int8 MMA is
       exact — no f16-noise tolerance). Host-parity check too.
