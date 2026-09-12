@@ -419,6 +419,15 @@ Design decisions (Julian 2026-09-12):
   validation. The auto-scheduler (submit→resolved launch) is unbuilt (9/135);
   this is the shipped occupancy-resolution surface.
 
+HYPOTHESIS CONFIRMED 2026-09-12 (zero new kernel): routing Q4_K_M prefill
+through the EXISTING multi-wave kernel via the int8-deq path (`deq` bench flag
+→ `q4 deqMw8Part`, q4kWmmaDeqMw8Kernel) = 636.8 tok/s vs packed single-wave
+217.8 = **2.9×**, 0.165x→0.48x llama. Multi-wave tiling IS the lever. That
+kernel still spills 124B (headroom). 6.2.1 = the same multi-wave win on the
+PACKED route (inline nibble widen, no 2× int8 weight memory). Template =
+q4kWmmaDeqMw8Kernel (8 waves/wg, 128×128 tile, register accumulators facc0-7,
+pre-folded cf/cg, rowBase grid-sweep).
+
 ### 6.1 TDD
 - [ ] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
       output (a fixed shape, e.g. 512×4096×4096 on a routable fixture) as a
