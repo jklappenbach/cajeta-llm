@@ -280,13 +280,20 @@ plan's acceptance and in the bench memory.
 ## Unit 3 — The MoE checkpoints (spec §4)
 
 ### 3.1 TDD
-- [ ] 3.1.1 `MoeForwardTest` (fixture `toy-moe.gguf` with an expert format
-      that had no batched route): prefill is `batched`; expert-group
-      dispatch records `device` for the groups the budget admits.
-- [ ] 3.1.2 A load-time test on `toy-moe.gguf`: `LlmEngine.load` wall is
-      dominated by bytes read (an instrumented breakdown — pack, upload,
-      warm-up — is printed under `trace`), so the Qwen1.5-MoE 31.6 s has a
-      named component before it is fixed.
+- [ ] 3.1.1 `MoeForwardTest` on a fixture whose expert format had no
+      batched route: prefill is `batched`; expert-group dispatch records
+      `device` for the groups the budget admits.
+      NOTE (2026-09-12): no checked-in MoE fixture witnesses this —
+      `toy-moe.gguf` and `toy-routable-moe.gguf` both carry Q4_K experts,
+      which always routed. Build a Q8_0-expert toy MoE (the real
+      Qwen1.5-MoE `ffn_down_exps` is Q8_0 — the exact Unit-2 case). The
+      `records device` half is amdgpu-only (cpu has no device grouped
+      path); on cpu assert prefill `batched` and skip the device half.
+- [x] 3.1.2 A load-time test on `toy-moe.gguf`: `LlmEngine.load` emits a
+      phase breakdown under `trace` (`load-phase` record: open / bind /
+      pack / warm-up / total nanos), so a slow load has a named component
+      before it is fixed. `LoadPhaseTest` GREEN on cpu; read-vs-upload
+      split inside `bind` is deferred to 3.2.2's profiler pass.
 
 ### 3.2 Coding
 - [ ] 3.2.1 Fix whatever Unit 1's diagnostic names on Mixtral (expected:
@@ -295,6 +302,9 @@ plan's acceptance and in the bench memory.
 - [ ] 3.2.2 Qwen1.5-MoE: profile the load (60 experts × 24 layers of small
       slabs; shared expert; `attn_*.bias`) and remove the component that
       scales with expert count rather than bytes; then the 512 prefill.
+      Instrument: the `load-phase` record (3.1.2) names the coarse phase;
+      build the engine `--profiler=instrument` and read the headless
+      `TraceSummary` for the per-slab method scaling 60×24 (cajeta-profiler).
 - [ ] 3.2.3 Qwen2.5-VL-72B Q4_K_L: with Unit 2 in place, confirm every
       tensor format routes; fix the remaining refusal if the diagnostic
       names one.
