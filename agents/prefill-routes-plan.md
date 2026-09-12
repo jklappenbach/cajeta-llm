@@ -456,6 +456,23 @@ cf [[mxfp4-kernel-perf-decode-bound]]), not more occupancy. PARITY ROADMAP:
 lever; (3) vectorized packed widen → 357 toward 639 at packed memory; (4)
 deeper GEMM AI tuning toward 1320. Reaching true parity (1320, 6x) is
 multi-iteration.
+LLAMA STUDY 2026-09-12 (decisive; reframes the roadmap): tile (128×128, 8
+wave32), int8 WMMA 16×16×16, 64 f32 acc/thread, and the d·sc/-dmin·m epilogue
+are ALL already identical to llama's mmq. The 2× gap is WEIGHT-READ BANDWIDTH:
+llama reads Q4_K at native 4.5 bpw and expands nibbles IN-REGISTER
+(`load_tiles_q4_K`, mmq.cuh:2120); our deq path reads an int8 copy at 8.5 bpw;
+4.5/8.5 = 0.53x ≈ measured 0.48x. llama does NOT double-buffer/async on AMD
+(sync K-loop, mmq.cuh:3485-3518); it hides latency via `__launch_bounds__
+(256,2)` = 2 blocks/CU. RANKED LEVERS: (1) feed the B fragment from nibbles via
+`CooperativeMatrix.fromWords` (proven in q4kWmmaIdMwKernel :1085-1160, "4 loads
++ 4 ALU"/half, no LDS/barrier) into q4kWmmaMwKernel — reads packed 4.5 bpw,
+drops the deq copy; expected ~2x → ~1300. (2) stage activations to LDS once
+with a LITERAL stride — all 8 waves re-read the same A fragment from global (8x
+redundant) AND the runtime `xRowBytes` stride degrades every A load to 16
+byte-loads. (3) AsyncCopy prefetch NOT viable — inert on gfx1151 (no LDS-DMA in
+RDNA3 silicon, AmdgpuKernelLowering.cpp:106-113). (4) retry @Occupancy
+(minResident=2) after (1)/(2) lighten registers. (5) keep both K-halves' mbA
+resident.
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
