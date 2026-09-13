@@ -776,3 +776,25 @@ CAVEAT: no Vulkan number today. Both local llama builds register only a ROCm
 device (build-vulkan/bin/llama-bench reports backend ROCm and --list-devices
 shows ROCm0 alone), so the recorded Vulkan decode figures (Q2_K 64.6) could
 not be re-measured and we are likely still behind Vulkan on decode.
+
+VULKAN RESOLVED 2026-09-13. The old build-vulkan binary never ran Vulkan: a
+system-wide ggml install in /usr/local/lib carries a HIP backend and the loader
+resolves libggml-*.so.0 from there ahead of the build's own, so it reported
+ROCm. Every "vulkan" figure taken from it was the HIP path. A clean clone at
+/home/julian/code/llama.cpp.vulkan (same commit 5306f4b, GGML_VULKAN=ON with
+HIP and CUDA OFF, needs glslc + spirv-headers) registers a real RADV device
+with KHR_coopmat once run with LD_LIBRARY_PATH pointed at its own bin.
+Settled box (load 1.5), best of passes: Q4_K llama-vulkan 1193 vs cajeta 1441
+= 1.21x; Q8_0 llama-vulkan 921 vs cajeta 1455 = 1.58x. Vulkan today reproduces
+the recorded 2026-09-06 figures (Q8_0 921 vs 914), so those rows are sound and
+the earlier ROCm shortfall was thermal/power: DECODE (bandwidth bound) is
+unchanged across both days while PREFILL (power bound) sags 7-13% after hours
+of benching.
+FINAL, vs llama's BEST EVER on this box (any backend, any day):
+  prefill  Q2_K 1.14x  Q3_K 1.03x  Q4_K 1.10x  Q5_K 1.07x  Q6_K 1.28x  Q8_0 1.59x
+  decode   0.87x-0.97x — BEHIND llama's Vulkan on every format, and that is the
+           number to quote; the earlier "decode matches or beats" was against
+           llama's ROCm path only. Ours also carries a 512-token KV context
+           where llama's tg64 starts empty, so the gap is smaller than it looks.
+The 2.47x Q8_0 figure was against llama's ROCm backend, which handles Q8_0
+badly (585 vs its own 1160 on Q4_K). Against its best, Q8_0 is 1.59x.
