@@ -674,3 +674,21 @@ NEXT: int-fold the shared q4kWmmaDeqMw8Kernel (52% of Q5_K's prefill, 21% of
 Q3_K's), then Q2_K/Q6_K. MoE is the far larger gap: Qwen1.5-MoE measures 75
 tok/s prefill against llama's 2342 (0.03x) and is a different route entirely
 (slots never take the deq path).
+
+MoE FINDING 2026-09-13 (Qwen1.5-MoE-A2.7B Q4_K_M, profiled): the MoE prefill
+gap is NOT a kernel problem. 512-token prefill takes 7095 ms of wall for
+**183 ms of total device time** — 97% of it is host/latency. The device work
+itself is the wrong shape too: 4096 calls of `q4kQ8WaveMatVecKernel` (the
+DECODE matvec, 11 us each) and 1036 of `q4kQ8BatchMatMulKernel` (66 us), i.e.
+the expert path runs many tiny launches instead of grouping tokens by expert
+into one GEMM per (layer, expert) the way llama.cpp's mul_mat_id does.
+Host profile shows `ExpertBank.admitAndRun` at 799 ms total and a
+`Prim.gluRowHost` CPU fallback inside prefill, plus per-expert upload/
+download round trips. Chunk size confirms the per-chunk overhead: 128 -> 512
+takes 79 -> 94 tok/s (+19%), still 0.04x llama's 2342. THE UNIT: group the
+chunk's tokens by expert once, then one batched GEMM per (layer, expert) on
+the existing Mw8 kernels, with the gather/scatter on device and no host round
+trip per expert. Everything the dense arc built (2x4 tiling, the partition
+law, the int fold) applies unchanged once the launches are the right shape.
+Mixtral 130 vs llama 542 (0.24x) and Qwen3-Coder-30B 337-689 vs 1295 are the
+same story at smaller ratios.
