@@ -1,0 +1,418 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.io.file.OpenMode;
+import cajeta.io.file.Path;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import cajeta.math.Tensor;
+import dev.cajeta.llm.LlmException;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.GgufWriter;
+import dev.cajeta.llm.tok.Tokenizer;
+import dev.cajeta.unit.Assert;
+
+/**
+ * The GGUF writer, gated against the reader that is its specification:
+ * every file here is built by `GgufWriter` and then opened by
+ * `GgufFile`, so the two either agree on the byte layout or the test
+ * fails. Nothing is asserted against a hand-written image except the
+ * metadata ARRAYS, which the reader skips structurally rather than
+ * retaining — those are decoded from the raw file here so their elements
+ * are checked too, not merely their length.
+ *
+ * The quantized arm carries real Q8_0 blocks lifted from the kquant
+ * fixture (34 bytes a block) and demands them back byte for byte: a
+ * payload that is only shaped right is not a payload a kernel can eat.
+ */
+public class GgufWriterTest {
+
+    static final String Q8 = "src/test/fixtures/gguf/kquant/q8_0.bin";
+    static final int64 Q8_BYTES = 68;      // two 34-byte blocks, 64 elements
+
+    public GgufWriterTest() { return; }
+
+    // ── plumbing ────────────────────────────────────────────────────────
+
+    static #String tmpPath(String leaf) {
+        // Repo-local tmp/, never /tmp: a shared tmpfs saturated by
+        // concurrent sessions turns a truncated write into a SIGBUS.
+        String p #= "tmp/cajeta_llm_gguf_writer_" + leaf;
+        return #p;
+    }
+
+    static void putF32(int8[] b, int64 at, float32 v) {
+        int32 bits = Cajeta.f32ToBits(v);
+        int64 k = 0;
+        while (k < 4) {
+            b[at + k] = (int8) ((bits >>> (k * 8)) & 255);
+            k = k + 1;
+        }
+        return;
+    }
+
+    static int64 loadU32(int8[] b, int64 at) {
+        return ((int64) b[at] & 255L) | (((int64) b[at + 1] & 255L) << 8)
+            | (((int64) b[at + 2] & 255L) << 16)
+            | (((int64) b[at + 3] & 255L) << 24);
+    }
+
+    static int64 loadU64(int8[] b, int64 at) {
+        return GgufWriterTest.loadU32(b, at)
+            | (GgufWriterTest.loadU32(b, at + 4) << 32);
+    }
+
+    /** Offset one past `needle`'s bytes in `img`, or -1. */
+    static int64 findBytes(int8[] img, String needle) {
+        int8[] pat #= needle.toBytes();
+        int64 n = (int64) pat.count();
+        int64 last = (int64) img.count() - n;
+        int64 i = 0;
+        while (i <= last) {
+            int64 k = 0;
+            while (k < n && img[i + k] == pat[k]) {
+                k = k + 1;
+            }
+            if (k == n) {
+                return i + n;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    static int64 alignUp(int64 v, int64 a) {
+        return ((v + a - 1) / a) * a;
+    }
+
+    /** Eight f32 values on a 1/8 grid — exact in both precisions. */
+    static float32 f32At(int64 j) {
+        return (float32) (j - 3) * 0.125f;
+    }
+
+    static #int8[] f32Payload() {
+        int8[] pay = heap int8[32];
+        int64 j = 0;
+        while (j < 8) {
+            GgufWriterTest.putF32(pay, j * 4, GgufWriterTest.f32At(j));
+            j = j + 1;
+        }
+        return #pay;
+    }
+
+    static #String[] vocab() {
+        String[] v = heap String[6];
+        v[0] #= "<unk>";
+        v[1] #= "<s>";
+        v[2] #= "</s>";
+        v[3] #= "hello";
+        v[4] #= "wörld";        // 6 bytes, 5 codepoints: the length is BYTES
+        v[5] #= "▁x";           // 4 bytes, 2 codepoints
+        return #v;
+    }
+
+    static #float32[] scores() {
+        float32[] s = heap float32[6];
+        s[0] = 0.0f;
+        s[1] = -1.0f;
+        s[2] = -2.0f;
+        s[3] = 0.5f;
+        s[4] = 0.25f;
+        s[5] = -0.125f;
+        return #s;
+    }
+
+    static #int32[] tokenTypes() {
+        int32[] t = heap int32[6];
+        t[0] = 2;               // UNKNOWN
+        t[1] = 3;               // CONTROL
+        t[2] = 3;
+        t[3] = 1;               // NORMAL
+        t[4] = 1;
+        t[5] = 4;               // USER_DEFINED
+        return #t;
+    }
+
+    // ── every KV kind, both tensors, through the real reader ────────────
+
+    @Test
+    public void everyKvKindAndBothTensorsRoundTrip() {
+        String path #= GgufWriterTest.tmpPath("roundtrip.gguf");
+        int8[] q8 #= File.readAllBytes(GgufWriterTest.Q8);
+        int8[] f32 #= GgufWriterTest.f32Payload();
+        String[] toks #= GgufWriterTest.vocab();
+        float32[] sc #= GgufWriterTest.scores();
+        int32[] tt #= GgufWriterTest.tokenTypes();
+
+        GgufWriter w = heap GgufWriter();
+        w.putString("general.architecture", "llama");
+        w.putString("general.name", "cajeta-writer-roundtrip");
+        w.putU32("writer.u32", 4000000000);       // over int32's positive range
+        w.putI32("writer.i32", -7);
+        w.putU64("writer.u64", 1099511627776L);
+        w.putF32("writer.f32", 0.375f);
+        w.putF64("writer.f64", -2.5);
+        w.putBool("writer.bool.true", true);
+        w.putBool("writer.bool.false", false);
+        w.putString("tokenizer.ggml.model", "llama");
+        w.putArrayString("tokenizer.ggml.tokens", toks);
+        w.putArrayF32("tokenizer.ggml.scores", sc);
+        w.putArrayI32("tokenizer.ggml.token_type", tt);
+        // Last on purpose: a KV the reader can only reach by walking the
+        // three arrays at exactly the right width.
+        w.putU32("writer.after.arrays", 4242);
+
+        int64[] f32Ne = heap int64[2];
+        f32Ne[0] = 4;                             // ne is fastest-first
+        f32Ne[1] = 2;
+        w.addTensor("writer.f32.weight", f32Ne, 0, f32, 32);
+        int64[] q8Ne = heap int64[1];
+        q8Ne[0] = 64;
+        w.addTensor("writer.q8.weight", q8Ne, 8, q8, GgufWriterTest.Q8_BYTES);
+
+        Assert.equals(14L, w.kvCount());
+        Assert.equals(2L, (int64) w.tensorCount());
+        w.write(path);
+
+        GgufFile g #= heap GgufFile(path);
+        Assert.equals(14L, g.kvCount());
+        Assert.equals(2L, g.tensorCount());
+        Assert.equals("llama", g.metaString("general.architecture"));
+        Assert.equals("cajeta-writer-roundtrip", g.metaString("general.name"));
+        Assert.equals(4000000000L, g.metaInt("writer.u32", 0L));
+        Assert.equals(-7L, g.metaInt("writer.i32", 0L));
+        Assert.equals(1099511627776L, g.metaInt("writer.u64", 0L));
+        Assert.thatFloat(g.metaFloat("writer.f32", 99.0)).isEqualTo(0.375);
+        Assert.thatFloat(g.metaFloat("writer.f64", 99.0)).isEqualTo(-2.5);
+        Assert.equals(1L, g.metaInt("writer.bool.true", -1L));
+        Assert.equals(0L, g.metaInt("writer.bool.false", -1L));
+        Assert.equals(4242L, g.metaInt("writer.after.arrays", 0L));
+
+        // What was NOT written stays absent — a reader that answered
+        // everything would pass every assertion above.
+        Assert.isFalse(g.hasKey("writer.never.written"));
+        Assert.equals(-1L, g.metaInt("writer.never.written", -1L));
+        Assert.isTrue(g.metaString("writer.never.written") == null);
+        // Kind is carried too: an int key is not a string key.
+        Assert.isTrue(g.metaString("writer.u32") == null);
+        Assert.isFalse(g.contains("no.such.tensor"));
+        Assert.equals(-1L, (int64) g.tensorIndexOf("no.such.tensor"));
+
+        // Directory: shapes come back in TORCH order, reversed from ne.
+        int32 fi = g.tensorIndexOf("writer.f32.weight");
+        Assert.isTrue(fi >= 0);
+        int64[] fshp = g.shapeOf(fi);
+        Assert.equals(2L, (int64) fshp.count());
+        Assert.equals(2L, fshp[0]);
+        Assert.equals(4L, fshp[1]);
+        Assert.equals(0L, (int64) g.typeOf(fi));
+        int32 qi = g.tensorIndexOf("writer.q8.weight");
+        Assert.isTrue(qi >= 0);
+        int64[] qshp = g.shapeOf(qi);
+        Assert.equals(1L, (int64) qshp.count());
+        Assert.equals(64L, qshp[0]);
+        Assert.equals(8L, (int64) g.typeOf(qi));
+
+        // The f32 payload decodes to the values that were written.
+        Tensor<float32> t #= g.loadF32("writer.f32.weight");
+        int64 j = 0;
+        while (j < 8) {
+            if (t.flatGet(j) != GgufWriterTest.f32At(j)) {
+                Assert.fail("f32 element " + j + " read back "
+                    + t.flatGet(j) + ", wrote " + GgufWriterTest.f32At(j));
+            }
+            j = j + 1;
+        }
+
+        // The quantized payload comes back byte for byte, at the offset
+        // the directory claims.
+        Assert.equals(w.dataStart() + 32L,
+            g.packedFileOffsetOf("writer.q8.weight"));
+        int8[] got #= g.loadPacked("writer.q8.weight");
+        Assert.equals(GgufWriterTest.Q8_BYTES, (int64) got.count());
+        int64 b = 0;
+        while (b < GgufWriterTest.Q8_BYTES) {
+            if (got[b] != q8[b]) {
+                Assert.fail("q8_0 byte " + b + " read back " + got[b]
+                    + ", wrote " + q8[b]);
+            }
+            b = b + 1;
+        }
+
+        // The string and i32 arrays through the reader's own consumer.
+        Tokenizer tok #= g.tokenizer();
+        Assert.equals(6L, (int64) tok.vocabSize());
+        Assert.equals("hello", tok.tokenOf(3));
+        Assert.equals("wörld", tok.tokenOf(4));
+        Assert.equals("▁x", tok.tokenOf(5));
+        Assert.equals(5L, (int64) tok.idOf("▁x"));
+        Assert.equals(0L, (int64) tok.idOf("<unk>"));
+        // token_type reached the tokenizer: 3/3/4 are the added ids.
+        Assert.equals(3L, (int64) tok.addedCount());
+        g.close();
+
+        GgufWriterTest.assertArraysOnDisk(path, sc, tt);
+        Path.of(path).delete();
+    }
+
+    /**
+     * The two numeric arrays, decoded off the raw image — the reader
+     * skips arrays it does not retain, so this is where their element
+     * bytes are checked rather than merely their width.
+     */
+    static void assertArraysOnDisk(String path, float32[] sc, int32[] tt) {
+        int8[] img #= File.readAllBytes(path);
+        int64 p = GgufWriterTest.findBytes(img, "tokenizer.ggml.scores");
+        Assert.isTrue(p >= 0);
+        Assert.equals(9L, GgufWriterTest.loadU32(img, p));        // array
+        Assert.equals(6L, GgufWriterTest.loadU32(img, p + 4));    // of f32
+        Assert.equals(6L, GgufWriterTest.loadU64(img, p + 8));
+        int64 i = 0;
+        while (i < 6) {
+            Assert.equals((int64) Cajeta.f32ToBits(sc[i]) & 0xFFFFFFFFL,
+                GgufWriterTest.loadU32(img, p + 16 + i * 4));
+            i = i + 1;
+        }
+        p = GgufWriterTest.findBytes(img, "tokenizer.ggml.token_type");
+        Assert.isTrue(p >= 0);
+        Assert.equals(9L, GgufWriterTest.loadU32(img, p));
+        Assert.equals(5L, GgufWriterTest.loadU32(img, p + 4));    // of i32
+        Assert.equals(6L, GgufWriterTest.loadU64(img, p + 8));
+        i = 0;
+        while (i < 6) {
+            Assert.equals((int64) tt[i] & 0xFFFFFFFFL,
+                GgufWriterTest.loadU32(img, p + 16 + i * 4));
+            i = i + 1;
+        }
+        return;
+    }
+
+    // ── general.alignment moves the payloads, and the reader follows ────
+
+    /**
+     * The 64-alignment fixture, with `fill` filler bytes in a padding
+     * value so the caller can steer where the metadata ends. The f32
+     * payload is TRANSFERRED (`#pay`): the writer holds the title and the
+     * bytes outlive this frame, which is the arm a lend cannot exercise.
+     */
+    static #GgufWriter alignFixture(int32 fill, int8[] q8) {
+        StringBuilder sb = heap StringBuilder();
+        int32 i = 0;
+        while (i < fill) {
+            sb.append("x");
+            i = i + 1;
+        }
+        GgufWriter w = heap GgufWriter();
+        w.putString("general.architecture", "llama");
+        w.putU32("general.alignment", 64);
+        String pad #= sb.toString();
+        w.putString("writer.pad", pad);
+        int8[] pay #= GgufWriterTest.f32Payload();
+        int64[] ne = heap int64[2];
+        ne[0] = 4;
+        ne[1] = 2;
+        w.addTensor("writer.f32.weight", ne, 0, #pay, 32);
+        int64[] qne = heap int64[1];
+        qne[0] = 64;
+        w.addTensor("writer.q8.weight", qne, 8, q8, GgufWriterTest.Q8_BYTES);
+        return #w;
+    }
+
+    @Test
+    public void generalAlignmentOverridesThirtyTwo() {
+        String path #= GgufWriterTest.tmpPath("align64.gguf");
+        int8[] q8 #= File.readAllBytes(GgufWriterTest.Q8);
+
+        // Steer the metadata so rounding at 32 and at 64 DISAGREE —
+        // otherwise a reader that ignored the key would land on the same
+        // dataStart and the gate below would pass vacuously.
+        GgufWriter probe #= GgufWriterTest.alignFixture(0, q8);
+        int64 r = probe.metadataEnd() % 64L;
+        int32 fill = 0;
+        if (r == 0L) {
+            fill = 1;
+        } else if (r > 32L) {
+            fill = (int32) (65L - r);
+        }
+
+        GgufWriter w #= GgufWriterTest.alignFixture(fill, q8);
+        int64 metaEnd = w.metadataEnd();
+        Assert.isTrue(GgufWriterTest.alignUp(metaEnd, 32L)
+            != GgufWriterTest.alignUp(metaEnd, 64L));
+        Assert.equals(GgufWriterTest.alignUp(metaEnd, 64L), w.dataStart());
+        w.write(path);
+
+        GgufFile g #= heap GgufFile(path);
+        Assert.equals(3L, g.kvCount());
+        Assert.equals(2L, g.tensorCount());
+        // The f32 tensor is 32 bytes, so at alignment 64 the second
+        // payload starts one whole unit in, not half of one.
+        Assert.equals(w.dataStart() + 64L,
+            g.packedFileOffsetOf("writer.q8.weight"));
+        Assert.equals(0L, g.packedFileOffsetOf("writer.q8.weight") % 64L);
+
+        int8[] got #= g.loadPacked("writer.q8.weight");
+        int64 b = 0;
+        while (b < GgufWriterTest.Q8_BYTES) {
+            if (got[b] != q8[b]) {
+                Assert.fail("q8_0 byte " + b + " at alignment 64 read back "
+                    + got[b] + ", wrote " + q8[b]);
+            }
+            b = b + 1;
+        }
+        Tensor<float32> t #= g.loadF32("writer.f32.weight");
+        int64 j = 0;
+        while (j < 8) {
+            if (t.flatGet(j) != GgufWriterTest.f32At(j)) {
+                Assert.fail("f32 element " + j + " at alignment 64 read back "
+                    + t.flatGet(j));
+            }
+            j = j + 1;
+        }
+        g.close();
+        Path.of(path).delete();
+    }
+
+    // ── the gate can fail: a corrupted magic is rejected ────────────────
+
+    @Test
+    public void aCorruptedMagicIsRejected() {
+        String path #= GgufWriterTest.tmpPath("badmagic.gguf");
+        int8[] f32 #= GgufWriterTest.f32Payload();
+        GgufWriter w = heap GgufWriter();
+        w.putString("general.architecture", "llama");
+        int64[] ne = heap int64[1];
+        ne[0] = 8;
+        w.addTensor("writer.f32.weight", ne, 0, f32, 32);
+        w.write(path);
+
+        // Control arm: as written, the file opens.
+        GgufFile ok #= heap GgufFile(path);
+        Assert.equals(1L, ok.tensorCount());
+        ok.close();
+
+        // Treatment: one byte of the magic, nothing else.
+        File f #= File.open(path, OpenMode.READ_WRITE);
+        f.seek(0);
+        int8[] wrong = heap int8[1];
+        wrong[0] = (int8) 88;                      // 'X'
+        Assert.equals(1L, f.write(wrong, 0, 1));
+        f.close();
+
+        boolean threw = false;
+        String msg = "";
+        try {
+            GgufFile bad #= heap GgufFile(path);
+            bad.close();
+        } catch (LlmException e) {
+            threw = true;
+            if (e.message != null) {
+                msg #= e.message.substring(0, e.message.byteLength());
+            }
+        }
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.contains("magic"));
+        Path.of(path).delete();
+    }
+}

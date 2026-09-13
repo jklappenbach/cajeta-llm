@@ -1,0 +1,464 @@
+package dev.cajeta.llm.io;
+
+import cajeta.collection.ArrayList;
+import cajeta.io.file.File;
+import cajeta.io.file.OpenMode;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import dev.cajeta.llm.LlmException;
+
+/**
+ * One queued tensor — the directory record plus the payload
+ * {@link GgufWriter#write} streams out.
+ *
+ * `data` is stored MODE-CARRYING, so the caller of `addTensor` chooses:
+ * `addTensor(…, bytes, n)` lends (the caller keeps title and must keep
+ * the buffer alive until the write) and `addTensor(…, #bytes, n)`
+ * transfers. Neither spelling copies, which is the whole point for an
+ * expert slab measured in gigabytes.
+ */
+final class GgufTensorEntry {
+    String name;
+    int64[] ne;
+    int32 type;
+    int8[] data;
+    int64 len;
+
+    GgufTensorEntry(#String name, #int64[] ne, int32 type, int8[] data,
+            int64 len) {
+        this.name #= name;
+        this.ne #= ne;
+        this.type = type;
+        this.data #= data;
+        this.len = len;
+    }
+}
+
+/**
+ * GGUF v3 writer — the inverse of {@link GgufFile}, and written against
+ * it: every field width and order below is what that reader's `readKv`
+ * and `readTensorInfo` consume, so a file this class emits parses back
+ * identically. It exists so fixture and checkpoint generation is cajeta
+ * rather than a pile of python next to the suite.
+ *
+ * The image, in the order it is written:
+ *
+ * ```
+ *   magic u32 'GGUF' | version u32 | tensorCount u64 | kvCount u64
+ *   KVs, insertion order:   key string | value type u32 | value
+ *   tensor infos, insertion order:
+ *       name string | nDims u32 | ne u64 × nDims | ggml type u32
+ *       | offset u64, RELATIVE to dataStart
+ *   zero pad to `alignment`                       ← dataStart
+ *   tensor payloads, insertion order, each zero-padded to `alignment`
+ * ```
+ *
+ * A string is a u64 byte length followed by the raw bytes, never
+ * terminated; an array value is an element type u32, a count u64, then
+ * the elements back to back. Everything is little-endian, emitted byte
+ * by byte rather than by reinterpreting a word, so the image does not
+ * depend on the host's byte order.
+ *
+ * Alignment defaults to 32 and is whatever a `general.alignment` key
+ * says — the reader reads that key back out of the KV block and rounds
+ * the post-directory position up by it, so the writer must agree with
+ * its own metadata. Setting it through `putU32`/`putI32`/`putU64` is
+ * what moves the payloads; the key is not synthesized, since a file that
+ * omits it is a file the reader aligns at 32.
+ *
+ * Shapes are handed in GGUF's own `ne` order — fastest-varying dimension
+ * first, so a `[out, in]` projection is added as `[in, out]`. That is
+ * the order the reader reverses into torch shapes; passing torch order
+ * here produces a file whose dimensions read back transposed.
+ */
+public final class GgufWriter {
+    static final int64 MAGIC = 0x46554747L;
+    static final int64 VERSION = 3L;
+
+    // GGUF metadata value type ids, as the reader's readKv dispatches on
+    // them (4/5/7 are the widths its scalarSize table covers).
+    static final int64 KV_U32 = 4L;
+    static final int64 KV_I32 = 5L;
+    static final int64 KV_F32 = 6L;
+    static final int64 KV_BOOL = 7L;
+    static final int64 KV_STRING = 8L;
+    static final int64 KV_ARRAY = 9L;
+    static final int64 KV_U64 = 10L;
+    static final int64 KV_F64 = 12L;
+
+    // The KV block, encoded as it is put — insertion order is the file's
+    // order, and nothing needs to be held twice.
+    int8[] kv;
+    int64 kvLen;
+    int64 nKv;
+
+    ArrayList<GgufTensorEntry> tensors;
+    // Running size of the tensor directory. Every field in a record is
+    // fixed-width but the name, so this is exact the moment a tensor is
+    // added, which is what lets dataStart() answer before a write.
+    int64 infoBytes;
+    int64 alignment;
+
+    public GgufWriter() {
+        this.kv #= heap int8[256];
+        this.kvLen = 0;
+        this.nKv = 0;
+        this.tensors #= heap ArrayList<GgufTensorEntry>();
+        this.infoBytes = 0;
+        this.alignment = 32;
+    }
+
+    // ── metadata ────────────────────────────────────────────────────────
+
+    public void putU32(String key, int32 v) {
+        this.beginKv(key, GgufWriter.KV_U32);
+        this.emitU32((int64) v);
+        this.noteAlignment(key, (int64) v & 0xFFFFFFFFL);
+    }
+
+    public void putI32(String key, int32 v) {
+        this.beginKv(key, GgufWriter.KV_I32);
+        this.emitU32((int64) v);
+        this.noteAlignment(key, (int64) v);
+    }
+
+    public void putU64(String key, int64 v) {
+        this.beginKv(key, GgufWriter.KV_U64);
+        this.emitU64(v);
+        this.noteAlignment(key, v);
+    }
+
+    public void putF32(String key, float32 v) {
+        this.beginKv(key, GgufWriter.KV_F32);
+        this.emitU32((int64) Cajeta.f32ToBits(v) & 0xFFFFFFFFL);
+    }
+
+    public void putF64(String key, float64 v) {
+        this.beginKv(key, GgufWriter.KV_F64);
+        this.emitU64(Cajeta.f64ToBits(v));
+    }
+
+    public void putBool(String key, boolean v) {
+        this.beginKv(key, GgufWriter.KV_BOOL);
+        int64 b = 0;
+        if (v) {
+            b = 1;
+        }
+        this.emitByte(b);
+    }
+
+    public void putString(String key, String v) {
+        this.beginKv(key, GgufWriter.KV_STRING);
+        this.emitString(v);
+    }
+
+    public void putArrayString(String key, String[] xs) {
+        int64 n = (int64) xs.count();
+        this.beginArray(key, GgufWriter.KV_STRING, n);
+        int64 i = 0;
+        while (i < n) {
+            this.emitString(xs[i]);
+            i = i + 1;
+        }
+    }
+
+    public void putArrayF32(String key, float32[] xs) {
+        int64 n = (int64) xs.count();
+        this.beginArray(key, GgufWriter.KV_F32, n);
+        int64 i = 0;
+        while (i < n) {
+            this.emitU32((int64) Cajeta.f32ToBits(xs[i]) & 0xFFFFFFFFL);
+            i = i + 1;
+        }
+    }
+
+    public void putArrayI32(String key, int32[] xs) {
+        int64 n = (int64) xs.count();
+        this.beginArray(key, GgufWriter.KV_I32, n);
+        int64 i = 0;
+        while (i < n) {
+            this.emitU32((int64) xs[i]);
+            i = i + 1;
+        }
+    }
+
+    // ── tensors ─────────────────────────────────────────────────────────
+
+    /**
+     * Queue `name` with `shape` in GGUF `ne` order (fastest-varying
+     * first) and `data[0..len)` as its payload. The payload is HELD, not
+     * copied: lend it and keep it alive until {@link #write}, or hand it
+     * over with `#data`.
+     *
+     * Throws {@link LlmException} on a rank the reader rejects, a length
+     * the buffer cannot serve, or — for a storage type whose byte count
+     * is known — a length that disagrees with shape × type.
+     */
+    public void addTensor(String name, int64[] shape, int32 type,
+            int8[] data, int64 len) {
+        int32 nd = (int32) shape.count();
+        if (nd < 1 || nd > 4) {
+            throw heap LlmException("gguf: tensor '" + name + "' has "
+                + nd + " dims; expected 1-4");
+        }
+        if (len < 0) {
+            throw heap LlmException("gguf: tensor '" + name + "' has a "
+                + len + "-byte payload");
+        }
+        if (len > 0 && data == null) {
+            throw heap LlmException("gguf: tensor '" + name + "' declares "
+                + len + " bytes with no payload");
+        }
+        if (data != null && len > (int64) data.count()) {
+            throw heap LlmException("gguf: tensor '" + name + "' declares "
+                + len + " bytes over a " + data.count() + "-byte buffer");
+        }
+        int64[] ne = heap int64[nd];
+        int32 d = 0;
+        while (d < nd) {
+            if (shape[d] < 1) {
+                throw heap LlmException("gguf: tensor '" + name
+                    + "' has dimension " + d + " = " + shape[d]);
+            }
+            ne[d] = shape[d];
+            d = d + 1;
+        }
+        int64 want = GgufWriter.payloadBytes(type, ne, name);
+        if (want >= 0 && want != len) {
+            throw heap LlmException("gguf: " + GgufFile.typeName(type)
+                + " tensor '" + name + "' needs " + want
+                + " payload bytes for its shape; got " + len);
+        }
+        String nm = "" + name;
+        this.infoBytes = this.infoBytes + 8 + (int64) nm.byteLength()
+            + 4 + 8 * (int64) nd + 4 + 8;
+        GgufTensorEntry e = heap GgufTensorEntry(#nm, #ne, type, #data, len);
+        this.tensors.add(#e);
+    }
+
+    /** Queued tensors, in the order they will be written. */
+    public int32 tensorCount() {
+        return this.tensors.count();
+    }
+
+    /** Metadata values put so far. */
+    public int64 kvCount() {
+        return this.nKv;
+    }
+
+    /**
+     * Byte position one past the tensor directory — the position
+     * `dataStart` rounds up from. Exact at any point, since a record's
+     * size is known when its tensor is added.
+     */
+    public int64 metadataEnd() {
+        return 24 + this.kvLen + this.infoBytes;
+    }
+
+    /** Absolute file offset of the first payload, under the current
+     *  alignment. Tensor offsets in the directory are relative to it. */
+    public int64 dataStart() {
+        return GgufWriter.alignUp(this.metadataEnd(), this.alignment);
+    }
+
+    // ── the image ───────────────────────────────────────────────────────
+
+    /**
+     * Write the whole file to `path`, truncating anything already there.
+     * Payloads stream straight from the buffers handed to `addTensor`, so
+     * peak memory is the metadata, not the weights.
+     */
+    public void write(String path) {
+        int64 a = this.alignment;
+        int64 metaEnd = this.metadataEnd();
+        int64 ds = GgufWriter.alignUp(metaEnd, a);
+        int32 n = this.tensors.count();
+
+        int8[] head = heap int8[24];
+        int64 p = GgufWriter.storeU32(head, 0, GgufWriter.MAGIC);
+        p = GgufWriter.storeU32(head, p, GgufWriter.VERSION);
+        p = GgufWriter.storeU64(head, p, (int64) n);
+        p = GgufWriter.storeU64(head, p, this.nKv);
+
+        int8[] info = heap int8[this.infoBytes];
+        p = 0;
+        int64 off = 0;
+        int32 i = 0;
+        while (i < n) {
+            GgufTensorEntry e = this.tensors.get(i);
+            int32 nd = (int32) e.ne.count();
+            p = GgufWriter.storeString(info, p, e.name);
+            p = GgufWriter.storeU32(info, p, (int64) nd);
+            int32 d = 0;
+            while (d < nd) {
+                p = GgufWriter.storeU64(info, p, e.ne[d]);
+                d = d + 1;
+            }
+            p = GgufWriter.storeU32(info, p, (int64) e.type);
+            p = GgufWriter.storeU64(info, p, off);
+            off = off + GgufWriter.alignUp(e.len, a);
+            i = i + 1;
+        }
+
+        // calloc'd, so the pad window is zeros without writing them.
+        int8[] pad = heap int8[a];
+        File f #= File.open(path, OpenMode.WRITE);
+        GgufWriter.emit(f, path, head, 24);
+        GgufWriter.emit(f, path, this.kv, this.kvLen);
+        GgufWriter.emit(f, path, info, this.infoBytes);
+        GgufWriter.emit(f, path, pad, ds - metaEnd);
+        i = 0;
+        while (i < n) {
+            GgufTensorEntry e = this.tensors.get(i);
+            GgufWriter.emit(f, path, e.data, e.len);
+            GgufWriter.emit(f, path, pad,
+                GgufWriter.alignUp(e.len, a) - e.len);
+            i = i + 1;
+        }
+        f.close();
+    }
+
+    // ── encoding internals ──────────────────────────────────────────────
+
+    void beginKv(String key, int64 valueType) {
+        this.emitString(key);
+        this.emitU32(valueType);
+        this.nKv = this.nKv + 1;
+    }
+
+    void beginArray(String key, int64 elemType, int64 count) {
+        this.beginKv(key, GgufWriter.KV_ARRAY);
+        this.emitU32(elemType);
+        this.emitU64(count);
+    }
+
+    /**
+     * The alignment the payloads will be laid out at. Taken from the KV
+     * value itself rather than a separate setter, so the metadata and the
+     * layout cannot disagree.
+     */
+    void noteAlignment(String key, int64 v) {
+        if (!key.equals("general.alignment")) {
+            return;
+        }
+        if (v < 1 || (v & (v - 1)) != 0) {
+            throw heap LlmException("gguf: general.alignment " + v
+                + " is not a power of two");
+        }
+        this.alignment = v;
+    }
+
+    void need(int64 extra) {
+        int64 want = this.kvLen + extra;
+        int64 cap = (int64) this.kv.count();
+        if (want <= cap) {
+            return;
+        }
+        while (cap < want) {
+            cap = cap + cap;
+        }
+        int8[] grown = heap int8[cap];
+        int64 i = 0;
+        while (i < this.kvLen) {
+            grown[i] = this.kv[i];
+            i = i + 1;
+        }
+        this.kv #= grown;
+    }
+
+    void emitByte(int64 v) {
+        this.need(1);
+        this.kv[this.kvLen] = (int8) (v & 255L);
+        this.kvLen = this.kvLen + 1;
+    }
+
+    void emitU32(int64 v) {
+        this.need(4);
+        this.kvLen = GgufWriter.storeU32(this.kv, this.kvLen, v);
+    }
+
+    void emitU64(int64 v) {
+        this.need(8);
+        this.kvLen = GgufWriter.storeU64(this.kv, this.kvLen, v);
+    }
+
+    void emitString(String s) {
+        this.need(8 + (int64) s.byteLength());
+        this.kvLen = GgufWriter.storeString(this.kv, this.kvLen, s);
+    }
+
+    static int64 storeU32(int8[] b, int64 at, int64 v) {
+        int64 k = 0;
+        while (k < 4) {
+            b[at + k] = (int8) ((v >>> (k * 8L)) & 255L);
+            k = k + 1;
+        }
+        return at + 4;
+    }
+
+    static int64 storeU64(int8[] b, int64 at, int64 v) {
+        int64 k = 0;
+        while (k < 8) {
+            b[at + k] = (int8) ((v >>> (k * 8L)) & 255L);
+            k = k + 1;
+        }
+        return at + 8;
+    }
+
+    static int64 storeString(int8[] b, int64 at, String s) {
+        int8[] sb #= s.toBytes();
+        int64 n = (int64) sb.count();
+        int64 p = GgufWriter.storeU64(b, at, n);
+        int64 i = 0;
+        while (i < n) {
+            b[p + i] = sb[i];
+            i = i + 1;
+        }
+        return p + n;
+    }
+
+    static int64 alignUp(int64 v, int64 a) {
+        return ((v + a - 1) / a) * a;
+    }
+
+    /**
+     * Payload bytes for `ne` at `type`, or -1 when the type's width is
+     * not one this library knows — the reader computes exactly this to
+     * decide what to read back, so a disagreement is a corrupt file.
+     */
+    static int64 payloadBytes(int32 type, int64[] ne, String name) {
+        int64 elems = 1;
+        int32 d = 0;
+        while (d < (int32) ne.count()) {
+            elems = elems * ne[d];
+            d = d + 1;
+        }
+        if (type == 0) {
+            return elems * 4;
+        }
+        if (type == 1 || type == 30) {
+            return elems * 2;
+        }
+        if (!Quant.supported(type)) {
+            return -1;
+        }
+        int64 be = (int64) Quant.blockElems(type);
+        if (elems % be != 0) {
+            throw heap LlmException("gguf: " + GgufFile.typeName(type)
+                + " tensor '" + name + "' has " + elems
+                + " elements - not a " + be + "-block multiple");
+        }
+        return (elems / be) * (int64) Quant.blockBytes(type);
+    }
+
+    static void emit(File f, String path, int8[] b, int64 n) {
+        if (n <= 0) {
+            return;
+        }
+        int64 got = f.write(b, 0, n);
+        if (got != n) {
+            throw heap LlmException("gguf: writing '" + path + "' put "
+                + got + " of " + n + " bytes");
+        }
+    }
+}
