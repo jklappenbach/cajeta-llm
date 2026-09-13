@@ -840,3 +840,30 @@ a wave64 launch path, not a re-mapping of the wave32 one.
 OWED: the other 23 kernels of this family still hardcode 32. The fix is
 mechanical now that the helper exists, but each needs its own decode
 fingerprint before and after.
+
+CORRECTION 2026-09-13 — the sweep in daa0d20 WAS NOT A SWEEP. The `mvrpb=`
+bench flag it claimed to use had silently failed to apply (a perl replace that
+did not match), and the check that should have caught it, `grep -n ... | head`,
+exits on HEAD and so reported success on zero matches. All four "swept" runs
+used the same default, and the 0.2% spread was pure noise. The conclusion
+happened to be right; the evidence for it did not exist.
+RE-RUN with a verified flag (an absurd value must move the number, checked
+first), best of alternating passes, Q2_K decode tok/s:
+  rows per WORKGROUP  1: 55.19   2: 54.75   4: 54.91   8: 54.83
+  rows per WAVE       1: 54.41   2: 54.56   4: 54.49
+Both flat-to-negative; the original one-row-per-wave, one-row-per-workgroup
+geometry is best. So the activation-amortization theory is REFUTED here too,
+despite predicting the cross-format pattern correctly: the activation vector
+is ~4 KB and lives in L1/L2, so re-reading it per row costs cache bandwidth,
+not DRAM, and this kernel is DRAM-bound on weights. The rule N = ceil(8A/B)
+is sound as a TRAFFIC argument and wrong as a THROUGHPUT prediction on a part
+whose cache holds the activations.
+KEPT: the wave-relative fix (the family was wave32-only), the shared geometry
+helper, and the knobs — with the derived default now 1, which is what this
+device measures. The multi-row kernel is reverted and saved at
+tmp/u3/q2k-multirow.patch; it is bit-identical and neutral, worth retrying on
+a part with less cache or with fp16 activations (A=2 doubles every N).
+STILL OPEN: q2kQ8WaveMatVecKernel's `b = lane / 4` with a literal `+ 8L`
+stride is correct only at wave32 — on wave64 lanes 32-63 re-walk blocks lanes
+0-31 already covered. The lane/row derivation is now wave-relative but this
+stride is not; the family is not yet genuinely portable.
