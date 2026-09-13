@@ -553,11 +553,11 @@ transfers; the A-staging technique does not (refuted on deq).
       output (a fixed shape, e.g. 512×4096×4096 on a routable fixture) as a
       reference; the new multi-wave kernel matches it bit-for-bit (int8 MMA is
       exact — no f16-noise tolerance). Host-parity check too.
-- [~] 6.1.2 Portability (slice law tested; block assertion needs a public accessor; the `32` grep gate was run by hand — clean): a GPU-free `LaunchGeometryTest`-style assertion that
+- [x] 6.1.2 (slice law + block = 8 waves asserted in `packedMwSubmissionMatchesManifest`; the `32` grep gate run by hand — clean) Portability: a GPU-free `LaunchGeometryTest`-style assertion that
       the launcher's derived block == `Group.laneBlock()`-consistent value and
       grid covers all tiles; and that no `block:[32]`/`/32` literal remains in
       the new kernel+launcher (grep gate).
-- [~] 6.1.3 Deployment (manifest half done + `partitionSliceFollowsResidentCapacity`; the Scheduler.submit half rides with 6.2.2): the launcher reads a non-null `manifest().feasibleBlocks()`
+- [x] 6.1.3 (`partitionSliceFollowsResidentCapacity` + `packedMwSubmissionMatchesManifest`: manifest block accepted, submission derives the access sets, no refusal, descriptor 4×256 / 31232 B / 32 waves) Deployment: the launcher reads a non-null `manifest().feasibleBlocks()`
       on gfx1151 and launches with `feasibleBlocks()[0]`; `Scheduler.submit`
       access sets match the manifest (no refusal).
 
@@ -567,7 +567,7 @@ transfers; the A-staging technique does not (refuted on deq).
       across sub-blocks, Q4_K sub-block scales + dmin folded in the epilogue
       WITHOUT per-sub-block LDS round-trips/barriers. Wave width via
       `Group.width()`. ISA-verified zero spill (`--xpu-emit=isa`).
-- [~] 6.2.2 (launcher + slice law done; Scheduler.submit routing and the default flip pending) Portable launcher `q4kWmmaMwLaunch`: manifest `feasibleBlocks` +
+- [x] 6.2.2 (launcher + slice law + every slice routed through `Scheduler.submit` via `mwSubmit`, geometry read back from the descriptor, no measurable cost 554→555; the default stays OFF: the packed route is the memory base and 19% behind the int8-deq route) Portable launcher `q4kWmmaMwLaunch`: manifest `feasibleBlocks` +
       `Device` geometry → block/grid (measured-literal fallback); route through
       `Scheduler.submit`; wire into Linear's packed Q4_K route behind a flag
       (`setQ4Mw`), default off until 6.3 passes, then default on.

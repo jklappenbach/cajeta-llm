@@ -10,6 +10,10 @@ import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelManifest;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelThread;
+import cajeta.xpu.KernelSubmission;
+import cajeta.xpu.KernelResourceDescriptor;
+import cajeta.xpu.Scheduler;
+import cajeta.xpu.ArithmeticCharacter;
 import cajeta.xpu.Shared;
 import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.io.GgufFile;
@@ -1814,6 +1818,7 @@ public final class WmmaKernel {
     // Profile-resolved launch geometry for q4kWmmaMwKernel, latched once.
     // 0 means "not yet resolved".
     static int32 mwBlock = 0;
+    static int32 mwLds = 0;
     static void resolveMwGeom() {
         if (WmmaKernel.mwBlock != 0) { return; }
         int32 wave = Device.waveSize();
@@ -1827,6 +1832,10 @@ public final class WmmaKernel {
         int32 reqBlock = wave > 0 ? 8 * wave : 256;
         int32 block = reqBlock;
         KernelManifest m #= KernelManifest.of("q4kWmmaMwKernel");
+        if (m != null) {
+            Optional<int32> ld = m.ldsStaticBytes();
+            if (ld.isPresent()) { WmmaKernel.mwLds = ld.get(); }
+        }
         if (m != null && m.hasFeasibleBlocks()) {
             int32[] fb = m.feasibleBlocks();
             if (fb != null && fb.count() > 0 && fb[0] == reqBlock) {
@@ -1835,6 +1844,34 @@ public final class WmmaKernel {
         }
         WmmaKernel.mwBlock = block;
         return;
+    }
+
+    /** The packed multi-wave kernel's launch block: 8 waves of the device's
+     *  width, the measured 256 when no device answers. */
+    public static int32 mwLaunchBlock() {
+        WmmaKernel.resolveMwGeom();
+        return WmmaKernel.mwBlock;
+    }
+
+    /**
+     * Route one packed multi-wave slice through the scheduler seam: the
+     * kernel is named and its buffers bound in parameter order, so
+     * Scheduler.submit derives the read/write sets from the manifest and
+     * refuses a restatement that disagrees; the caller launches with the
+     * descriptor's geometry.
+     */
+    public static #KernelResourceDescriptor mwSubmit(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int32> packedW,
+            KernelBuffer<int8> xp, int32 gridBlocks, int32 blockThreads) {
+        KernelSubmission sub = heap KernelSubmission(gridBlocks, blockThreads);
+        sub.kernel = "q4kWmmaMwKernel";
+        sub.character = ArithmeticCharacter.ComputeBound;
+        sub.ldsBytes = WmmaKernel.mwLds;
+        sub.bind(y.handle());
+        sub.bind(packed.handle());
+        sub.bind(packedW.handle());
+        sub.bind(xp.handle());
+        return Scheduler.submit(sub);
     }
 
     /**
@@ -1865,8 +1902,10 @@ public final class WmmaKernel {
         while (base < tilesN8) {
             int64 n8 = sliceN8;
             if (base + n8 > tilesN8) { n8 = tilesN8 - base; }
+            KernelResourceDescriptor d #= WmmaKernel.mwSubmit(y, packed,
+                packedW, xp, (int32) (tilesM8 * n8), (int32) blk);
             q4kWmmaMwKernel.launch(s,
-                grid: [(uint32) (tilesM8 * n8)], block: [blk])
+                grid: [(uint32) d.gridX], block: [(uint32) d.blockX])
                 (y, packed, packedW, xp, (uint32) rows, (uint32) outDim,
                  (uint32) n8, cols / 256L, (uint32) (base * 128L));
             base = base + n8;
