@@ -510,7 +510,7 @@ explicit staging barrier is restored (5/block) until a fold is proven. Spill
 204 B at vgpr=192 (the LDS budget lowered the VGPR cap). Kernel now: B at 4.5
 bpw via fromWords + A staged once per block in LDS (30.5 KB, literal stride
 144, wide fragment loads). NEXT: partWgs sweep (32/40/64/80, both arms).
-PROGRESS 2026-09-12: barrier fold PASSES the gate (the shadow was the sole
+PROGRESS 2026-09-12 (9ab9739): barrier fold PASSES the gate (the shadow was the sole
 cause; 4 barriers/block, gain within noise). partWgs SWEEP, two replicates
 ≤1% apart: packed-mw 32/40/60/64/72/80 → 510/534/557/550/555/555; deq →
 638/688/633/628/693/690 (48 → 591). The pattern is WHOLE ROUNDS of resident
@@ -526,6 +526,18 @@ pins 80/40 on gfx1151 and the `launch-geom` Diag record shows it under
 6.3.1's first gate is crossed by the deq route. HELD compiler follow-ups:
 manifest residency granularity, residency for feasible-block kernels, a
 CUs-per-multiprocessor surface. NEXT: port A-staging to the deq kernel.
+PROGRESS 2026-09-12: A-staging ported to q4kWmmaDeqMw8Kernel per K-half (2→4
+barriers/block, spill 124→0): bit-gate PASS but 666 vs 688 = −3% (three runs,
+packed-mw control steady 553). On this kernel the two extra barriers cost
+more than the wide A loads gain (its B loads were already wide global reads).
+Trying ONE copy per block (128×256 tile, stride 272, 36 KB, barriers back to
+2); patch of the two-half form kept at tmp/u3/deq-astage-two-half.patch.
+RESULT: one-copy variant (2 barriers, 47.6 KB LDS, spill 8 B) bit-gate PASS,
+685/686/678 vs 688 = parity. A-staging is REFUTED on the deq kernel: its A
+loads were never the bottleneck (the +18% on packed-mw came from relieving
+the fromWords VALU path, not from A bytes). REVERTED to the plain kernel;
+patches kept in tmp/u3/deq-astage-{two-half,one-copy}.patch. NEXT:
+re-profile the deq route at 688 to find where the remaining 2x lives.
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
@@ -554,7 +566,7 @@ CUs-per-multiprocessor surface. NEXT: port A-staging to the deq kernel.
       14.5%) if the technique transfers, or record why Q6_K differs.
 
 ### 6.3 Acceptance
-- [ ] 6.3.1 Prefill parity (amdgpu/gfx1151, idle-gated A/B, announce first):
+- [~] 6.3.1 (FIRST GATE MET 2026-09-12: deq route 688 = 0.52x llama 1320, packed-mw 554 = 0.42x; decode 42.0 tok/s on both routes at gen=64, unchanged; ppl tied by the bit-gate — the slice law re-partitions the grid only; parity stretch OPEN, re-profile pending) Prefill parity (amdgpu/gfx1151, idle-gated A/B, announce first):
       8B Q4_K_M prefill 512 ≥ 0.5x llama (first gate, from 0.165x), target
       parity ≥ 1.0x (stretch). Re-profile: q4kWmmaMwKernel share + occupancy
       (`residentGroupsPerCu` up vs the single-wave kernel). ppl unchanged
