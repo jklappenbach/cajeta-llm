@@ -8,6 +8,8 @@ import cajeta.xpu.KernelThread;
 import cajeta.xpu.Shared;
 import cajeta.xpu.Wave;
 import cajeta.xpu.Group;
+import cajeta.xpu.Autotune;
+import cajeta.lang.Optional;
 import cajeta.xpu.GroupOp;
 import cajeta.xpu.MemoryOrder;
 import cajeta.lang.Cajeta;
@@ -9116,6 +9118,69 @@ public final class QuantKernel {
         return;
     }
 
+    // ---- wave-per-row launch geometry, in ONE place ------------------- //
+    // Every qNkQ8WaveMatVec kernel has the same shape: one wave reduces one
+    // row and lane 0 writes it. Two of the three numbers are DERIVED from
+    // the device -- the wave width, and the workgroup ceiling. The only
+    // free parameter is how many rows share a workgroup, which depends on
+    // cache behaviour rather than on any reported fact, so it is measured
+    // once per device and cached. A new kernel of this shape calls these
+    // three and inherits the answer instead of repeating the search.
+    static String mvTuneDir = "";
+    static int32 mvRowsPerBlock = 0;
+    public static void setMatVecTuneDir(String d) {
+        QuantKernel.mvTuneDir = d;
+        QuantKernel.mvRowsPerBlock = 0;
+    }
+    /** The knob name the rows-per-workgroup choice is stored under. */
+    public static String MV_ROWS_PER_BLOCK = "mvRowsPerBlock";
+
+    /** Force rows per workgroup, for a sweep. 0 restores the derived value. */
+    public static void setWaveRowsPerBlock(int32 n) {
+        QuantKernel.mvRowsPerBlock = n;
+    }
+
+    /** Wave width, or the measured 32 when no device answers. */
+    public static int32 waveWidth() {
+        int32 w = Device.waveSize();
+        if (w <= 0) { return 32; }
+        return w;
+    }
+
+    /**
+     * Rows per workgroup for the wave-per-row family. A value measured on
+     * THIS machine wins; otherwise 4, which is where the derived ceiling
+     * and the launch-count tradeoff meet on the parts measured so far.
+     * Always clamped so the workgroup fits the device.
+     */
+    public static int32 waveRowsPerBlock() {
+        if (QuantKernel.mvRowsPerBlock > 0) { return QuantKernel.mvRowsPerBlock; }
+        int32 rpb = 4;
+        if (QuantKernel.mvTuneDir.byteLength() > 0) {
+            Optional<int32> t = Autotune.recall(QuantKernel.mvTuneDir,
+                QuantKernel.MV_ROWS_PER_BLOCK);
+            if (t.isPresent() && t.get() > 0) { rpb = t.get(); }
+        }
+        int32 wave = QuantKernel.waveWidth();
+        int32 maxT = Device.maxThreadsPerBlock();
+        if (maxT <= 0) { maxT = 256; }
+        while (rpb > 1 && rpb * wave > maxT) { rpb = rpb / 2; }
+        if (rpb < 1) { rpb = 1; }
+        QuantKernel.mvRowsPerBlock = rpb;
+        return rpb;
+    }
+
+    /** Workgroup size for the wave-per-row family. */
+    public static uint32 waveRowBlock() {
+        return (uint32) (QuantKernel.waveRowsPerBlock() * QuantKernel.waveWidth());
+    }
+
+    /** Workgroups needed to cover `rows`, one wave each. */
+    public static uint32 waveRowGrid(int64 rows) {
+        int64 rpb = (int64) QuantKernel.waveRowsPerBlock();
+        return (uint32) ((rows + rpb - 1L) / rpb);
+    }
+
     /**
      * WAVE-COOPERATIVE Q2_K x q8_K (10.12.45.C). The Q6 wave kernel's
      * decomposition on Q2_K's shape: one workgroup of 32 per output
@@ -9135,8 +9200,12 @@ public final class QuantKernel {
     public static void q2kQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
-        uint32 lane = KernelThread.x();
-        uint32 row = KernelThread.globalIdX() / 32;
+        // Wave-relative, so a workgroup may carry SEVERAL rows and the
+        // kernel is correct at any wave width. The 32 this used to assume
+        // made one workgroup per row and was wrong on a wave64 part.
+        uint32 wv = (uint32) Group.width();
+        uint32 lane = KernelThread.x() % wv;
+        uint32 row = KernelThread.globalIdX() / wv;
         int64 rowBytes = blocksPerRow * 84L;
         float32 acc = 0.0f;
         if (row < rows) {
@@ -9227,7 +9296,8 @@ public final class QuantKernel {
             int64 rows, int64 cols, int64 yOff) {
         uint32 ur = (uint32) rows;
         KernelStream s = QuantKernel.stream();
-        q2kQ8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+        q2kQ8WaveMatVecKernel.launch(s, grid: [QuantKernel.waveRowGrid(rows)],
+                block: [QuantKernel.waveRowBlock()])
             (y, packed, xp, ur, cols / 256L, yOff);
         return;
     }

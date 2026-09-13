@@ -818,3 +818,25 @@ cost per weight byte is highest. Q5_K at 0.97x is marginal.
 LESSON: llama-bench's tg figure is depth 0 by default. Any decode comparison
 must pass -d to match the context the other engine is carrying, or it measures
 two different workloads.
+
+LANE MAPPING 2026-09-13 — one real bug fixed, one hypothesis REFUTED.
+The wave-per-row mat-vec family (24 kernels) hardcoded `globalIdX() / 32` and
+launched `block: [32]`, so every one of them is WAVE32-ONLY and wrong on a
+wave64 part, and each row got its own workgroup. q2kQ8WaveMatVecKernel is now
+wave-relative (`Group.width()` for both the lane mask and the row divisor) and
+its launcher takes geometry from a new shared helper — `QuantKernel.
+waveWidth/waveRowsPerBlock/waveRowBlock/waveRowGrid` — which DERIVES the wave
+width and the workgroup ceiling from the device and leaves exactly one free
+parameter, rows per workgroup, measured per machine through Autotune.
+REFUTED: rows per workgroup does not matter here. Swept 1/2/4/8 on Q2_K
+decode: 55.29 / 55.40 / 55.36 / 55.35 tok/s — flat within 0.2%. Launch count
+was not the limiter, so the 7% gap to llama's Vulkan decode (176 vs 189 GB/s
+against a 212 GB/s roofline) is read efficiency inside the kernel, not launch
+geometry. Decode output is byte-identical across the change.
+NEXT for the Q2_K gap: the remaining structural difference is that llama's
+Vulkan shaders run a 64-wide subgroup on RADV while ours is one wave32 per
+row, so each of their rows is reduced by twice the lanes. Testing that needs
+a wave64 launch path, not a re-mapping of the wave32 one.
+OWED: the other 23 kernels of this family still hardcode 32. The fix is
+mechanical now that the helper exists, but each needs its own decode
+fingerprint before and after.
