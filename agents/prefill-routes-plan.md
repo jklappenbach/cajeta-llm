@@ -647,3 +647,30 @@ llama study per format: their MMQ does all unpacking once in `load_tiles`
 under a transposed C fragment — and Q2_K's 1×5 is an LDS-overflow artifact
 (16 of its 100 ints per row are dead), not a model to copy. Their Q2_K also
 pays an extra all-ones MMA for the tail min-sums, which our staging avoids.
+
+PROGRESS 2026-09-13 (partition law + int fold): TWO further levers.
+(1) The partition width was a per-kernel resident-capacity derivation (40 or
+80) and four of the six int8 launchers ignored it entirely, still slicing at
+the 32 literal. MEASURED: 60 WGs is the optimum for EVERY format, sharply —
+50 and 70 are 3-6% worse in two reps — and it does NOT track each kernel's
+own residency (60 wins whether the kernel holds 2 groups/CU or 4). So the
+law is now three slices per driver multiprocessor, shared by all five int8
+deq launchers; the capacity number is still computed and reported in the
+`launch-geom` Diag record, but no longer sizes the partition. Mechanism for
+the sharp peak at exactly 3/mp is NOT established (tile divisibility is an
+untested alternative), and one device cannot separate the two.
+(2) `scaledAccumI32` (the compiler verb shipped today) applied to
+q3kWmmaDeqMw8Kernel: the raw 6-bit scale folds into an int32 accumulator via
+mul.i24 per 16-k sub-block and the float drain runs once per 256-k block
+instead of 16 times. Staging splits `d*sc` into `scAll` (int32) + `dAll`
+(float per column). No spill (~241 VGPR estimate fit). +4.7%. Output moves
+by 2.4e-10 relative — it now rounds ONCE per block instead of 16 times, so
+it is strictly more accurate; the other five formats stay bit-identical.
+8B prefill 512, shipped default at session start -> now, vs llama's best:
+Q2_K 919 -> 943 (0.84x), Q3_K 422 -> 898 (0.67x), Q4_K 218 -> 915 (0.69x),
+Q5_K 555 -> 900 (0.68x), Q6_K 216 -> 799 (0.77x), Q8_0 640 -> 876 (0.96x,
+and 1.40x llama's own ROCm backend). Decode unchanged.
+NEXT: int-fold the shared q4kWmmaDeqMw8Kernel (52% of Q5_K's prefill, 21% of
+Q3_K's), then Q2_K/Q6_K. MoE is the far larger gap: Qwen1.5-MoE measures 75
+tok/s prefill against llama's 2342 (0.03x) and is a different route entirely
+(slots never take the deq path).

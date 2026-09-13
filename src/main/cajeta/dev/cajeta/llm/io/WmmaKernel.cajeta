@@ -4198,7 +4198,11 @@ public final class WmmaKernel {
             KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
-        int64 sliceN8 = WmmaKernel.partWgs / tilesM8;
+        if (WmmaKernel.deqMwSlice <= 0L) {
+            WmmaKernel.deqMwSlice =
+                WmmaKernel.sliceWgsFor("q4kWmmaDeqMw8Kernel", 256L);
+        }
+        int64 sliceN8 = WmmaKernel.deqMwSlice / tilesM8;
         if (sliceN8 < 1L) { sliceN8 = 1L; }
         KernelStream s = QuantKernel.stream();
         int64 base = 0L;
@@ -4261,8 +4265,8 @@ public final class WmmaKernel {
             source = 2L;
             slice = WmmaKernel.partWgs;
             resident = WmmaKernel.residentGroupsPerMp(kernel, block);
-            if (mps > 0L && resident > 0L) {
-                slice = resident * mps;
+            if (mps > 0L) {
+                slice = 3L * mps;
                 source = 1L;
             }
         }
@@ -4274,6 +4278,13 @@ public final class WmmaKernel {
     }
 
     /**
+     * MEASURED: three slices per driver multiprocessor is the optimum for
+     * every format on gfx1151 (60 WGs; 50 and 70 are both 3-6%% worse, and
+     * the peak is sharp), and it does NOT track each kernel's own resident
+     * capacity — 60 wins whether the kernel holds 2 groups per CU or 4. The
+     * partition bounds the grid sweep rather than matching residency, so
+     * the capacity below is reported for the record, not used to size it.
+     *
      * Groups of `block` threads one driver multiprocessor holds at once
      * for `kernel`, from the manifest footprint and the device ceilings.
      * Not the manifest's residentGroupsPerCu: that divides total resident
@@ -4753,7 +4764,11 @@ public final class WmmaKernel {
             KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
-        int64 sliceN8 = WmmaKernel.partWgs / tilesM8;
+        if (WmmaKernel.deqMwSlice <= 0L) {
+            WmmaKernel.deqMwSlice =
+                WmmaKernel.sliceWgsFor("q4kWmmaDeqMw8Kernel", 256L);
+        }
+        int64 sliceN8 = WmmaKernel.deqMwSlice / tilesM8;
         if (sliceN8 < 1L) { sliceN8 = 1L; }
         KernelStream s = QuantKernel.stream();
         int64 base = 0L;
@@ -4772,10 +4787,18 @@ public final class WmmaKernel {
     /**
      * 10.12.45.D — the Q3_K T=8 deq GEMM: the Q6 Mw8 kernel's exact
      * shape (16 slices of 16, a 2x4 wave tiling so four weight
-     * fragments and two token fragments feed eight mmas per 16-k step,
-     * single-verb drain) with Q3's header: d at 108 and the 16 signed
-     * six-bit scales unpacked from 12 bytes at staging, split across
-     * the lane halves like the Q6 kernel's prefold.
+     * fragments and two token fragments feed eight mmas per 16-k step)
+     * with Q3's header: d at 108 and the 16 signed six-bit scales
+     * unpacked from 12 bytes at staging, split across the lane halves
+     * like the Q6 kernel's prefold.
+     *
+     * The drain is INTEGER-FOLDED: the six-bit sub-block scale is a
+     * small integer, so each 16-k step folds it with scaledAccumI32
+     * into a persistent int32 tile and the float epilogue runs ONCE
+     * per 256-k block instead of sixteen times. Q3's 16-k scale
+     * granularity makes that epilogue twice as frequent as Q4's, and
+     * this is what removes it. Algebraically identical and strictly
+     * more accurate — no per-sub-block float rounding survives.
      */
     @Kernel @FastMath
     public static void q3kWmmaDeqMw8Kernel(KernelBuffer<float32> y,
@@ -4786,7 +4809,12 @@ public final class WmmaKernel {
         // read as xsAll[tile * 16] — the eight separate arrays and the
         // 8-arm wave-uniform store chain they needed are gone.
         Shared<float32> xsAll = shared float32[128];
-        Shared<float32> cfAll = shared float32[2048];
+        // The RAW six-bit scale, not d*sc: the j-loop folds it as an
+        // integer, so d never enters the sub-block step.
+        Shared<int32> scAll = shared int32[2048];
+        // This block's per-column d, read at the drain by the column
+        // tile the wave OWNS rather than the one it staged.
+        Shared<float32> dAll = shared float32[128];
 
         uint32 tid = KernelThread.x();
         uint32 lane = tid % 32;
@@ -4830,6 +4858,16 @@ public final class WmmaKernel {
             CooperativeMatrix<int32,16,16,2> mc5;
             CooperativeMatrix<int32,16,16,2> mc6;
             CooperativeMatrix<int32,16,16,2> mc7;
+            // The integer seam: one per output tile, carrying
+            // sum_j sc_j * mc_j across the whole 256-k block.
+            CooperativeMatrix<int32,16,16,2> iacc0;
+            CooperativeMatrix<int32,16,16,2> iacc1;
+            CooperativeMatrix<int32,16,16,2> iacc2;
+            CooperativeMatrix<int32,16,16,2> iacc3;
+            CooperativeMatrix<int32,16,16,2> iacc4;
+            CooperativeMatrix<int32,16,16,2> iacc5;
+            CooperativeMatrix<int32,16,16,2> iacc6;
+            CooperativeMatrix<int32,16,16,2> iacc7;
             CooperativeMatrix<float32,16,16,2> facc0;
             CooperativeMatrix<float32,16,16,2> facc1;
             CooperativeMatrix<float32,16,16,2> facc2;
@@ -4846,6 +4884,7 @@ public final class WmmaKernel {
             facc5.splat(0.0f);
             facc6.splat(0.0f);
             facc7.splat(0.0f);
+            uint32 xbase = 32 * wr;
 
             int64 b = 0;
             while (b < blocksPerRow) {
@@ -4862,6 +4901,7 @@ public final class WmmaKernel {
                         | (((int32) xp[xb + 290L] & 255) << 16)
                         | (((int32) xp[xb + 291L] & 255) << 24));
                     xsAll[wid * 16 + lane] = xv;
+                    dAll[wid * 16 + lane] = dv;
                     // Scales 0-7 of THIS row: low nibbles.
                     uint32 cb = (wid * 16 + lane) * 16;
                     uint32 k = 0;
@@ -4871,8 +4911,8 @@ public final class WmmaKernel {
                         int32 hb = ((int32) packed[ro
                             + (int64) (104 + (k & 3))] & 255)
                             >> (2 * (k / 4));
-                        cfAll[cb + k] = dv * (float32)
-                            (((b0 & 15) | ((hb & 3) << 4)) - 32);
+                        scAll[cb + k] =
+                            ((b0 & 15) | ((hb & 3) << 4)) - 32;
                         k = k + 1;
                     }
                 } else {
@@ -4886,23 +4926,31 @@ public final class WmmaKernel {
                         int32 hb = ((int32) packed[ro
                             + (int64) (104 + (kk & 3))] & 255)
                             >> (2 * (kk / 4));
-                        cfAll[cb + kk] = dv * (float32)
-                            (((b0 >> 4) | ((hb & 3) << 4)) - 32);
+                        scAll[cb + kk] =
+                            ((b0 >> 4) | ((hb & 3) << 4)) - 32;
                         k = k + 1;
                     }
                 }
                 Barrier.workgroup();
 
+                iacc0.splat(0);
+                iacc1.splat(0);
+                iacc2.splat(0);
+                iacc3.splat(0);
+                iacc4.splat(0);
+                iacc5.splat(0);
+                iacc6.splat(0);
+                iacc7.splat(0);
+
                 uint32 j = 0;
                 while (j < 16) {
-                    // ONE pre-folded cf per column tile, shared by both
-                    // token tiles; the xs slice is per token tile.
+                    // ONE raw integer scale per column tile, shared by
+                    // both token tiles.
                     uint32 cbase = (64 * wc + lane16) * 16 + j;
-                    float32 cfv0 = cfAll[cbase];
-                    float32 cfv1 = cfAll[cbase + 256];
-                    float32 cfv2 = cfAll[cbase + 512];
-                    float32 cfv3 = cfAll[cbase + 768];
-                    uint32 xbase = 32 * wr;
+                    int32 scv0 = scAll[cbase];
+                    int32 scv1 = scAll[cbase + 256];
+                    int32 scv2 = scAll[cbase + 512];
+                    int32 scv3 = scAll[cbase + 768];
                     uint32 kBase = 16 * j;
                     int64 aOff = (int64) tw * xRowBytes + b * 320L
                         + (int64) kBase;
@@ -4934,16 +4982,35 @@ public final class WmmaKernel {
                     mc5.mma(maB, mbB);
                     mc6.mma(maB, mbC);
                     mc7.mma(maB, mbD);
-                    mc0.scaledAccumIntoS(facc0, xsAll[xbase], cfv0);
-                    mc1.scaledAccumIntoS(facc1, xsAll[xbase], cfv1);
-                    mc2.scaledAccumIntoS(facc2, xsAll[xbase], cfv2);
-                    mc3.scaledAccumIntoS(facc3, xsAll[xbase], cfv3);
-                    mc4.scaledAccumIntoS(facc4, xsAll[xbase + 16], cfv0);
-                    mc5.scaledAccumIntoS(facc5, xsAll[xbase + 16], cfv1);
-                    mc6.scaledAccumIntoS(facc6, xsAll[xbase + 16], cfv2);
-                    mc7.scaledAccumIntoS(facc7, xsAll[xbase + 16], cfv3);
+                    // Integer fold — no convert, no fma, no float in
+                    // the sub-block step. Both operands sit inside 24
+                    // bits: |mc| <= 16*127*4 and |sc| <= 32.
+                    mc0.scaledAccumI32(iacc0, scv0);
+                    mc1.scaledAccumI32(iacc1, scv1);
+                    mc2.scaledAccumI32(iacc2, scv2);
+                    mc3.scaledAccumI32(iacc3, scv3);
+                    mc4.scaledAccumI32(iacc4, scv0);
+                    mc5.scaledAccumI32(iacc5, scv1);
+                    mc6.scaledAccumI32(iacc6, scv2);
+                    mc7.scaledAccumI32(iacc7, scv3);
                     j = j + 1;
                 }
+                // The block's ONE float epilogue: the sixteen scales
+                // are already summed in as integers, so the row scale
+                // and this column's d apply once.
+                uint32 dbase = 64 * wc + lane16;
+                float32 dcv0 = dAll[dbase];
+                float32 dcv1 = dAll[dbase + 16];
+                float32 dcv2 = dAll[dbase + 32];
+                float32 dcv3 = dAll[dbase + 48];
+                iacc0.scaledAccumIntoS(facc0, xsAll[xbase], dcv0);
+                iacc1.scaledAccumIntoS(facc1, xsAll[xbase], dcv1);
+                iacc2.scaledAccumIntoS(facc2, xsAll[xbase], dcv2);
+                iacc3.scaledAccumIntoS(facc3, xsAll[xbase], dcv3);
+                iacc4.scaledAccumIntoS(facc4, xsAll[xbase + 16], dcv0);
+                iacc5.scaledAccumIntoS(facc5, xsAll[xbase + 16], dcv1);
+                iacc6.scaledAccumIntoS(facc6, xsAll[xbase + 16], dcv2);
+                iacc7.scaledAccumIntoS(facc7, xsAll[xbase + 16], dcv3);
                 Barrier.workgroup();
                 b = b + 1;
             }
@@ -4985,7 +5052,11 @@ public final class WmmaKernel {
             KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
-        int64 sliceN8 = WmmaKernel.partWgs / tilesM8;
+        if (WmmaKernel.deqMwSlice <= 0L) {
+            WmmaKernel.deqMwSlice =
+                WmmaKernel.sliceWgsFor("q4kWmmaDeqMw8Kernel", 256L);
+        }
+        int64 sliceN8 = WmmaKernel.deqMwSlice / tilesM8;
         if (sliceN8 < 1L) { sliceN8 = 1L; }
         KernelStream s = QuantKernel.stream();
         int64 base = 0L;
@@ -5271,7 +5342,11 @@ public final class WmmaKernel {
             KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
-        int64 sliceN8 = WmmaKernel.partWgs / tilesM8;
+        if (WmmaKernel.deqMwSlice <= 0L) {
+            WmmaKernel.deqMwSlice =
+                WmmaKernel.sliceWgsFor("q4kWmmaDeqMw8Kernel", 256L);
+        }
+        int64 sliceN8 = WmmaKernel.deqMwSlice / tilesM8;
         if (sliceN8 < 1L) { sliceN8 = 1L; }
         KernelStream s = QuantKernel.stream();
         int64 base = 0L;
