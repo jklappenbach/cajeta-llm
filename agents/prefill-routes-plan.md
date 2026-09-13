@@ -751,3 +751,28 @@ curve and picked 72; three passes, alternating direction, keeping the MIN per
 candidate gives 400/379/367/372/374 — a clean minimum at 60, independently
 reproducing the hand sweep. A tuner that can pick a bad value is worse than
 a constant.
+
+HEAD-TO-HEAD 2026-09-13, same window, quiet box (load ~1.5), llama.cpp build
+5306f4b. Both engines measured minutes apart rather than against the recorded
+2026-09-06 rows, because llama's ROCm numbers today read 10-13% BELOW what the
+same build produced that day (Q4_K 1160 vs 1320) while ours moved ~1% — so the
+stale rows would have flattered us. 8B Llama-3.1, prompt 512, gen 64:
+
+  format   cajeta pp/tg     llama ROCm pp/tg   pp ratio  tg ratio
+  Q2_K     1281 / 55.36     989 / 55.58        1.29x     1.00x
+  Q3_K_M   1392 / 47.86    1186 / 46.01        1.17x     1.04x
+  Q4_K_M   1449 / 41.80    1160 / 39.70        1.25x     1.05x
+  Q5_K_M   1409 / 35.65    1146 / 35.28        1.23x     1.01x
+  Q6_K     1320 / 31.84     926 / 31.42        1.42x     1.01x
+  Q8_0     1460 / 25.78     585 / 25.41        2.49x     1.01x
+
+Against the RECORDED llama best-of-backends (hip or vulkan, 2026-09-06) the
+prefill claim still holds on every format: 1.14x / 1.03x / 1.10x / 1.07x /
+1.28x / 1.60x. DECODE now matches or beats llama's ROCm on all six, and the
+comparison is CONSERVATIVE: llama's tg64 generates from an empty context while
+ours decodes after a 512-token prefill, so ours carries a 512-token KV
+attention cost per token that llama's does not.
+CAVEAT: no Vulkan number today. Both local llama builds register only a ROCm
+device (build-vulkan/bin/llama-bench reports backend ROCm and --list-devices
+shows ROCm0 alone), so the recorded Vulkan decode figures (Q2_K 64.6) could
+not be re-measured and we are likely still behind Vulkan on decode.
