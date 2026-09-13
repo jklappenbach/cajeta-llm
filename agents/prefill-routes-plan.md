@@ -626,3 +626,24 @@ intrinsic, loop-unroll directive; then re-profile.
 - [x] 6.3.2 (80/40 reproduced from the profile; SM expectation: simds=4 → the unit is the SM, 65536 regs) Portability re-derive: the launcher reproduces gfx1151's measured
       block/grid from the profile (not a literal); note the NVIDIA-path
       expectation (wave32, different simdCount) without a device to run it.
+
+PROGRESS 2026-09-13: EVERY FORMAT. The 2×4 wave re-shape applied to the three
+remaining int8 GEMMs (Q8_0, Q3_K, Q2_K), all spill-free, all six formats
+bit-identical to a pinned pre-change fingerprint (new `deqMw8Fingerprints-
+AcrossFormats`, a position-weighted fold — an XOR fold reads 0 here because
+these outputs repeat and XOR cancels). Q8_0 deq 567 → 804 (+42%), Q3_K
+749 → 778, Q2_K 676 → 721. Separately, the SHIPPED default was the wrong arm
+on four of six formats: `prefillWeights` now defaults to "auto", a per-format
+policy (int8 widen for every k-quant but Q2_K, which keeps the packed
+cooperative GEMM), with "packed"/"int8" still forcing globally. 8B prefill
+512, shipped default before → after, vs llama.cpp's best backend:
+Q2_K 919 → 915 (0.81x), Q3_K 422 → 775 (0.57x), Q4_K 218 → 889 (0.67x),
+Q5_K 555 → 833 (0.63x), Q6_K 216 → 781 (0.76x), Q8_0 640 → 803 (0.88x, and
+1.29x llama's own ROCm backend). Decode unchanged at 25.8-55.4, which is
+0.86-0.97 of llama's best and already beats its ROCm backend on Q3_K/Q4_K.
+llama study per format: their MMQ does all unpacking once in `load_tiles`
+(our `deq` widen is the same decision one level out); their per-warp shape is
+2 weight-row × 4 token tiles for Q8_0/Q4_K/Q3_K — the same rule as our 2×4
+under a transposed C fragment — and Q2_K's 1×5 is an LDS-overflow artifact
+(16 of its 100 ints per row are dead), not a model to copy. Their Q2_K also
+pays an extra all-ones MMA for the tail min-sums, which our staging avoids.
