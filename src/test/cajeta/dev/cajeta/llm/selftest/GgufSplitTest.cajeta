@@ -1,0 +1,202 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.LlmException;
+import cajeta.io.file.File;
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+
+/**
+ * Split GGUF (`<base>-%05d-of-%05d.gguf`, `split.no`/`split.count`/
+ * `split.tensors.count`) — the fixture is `toy-moe.gguf` run through
+ * llama.cpp's own `llama-gguf-split --split-max-tensors 13`, so the
+ * shards are byte-for-byte what the reference writes.
+ *
+ * The whole file is the oracle: the split must present the SAME surface,
+ * and the refusal on a missing shard must actually fire.
+ */
+public class GgufSplitTest {
+
+    static final String WHOLE = "src/test/fixtures/gguf/toy-moe.gguf";
+    static final String SPLIT =
+        "src/test/fixtures/gguf/toy-moe-split-00001-of-00003.gguf";
+    static final String MID =
+        "src/test/fixtures/gguf/toy-moe-split-00002-of-00003.gguf";
+    static final String LAST =
+        "src/test/fixtures/gguf/toy-moe-split-00003-of-00003.gguf";
+    static final String COPY_DIR = "tmp/ggufsplit";
+
+    public GgufSplitTest() { return; }
+
+    static void packedBytesMatch(GgufFile a, GgufFile b, String name) {
+        int8[] x #= a.loadPacked(name);
+        int8[] y #= b.loadPacked(name);
+        Assert.equals((int64) x.count(), (int64) y.count());
+        int64 i = 0;
+        while (i < (int64) x.count()) {
+            if (x[i] != y[i]) {
+                Assert.fail("'" + name + "' byte " + i + " differs: "
+                    + x[i] + " vs " + y[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    @Test
+    public void splitPresentsTheSameSurfaceAsTheWholeFile() {
+        GgufFile w #= heap GgufFile(GgufSplitTest.WHOLE);
+        GgufFile s #= heap GgufFile(GgufSplitTest.SPLIT);
+        Assert.equals(1L, (int64) w.shardCount());
+        Assert.equals(3L, (int64) s.shardCount());
+        Assert.equals(w.tensorCount(), s.tensorCount());
+        Assert.equals(37L, s.tensorCount());
+
+        // Shard 0 carries the metadata, so the split answers the model's
+        // own keys exactly as the one-file form does.
+        Assert.equals(w.metaString("general.architecture"),
+            s.metaString("general.architecture"));
+        Assert.equals(w.metaInt("qwen2moe.block_count", -1L),
+            s.metaInt("qwen2moe.block_count", -1L));
+
+        int32 i = 0;
+        while (i < (int32) w.tensorCount()) {
+            String n = w.nameAt(i);
+            int32 j = s.tensorIndexOf(n);
+            if (j < 0) {
+                Assert.fail("split is missing '" + n + "'");
+            }
+            Assert.equals((int64) w.typeOf(i), (int64) s.typeOf(j));
+            int64[] ws = w.shapeOf(i);
+            int64[] ss = s.shapeOf(j);
+            Assert.equals((int64) ws.count(), (int64) ss.count());
+            int32 d = 0;
+            while (d < (int32) ws.count()) {
+                Assert.equals(ws[d], ss[d]);
+                d = d + 1;
+            }
+            i = i + 1;
+        }
+
+        // Payloads, one per shard: tensor 0 lands in shard 0, tensor 19
+        // in shard 1, tensor 36 in shard 2, so this covers resolution
+        // through every mapping rather than only the one that was opened.
+        Tensor<float32> we #= w.loadF32("token_embd.weight");
+        Tensor<float32> se #= s.loadF32("token_embd.weight");
+        int64 n = we.shapeAt(0) * we.shapeAt(1);
+        int64 e = 0;
+        while (e < n) {
+            if (we.flatGet(e) != se.flatGet(e)) {
+                Assert.fail("token_embd element " + e + " differs");
+            }
+            e = e + 1;
+        }
+        GgufSplitTest.packedBytesMatch(w, s, "blk.1.attn_q.weight");
+        GgufSplitTest.packedBytesMatch(w, s, "output.weight");
+
+        String p0 #= s.shardPathOf("token_embd.weight");
+        String p1 #= s.shardPathOf("blk.1.attn_q.weight");
+        String p2 #= s.shardPathOf("output.weight");
+        Assert.isTrue(p0.endsWith("-00001-of-00003.gguf"));
+        Assert.isTrue(p1.endsWith("-00002-of-00003.gguf"));
+        Assert.isTrue(p2.endsWith("-00003-of-00003.gguf"));
+        w.close();
+        s.close();
+    }
+
+    @Test
+    public void anyShardOpensTheWholeModel() {
+        // A later shard holds only the three split.* keys; opening one
+        // has to re-root the metadata parse at shard 0.
+        GgufFile a #= heap GgufFile(GgufSplitTest.MID);
+        GgufFile b #= heap GgufFile(GgufSplitTest.LAST);
+        Assert.equals(37L, a.tensorCount());
+        Assert.equals(37L, b.tensorCount());
+        Assert.equals("qwen2moe", a.metaString("general.architecture"));
+        Assert.equals("qwen2moe", b.metaString("general.architecture"));
+        Assert.isTrue(a.contains("token_embd.weight"));
+        Assert.isTrue(b.contains("token_embd.weight"));
+        GgufSplitTest.packedBytesMatch(a, b, "blk.0.ffn_gate_exps.weight");
+        a.close();
+        b.close();
+    }
+
+    static void copyTo(String src, String dst) {
+        int8[] raw #= File.readAllBytes(src);
+        File.writeAllBytes(dst, raw, (int64) raw.count());
+    }
+
+    static #String stage(int32 drop) {
+        Path d #= Path.of(GgufSplitTest.COPY_DIR);
+        d.mkdirs();
+        String a = GgufSplitTest.COPY_DIR + "/part-00001-of-00003.gguf";
+        String b = GgufSplitTest.COPY_DIR + "/part-00002-of-00003.gguf";
+        String c = GgufSplitTest.COPY_DIR + "/part-00003-of-00003.gguf";
+        GgufSplitTest.copyTo(GgufSplitTest.SPLIT, a);
+        GgufSplitTest.copyTo(GgufSplitTest.MID, b);
+        GgufSplitTest.copyTo(GgufSplitTest.LAST, c);
+        if (drop == 1) {
+            Path p #= Path.of(b);
+            p.delete();
+        }
+        if (drop == 2) {
+            Path p #= Path.of(c);
+            p.delete();
+        }
+        String first #= "" + a;
+        return #first;
+    }
+
+    @Test
+    public void aCompleteStagedCopyStillLoads() {
+        // The control for the refusal below: the same staging, nothing
+        // removed. Without it a refusal could just as well mean the copy
+        // is broken.
+        String first #= GgufSplitTest.stage(0);
+        GgufFile g #= heap GgufFile(first);
+        Assert.equals(37L, g.tensorCount());
+        Assert.equals(3L, (int64) g.shardCount());
+        g.close();
+    }
+
+    @Test
+    public void aMissingShardIsRefusedByName() {
+        String first #= GgufSplitTest.stage(1);
+        boolean threw = false;
+        String msg = null;
+        try {
+            GgufFile g #= heap GgufFile(first);
+            g.close();
+        } catch (LlmException e) {
+            threw = true;
+            msg = "" + e.message;
+        }
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.contains("part-00002-of-00003.gguf"));
+        Assert.isTrue(msg.contains("shard 2 of 3"));
+        Assert.isTrue(msg.contains("found 2 of 3"));
+        Assert.isTrue(msg.contains("Refusing to load a truncated model"));
+    }
+
+    @Test
+    public void aMissingLastShardIsRefusedToo() {
+        // The tensors of shard 0 are all present and parse fine; a loader
+        // that only checked the file it opened would report 13 tensors
+        // and bind 1 of 2 layers.
+        String first #= GgufSplitTest.stage(2);
+        boolean threw = false;
+        String msg = null;
+        try {
+            GgufFile g #= heap GgufFile(first);
+            g.close();
+        } catch (LlmException e) {
+            threw = true;
+            msg = "" + e.message;
+        }
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.contains("part-00003-of-00003.gguf"));
+        Assert.isTrue(msg.contains("shard 3 of 3"));
+        Assert.isTrue(msg.contains("found 2 of 3"));
+    }
+}

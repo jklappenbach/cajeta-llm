@@ -2,6 +2,7 @@ package dev.cajeta.llm.io;
 
 import cajeta.collection.HashMap;
 import cajeta.io.file.MappedFile;
+import cajeta.io.file.Path;
 import cajeta.lang.Cajeta;
 import cajeta.lang.String;
 import cajeta.math.Tensor;
@@ -40,6 +41,17 @@ view GgufHeader {
  * no external file (9.2/16.1.4); `chatTemplate()` hands
  * `tokenizer.chat_template` to Unit 13's interpreter (7.11/16.1.5);
  * `ModelConfig.fromGguf` maps the hyperparameter keys (9.3/16.2.2).
+ *
+ * A model shipped as a SPLIT GGUF — `<base>-%05d-of-%05d.gguf`, declared
+ * by `split.no` / `split.count` / `split.tensors.count` — presents the
+ * same single surface as a one-file model: one name→tensor map, one
+ * tensor count, transparent reads. Every shard is a complete GGUF with
+ * its own prelude and its own tensor directory covering only its own
+ * tensors; only shard 0 carries the model metadata, so opening a later
+ * shard re-roots the KV parse at shard 0. Shard resolution lives here
+ * rather than in `Checkpoint` because the split is described INSIDE the
+ * file, not by a sidecar index — nothing above this class can know a
+ * `.gguf` is split without parsing it.
  */
 public final class GgufFile {
     // ggml type ids (ggml.h) — the four Unit-16 storage types.
@@ -48,12 +60,20 @@ public final class GgufFile {
     static final int32 T_Q8_0 = 8;
     static final int32 T_BF16 = 30;
 
-    MappedFile map;
+    // Byte length of the "-00001-of-00004.gguf" tail.
+    static final int32 SPLIT_TAIL = 20;
+
     String path;
     int64 nTensors;
     int64 nKv;
-    int64 dataStart;
     int64 alignment;
+
+    // Shards, in split order; a one-file model has exactly one. Every
+    // tensor read resolves through the shard that owns it.
+    int32 nShards;
+    String[] shardPaths;
+    MappedFile[] shardMaps;
+    int64[] shardStart;     // per-shard payload base (aligned dataStart)
 
     // Scalars: parallel arrays by KV index. kind: 0 int (all int widths +
     // bool), 1 float (f32/f64), 2 string, 3 skipped-array, 4 kept-array.
@@ -76,85 +96,53 @@ public final class GgufFile {
     String[] tNames;
     int64[][] tShapes;      // TORCH order (reversed ggml ne)
     int32[] tTypes;
-    int64[] tOffsets;       // relative to dataStart
+    int64[] tOffsets;       // relative to the OWNING shard's payload base
+    int32[] tShard;         // which shard holds each tensor
     HashMap<String, int32> tIdx;
 
     int64 pos;              // parse cursor
 
     public GgufFile(String path) {
         this.path = "" + path;
-        this.map #= heap MappedFile(path);
-        int64 fileLen = this.map.size();
-        if (fileLen < 24) {
-            throw heap LlmException("gguf: '" + path + "' is " + fileLen
-                + " bytes - too short for the GGUF header");
-        }
-        // The fixed prelude reads through the view overlay (16.2.1).
-        int8[] hb #= heap int8[24];
-        this.map.read(0, hb, 0, 24);
-        GgufHeader h = GgufHeader(hb);
-        if (h.magic != 0x46554747) {
-            throw heap LlmException("gguf: '" + path
-                + "' has magic " + h.magic + "; expected GGUF");
-        }
-        if (h.version != 3 && h.version != 2) {
-            throw heap LlmException("gguf: '" + path + "' is version "
-                + h.version + "; supported: 2, 3");
-        }
-        this.nTensors = h.tensorCount;
-        this.nKv = h.kvCount;
-        this.pos = 24;
         this.alignment = 32;
-
-        int32 nk = (int32) this.nKv;
-        this.kKeys #= heap String[nk];
-        this.kKinds #= heap int32[nk];
-        this.kInts #= heap int64[nk];
-        this.kFloats #= heap float64[nk];
-        this.kStrs #= heap String[nk];
-        this.kIdx #= heap HashMap<String, int32>();
-        this.tokTokens = null;
-        this.tokScores = null;
-        this.tokTypes = null;
-        this.tokMerges = null;
-        this.tokCount = 0;
-        this.mergeCount = 0;
-        int32 i = 0;
-        while (i < nk) {
-            this.readKv(i);
-            i = i + 1;
-        }
-        // general.alignment overrides the default 32.
-        int32 ai = this.indexOfKey("general.alignment");
-        if (ai >= 0) {
-            if (this.kKinds[ai] == 0) {
-                this.alignment = this.kInts[ai];
-            }
-        }
-
-        int32 nt = (int32) this.nTensors;
-        this.tNames #= heap String[nt];
-        this.tShapes #= heap int64[nt][];
-        this.tTypes #= heap int32[nt];
-        this.tOffsets #= heap int64[nt];
-        this.tIdx #= heap HashMap<String, int32>();
-        i = 0;
-        while (i < nt) {
-            this.readTensorInfo(i);
-            i = i + 1;
-        }
-        int64 a = this.alignment;
-        this.dataStart = ((this.pos + a - 1) / a) * a;
+        this.nShards = 1;
+        String root #= this.metadataShardOf(path);
+        this.openRooted(root);
     }
 
     public void close() {
-        this.map.close();
+        int32 i = 0;
+        while (i < this.nShards) {
+            this.shardMaps[i].close();
+            i = i + 1;
+        }
     }
 
     // ── surface ─────────────────────────────────────────────────────────
 
+    /** Tensors across EVERY shard. */
     public int64 tensorCount() {
         return this.nTensors;
+    }
+
+    /** How many files back this model — 1 unless it is a split GGUF. */
+    public int32 shardCount() {
+        return this.nShards;
+    }
+
+    /**
+     * The file that actually holds `name` — the path a caller must map to
+     * read at {@link #packedFileOffsetOf}. Identical to
+     * {@link #filePath} for a one-file model.
+     */
+    public #String shardPathOf(String name) {
+        int32 i = this.tensorIndexOf(name);
+        if (i < 0) {
+            throw heap LlmException("gguf: no tensor '" + name + "' in '"
+                + this.path + "'");
+        }
+        String p #= "" + this.shardPaths[this.tShard[i]];
+        return #p;
     }
 
     public int64 kvCount() {
@@ -205,6 +193,11 @@ public final class GgufFile {
             return -1;
         }
         return this.tIdx.get(name);
+    }
+
+    /** Directory name at `idx` — a borrow of interior storage. */
+    public String nameAt(int32 idx) {
+        return this.tNames[idx];
     }
 
     public int64[] shapeOf(int32 idx) {
@@ -311,11 +304,12 @@ public final class GgufFile {
                 + GgufFile.typeName(this.tTypes[i])
                 + ", not a packed block type");
         }
-        return this.dataStart + this.tOffsets[i];
+        return this.shardStart[this.tShard[i]] + this.tOffsets[i];
     }
 
     /** The path this file was opened from (for a second mapping of
-     *  the same bytes; the page cache is shared). */
+     *  the same bytes; the page cache is shared). Split models: this is
+     *  the metadata shard — {@link #shardPathOf} names a tensor's own. */
     public #String filePath() {
         String p #= "" + this.path;
         return #p;
@@ -347,7 +341,9 @@ public final class GgufFile {
         }
         int64 bytes = (n / be) * (int64) Quant.blockBytes(ty);
         int8[] raw #= heap int8[bytes];
-        this.map.read(this.dataStart + this.tOffsets[i], raw, 0, bytes);
+        MappedFile m = this.shardMaps[this.tShard[i]];
+        m.read(this.shardStart[this.tShard[i]] + this.tOffsets[i], raw, 0,
+            bytes);
         return #raw;
     }
 
@@ -372,12 +368,13 @@ public final class GgufFile {
             d = d + 1;
         }
         Tensor<float32> t #= Tensor.zeros<float32>(shpCopy);
-        int64 off = this.dataStart + this.tOffsets[i];
+        MappedFile m = this.shardMaps[this.tShard[i]];
+        int64 off = this.shardStart[this.tShard[i]] + this.tOffsets[i];
         if (ty == GgufFile.T_F32) {
-            this.map.copyTo(off, t.hostAddress(), n * 4);
+            m.copyTo(off, t.hostAddress(), n * 4);
         } else if (ty == GgufFile.T_F16) {
             int8[] raw #= heap int8[n * 2];
-            this.map.read(off, raw, 0, n * 2);
+            m.read(off, raw, 0, n * 2);
             int64 j = 0;
             while (j < n) {
                 int32 h = ((int32) raw[j * 2] & 255)
@@ -387,7 +384,7 @@ public final class GgufFile {
             }
         } else if (ty == GgufFile.T_BF16) {
             int8[] raw #= heap int8[n * 2];
-            this.map.read(off, raw, 0, n * 2);
+            m.read(off, raw, 0, n * 2);
             int64 j = 0;
             while (j < n) {
                 int64 hi = ((int64) raw[j * 2] & 255L)
@@ -408,7 +405,7 @@ public final class GgufFile {
             int64 blocks = n / be;
             int64 bb = (int64) Quant.blockBytes(ty);
             int8[] raw #= heap int8[blocks * bb];
-            this.map.read(off, raw, 0, blocks * bb);
+            m.read(off, raw, 0, blocks * bb);
             float32[] dq #= heap float32[n];
             Quant.dequantize(ty, raw, 0, blocks, dq, 0);
             int64 j = 0;
@@ -425,6 +422,267 @@ public final class GgufFile {
         return #t;
     }
 
+    // ── split resolution ────────────────────────────────────────────────
+
+    /**
+     * The shard whose KV block is the model's metadata. `gguf-split`
+     * writes the full metadata into shard 0 and only the three `split.*`
+     * keys into the rest (gguf-split.cpp:234-240), so opening a later
+     * shard has to re-root. The FILENAME says which shard this is before
+     * anything is parsed, and that file's own `split.count` confirms it.
+     */
+    #String metadataShardOf(String p) {
+        int32 no = GgufFile.splitNoInName(p);
+        if (no <= 0) {
+            String same #= "" + p;
+            return #same;
+        }
+        MappedFile probe #= heap MappedFile(p);
+        this.readHeader(probe, p);
+        int64[] meta #= heap int64[3];
+        this.scanShardKvs(probe, meta);
+        probe.close();
+        int64 count = meta[2];
+        if (count <= 1L) {
+            String same #= "" + p;
+            return #same;
+        }
+        int32 named = GgufFile.splitTotalInName(p);
+        if (count != (int64) named) {
+            throw heap LlmException("gguf: '" + p + "' declares split.count "
+                + count + " but its name says " + named
+                + " of them (<base>-%05d-of-%05d.gguf)");
+        }
+        String pre #= p.substring(0, p.byteLength() - GgufFile.SPLIT_TAIL);
+        String s0 #= GgufFile.shardPathAt(pre, 0, named);
+        Path q #= Path.of(s0);
+        if (!q.exists()) {
+            throw heap LlmException("gguf: '" + p + "' is shard "
+                + (no + 1) + " of " + named
+                + " and shard 1 of " + named + ", which carries the model"
+                + " metadata, is missing - expected '" + s0 + "'; found "
+                + GgufFile.shardsPresent(pre, named) + " of " + named
+                + " shards. Refusing to load a truncated model.");
+        }
+        return #s0;
+    }
+
+    static int32 shardsPresent(String prefix, int32 ns) {
+        int32 have = 0;
+        int32 i = 0;
+        while (i < ns) {
+            String sp #= GgufFile.shardPathAt(prefix, i, ns);
+            Path sq #= Path.of(sp);
+            if (sq.exists()) {
+                have = have + 1;
+            }
+            i = i + 1;
+        }
+        return have;
+    }
+
+    /** Parse `root`'s metadata, then fold in whatever shards it declares. */
+    void openRooted(String root) {
+        MappedFile m0 #= heap MappedFile(root);
+        this.readHeader(m0, root);
+        this.parseKvs(m0);
+        int64 dir0 = this.pos;
+        int64 count = this.metaInt("split.count", 1L);
+        int32 ns = 1;
+        if (count > 1L) {
+            ns = (int32) count;
+            int64 no = this.metaInt("split.no", 0L);
+            if (no != 0L) {
+                throw heap LlmException("gguf: '" + root
+                    + "' carries the model metadata but declares split.no "
+                    + no + "; expected 0");
+            }
+        }
+        this.nShards = ns;
+        this.shardPaths #= heap String[ns];
+        this.shardMaps #= heap MappedFile[ns];
+        this.shardStart #= heap int64[ns];
+        this.shardPaths[0] #= "" + root;
+        this.shardMaps[0] #= m0;
+        if (ns > 1) {
+            this.nameSiblings(root, ns);
+        }
+        this.buildDirectory(dir0);
+    }
+
+    /**
+     * Fill in the sibling shard paths, refusing loudly when one is
+     * absent: a model that silently loads 3 of 4 shards fails later, far
+     * from the cause, as a missing tensor.
+     */
+    void nameSiblings(String root, int32 ns) {
+        if (GgufFile.splitNoInName(root) != 0) {
+            throw heap LlmException("gguf: '" + root + "' declares split.count "
+                + ns + " but its name does not follow"
+                + " <base>-%05d-of-%05d.gguf, so its sibling shards"
+                + " cannot be derived");
+        }
+        String pre #= root.substring(0, root.byteLength()
+            - GgufFile.SPLIT_TAIL);
+        int32 have = GgufFile.shardsPresent(pre, ns);
+        int32 i = 0;
+        while (i < ns) {
+            String sp #= GgufFile.shardPathAt(pre, i, ns);
+            this.shardPaths[i] #= sp;
+            i = i + 1;
+        }
+        if (have == ns) {
+            return;
+        }
+        i = 0;
+        while (i < ns) {
+            Path sq #= Path.of(this.shardPaths[i]);
+            if (!sq.exists()) {
+                throw heap LlmException("gguf: '" + this.path + "' is a "
+                    + ns + "-shard split model and shard " + (i + 1)
+                    + " of " + ns + " is missing - expected '"
+                    + this.shardPaths[i] + "'; found " + have + " of "
+                    + ns + " shards. Refusing to load a truncated model.");
+            }
+            i = i + 1;
+        }
+    }
+
+    /**
+     * Read every shard's tensor directory into ONE name→tensor index.
+     * Offsets stay relative to the owning shard's payload base, which each
+     * shard aligns by its OWN `general.alignment` — the later shards carry
+     * no metadata, so they take the 32-byte default.
+     */
+    void buildDirectory(int64 dir0) {
+        int32 ns = this.nShards;
+        int64[] counts #= heap int64[ns];
+        counts[0] = this.nTensors;
+        int32 i = 1;
+        while (i < ns) {
+            MappedFile mi #= heap MappedFile(this.shardPaths[i]);
+            this.readHeader(mi, this.shardPaths[i]);
+            counts[i] = this.nTensors;
+            this.shardMaps[i] #= mi;
+            i = i + 1;
+        }
+        int64 total = 0;
+        i = 0;
+        while (i < ns) {
+            total = total + counts[i];
+            i = i + 1;
+        }
+        int32 nt = (int32) total;
+        this.tNames #= heap String[nt];
+        this.tShapes #= heap int64[nt][];
+        this.tTypes #= heap int32[nt];
+        this.tOffsets #= heap int64[nt];
+        this.tShard #= heap int32[nt];
+        this.tIdx #= heap HashMap<String, int32>();
+
+        int32 w = 0;
+        i = 0;
+        while (i < ns) {
+            MappedFile m = this.shardMaps[i];
+            int64 a = this.alignment;
+            if (i == 0) {
+                this.pos = dir0;
+            } else {
+                this.readHeader(m, this.shardPaths[i]);
+                int64[] meta #= heap int64[3];
+                this.scanShardKvs(m, meta);
+                if (meta[0] != (int64) i) {
+                    throw heap LlmException("gguf: shard '"
+                        + this.shardPaths[i] + "' declares split.no "
+                        + meta[0] + "; its name says " + i);
+                }
+                a = meta[1];
+            }
+            int64 j = 0;
+            while (j < counts[i]) {
+                this.readTensorInfo(m, w, i);
+                w = w + 1;
+                j = j + 1;
+            }
+            this.shardStart[i] = ((this.pos + a - 1) / a) * a;
+            i = i + 1;
+        }
+        this.nTensors = total;
+        int64 declared = this.metaInt("split.tensors.count", total);
+        if (declared != total) {
+            throw heap LlmException("gguf: '" + this.path + "' declares "
+                + declared + " tensors across " + ns
+                + " shards but their directories hold " + total);
+        }
+    }
+
+    /** The 0-based shard index in `<base>-%05d-of-%05d.gguf`, else -1.
+     *  The format is llama.cpp's SPLIT_PATH_FORMAT (llama.cpp:509). */
+    static int32 splitNoInName(String p) {
+        int32 n = p.byteLength();
+        if (n <= GgufFile.SPLIT_TAIL) {
+            return -1;
+        }
+        int32 at = n - GgufFile.SPLIT_TAIL;
+        if (!p.endsWith(".gguf")) {
+            return -1;
+        }
+        if (p.charAt(at) != (int8) 45 || p.charAt(at + 6) != (int8) 45
+                || p.charAt(at + 7) != (int8) 111
+                || p.charAt(at + 8) != (int8) 102
+                || p.charAt(at + 9) != (int8) 45) {
+            return -1;
+        }
+        int32 a = GgufFile.digits5(p, at + 1);
+        int32 b = GgufFile.digits5(p, at + 10);
+        if (a < 1 || b < 1) {
+            return -1;
+        }
+        return a - 1;
+    }
+
+    /** The shard TOTAL in `<base>-%05d-of-%05d.gguf`, else -1. */
+    static int32 splitTotalInName(String p) {
+        if (GgufFile.splitNoInName(p) < 0) {
+            return -1;
+        }
+        return GgufFile.digits5(p, p.byteLength() - GgufFile.SPLIT_TAIL + 10);
+    }
+
+    static int32 digits5(String p, int32 at) {
+        int32 v = 0;
+        int32 i = 0;
+        while (i < 5) {
+            int32 c = ((int32) p.charAt(at + i)) & 255;
+            if (c < 48 || c > 57) {
+                return -1;
+            }
+            v = v * 10 + (c - 48);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    static #String pad5(int32 v) {
+        int8[] b #= heap int8[5];
+        int32 x = v;
+        int32 i = 4;
+        while (i >= 0) {
+            b[i] = (int8) (48 + (x % 10));
+            x = x / 10;
+            i = i - 1;
+        }
+        String s = heap String(#b, 5);
+        return #s;
+    }
+
+    static #String shardPathAt(String prefix, int32 idx, int32 total) {
+        String a #= GgufFile.pad5(idx + 1);
+        String b #= GgufFile.pad5(total);
+        String out = prefix + "-" + a + "-of-" + b + ".gguf";
+        return #out;
+    }
+
     // ── parsing internals ───────────────────────────────────────────────
 
     int32 indexOfKey(String key) {
@@ -434,36 +692,148 @@ public final class GgufFile {
         return this.kIdx.get(key);
     }
 
-    int64 readU32() {
+    /** The fixed prelude, through the view overlay (16.2.1). */
+    void readHeader(MappedFile m, String p) {
+        int64 fileLen = m.size();
+        if (fileLen < 24) {
+            throw heap LlmException("gguf: '" + p + "' is " + fileLen
+                + " bytes - too short for the GGUF header");
+        }
+        int8[] hb #= heap int8[24];
+        m.read(0, hb, 0, 24);
+        GgufHeader h = GgufHeader(hb);
+        if (h.magic != 0x46554747) {
+            throw heap LlmException("gguf: '" + p
+                + "' has magic " + h.magic + "; expected GGUF");
+        }
+        if (h.version != 3 && h.version != 2) {
+            throw heap LlmException("gguf: '" + p + "' is version "
+                + h.version + "; supported: 2, 3");
+        }
+        this.nTensors = h.tensorCount;
+        this.nKv = h.kvCount;
+        this.pos = 24;
+    }
+
+    void parseKvs(MappedFile m) {
+        int32 nk = (int32) this.nKv;
+        this.kKeys #= heap String[nk];
+        this.kKinds #= heap int32[nk];
+        this.kInts #= heap int64[nk];
+        this.kFloats #= heap float64[nk];
+        this.kStrs #= heap String[nk];
+        this.kIdx #= heap HashMap<String, int32>();
+        this.tokTokens = null;
+        this.tokScores = null;
+        this.tokTypes = null;
+        this.tokMerges = null;
+        this.tokCount = 0;
+        this.mergeCount = 0;
+        int32 i = 0;
+        while (i < nk) {
+            this.readKv(m, i);
+            i = i + 1;
+        }
+        // general.alignment overrides the default 32.
+        int32 ai = this.indexOfKey("general.alignment");
+        if (ai >= 0) {
+            if (this.kKinds[ai] == 0) {
+                this.alignment = this.kInts[ai];
+            }
+        }
+    }
+
+    /**
+     * Walk a KV block keeping only what a metadata-less shard can carry:
+     * out[0] `split.no`, out[1] `general.alignment`, out[2] `split.count`.
+     * Nothing is retained, so this never disturbs the metadata shard's
+     * parsed state.
+     */
+    void scanShardKvs(MappedFile m, int64[] out) {
+        out[0] = -1;
+        out[1] = 32;
+        out[2] = -1;
+        int64 i = 0;
+        while (i < this.nKv) {
+            String key #= this.readStr(m);
+            int32 vt = (int32) this.readU32(m);
+            if (vt == 8) {
+                int64 len = this.readU64(m);
+                this.pos = this.pos + len;
+            } else if (vt == 9) {
+                this.skipArrayValue(m, key);
+            } else if (vt == 6) {
+                this.pos = this.pos + 4;
+            } else if (vt == 12) {
+                this.pos = this.pos + 8;
+            } else if (GgufFile.scalarSize(vt) > 0) {
+                int64 v = this.readScalarInt(m, vt);
+                if (key.equals("split.no")) {
+                    out[0] = v;
+                } else if (key.equals("general.alignment")) {
+                    out[1] = v;
+                } else if (key.equals("split.count")) {
+                    out[2] = v;
+                }
+            } else {
+                throw heap LlmException("gguf: '" + this.path
+                    + "' key '" + key + "' has unknown value type " + vt);
+            }
+            i = i + 1;
+        }
+    }
+
+    void skipArrayValue(MappedFile m, String key) {
+        int32 et = (int32) this.readU32(m);
+        int64 count = this.readU64(m);
+        if (et == 8) {
+            int64 j = 0;
+            while (j < count) {
+                int64 len = this.readU64(m);
+                this.pos = this.pos + len;
+                j = j + 1;
+            }
+            return;
+        }
+        int64 sz = GgufFile.scalarSize(et);
+        if (sz < 0) {
+            throw heap LlmException("gguf: '" + this.path
+                + "' key '" + key + "' is an array of type " + et
+                + " - unsupported");
+        }
+        this.pos = this.pos + sz * count;
+    }
+
+    int64 readU32(MappedFile m) {
         int8[] b #= heap int8[4];
-        this.map.read(this.pos, b, 0, 4);
+        m.read(this.pos, b, 0, 4);
         this.pos = this.pos + 4;
         return ((int64) b[0] & 255L) | (((int64) b[1] & 255L) << 8)
             | (((int64) b[2] & 255L) << 16) | (((int64) b[3] & 255L) << 24);
     }
 
-    int64 readU64() {
-        int64 lo = this.readU32();
-        int64 hi = this.readU32();
+    int64 readU64(MappedFile m) {
+        int64 lo = this.readU32(m);
+        int64 hi = this.readU32(m);
         return lo | (hi << 32);
     }
 
-    #String readStr() {
-        int64 len = this.readU64();
-        if (len < 0 || this.pos + len > this.map.size()) {
+    #String readStr(MappedFile m) {
+        int64 len = this.readU64(m);
+        if (len < 0 || this.pos + len > m.size()) {
             throw heap LlmException("gguf: '" + this.path
                 + "' declares a " + len + "-byte string at " + this.pos
                 + " past the file end");
         }
         int8[] b #= heap int8[len];
-        this.map.read(this.pos, b, 0, len);
+        m.read(this.pos, b, 0, len);
         this.pos = this.pos + len;
         String s = heap String(#b, (int32) len);
         return #s;
     }
 
-    float64 readF32Val() {
-        int64 bits = this.readU32();
+    float64 readF32Val(MappedFile m) {
+        int64 bits = this.readU32(m);
         return (float64) GgufFile.singleBits(bits);
     }
 
@@ -471,8 +841,8 @@ public final class GgufFile {
      * f64 metadata values decode arithmetically too (same isel-abort
      * avoidance). 52-bit mantissas split into two exact halves.
      */
-    float64 readF64Val() {
-        int64 bits = this.readU64();
+    float64 readF64Val(MappedFile m) {
+        int64 bits = this.readU64(m);
         int32 sign = (int32) ((bits >> 63) & 1L);
         int32 exp = (int32) ((bits >> 52) & 2047L);
         int64 man = bits & 4503599627370495L;
@@ -501,10 +871,10 @@ public final class GgufFile {
         return -1;
     }
 
-    int64 readScalarInt(int32 ty) {
+    int64 readScalarInt(MappedFile m, int32 ty) {
         int64 sz = GgufFile.scalarSize(ty);
         int8[] b #= heap int8[8];
-        this.map.read(this.pos, b, 0, sz);
+        m.read(this.pos, b, 0, sz);
         this.pos = this.pos + sz;
         int64 v = 0;
         int64 j = 0;
@@ -519,25 +889,25 @@ public final class GgufFile {
         return v;
     }
 
-    void readKv(int32 i) {
-        String key #= this.readStr();
-        int32 vt = (int32) this.readU32();
+    void readKv(MappedFile m, int32 i) {
+        String key #= this.readStr(m);
+        int32 vt = (int32) this.readU32(m);
         this.kKinds[i] = 3;
         if (vt == 8) {                       // string
-            String sv #= this.readStr();
+            String sv #= this.readStr(m);
             this.kKinds[i] = 2;
             this.kStrs[i] #= sv;
         } else if (vt == 6) {                // f32
             this.kKinds[i] = 1;
-            this.kFloats[i] = this.readF32Val();
+            this.kFloats[i] = this.readF32Val(m);
         } else if (vt == 12) {               // f64
             this.kKinds[i] = 1;
-            this.kFloats[i] = this.readF64Val();
+            this.kFloats[i] = this.readF64Val(m);
         } else if (GgufFile.scalarSize(vt) > 0) {
             this.kKinds[i] = 0;
-            this.kInts[i] = this.readScalarInt(vt);
+            this.kInts[i] = this.readScalarInt(m, vt);
         } else if (vt == 9) {                // array
-            this.readArrayValue(i, key);
+            this.readArrayValue(m, i, key);
         } else {
             throw heap LlmException("gguf: '" + this.path
                 + "' key '" + key + "' has unknown value type " + vt);
@@ -546,9 +916,9 @@ public final class GgufFile {
         this.kKeys[i] #= key;
     }
 
-    void readArrayValue(int32 i, String key) {
-        int32 et = (int32) this.readU32();
-        int64 count = this.readU64();
+    void readArrayValue(MappedFile m, int32 i, String key) {
+        int32 et = (int32) this.readU32(m);
+        int64 count = this.readU64(m);
         boolean isTokens = key.equals("tokenizer.ggml.tokens");
         boolean isMerges = key.equals("tokenizer.ggml.merges");
         boolean isScores = key.equals("tokenizer.ggml.scores");
@@ -558,7 +928,7 @@ public final class GgufFile {
                 String[] arr #= heap String[(int32) count];
                 int64 j = 0;
                 while (j < count) {
-                    String sv #= this.readStr();
+                    String sv #= this.readStr(m);
                     arr[(int32) j] #= sv;
                     j = j + 1;
                 }
@@ -573,7 +943,7 @@ public final class GgufFile {
             } else {
                 int64 j = 0;
                 while (j < count) {
-                    int64 len = this.readU64();
+                    int64 len = this.readU64(m);
                     this.pos = this.pos + len;
                     j = j + 1;
                 }
@@ -582,7 +952,7 @@ public final class GgufFile {
             float32[] sc #= heap float32[(int32) count];
             int64 j = 0;
             while (j < count) {
-                sc[(int32) j] = (float32) this.readF32Val();
+                sc[(int32) j] = (float32) this.readF32Val(m);
                 j = j + 1;
             }
             this.kKinds[i] = 4;
@@ -591,7 +961,7 @@ public final class GgufFile {
             int32[] tt #= heap int32[(int32) count];
             int64 j = 0;
             while (j < count) {
-                tt[(int32) j] = (int32) this.readScalarInt(5);
+                tt[(int32) j] = (int32) this.readScalarInt(m, 5);
                 j = j + 1;
             }
             this.kKinds[i] = 4;
@@ -607,9 +977,9 @@ public final class GgufFile {
         }
     }
 
-    void readTensorInfo(int32 i) {
-        String name #= this.readStr();
-        int32 nd = (int32) this.readU32();
+    void readTensorInfo(MappedFile m, int32 i, int32 shard) {
+        String name #= this.readStr(m);
+        int32 nd = (int32) this.readU32(m);
         if (nd < 1 || nd > 4) {
             throw heap LlmException("gguf: tensor '" + name + "' has "
                 + nd + " dims; expected 1-4");
@@ -617,7 +987,7 @@ public final class GgufFile {
         int64[] ne #= heap int64[nd];
         int32 d = 0;
         while (d < nd) {
-            ne[d] = this.readU64();
+            ne[d] = this.readU64(m);
             d = d + 1;
         }
         // ggml ne is fastest-first; the engine's torch shapes are the
@@ -628,8 +998,9 @@ public final class GgufFile {
             shp[d] = ne[nd - 1 - d];
             d = d + 1;
         }
-        this.tTypes[i] = (int32) this.readU32();
-        this.tOffsets[i] = this.readU64();
+        this.tTypes[i] = (int32) this.readU32(m);
+        this.tOffsets[i] = this.readU64(m);
+        this.tShard[i] = shard;
         this.tIdx.put("" + name, i);
         this.tNames[i] #= name;
         this.tShapes[i] #= shp;
