@@ -12,6 +12,8 @@ import dev.cajeta.llm.model.Linear;
 import cajeta.math.Tensor;
 import cajeta.lang.String;
 import cajeta.lang.Cajeta;
+import cajeta.time.Clock;
+import cajeta.xpu.Autotune;
 import dev.cajeta.llm.gen.SampleParams;
 import dev.cajeta.llm.LlmEngine;
 import dev.cajeta.llm.EngineOptions;
@@ -1268,6 +1270,80 @@ public class LinearKernelRouteTest {
                 + "\n  512: " + b);
         }
         System.stdout.println("   greedy output identical at chunk 128 and 512");
+        return;
+    }
+
+    static int64 timePrefill(LlmEngine e, int32 n) {
+        int32[] toks #= heap int32[n];
+        int32 i = 0;
+        while (i < n) { toks[i] = 1000 + i * 7; i = i + 1; }
+        SampleParams p #= heap SampleParams(0.0f, 0L);
+        int64 t0 = Clock.nanoTime();
+        int32 id = e.submitTokens(toks, n, 1, #p);
+        e.runAll(8192);
+        return Clock.nanoTime() - t0;
+    }
+
+    /** 6.2.7: the partition width is DISCOVERED on this machine, not assumed.
+     *  The derived rule (three slices per multiprocessor) is only what one
+     *  part preferred; this times the candidates on the real prefill and
+     *  keeps the winner, so a different device reaches its own answer. */
+    @Test
+    public void tunesThePartitionWidthOnThisDevice() {
+        Path mp #= Path.of(LinearKernelRouteTest.M8B);
+        if (!mp.exists()) {
+            System.stdout.println("  (skipped: 8B witness not on this box)");
+            return;
+        }
+        String dir = "tmp/u3/tune";
+        EngineOptions o #= heap EngineOptions(LinearKernelRouteTest.M8B);
+        o.ctx = 1024;
+        o.maxSeqs = 1;
+        o.chunk = 512;
+        LlmEngine e #= LlmEngine.load(#o);
+
+        int32[] cand #= heap int32[5];
+        cand[0] = 40; cand[1] = 50; cand[2] = 60; cand[3] = 72; cand[4] = 80;
+        // One throwaway prefill: the first candidate would otherwise pay every
+        // first-touch cost in the engine and lose on that alone.
+        LinearKernelRouteTest.timePrefill(e, 512);
+
+        // One sample per candidate reads as a 60%% spread with no curve on a
+        // busy box. Take the MIN of several, and alternate the direction of
+        // travel each pass so a drifting machine cannot favour whichever end
+        // it visited first.
+        int64[] bestT #= heap int64[5];
+        int32 pass = 0;
+        while (pass < 3) {
+            int32 k = 0;
+            while (k < 5) {
+                int32 idx = k;
+                if (pass % 2 == 1) { idx = 4 - k; }
+                WmmaKernel.setPartWgs((int64) cand[idx]);
+                int64 t = LinearKernelRouteTest.timePrefill(e, 512);
+                if (bestT[idx] == 0L || t < bestT[idx]) { bestT[idx] = t; }
+                k = k + 1;
+            }
+            pass = pass + 1;
+        }
+        int64 best = 0L;
+        int32 bestW = 0;
+        int32 i = 0;
+        while (i < 5) {
+            System.stdout.println("   partWgs=" + cand[i]
+                + " best of 3, prefill ms " + (bestT[i] / 1000000L));
+            if (bestW == 0 || bestT[i] < best) { best = bestT[i]; bestW = cand[i]; }
+            i = i + 1;
+        }
+        WmmaKernel.resetPartWgs();
+        e.close();
+        if (bestW <= 0) { Assert.fail("no candidate completed"); }
+        Autotune.remember(dir, WmmaKernel.PART_WGS, bestW);
+        Optional<int32> back = Autotune.recall(dir, WmmaKernel.PART_WGS);
+        if (!back.isPresent()) { Assert.fail("tuned value did not persist"); }
+        if (back.get() != bestW) { Assert.fail("tuned value round-tripped wrong"); }
+        System.stdout.println("   tuned partWgs=" + bestW + " for "
+            + Autotune.deviceKey());
         return;
     }
 

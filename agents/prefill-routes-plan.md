@@ -726,3 +726,28 @@ stayed bit-identical.
 6.3.1 is MET on every dense format. Remaining: decode 0.86-0.97x (bandwidth
 bound, at the measured coalesced ceiling), and MoE, which is a launch-shape
 problem (see the MoE FINDING above), not a kernel one.
+
+PROGRESS 2026-09-13 (adaptive by construction). Three pieces so a kernel sizes
+itself on hardware the toolchain has never met, rather than inheriting
+gfx1151's constants:
+(1) MEASURED footprint (cajeta 3e628b40): `KernelManifest.measuredRegsPerThread/
+SpillBytes/LdsStaticBytes/MaxThreads` read the LOADED code object through
+cuFuncGetAttribute/hipFuncGetAttribute. Static, because on unknown hardware
+there is no manifest to hang them on. `residentGroupsPerMp` now asks the
+driver first and falls back to the manifest, so the occupancy law answers
+where the compile-time model is absent entirely. On gfx1151 measured and
+modelled agree exactly (192/192 and 234/234 regs, 168/0 spill), which is the
+validation, not a no-op.
+(2) `cajeta.xpu.Autotune` (cajeta 9b28e72b): a per-device store keyed by a
+fingerprint of the machine shape, so a cache copied between machines is
+ignored rather than believed. One file per (device, knob); a corrupt entry
+reads as absent. The SWEEP stays with the caller by design — only the caller
+knows what a candidate costs and how to check it is still correct.
+(3) The partition width is now DISCOVERED here: `tunesThePartitionWidth-
+OnThisDevice` times 40/50/60/72/80 on real prefills and records the winner;
+`sliceWgsFor` prefers a tuned value over the derived rule (launch-geom source
+3 vs 1). METHOD MATTERS: one sample per candidate gave a 60% spread with no
+curve and picked 72; three passes, alternating direction, keeping the MIN per
+candidate gives 400/379/367/372/374 — a clean minimum at 60, independently
+reproducing the hand sweep. A tuner that can pick a bad value is worse than
+a constant.
