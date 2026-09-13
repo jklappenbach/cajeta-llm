@@ -8,6 +8,7 @@ import cajeta.time.Clock;
 import cajeta.xpu.Device;
 import cajeta.xpu.MemoryKind;
 import cajeta.math.Tensor;
+import cajeta.io.file.MappedFile;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import dev.cajeta.llm.LlmException;
@@ -31,6 +32,12 @@ public final class Linear extends InfModule {
     // host copy can be released after upload without losing the size
     // every sizing site needs (unit 8).
     int64 packedBytes;
+    // Unit 8.2: the packed bytes as (mapping, offset) instead of a host
+    // array — ExpertBank's 15.19 discipline, which its own comment says
+    // loadPacked defeats. Set by the checkpoint bind; null for a test
+    // that hands over bytes directly.
+    MappedFile srcMap;
+    int64 mapOff;
     // Projection bias (spec 4.12) — Qwen2's q/k/v carry one, Llama's carry
     // none. Always f32 in the file, never quantized. `biasDev` is its
     // device copy, uploaded with the weight.
@@ -677,6 +684,8 @@ public final class Linear extends InfModule {
         this.weight = null;
         this.packed = null;
         this.packedBytes = 0L;
+        this.srcMap = null;
+        this.mapOff = 0L;
         this.packedTy = -1;
         this.inDim = inDim;
         this.outDim = outDim;
@@ -796,17 +805,44 @@ public final class Linear extends InfModule {
                     + "]; expected [out, in] = [" + this.outDim + ", "
                     + this.inDim + "]");
             }
-            int8[] p #= ckpt.loadPacked(name);
             int64 be = (int64) Quant.blockElems(pty);
             int64 want = (int64) this.outDim * ((int64) this.inDim / be)
                 * (int64) Quant.blockBytes(pty);
-            if ((int64) p.count() != want) {
-                throw heap LlmException("weight binding: '" + name
-                    + "' packed " + pty + " is " + (int64) p.count()
-                    + " bytes; expected " + want + " for [" + this.outDim
-                    + ", " + this.inDim + "]");
+            // A tensor loadPacked REWRITES cannot be streamed from the
+            // file: the bytes on disk are not the bytes to bind. Only
+            // llama q_proj/k_proj qualify (the rope permute), and the
+            // gate that found this was the 8B greedy fingerprint moving
+            // — self-consistency at two chunk sizes had passed, because
+            // both arms were equally wrong.
+            if (ckpt.packedIsTransformed(name)) {
+                int8[] p #= ckpt.loadPacked(name);
+                if ((int64) p.count() != want) {
+                    throw heap LlmException("weight binding: '" + name
+                        + "' packed " + pty + " is " + (int64) p.count()
+                        + " bytes; expected " + want + " for ["
+                        + this.outDim + ", " + this.inDim + "]");
+                }
+                this.bindPacked(#p, pty);
+                return;
             }
-            this.bindPacked(#p, pty);
+            // Unit 8.2: bind as (mapping, offset), NOT as a host array.
+            // loadPacked heap-copies the whole tensor, and that copy
+            // then lives beside the device buffer for the life of the
+            // model — two resident copies of every weight, which is what
+            // stops a 47 GB checkpoint loading at all. ExpertBank has
+            // bound its slabs this way since 15.19 and says so.
+            int64 fo = ckpt.packedFileOffsetOf(name);
+            String sp #= ckpt.shardPathOf(name);
+            MappedFile mm #= heap MappedFile(sp);
+            if (mm.size() < fo + want) {
+                throw heap LlmException("weight binding: '" + name
+                    + "' wants " + want + " bytes at offset " + fo
+                    + " but '" + sp + "' holds " + mm.size());
+            }
+            this.srcMap #= mm;
+            this.mapOff = fo;
+            this.packedBytes = want;
+            this.packedTy = pty;
             return;
         }
         Tensor<float32> t #= ckpt.loadF32(name);
@@ -885,6 +921,9 @@ public final class Linear extends InfModule {
                 this.matvecIntoDevice(sb, so, db, doff);
                 return;
             }
+            // Everything below reads the BYTES, so a streamed bind has
+            // to materialize them first (unit 8.2).
+            this.ensureHostPacked();
             if (this.packedTy == Quant.GG_Q8_0) {
                 Quant.q8MatVecInto(this.packed, (int64) this.outDim,
                     (int64) this.inDim, sb, so, db, doff);
@@ -2418,7 +2457,7 @@ public final class Linear extends InfModule {
      *  prefill does not pay them. Q4_K always; Q6_K only when its
      *  token-blocked deq route is on (10.12.27). */
     void prewarmDeq() {
-        if (this.packed == null) { return; }
+        if (this.packedBytes == 0L) { return; }
         boolean q4 = this.packedTy == Quant.GG_Q4_K;
         boolean q6 = this.packedTy == Quant.GG_Q6_K && Linear.q6Mw4On;
         // 10.12.45.D: Q5_K/Q8_0 widen off-clock too when their deq
@@ -2930,6 +2969,57 @@ public final class Linear extends InfModule {
         return;
     }
 
+    /** Fill `packedDev` straight from the checkpoint mapping in chunks,
+     *  so the whole tensor never exists as a host array. The staging
+     *  buffer is the only host cost and it is bounded, not proportional
+     *  to the weight. */
+    void streamPackedFromMap() {
+        if (this.srcMap == null) {
+            throw heap LlmException("ensureDevice: no host bytes and no "
+                + "source mapping for a packed weight of "
+                + this.packedBytes + " bytes");
+        }
+        int64 chunk = 33554432L;
+        if (chunk > this.packedBytes) { chunk = this.packedBytes; }
+        int8[] stage #= heap int8[chunk];
+        int64 off = 0L;
+        while (off < this.packedBytes) {
+            int64 n = chunk;
+            if (off + n > this.packedBytes) { n = this.packedBytes - off; }
+            int64 got = this.srcMap.read(this.mapOff + off, stage, 0L, n);
+            if (got != n) {
+                throw heap LlmException("ensureDevice: short read at "
+                    + (this.mapOff + off) + " - wanted " + n + ", got "
+                    + got);
+            }
+            KernelBuffer<int8> sl #= this.packedDev.slice((uint64) off,
+                (uint64) n);
+            sl.upload(stage, n);
+            off = off + n;
+        }
+        return;
+    }
+
+    /** The host mat-vec needs the bytes themselves. Under a streamed
+     *  bind there is no host array, so materialize one ON DEMAND — the
+     *  fallback then costs memory only if something actually takes it,
+     *  instead of every model paying for a path it never uses. */
+    void ensureHostPacked() {
+        if (this.packed != null) { return; }
+        if (this.srcMap == null) {
+            throw heap LlmException("matvecInto: no host bytes and no "
+                + "source mapping for packed type " + this.packedTy);
+        }
+        int8[] p #= heap int8[this.packedBytes];
+        int64 got = this.srcMap.read(this.mapOff, p, 0L, this.packedBytes);
+        if (got != this.packedBytes) {
+            throw heap LlmException("matvecInto: short read - wanted "
+                + this.packedBytes + ", got " + got);
+        }
+        this.packed #= p;
+        return;
+    }
+
     /** Build this Linear's device side — the weight upload, the output
      *  buffer, the shared stage, and every latched routing flag. */
     void ensureDevice() {
@@ -2937,7 +3027,11 @@ public final class Linear extends InfModule {
             this.devWBytes = this.devWBytes + this.packedBytes;
             this.packedDev #= heap KernelBuffer<int8>(
                 (uint64) this.packedBytes);
-            this.packedDev.upload(this.packed);
+            if (this.packed != null) {
+                this.packedDev.upload(this.packed);
+            } else {
+                this.streamPackedFromMap();
+            }
             // Only the OUTPUT is per-Linear now; the activation side is
             // shared (see ensureStage), because that is the half that is
             // identical across q/k/v and across gate/up.
