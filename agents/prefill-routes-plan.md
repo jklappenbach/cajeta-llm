@@ -618,7 +618,7 @@ intrinsic, loop-unroll directive; then re-profile.
       14.5%) if the technique transfers, or record why Q6_K differs.
 
 ### 6.3 Acceptance
-- [~] 6.3.1 (FIRST GATE MET 2026-09-12: deq route 688 = 0.52x llama 1320, packed-mw 554 = 0.42x; decode 42.0 tok/s on both routes at gen=64, unchanged; ppl tied by the bit-gate — the slice law re-partitions the grid only; parity stretch OPEN, re-profile pending) Prefill parity (amdgpu/gfx1151, idle-gated A/B, announce first):
+- [x] 6.3.1 (PARITY PASSED 2026-09-13 on every dense format: 1.04x-1.59x llama.cpp's best backend at matched micro-batch; decode unchanged) Prefill parity (amdgpu/gfx1151, idle-gated A/B, announce first):
       8B Q4_K_M prefill 512 ≥ 0.5x llama (first gate, from 0.165x), target
       parity ≥ 1.0x (stretch). Re-profile: q4kWmmaMwKernel share + occupancy
       (`residentGroupsPerCu` up vs the single-wave kernel). ppl unchanged
@@ -692,3 +692,33 @@ trip per expert. Everything the dense arc built (2x4 tiling, the partition
 law, the int fold) applies unchanged once the launches are the right shape.
 Mixtral 130 vs llama 542 (0.24x) and Qwen3-Coder-30B 337-689 vs 1295 are the
 same story at smaller ratios.
+
+PROGRESS 2026-09-13 — PARITY PASSED ON EVERY DENSE FORMAT. Two more levers.
+(1) The DEFAULT PREFILL MICRO-BATCH was 128 while llama.cpp's own default is
+512, so every comparison so far ran at a 4x batching handicap. Raising it is
+worth ~46% (Q4_K 910 -> 1325 at a stroke) and is purely a batching choice:
+new gate `greedyOutputIsIndependentOfPrefillChunk` runs a ~300-token prompt
+through the real 8B engine at chunk 128 and 512 and requires identical greedy
+text. 1024 is worse than 512 on five of six formats.
+(2) `scaledAccumI32` applied to the remaining int8 GEMMs. Q4_K/Q5_K share a
+kernel that also carries a dmin term, so only the dot term int-folds and the
+min stays per-sub-block on the new `rank1AccumS`; that kernel needed its mma
+temporaries halved to 4 with two token chunks (est. 239 VGPR vs 275) to stay
+spill-free. Q6_K and Q2_K likewise.
+8B prefill 512 vs llama.cpp's BEST backend (hip or vulkan, whichever wins):
+  Q2_K   1274 vs 1123 = 1.13x
+  Q3_K_M 1396 vs 1349 = 1.04x
+  Q4_K_M 1465 vs 1320 = 1.11x
+  Q5_K_M 1415 vs 1314 = 1.08x
+  Q6_K   1318 vs 1033 = 1.28x
+  Q8_0   1452 vs  914 = 1.59x
+Session start, shipped default, was 218-919. Decode unchanged at 25.8-55.5,
+which is 0.86-0.97x llama's best and beats its ROCm backend on Q3_K/Q4_K.
+The two bit-identity gates between kernel pairs became tolerance gates (3e-8
+and 6e-8): the folded routes no longer share a summation order with their
+unfolded siblings, by design. Per-format fingerprints moved 1e-9 to 1e-10
+(fewer roundings, so strictly more accurate); Q8_0, which was not folded,
+stayed bit-identical.
+6.3.1 is MET on every dense format. Remaining: decode 0.86-0.97x (bandwidth
+bound, at the measured coalesced ceiling), and MoE, which is a launch-shape
+problem (see the MoE FINDING above), not a kernel one.

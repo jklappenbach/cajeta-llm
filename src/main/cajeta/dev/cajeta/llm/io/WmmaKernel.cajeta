@@ -3893,14 +3893,18 @@ public final class WmmaKernel {
         // the j-loop (drift cannot touch it), sliced per (tile, j)
         // by the verb.
         Shared<float32> rgAll = shared float32[1024];
-        // 10.12.42: cf/cg pre-folded per (row-in-WG, j) at block
-        // staging — d*sc and -dmin*mn land in LDS ONCE per block, so
-        // the j-loop reads two scalars instead of holding the 24-
-        // register header decode + select chain across all 8 j
-        // (llama.cpp's (d*sc,-d*m)-at-tile-load shape). Indexed
-        // [col-in-WG * 8 + j], written by the staging as (wid*16+lane).
-        Shared<float32> cfAll = shared float32[1024];
+        // 10.12.42: sc/cg pre-folded per (row-in-WG, j) at block
+        // staging — the raw six-bit scale and -dmin*mn land in LDS
+        // ONCE per block, so the j-loop reads two scalars instead of
+        // holding the 24-register header decode + select chain across
+        // all 8 j. Indexed [col-in-WG * 8 + j], written by the staging
+        // as (wid*16+lane). `sc` stays an INTEGER: the dot term folds
+        // it through scaledAccumI32 and d applies once per block.
+        Shared<int32> scAll = shared int32[1024];
         Shared<float32> cgAll = shared float32[1024];
+        // This block's per-column d, read at the drain by the column
+        // tile the wave OWNS rather than the one it staged.
+        Shared<float32> dAll = shared float32[128];
 
         uint32 tid = KernelThread.x();
         uint32 lane = tid % 32;
@@ -3931,8 +3935,10 @@ public final class WmmaKernel {
 
             // 2x4 tiling: TWO A fragments (the wave's two token tiles)
             // and FOUR B fragments (its four column tiles) feed sixteen
-            // mmas into eight int32 tiles per 32-k sub-block, so each
-            // operand load is used four times instead of once.
+            // mmas per 32-k sub-block. FOUR mma temporaries, not eight:
+            // the integer seam costs eight persistent tiles, so the
+            // temporaries are reused by the wave's second token tile
+            // and the weight fragments are re-read from L0.
             CooperativeMatrix<int8,16,16,0> ma;
             CooperativeMatrix<int8,16,16,0> maB;
             CooperativeMatrix<int8,16,16,1> mbA;
@@ -3943,10 +3949,16 @@ public final class WmmaKernel {
             CooperativeMatrix<int32,16,16,2> mc1;
             CooperativeMatrix<int32,16,16,2> mc2;
             CooperativeMatrix<int32,16,16,2> mc3;
-            CooperativeMatrix<int32,16,16,2> mc4;
-            CooperativeMatrix<int32,16,16,2> mc5;
-            CooperativeMatrix<int32,16,16,2> mc6;
-            CooperativeMatrix<int32,16,16,2> mc7;
+            // The integer seam: one per output tile, carrying
+            // sum_j sc_j * mc_j across the whole 256-k block.
+            CooperativeMatrix<int32,16,16,2> iacc0;
+            CooperativeMatrix<int32,16,16,2> iacc1;
+            CooperativeMatrix<int32,16,16,2> iacc2;
+            CooperativeMatrix<int32,16,16,2> iacc3;
+            CooperativeMatrix<int32,16,16,2> iacc4;
+            CooperativeMatrix<int32,16,16,2> iacc5;
+            CooperativeMatrix<int32,16,16,2> iacc6;
+            CooperativeMatrix<int32,16,16,2> iacc7;
             CooperativeMatrix<float32,16,16,2> facc0;
             CooperativeMatrix<float32,16,16,2> facc1;
             CooperativeMatrix<float32,16,16,2> facc2;
@@ -3963,6 +3975,7 @@ public final class WmmaKernel {
             facc5.splat(0.0f);
             facc6.splat(0.0f);
             facc7.splat(0.0f);
+            uint32 xbase = 32 * wr;
 
             int64 b = 0;
             while (b < blocksPerRow) {
@@ -3979,7 +3992,7 @@ public final class WmmaKernel {
                         | (((int32) xp[xb + 291L] & 255) << 24));
                     xsAll[wid * 16 + lane] = xv;
                     // 10.12.42: this lane's ROW header, decoded once
-                    // per block and pre-folded to (cf, cg) per j —
+                    // per block and pre-folded to (sc, cg) per j —
                     // nothing of it survives into the j-loop.
                     int64 ro = myRo + b * blockBytes;
                     float32 dv = GgufFile.halfBitsToF32(
@@ -4001,18 +4014,15 @@ public final class WmmaKernel {
                     int32 k2 = (int32) packed[ro + 14L] & 255;
                     int32 k3 = (int32) packed[ro + 15L] & 255;
                     uint32 cb = (wid * 16 + lane) * 8;
-                    cfAll[cb] = dv * (float32) (d0 & 63);
-                    cfAll[cb + 1] = dv * (float32) (d1 & 63);
-                    cfAll[cb + 2] = dv * (float32) (d2 & 63);
-                    cfAll[cb + 3] = dv * (float32) (d3 & 63);
-                    cfAll[cb + 4] = dv
-                        * (float32) ((k0 & 15) | ((d0 >> 2) & 48));
-                    cfAll[cb + 5] = dv
-                        * (float32) ((k1 & 15) | ((d1 >> 2) & 48));
-                    cfAll[cb + 6] = dv
-                        * (float32) ((k2 & 15) | ((d2 >> 2) & 48));
-                    cfAll[cb + 7] = dv
-                        * (float32) ((k3 & 15) | ((d3 >> 2) & 48));
+                    dAll[wid * 16 + lane] = dv;
+                    scAll[cb] = d0 & 63;
+                    scAll[cb + 1] = d1 & 63;
+                    scAll[cb + 2] = d2 & 63;
+                    scAll[cb + 3] = d3 & 63;
+                    scAll[cb + 4] = (k0 & 15) | ((d0 >> 2) & 48);
+                    scAll[cb + 5] = (k1 & 15) | ((d1 >> 2) & 48);
+                    scAll[cb + 6] = (k2 & 15) | ((d2 >> 2) & 48);
+                    scAll[cb + 7] = (k3 & 15) | ((d3 >> 2) & 48);
                     cgAll[cb] = 0.0f - dmv * (float32) (m0 & 63);
                     cgAll[cb + 1] = 0.0f - dmv * (float32) (m1 & 63);
                     cgAll[cb + 2] = 0.0f - dmv * (float32) (m2 & 63);
@@ -4048,54 +4058,51 @@ public final class WmmaKernel {
                 }
                 Barrier.workgroup();
 
+                iacc0.splat(0);
+                iacc1.splat(0);
+                iacc2.splat(0);
+                iacc3.splat(0);
+                iacc4.splat(0);
+                iacc5.splat(0);
+                iacc6.splat(0);
+                iacc7.splat(0);
+
                 uint32 j = 0;
                 while (j < 8) {
-                    // 10.12.42: the pre-folded row factors — ONE (cf,
+                    // 10.12.42: the pre-folded row factors — ONE (sc,
                     // cg) pair per column tile, shared by both token
-                    // tiles; the rg/xs slices are per token tile.
+                    // tiles; the rg slices are per token tile.
                     uint32 cbase = (64 * wc + lane16) * 8 + j;
-                    float32 cfv0 = cfAll[cbase];
-                    float32 cfv1 = cfAll[cbase + 128];
-                    float32 cfv2 = cfAll[cbase + 256];
-                    float32 cfv3 = cfAll[cbase + 384];
+                    int32 scv0 = scAll[cbase];
+                    int32 scv1 = scAll[cbase + 128];
+                    int32 scv2 = scAll[cbase + 256];
+                    int32 scv3 = scAll[cbase + 384];
                     float32 cgv0 = cgAll[cbase];
                     float32 cgv1 = cgAll[cbase + 128];
                     float32 cgv2 = cgAll[cbase + 256];
                     float32 cgv3 = cgAll[cbase + 384];
                     uint32 rbase = (16 * wr + j) * 16;
-                    uint32 xbase = 32 * wr;
                     uint32 kBase = 32 * j;
                     int64 aOff = (int64) tw * xRowBytes + b * 320L
                         + (int64) kBase;
                     int64 kAbs = b * 256L + (int64) kBase;
                     int64 bOff = ((int64) (cw / 16)
                         * (blocksPerRow * 16L) + kAbs / 16L) * 256L;
+                    // Chunk 0: the wave's FIRST token tile over both
+                    // 16-k halves, then the integer fold.
                     mc0.splat(0);
                     mc1.splat(0);
                     mc2.splat(0);
                     mc3.splat(0);
-                    mc4.splat(0);
-                    mc5.splat(0);
-                    mc6.splat(0);
-                    mc7.splat(0);
-                    // Half 0: four column fragments and two token
-                    // fragments feed all eight mmas.
                     mbA.load(deq, (uint32) bOff, 1, 16);
                     mbB.load(deq, (uint32) (bOff + bStep), 1, 16);
                     mbC.load(deq, (uint32) (bOff + bStep * 2L), 1, 16);
                     mbD.load(deq, (uint32) (bOff + bStep * 3L), 1, 16);
                     ma.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
-                    maB.load(xp, (uint32) (aOff + xRowBytes * 16L), 0,
-                        (uint32) xRowBytes);
                     mc0.mma(ma, mbA);
                     mc1.mma(ma, mbB);
                     mc2.mma(ma, mbC);
                     mc3.mma(ma, mbD);
-                    mc4.mma(maB, mbA);
-                    mc5.mma(maB, mbB);
-                    mc6.mma(maB, mbC);
-                    mc7.mma(maB, mbD);
-                    // Half 1: the same six fragments, next 16 k.
                     mbA.load(deq, (uint32) (bOff + 256L), 1, 16);
                     mbB.load(deq, (uint32) (bOff + bStep + 256L), 1, 16);
                     mbC.load(deq, (uint32) (bOff + bStep * 2L + 256L),
@@ -4104,38 +4111,80 @@ public final class WmmaKernel {
                         1, 16);
                     ma.load(xp, (uint32) (aOff + 16L), 0,
                         (uint32) xRowBytes);
-                    maB.load(xp, (uint32) (aOff + xRowBytes * 16L + 16L),
-                        0, (uint32) xRowBytes);
                     mc0.mma(ma, mbA);
                     mc1.mma(ma, mbB);
                     mc2.mma(ma, mbC);
                     mc3.mma(ma, mbD);
-                    mc4.mma(maB, mbA);
-                    mc5.mma(maB, mbB);
-                    mc6.mma(maB, mbC);
-                    mc7.mma(maB, mbD);
-                    // 10.12.33: straight-line — rg comes from the
-                    // block-precomputed rgAll via verb slices; no
-                    // branch, no per-wave copies (rgAll is read-only
-                    // in the j-loop, so drift cannot touch it).
-                    mc0.scaledAccumInto2S(facc0, xsAll[xbase], cfv0,
-                        rgAll[rbase], cgv0);
-                    mc1.scaledAccumInto2S(facc1, xsAll[xbase], cfv1,
-                        rgAll[rbase], cgv1);
-                    mc2.scaledAccumInto2S(facc2, xsAll[xbase], cfv2,
-                        rgAll[rbase], cgv2);
-                    mc3.scaledAccumInto2S(facc3, xsAll[xbase], cfv3,
-                        rgAll[rbase], cgv3);
-                    mc4.scaledAccumInto2S(facc4, xsAll[xbase + 16], cfv0,
-                        rgAll[rbase + 128], cgv0);
-                    mc5.scaledAccumInto2S(facc5, xsAll[xbase + 16], cfv1,
-                        rgAll[rbase + 128], cgv1);
-                    mc6.scaledAccumInto2S(facc6, xsAll[xbase + 16], cfv2,
-                        rgAll[rbase + 128], cgv2);
-                    mc7.scaledAccumInto2S(facc7, xsAll[xbase + 16], cfv3,
-                        rgAll[rbase + 128], cgv3);
+                    // Integer fold — no convert, no fma, no float in
+                    // the sub-block step. Both operands sit inside 24
+                    // bits: |mc| <= 32*127*31 and |sc| <= 63.
+                    mc0.scaledAccumI32(iacc0, scv0);
+                    mc1.scaledAccumI32(iacc1, scv1);
+                    mc2.scaledAccumI32(iacc2, scv2);
+                    mc3.scaledAccumI32(iacc3, scv3);
+                    // Chunk 1: the SECOND token tile, same two halves,
+                    // the four mma temporaries reused.
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
+                    mbA.load(deq, (uint32) bOff, 1, 16);
+                    mbB.load(deq, (uint32) (bOff + bStep), 1, 16);
+                    mbC.load(deq, (uint32) (bOff + bStep * 2L), 1, 16);
+                    mbD.load(deq, (uint32) (bOff + bStep * 3L), 1, 16);
+                    maB.load(xp, (uint32) (aOff + xRowBytes * 16L), 0,
+                        (uint32) xRowBytes);
+                    mc0.mma(maB, mbA);
+                    mc1.mma(maB, mbB);
+                    mc2.mma(maB, mbC);
+                    mc3.mma(maB, mbD);
+                    mbA.load(deq, (uint32) (bOff + 256L), 1, 16);
+                    mbB.load(deq, (uint32) (bOff + bStep + 256L), 1, 16);
+                    mbC.load(deq, (uint32) (bOff + bStep * 2L + 256L),
+                        1, 16);
+                    mbD.load(deq, (uint32) (bOff + bStep * 3L + 256L),
+                        1, 16);
+                    maB.load(xp, (uint32) (aOff + xRowBytes * 16L + 16L),
+                        0, (uint32) xRowBytes);
+                    mc0.mma(maB, mbA);
+                    mc1.mma(maB, mbB);
+                    mc2.mma(maB, mbC);
+                    mc3.mma(maB, mbD);
+                    mc0.scaledAccumI32(iacc4, scv0);
+                    mc1.scaledAccumI32(iacc5, scv1);
+                    mc2.scaledAccumI32(iacc6, scv2);
+                    mc3.scaledAccumI32(iacc7, scv3);
+                    // 10.12.33: the dmin term is NOT factorable — rg
+                    // and cg both vary per sub-block — so it stays in
+                    // float, once per j, through the rank-1 verb. rg
+                    // still comes from the block-precomputed rgAll via
+                    // verb slices (read-only, so drift cannot touch it).
+                    facc0.rank1AccumS(rgAll[rbase], cgv0);
+                    facc1.rank1AccumS(rgAll[rbase], cgv1);
+                    facc2.rank1AccumS(rgAll[rbase], cgv2);
+                    facc3.rank1AccumS(rgAll[rbase], cgv3);
+                    facc4.rank1AccumS(rgAll[rbase + 128], cgv0);
+                    facc5.rank1AccumS(rgAll[rbase + 128], cgv1);
+                    facc6.rank1AccumS(rgAll[rbase + 128], cgv2);
+                    facc7.rank1AccumS(rgAll[rbase + 128], cgv3);
                     j = j + 1;
                 }
+                // The block's ONE float epilogue for the dot term: the
+                // eight scales are already summed in as integers, so
+                // the row scale and this column's d apply once.
+                uint32 dbase = 64 * wc + lane16;
+                float32 dcv0 = dAll[dbase];
+                float32 dcv1 = dAll[dbase + 16];
+                float32 dcv2 = dAll[dbase + 32];
+                float32 dcv3 = dAll[dbase + 48];
+                iacc0.scaledAccumIntoS(facc0, xsAll[xbase], dcv0);
+                iacc1.scaledAccumIntoS(facc1, xsAll[xbase], dcv1);
+                iacc2.scaledAccumIntoS(facc2, xsAll[xbase], dcv2);
+                iacc3.scaledAccumIntoS(facc3, xsAll[xbase], dcv3);
+                iacc4.scaledAccumIntoS(facc4, xsAll[xbase + 16], dcv0);
+                iacc5.scaledAccumIntoS(facc5, xsAll[xbase + 16], dcv1);
+                iacc6.scaledAccumIntoS(facc6, xsAll[xbase + 16], dcv2);
+                iacc7.scaledAccumIntoS(facc7, xsAll[xbase + 16], dcv3);
                 Barrier.workgroup();
                 b = b + 1;
             }
@@ -5105,7 +5154,7 @@ public final class WmmaKernel {
      * 10.12.45.D — the Q2_K T=8 deq GEMM: Q6's slice geometry (16 of
      * 16) in a 2x4 wave tiling — four weight fragments and two token
      * fragments feed eight mmas per 16-k step — carrying Q4's
-     * TWO-FACTOR drain. cf = d*(sb&15) and
+     * TWO-FACTOR drain. The raw sc = (sb&15) and
      * cg = -dmin*(sb>>4) pre-fold to LDS at staging (lanes 0-15, one
      * row each); the min term's rank-1 vector is the PER-16 activation
      * sums — llama.cpp's bsums — which lanes 16-31 materialize into
@@ -5122,9 +5171,14 @@ public final class WmmaKernel {
         // read as xsAll[tile * 16] — the eight separate arrays and the
         // 8-arm wave-uniform store chain they needed are gone.
         Shared<float32> xsAll = shared float32[128];
-        Shared<float32> cfAll = shared float32[2048];
+        // The RAW four-bit scale, not d*sc: the j-loop folds it as an
+        // integer, so d never enters the sub-block step.
+        Shared<int32> scAll = shared int32[2048];
         Shared<float32> cgAll = shared float32[2048];
         Shared<float32> rgAll2 = shared float32[2048];
+        // This block's per-column d, read at the drain by the column
+        // tile the wave OWNS rather than the one it staged.
+        Shared<float32> dAll = shared float32[128];
 
         uint32 tid = KernelThread.x();
         uint32 lane = tid % 32;
@@ -5152,8 +5206,11 @@ public final class WmmaKernel {
 
             // 2x4 tiling: TWO A fragments (the wave's two token tiles)
             // and FOUR B fragments (its four column tiles) feed eight
-            // mmas into eight int32 tiles per 16-k step — each A load
-            // serves four mmas, each B load two.
+            // mmas per 16-k step. FOUR mma temporaries, not eight: the
+            // integer seam costs eight persistent tiles, so the
+            // temporaries are reused by the wave's second token tile —
+            // free here, because one k-step keeps the weight fragments
+            // live across both.
             CooperativeMatrix<int8,16,16,0> ma;
             CooperativeMatrix<int8,16,16,0> maB;
             CooperativeMatrix<int8,16,16,1> mbA;
@@ -5164,10 +5221,16 @@ public final class WmmaKernel {
             CooperativeMatrix<int32,16,16,2> mc1;
             CooperativeMatrix<int32,16,16,2> mc2;
             CooperativeMatrix<int32,16,16,2> mc3;
-            CooperativeMatrix<int32,16,16,2> mc4;
-            CooperativeMatrix<int32,16,16,2> mc5;
-            CooperativeMatrix<int32,16,16,2> mc6;
-            CooperativeMatrix<int32,16,16,2> mc7;
+            // The integer seam: one per output tile, carrying
+            // sum_j sc_j * mc_j across the whole 256-k block.
+            CooperativeMatrix<int32,16,16,2> iacc0;
+            CooperativeMatrix<int32,16,16,2> iacc1;
+            CooperativeMatrix<int32,16,16,2> iacc2;
+            CooperativeMatrix<int32,16,16,2> iacc3;
+            CooperativeMatrix<int32,16,16,2> iacc4;
+            CooperativeMatrix<int32,16,16,2> iacc5;
+            CooperativeMatrix<int32,16,16,2> iacc6;
+            CooperativeMatrix<int32,16,16,2> iacc7;
             CooperativeMatrix<float32,16,16,2> facc0;
             CooperativeMatrix<float32,16,16,2> facc1;
             CooperativeMatrix<float32,16,16,2> facc2;
@@ -5184,6 +5247,7 @@ public final class WmmaKernel {
             facc5.splat(0.0f);
             facc6.splat(0.0f);
             facc7.splat(0.0f);
+            uint32 xbase = 32 * wr;
 
             int64 b = 0;
             while (b < blocksPerRow) {
@@ -5204,10 +5268,11 @@ public final class WmmaKernel {
                         ((int32) packed[ro + 82L] & 255)
                         | (((int32) packed[ro + 83L] & 255) << 8));
                     uint32 cb = (wid * 16 + lane) * 16;
+                    dAll[wid * 16 + lane] = dv;
                     uint32 k = 0;
                     while (k < 16) {
                         int32 sb = (int32) packed[ro + (int64) k] & 255;
-                        cfAll[cb + k] = dv * (float32) (sb & 15);
+                        scAll[cb + k] = sb & 15;
                         cgAll[cb + k] = 0.0f - dmv * (float32) (sb >> 4);
                         k = k + 1;
                     }
@@ -5237,70 +5302,103 @@ public final class WmmaKernel {
                 }
                 Barrier.workgroup();
 
+                iacc0.splat(0);
+                iacc1.splat(0);
+                iacc2.splat(0);
+                iacc3.splat(0);
+                iacc4.splat(0);
+                iacc5.splat(0);
+                iacc6.splat(0);
+                iacc7.splat(0);
+
                 uint32 j = 0;
                 while (j < 16) {
-                    // ONE (cf, cg) pair per column tile, shared by both
-                    // token tiles; the rg/xs slices are per token tile.
+                    // ONE (sc, cg) pair per column tile, shared by both
+                    // token tiles; the rg slices are per token tile.
                     uint32 cbase = (64 * wc + lane16) * 16 + j;
-                    float32 cfv0 = cfAll[cbase];
-                    float32 cfv1 = cfAll[cbase + 256];
-                    float32 cfv2 = cfAll[cbase + 512];
-                    float32 cfv3 = cfAll[cbase + 768];
+                    int32 scv0 = scAll[cbase];
+                    int32 scv1 = scAll[cbase + 256];
+                    int32 scv2 = scAll[cbase + 512];
+                    int32 scv3 = scAll[cbase + 768];
                     float32 cgv0 = cgAll[cbase];
                     float32 cgv1 = cgAll[cbase + 256];
                     float32 cgv2 = cgAll[cbase + 512];
                     float32 cgv3 = cgAll[cbase + 768];
                     uint32 rbase = (32 * wr + j) * 16;
-                    uint32 xbase = 32 * wr;
                     uint32 kBase = 16 * j;
                     int64 aOff = (int64) tw * xRowBytes + b * 320L
                         + (int64) kBase;
                     int64 kAbs = b * 256L + (int64) kBase;
                     int64 bOff = ((int64) (cw / 16)
                         * (blocksPerRow * 16L) + kAbs / 16L) * 256L;
-                    mc0.splat(0);
-                    mc1.splat(0);
-                    mc2.splat(0);
-                    mc3.splat(0);
-                    mc4.splat(0);
-                    mc5.splat(0);
-                    mc6.splat(0);
-                    mc7.splat(0);
-                    // Four column fragments and two token fragments
-                    // feed all eight mmas of this 16-k step.
+                    // Four column fragments, live across both token
+                    // chunks because this j is a single 16-k step.
                     mbA.load(deq, (uint32) bOff, 1, 16);
                     mbB.load(deq, (uint32) (bOff + bStep), 1, 16);
                     mbC.load(deq, (uint32) (bOff + bStep * 2L), 1, 16);
                     mbD.load(deq, (uint32) (bOff + bStep * 3L), 1, 16);
+                    // Chunk 0: the wave's FIRST token tile.
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
                     ma.load(xp, (uint32) aOff, 0, (uint32) xRowBytes);
-                    maB.load(xp, (uint32) (aOff + xRowBytes * 16L), 0,
-                        (uint32) xRowBytes);
                     mc0.mma(ma, mbA);
                     mc1.mma(ma, mbB);
                     mc2.mma(ma, mbC);
                     mc3.mma(ma, mbD);
-                    mc4.mma(maB, mbA);
-                    mc5.mma(maB, mbB);
-                    mc6.mma(maB, mbC);
-                    mc7.mma(maB, mbD);
-                    mc0.scaledAccumInto2S(facc0, xsAll[xbase], cfv0,
-                        rgAll2[rbase], cgv0);
-                    mc1.scaledAccumInto2S(facc1, xsAll[xbase], cfv1,
-                        rgAll2[rbase], cgv1);
-                    mc2.scaledAccumInto2S(facc2, xsAll[xbase], cfv2,
-                        rgAll2[rbase], cgv2);
-                    mc3.scaledAccumInto2S(facc3, xsAll[xbase], cfv3,
-                        rgAll2[rbase], cgv3);
-                    mc4.scaledAccumInto2S(facc4, xsAll[xbase + 16], cfv0,
-                        rgAll2[rbase + 256], cgv0);
-                    mc5.scaledAccumInto2S(facc5, xsAll[xbase + 16], cfv1,
-                        rgAll2[rbase + 256], cgv1);
-                    mc6.scaledAccumInto2S(facc6, xsAll[xbase + 16], cfv2,
-                        rgAll2[rbase + 256], cgv2);
-                    mc7.scaledAccumInto2S(facc7, xsAll[xbase + 16], cfv3,
-                        rgAll2[rbase + 256], cgv3);
+                    // Integer fold — no convert, no fma, no float in
+                    // the sub-block step. Both operands sit inside 24
+                    // bits: |mc| <= 16*127*3 and |sc| <= 15.
+                    mc0.scaledAccumI32(iacc0, scv0);
+                    mc1.scaledAccumI32(iacc1, scv1);
+                    mc2.scaledAccumI32(iacc2, scv2);
+                    mc3.scaledAccumI32(iacc3, scv3);
+                    // Chunk 1: the SECOND token tile, the four mma
+                    // temporaries reused.
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
+                    maB.load(xp, (uint32) (aOff + xRowBytes * 16L), 0,
+                        (uint32) xRowBytes);
+                    mc0.mma(maB, mbA);
+                    mc1.mma(maB, mbB);
+                    mc2.mma(maB, mbC);
+                    mc3.mma(maB, mbD);
+                    mc0.scaledAccumI32(iacc4, scv0);
+                    mc1.scaledAccumI32(iacc5, scv1);
+                    mc2.scaledAccumI32(iacc6, scv2);
+                    mc3.scaledAccumI32(iacc7, scv3);
+                    // The dmin term is NOT factorable — rg and cg both
+                    // vary per sub-block — so it stays in float, once
+                    // per j, through the rank-1 verb.
+                    facc0.rank1AccumS(rgAll2[rbase], cgv0);
+                    facc1.rank1AccumS(rgAll2[rbase], cgv1);
+                    facc2.rank1AccumS(rgAll2[rbase], cgv2);
+                    facc3.rank1AccumS(rgAll2[rbase], cgv3);
+                    facc4.rank1AccumS(rgAll2[rbase + 256], cgv0);
+                    facc5.rank1AccumS(rgAll2[rbase + 256], cgv1);
+                    facc6.rank1AccumS(rgAll2[rbase + 256], cgv2);
+                    facc7.rank1AccumS(rgAll2[rbase + 256], cgv3);
                     j = j + 1;
                 }
+                // The block's ONE float epilogue for the dot term: the
+                // sixteen scales are already summed in as integers, so
+                // the row scale and this column's d apply once.
+                uint32 dbase = 64 * wc + lane16;
+                float32 dcv0 = dAll[dbase];
+                float32 dcv1 = dAll[dbase + 16];
+                float32 dcv2 = dAll[dbase + 32];
+                float32 dcv3 = dAll[dbase + 48];
+                iacc0.scaledAccumIntoS(facc0, xsAll[xbase], dcv0);
+                iacc1.scaledAccumIntoS(facc1, xsAll[xbase], dcv1);
+                iacc2.scaledAccumIntoS(facc2, xsAll[xbase], dcv2);
+                iacc3.scaledAccumIntoS(facc3, xsAll[xbase], dcv3);
+                iacc4.scaledAccumIntoS(facc4, xsAll[xbase + 16], dcv0);
+                iacc5.scaledAccumIntoS(facc5, xsAll[xbase + 16], dcv1);
+                iacc6.scaledAccumIntoS(facc6, xsAll[xbase + 16], dcv2);
+                iacc7.scaledAccumIntoS(facc7, xsAll[xbase + 16], dcv3);
                 Barrier.workgroup();
                 b = b + 1;
             }
@@ -5758,8 +5856,13 @@ public final class WmmaKernel {
         // read as xsAll[tile * 16] — the eight separate arrays and the
         // 8-arm wave-uniform store chain they needed are gone.
         Shared<float32> xsAll = shared float32[128];
-        // [(wid*16 + row) * 16 + j] — 128 rows x 16 slices.
-        Shared<float32> cfAll = shared float32[2048];
+        // [(wid*16 + row) * 16 + j] — 128 rows x 16 slices. The RAW
+        // signed int8 slice scale, not d*sc: the j-loop folds it as an
+        // integer, so d never enters the sub-block step.
+        Shared<int32> scAll = shared int32[2048];
+        // This block's per-column d, read at the drain by the column
+        // tile the wave OWNS rather than the one it staged.
+        Shared<float32> dAll = shared float32[128];
 
         uint32 tid = KernelThread.x();
         uint32 lane = tid % 32;
@@ -5803,6 +5906,16 @@ public final class WmmaKernel {
             CooperativeMatrix<int32,16,16,2> mc5;
             CooperativeMatrix<int32,16,16,2> mc6;
             CooperativeMatrix<int32,16,16,2> mc7;
+            // The integer seam: one per output tile, carrying
+            // sum_j sc_j * mc_j across the whole 256-k block.
+            CooperativeMatrix<int32,16,16,2> iacc0;
+            CooperativeMatrix<int32,16,16,2> iacc1;
+            CooperativeMatrix<int32,16,16,2> iacc2;
+            CooperativeMatrix<int32,16,16,2> iacc3;
+            CooperativeMatrix<int32,16,16,2> iacc4;
+            CooperativeMatrix<int32,16,16,2> iacc5;
+            CooperativeMatrix<int32,16,16,2> iacc6;
+            CooperativeMatrix<int32,16,16,2> iacc7;
             CooperativeMatrix<float32,16,16,2> facc0;
             CooperativeMatrix<float32,16,16,2> facc1;
             CooperativeMatrix<float32,16,16,2> facc2;
@@ -5819,6 +5932,7 @@ public final class WmmaKernel {
             facc5.splat(0.0f);
             facc6.splat(0.0f);
             facc7.splat(0.0f);
+            uint32 xbase = 32 * wr;
 
             int64 b = 0;
             while (b < blocksPerRow) {
@@ -5839,54 +5953,47 @@ public final class WmmaKernel {
                         | (((int32) xp[xb + 290L] & 255) << 16)
                         | (((int32) xp[xb + 291L] & 255) << 24));
                     xsAll[wid * 16 + lane] = xv;
+                    dAll[wid * 16 + lane] = dv;
                     uint32 cb = (wid * 16 + lane) * 16;
-                    cfAll[cb] = dv * (float32) (int32) packed[ro + 192L];
-                    cfAll[cb + 1] = dv
-                        * (float32) (int32) packed[ro + 193L];
-                    cfAll[cb + 2] = dv
-                        * (float32) (int32) packed[ro + 194L];
-                    cfAll[cb + 3] = dv
-                        * (float32) (int32) packed[ro + 195L];
-                    cfAll[cb + 4] = dv
-                        * (float32) (int32) packed[ro + 196L];
-                    cfAll[cb + 5] = dv
-                        * (float32) (int32) packed[ro + 197L];
-                    cfAll[cb + 6] = dv
-                        * (float32) (int32) packed[ro + 198L];
-                    cfAll[cb + 7] = dv
-                        * (float32) (int32) packed[ro + 199L];
+                    scAll[cb] = (int32) packed[ro + 192L];
+                    scAll[cb + 1] = (int32) packed[ro + 193L];
+                    scAll[cb + 2] = (int32) packed[ro + 194L];
+                    scAll[cb + 3] = (int32) packed[ro + 195L];
+                    scAll[cb + 4] = (int32) packed[ro + 196L];
+                    scAll[cb + 5] = (int32) packed[ro + 197L];
+                    scAll[cb + 6] = (int32) packed[ro + 198L];
+                    scAll[cb + 7] = (int32) packed[ro + 199L];
                 } else {
                     uint32 cb = (wid * 16 + lane16) * 16;
-                    cfAll[cb + 8] = dv
-                        * (float32) (int32) packed[ro + 200L];
-                    cfAll[cb + 9] = dv
-                        * (float32) (int32) packed[ro + 201L];
-                    cfAll[cb + 10] = dv
-                        * (float32) (int32) packed[ro + 202L];
-                    cfAll[cb + 11] = dv
-                        * (float32) (int32) packed[ro + 203L];
-                    cfAll[cb + 12] = dv
-                        * (float32) (int32) packed[ro + 204L];
-                    cfAll[cb + 13] = dv
-                        * (float32) (int32) packed[ro + 205L];
-                    cfAll[cb + 14] = dv
-                        * (float32) (int32) packed[ro + 206L];
-                    cfAll[cb + 15] = dv
-                        * (float32) (int32) packed[ro + 207L];
+                    scAll[cb + 8] = (int32) packed[ro + 200L];
+                    scAll[cb + 9] = (int32) packed[ro + 201L];
+                    scAll[cb + 10] = (int32) packed[ro + 202L];
+                    scAll[cb + 11] = (int32) packed[ro + 203L];
+                    scAll[cb + 12] = (int32) packed[ro + 204L];
+                    scAll[cb + 13] = (int32) packed[ro + 205L];
+                    scAll[cb + 14] = (int32) packed[ro + 206L];
+                    scAll[cb + 15] = (int32) packed[ro + 207L];
                 }
                 Barrier.workgroup();
 
+                iacc0.splat(0);
+                iacc1.splat(0);
+                iacc2.splat(0);
+                iacc3.splat(0);
+                iacc4.splat(0);
+                iacc5.splat(0);
+                iacc6.splat(0);
+                iacc7.splat(0);
+
                 uint32 j = 0;
                 while (j < 16) {
-                    // ONE pre-folded cf per column tile and one xs
-                    // slice per token tile. Q6 has no dmin, so the
-                    // drain stays the single-verb scaledAccumIntoS.
+                    // ONE raw integer scale per column tile. Q6 has no
+                    // dmin, so there is no rank-1 term at all.
                     uint32 cbase = (64 * wc + lane16) * 16 + j;
-                    float32 cfv0 = cfAll[cbase];
-                    float32 cfv1 = cfAll[cbase + 256];
-                    float32 cfv2 = cfAll[cbase + 512];
-                    float32 cfv3 = cfAll[cbase + 768];
-                    uint32 xbase = 32 * wr;
+                    int32 scv0 = scAll[cbase];
+                    int32 scv1 = scAll[cbase + 256];
+                    int32 scv2 = scAll[cbase + 512];
+                    int32 scv3 = scAll[cbase + 768];
                     uint32 kBase = 16 * j;
                     int64 aOff = (int64) tw * xRowBytes + b * 320L
                         + (int64) kBase;
@@ -5918,16 +6025,35 @@ public final class WmmaKernel {
                     mc5.mma(maB, mbB);
                     mc6.mma(maB, mbC);
                     mc7.mma(maB, mbD);
-                    mc0.scaledAccumIntoS(facc0, xsAll[xbase], cfv0);
-                    mc1.scaledAccumIntoS(facc1, xsAll[xbase], cfv1);
-                    mc2.scaledAccumIntoS(facc2, xsAll[xbase], cfv2);
-                    mc3.scaledAccumIntoS(facc3, xsAll[xbase], cfv3);
-                    mc4.scaledAccumIntoS(facc4, xsAll[xbase + 16], cfv0);
-                    mc5.scaledAccumIntoS(facc5, xsAll[xbase + 16], cfv1);
-                    mc6.scaledAccumIntoS(facc6, xsAll[xbase + 16], cfv2);
-                    mc7.scaledAccumIntoS(facc7, xsAll[xbase + 16], cfv3);
+                    // Integer fold — no convert, no fma, no float in
+                    // the sub-block step. Both operands sit inside 24
+                    // bits: |mc| <= 16*127*32 and |sc| <= 128.
+                    mc0.scaledAccumI32(iacc0, scv0);
+                    mc1.scaledAccumI32(iacc1, scv1);
+                    mc2.scaledAccumI32(iacc2, scv2);
+                    mc3.scaledAccumI32(iacc3, scv3);
+                    mc4.scaledAccumI32(iacc4, scv0);
+                    mc5.scaledAccumI32(iacc5, scv1);
+                    mc6.scaledAccumI32(iacc6, scv2);
+                    mc7.scaledAccumI32(iacc7, scv3);
                     j = j + 1;
                 }
+                // The block's ONE float epilogue: the sixteen scales
+                // are already summed in as integers, so the row scale
+                // and this column's d apply once.
+                uint32 dbase = 64 * wc + lane16;
+                float32 dcv0 = dAll[dbase];
+                float32 dcv1 = dAll[dbase + 16];
+                float32 dcv2 = dAll[dbase + 32];
+                float32 dcv3 = dAll[dbase + 48];
+                iacc0.scaledAccumIntoS(facc0, xsAll[xbase], dcv0);
+                iacc1.scaledAccumIntoS(facc1, xsAll[xbase], dcv1);
+                iacc2.scaledAccumIntoS(facc2, xsAll[xbase], dcv2);
+                iacc3.scaledAccumIntoS(facc3, xsAll[xbase], dcv3);
+                iacc4.scaledAccumIntoS(facc4, xsAll[xbase + 16], dcv0);
+                iacc5.scaledAccumIntoS(facc5, xsAll[xbase + 16], dcv1);
+                iacc6.scaledAccumIntoS(facc6, xsAll[xbase + 16], dcv2);
+                iacc7.scaledAccumIntoS(facc7, xsAll[xbase + 16], dcv3);
                 Barrier.workgroup();
                 b = b + 1;
             }

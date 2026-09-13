@@ -12,6 +12,10 @@ import dev.cajeta.llm.model.Linear;
 import cajeta.math.Tensor;
 import cajeta.lang.String;
 import cajeta.lang.Cajeta;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.EngineOptions;
+import cajeta.io.file.Path;
 import dev.cajeta.llm.io.WmmaKernel;
 import cajeta.xpu.KernelManifest;
 import cajeta.xpu.KernelBuffer;
@@ -935,7 +939,7 @@ public class LinearKernelRouteTest {
      * packed WMMA route is not taken (vulkan).
      */
     @Test
-    public void multiWavePackedQ4kMatchesDeqMw8BitForBit() {
+    public void multiWavePackedQ4kAgreesWithDeqMw8() {
         if (!Device.kernelAvailable("q4kWmmaMwKernel")
                 || !Device.kernelAvailable("q4kWmmaDeqMw8Kernel")) {
             System.stdout.println("  (skipped: backend "
@@ -993,17 +997,30 @@ public class LinearKernelRouteTest {
 
         LinearKernelRouteTest.assertLive(want, (int64) rows * co, "q4 deqMw8");
         LinearKernelRouteTest.assertLive(got, (int64) rows * co, "q4 mw");
+        // The two kernels no longer share a summation order: the int8-deq
+        // route folds each sub-block scale as an integer and converts once
+        // per 256-k block, while the packed route still scales in float per
+        // sub-block. They agree to float rounding, not to the bit.
         int64 i = 0;
+        float32 worst = 0.0f;
         while (i < (int64) rows * co) {
             float32 a = want.flatGet(i);
             float32 b = got.flatGet(i);
-            if (a != b) {
+            float32 d = a - b;
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 s = a;
+            if (s < 0.0f) { s = 0.0f - s; }
+            if (s < 1.0f) { s = 1.0f; }
+            float32 rel = d / s;
+            if (rel > worst) { worst = rel; }
+            if (rel > 0.00001f) {
                 Assert.fail("element " + i + ": packed multi-wave " + b
                     + " vs int8-deq multi-wave " + a
-                    + " - the inline widen must be bit-for-bit identical");
+                    + " - the two routes must agree to float rounding");
             }
             i = i + 1;
         }
+        System.stdout.println("   packed vs int8-deq max rel diff " + worst);
         return;
     }
 
@@ -1118,7 +1135,7 @@ public class LinearKernelRouteTest {
             if (s < 1.0f) { s = 1.0f; }
             float32 r = d / s;
             if (r > worst) { worst = r; }
-            if (d != 0.0f) {
+            if (r > 0.00001f) {
                 Assert.fail("element " + o + ": q6 deqMw8 " + a
                     + " vs deqMw4 " + w);
             }
@@ -1208,6 +1225,49 @@ public class LinearKernelRouteTest {
         if (Linear.deqFor(Quant.GG_Q4_K)) { Assert.fail("packed mode is global"); }
         if (Linear.deqFor(Quant.GG_Q6_K)) { Assert.fail("packed mode is global"); }
         System.stdout.println("   auto/int8/packed policies agree per format");
+        return;
+    }
+
+    static final String M8B =
+        "/home/julian/models/Meta-Llama-3.1-8B-Instruct-GGUF/"
+        + "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf";
+
+    static #String greedyAtChunk(int32 chunk, String prompt, int32 maxNew) {
+        EngineOptions o #= heap EngineOptions(LinearKernelRouteTest.M8B);
+        o.ctx = 1024;
+        o.maxSeqs = 1;
+        o.chunk = chunk;
+        LlmEngine e #= LlmEngine.load(#o);
+        SampleParams p #= heap SampleParams(0.0f, 0L);
+        int32 id = e.submitText(prompt, #p, maxNew);
+        e.runAll(4096);
+        String t #= e.textOf(id);
+        e.close();
+        return #t;
+    }
+
+    /** 6.2.6: the prefill micro-batch is a BATCHING choice, not a
+     *  numerical one — greedy output must not depend on it. The prompt
+     *  spans several batches at 128 and one at 512, which is exactly the
+     *  difference the default change makes. */
+    @Test
+    public void greedyOutputIsIndependentOfPrefillChunk() {
+        Path mp #= Path.of(LinearKernelRouteTest.M8B);
+        if (!mp.exists()) {
+            System.stdout.println("  (skipped: 8B witness not on this box)");
+            return;
+        }
+        String u = "The pipeline stages a tile of activations, folds the "
+            + "block scales in the epilogue, and writes one row per lane. ";
+        String prompt #= "Summarize the following note. " + u + u + u + u
+            + u + u + u + u + u + u + u + u;
+        String a #= LinearKernelRouteTest.greedyAtChunk(128, prompt, 24);
+        String b #= LinearKernelRouteTest.greedyAtChunk(512, prompt, 24);
+        if (!a.equals(b)) {
+            Assert.fail("chunk changed the greedy output:\n  128: " + a
+                + "\n  512: " + b);
+        }
+        System.stdout.println("   greedy output identical at chunk 128 and 512");
         return;
     }
 
