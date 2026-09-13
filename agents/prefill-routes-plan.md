@@ -287,7 +287,15 @@ plan's acceptance and in the bench memory.
 ## Unit 3 — The MoE checkpoints (spec §4)
 
 ### 3.1 TDD
-- [ ] 3.1.1 `MoeForwardTest` on a fixture whose expert format had no
+- [x] 3.1.1 DONE 2026-09-13: `toy-moe-q8exp.gguf` built (gen_moe_fixture.py
+      gained a Q8_0 rank-3 slab builder; ffn_down_exps is Q8_0 exactly as the
+      real Qwen1.5-MoE witness, gate/up stay Q4_K so `batch` cannot be a Q4_K
+      fallback). `q8ExpertSlabPrefillsBatched` asserts prefill-mode=batched and
+      expert-cache=batch. NOTE: cajeta has no GGUF WRITER, so all nine fixture
+      generators are python under tools/ — a real gap against the no-python
+      rule, worked around here by extending an existing generator rather than
+      adding one.
+      `MoeForwardTest` on a fixture whose expert format had no
       batched route: prefill is `batched`; expert-group dispatch records
       `device` for the groups the budget admits.
       NOTE (2026-09-12): no checked-in MoE fixture witnesses this —

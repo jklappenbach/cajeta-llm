@@ -408,3 +408,44 @@ write_gguf(os.path.join(OUT, "toy-moe-badwidth.gguf"),
                kv_u32("qwen2moe.expert_count", E),
                kv_u32("qwen2moe.expert_used_count", USED),
            ]), wt)
+
+
+# ── toy-moe-q8exp.gguf ──────────────────────────────────────────────────
+# The 3.1.1 witness: an expert format that had NO batched route before
+# Unit 2 opened the coop GEMM on HIP. The real Qwen1.5-MoE carries
+# ffn_down_exps as Q8_0 (see the note at the top), so this fixture is
+# that shape and nothing else — gate and up stay Q4_K, exactly as the
+# witness has them, so a test that sees `batched` here is seeing the
+# Q8_0 slab route and not a Q4_K fallback.
+GG_Q8_0 = 8
+Q8_ELEMS, Q8_BYTES = 32, 34
+q80 = open(os.path.join(KQ, "q8_0.bin"), "rb").read()
+assert len(q80) == SRC_BLOCKS * Q8_BYTES, len(q80)
+
+
+def q8_tile_blocks(nblocks, phase=0):
+    """Q8_0 twin of q4k_tile_blocks: real blocks tiled cyclically from
+    `phase`, so no two experts share bytes."""
+    return b"".join(
+        q80[((i + phase) % SRC_BLOCKS) * Q8_BYTES:
+            (((i + phase) % SRC_BLOCKS) + 1) * Q8_BYTES]
+        for i in range(nblocks))
+
+
+def q8_rank2(rows, cols, phase=0):
+    assert cols % Q8_ELEMS == 0, (rows, cols)
+    return q8_tile_blocks(rows * (cols // Q8_ELEMS), phase)
+
+
+def q8_rank3(cols, rows, experts):
+    return b"".join(q8_rank2(rows, cols, phase=e) for e in range(experts))
+
+
+qtensors = []
+for name, ne, ty, pay in tensors:
+    if name.endswith("ffn_down_exps.weight"):
+        qtensors.append((name, ne, GG_Q8_0, q8_rank3(IT_E, H, E)))
+    else:
+        qtensors.append((name, ne, ty, pay))
+assert any(t[2] == GG_Q8_0 for t in qtensors), "no Q8_0 expert slab emitted"
+write_gguf(os.path.join(OUT, "toy-moe-q8exp.gguf"), kvs, qtensors)
