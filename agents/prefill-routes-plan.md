@@ -577,6 +577,14 @@ one-step j iterations and no min term: 2 A + 4 B loads + 8 mma per j, cf
 stride 16 → column-tile offset 256; xsA..xsH → xsAll[128]; no unmasked byte
 assembly to fix): bit-identical to the Mw4 sibling (new gate, exact), route
 877 → 884 (+1%, its 11% share), no spill.
+PROGRESS 2026-09-12: re-profile at 884: q4kWmmaDeqMw8 409 ms (was 668), q6k
+88 (was 97), attention 33, widen 135 (load-time). Remaining gap to llama
+1320 = 1.49x, almost all inside the two GEMMs. The 32-k step loop is NOT
+unrolled (llama's is; that is where its load batching comes from) and the
+kernel language has no unroll directive — third HELD compiler item beside
+scaledAccumI32 (mad.i24 int-fold, −17% floor) and a native f16→f32.
+Packed-mw kernel: 4×2 re-shape (its B unpack is VALU per column tile, so
+2×4 would quadruple it) LANDED: bit-gate PASS, spill 204 → 168 B, 555 → 566 (+2%).
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
