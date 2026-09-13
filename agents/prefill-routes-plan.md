@@ -867,3 +867,24 @@ STILL OPEN: q2kQ8WaveMatVecKernel's `b = lane / 4` with a literal `+ 8L`
 stride is correct only at wave32 — on wave64 lanes 32-63 re-walk blocks lanes
 0-31 already covered. The lane/row derivation is now wave-relative but this
 stride is not; the family is not yet genuinely portable.
+
+STRIDE IS PROFILE-DRIVEN 2026-09-13. The rule: a wave-cooperative kernel has
+TWO numbers, and only one of them is a literal.
+  lanesPerItem   = ALGORITHMIC. Four lanes share one 16-byte Q2_K group
+                   because the group holds four 2-bit planes. A property of
+                   the decomposition, so it stays written down.
+  itemsInFlight  = waveWidth / lanesPerItem = THE MACHINE'S. It must come
+                   from Group.width(), and it is the loop stride.
+q2kQ8WaveMatVecKernel's stride was the literal 8, which is 32/4 — wave32 only.
+At wave64 lanes 32-63 re-walked blocks lanes 0-31 had already done, double
+counting. Now `bStride = wv / 4`. Bit-identical on wave32 (8), correct at
+wave64 (16), decode unchanged at 55.2-55.3.
+The same rewrite is owed to the rest of the family: `b = b + 32L` appears
+twice (lanesPerItem = 1, so stride is simply `wv`) and `b = b + 8L` once more.
+COMPILER FINDING, needs a minimal repro before filing: while editing, a sed
+deleted `int64 b = (int64) (lane / 4);` from the kernel body. The build
+SUCCEEDED with zero errors and the kernel ran on device, producing wrong
+output and a fake 70% decode speedup (it was skipping work). An UNDECLARED
+name in a @Kernel body appears to resolve to something rather than failing to
+compile. Same family as the differently-typed shadow fixed in cajeta 706f2117,
+but that check only fires on a REDECLARATION; this was no declaration at all.
