@@ -538,6 +538,15 @@ loads were never the bottleneck (the +18% on packed-mw came from relieving
 the fromWords VALU path, not from A bytes). REVERTED to the plain kernel;
 patches kept in tmp/u3/deq-astage-{two-half,one-copy}.patch. NEXT:
 re-profile the deq route at 688 to find where the remaining 2x lives.
+PROGRESS 2026-09-12: profile of the deq route (whole run): q4kWmmaDeqMw8 66.8%,
+q4k/q6k widen 13% (LOAD-time, ensureDeq builds once), q6kWmmaDeqMw8 9.7%,
+attention 3.2% — inside the measured prefill the Q4_K GEMM is ~77%, Q6_K
+~11%. Q6_K partitioned launcher moved onto the slice law (derives 40):
+neutral, 688→689. @Occupancy(minResident=8) on the deq kernel RE-MEASURED
+under the 80-slot slice the old note asked for: 192 VGPR / 212 B spill →
+519 at 80, 497 at 40, vs 688 unpinned — spill dominates at any partition;
+REVERTED, note extended in the kernel. 6.2.3 (Q6_K): the slice law
+transfers; the A-staging technique does not (refuted on deq).
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
@@ -562,7 +571,7 @@ re-profile the deq route at 688 to find where the remaining 2x lives.
       `Device` geometry → block/grid (measured-literal fallback); route through
       `Scheduler.submit`; wire into Linear's packed Q4_K route behind a flag
       (`setQ4Mw`), default off until 6.3 passes, then default on.
-- [ ] 6.2.3 Apply the same to the Q6_K packed route (`q6kWmmaEpiKernel`,
+- [~] 6.2.3 (slice law applied to the Q6_K deq launcher, neutral; the packed Q6 route itself untouched) Apply the same to the Q6_K packed route (`q6kWmmaEpiKernel`,
       14.5%) if the technique transfers, or record why Q6_K differs.
 
 ### 6.3 Acceptance
