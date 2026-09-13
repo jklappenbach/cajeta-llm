@@ -4214,6 +4214,17 @@ public final class WmmaKernel {
         return rows % 128L == 0L && outDim % 128L == 0L;
     }
 
+    /** The k side of the same question, and it was MISSING. Every deq
+     *  GEMM derives `blocksPerRow` as `cols / 256`, and the widen fills
+     *  exactly that many super-blocks, so a column count with a
+     *  remainder silently computes a SHORT dot product — no bounds
+     *  error, no diagnostic, just a wrong answer. Qwen2.5-VL-72B is the
+     *  first checkpoint to reach it: ffn_down is 29568 = 115*256 + 128
+     *  wide. */
+    public static boolean fitsMw8Cols(int64 cols) {
+        return cols % 256L == 0L;
+    }
+
     public static void q4kWmmaDeqMw8Launch(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> deq,
             KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
@@ -4611,6 +4622,102 @@ public final class WmmaKernel {
     }
 
     /**
+     * The Q4_0 widen: nibble minus the implicit 8, which lands in
+     * [-8,7] — exactly representable, so the widened copy is lossless
+     * and the per-32 d rides the GEMM's cf prefold at an 18-byte
+     * stride. One thread per qs byte, two elements out, as Q4_K's.
+     */
+    @Kernel
+    public static void q40WidenKernel(KernelBuffer<int8> deq,
+            KernelBuffer<int8> packed, uint32 total, int64 blocksPerRow) {
+        uint32 tid = KernelThread.globalIdX();
+        if (tid < total) {
+            uint32 perRow = (uint32) blocksPerRow * 128;
+            uint32 ii = tid / perRow;
+            uint32 rem = tid % perRow;
+            uint32 b = rem / 128;
+            uint32 byteIdx = rem % 128;
+            uint32 bi = byteIdx / 16;
+            uint32 j = byteIdx % 16;
+            int64 ro = (int64) ii * (blocksPerRow * 144L)
+                + (int64) b * 144L + (int64) bi * 18L
+                + 2L + (int64) j;
+            int32 rb = (int32) packed[ro] & 255;
+            int64 tilesK = blocksPerRow * 16L;
+            int64 kLo = (int64) b * 256L + (int64) (bi * 32 + j);
+            int64 kHi = kLo + 16L;
+            int64 tI = (int64) (ii / 16);
+            int64 iIn = (int64) (ii % 16);
+            deq[(tI * tilesK + kLo / 16L) * 256L
+                + iIn * 16L + (kLo % 16L)] = (int8) ((rb & 15) - 8);
+            deq[(tI * tilesK + kHi / 16L) * 256L
+                + iIn * 16L + (kHi % 16L)] = (int8) (((rb >> 4) & 15) - 8);
+        }
+    }
+
+    public static void q40WidenLaunch(KernelBuffer<int8> deq,
+            KernelBuffer<int8> packed, int64 outDim, int64 cols) {
+        int64 bpr = cols / 256L;
+        int64 total = outDim * bpr * 128L;
+        KernelStream s = QuantKernel.stream();
+        q40WidenKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
+            block: [256])
+            (deq, packed, (uint32) total, bpr);
+        return;
+    }
+
+    /**
+     * The Q5_0 widen: the fifth bit comes out of the block's u32 qh —
+     * bit j for the low nibble of byte j, bit j+16 for the high — and
+     * the bias is 16, so the value lands in [-16,15]. Lossless into
+     * int8, 22-byte block stride for the cf prefold.
+     */
+    @Kernel
+    public static void q50WidenKernel(KernelBuffer<int8> deq,
+            KernelBuffer<int8> packed, uint32 total, int64 blocksPerRow) {
+        uint32 tid = KernelThread.globalIdX();
+        if (tid < total) {
+            uint32 perRow = (uint32) blocksPerRow * 128;
+            uint32 ii = tid / perRow;
+            uint32 rem = tid % perRow;
+            uint32 b = rem / 128;
+            uint32 byteIdx = rem % 128;
+            uint32 bi = byteIdx / 16;
+            uint32 j = byteIdx % 16;
+            int64 bb = (int64) ii * (blocksPerRow * 176L)
+                + (int64) b * 176L + (int64) bi * 22L;
+            int32 qh = ((int32) packed[bb + 2L] & 255)
+                | (((int32) packed[bb + 3L] & 255) << 8)
+                | (((int32) packed[bb + 4L] & 255) << 16)
+                | (((int32) packed[bb + 5L] & 255) << 24);
+            int32 rb = (int32) packed[bb + 6L + (int64) j] & 255;
+            int32 h0 = ((qh >> j) & 1) << 4;
+            int32 h1 = ((qh >> (j + 16)) & 1) << 4;
+            int64 tilesK = blocksPerRow * 16L;
+            int64 kLo = (int64) b * 256L + (int64) (bi * 32 + j);
+            int64 kHi = kLo + 16L;
+            int64 tI = (int64) (ii / 16);
+            int64 iIn = (int64) (ii % 16);
+            deq[(tI * tilesK + kLo / 16L) * 256L
+                + iIn * 16L + (kLo % 16L)] = (int8) (((rb & 15) | h0) - 16);
+            deq[(tI * tilesK + kHi / 16L) * 256L
+                + iIn * 16L + (kHi % 16L)] =
+                (int8) ((((rb >> 4) & 15) | h1) - 16);
+        }
+    }
+
+    public static void q50WidenLaunch(KernelBuffer<int8> deq,
+            KernelBuffer<int8> packed, int64 outDim, int64 cols) {
+        int64 bpr = cols / 256L;
+        int64 total = outDim * bpr * 128L;
+        KernelStream s = QuantKernel.stream();
+        q50WidenKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
+            block: [256])
+            (deq, packed, (uint32) total, bpr);
+        return;
+    }
+
+    /**
      * 10.12.45.D — the Q8_0 T=8 deq GEMM: the Q4 Mw8 structure with the
      * simplest possible drain — no mins, no rank-1 term, cf per j-slice
      * is just the f16 d of Q8_0 block `b*8 + j` (34-byte stride). The
@@ -4624,7 +4731,8 @@ public final class WmmaKernel {
     public static void q80WmmaDeqMw8Kernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> deq,
             KernelBuffer<int8> xp, uint32 rows, uint32 outDim,
-            uint32 tilesN8, int64 blocksPerRow, uint32 rowBase) {
+            uint32 tilesN8, int64 blocksPerRow, uint32 rowBase,
+            int64 blkBytes) {
         // 10.12.33 slice form: ONE array for all eight token tiles,
         // read as xsAll[tile * 16] — the eight separate arrays and the
         // 8-arm wave-uniform store chain they needed are gone.
@@ -4649,7 +4757,8 @@ public final class WmmaKernel {
         uint32 tw = t0 + 32 * wr;
         uint32 cw = rowBase + tileI8 * 128 + 64 * wc;
         if (t0 < rows && i0 < outDim) {
-            int64 rowBytes = blocksPerRow * 272L;
+            int64 sbBytes = blkBytes * 8L;
+            int64 rowBytes = blocksPerRow * sbBytes;
             int64 xRowBytes = blocksPerRow * 320L;
             // One 16-column group of `deq` to the next.
             int64 bStep = blocksPerRow * 4096L;
@@ -4702,32 +4811,32 @@ public final class WmmaKernel {
                         | (((int32) xp[xb + 291L] & 255) << 24));
                     xsAll[wid * 16 + lane] = xv;
                     // This row's eight Q8_0 d's, pre-folded to LDS.
-                    int64 ro = myRo + b * 272L;
+                    int64 ro = myRo + b * sbBytes;
                     uint32 cb = (wid * 16 + lane) * 8;
                     cfAll[cb] = GgufFile.halfBitsToF32(
                         ((int32) packed[ro] & 255)
                         | (((int32) packed[ro + 1L] & 255) << 8));
                     cfAll[cb + 1] = GgufFile.halfBitsToF32(
-                        ((int32) packed[ro + 34L] & 255)
-                        | (((int32) packed[ro + 35L] & 255) << 8));
+                        ((int32) packed[ro + blkBytes] & 255)
+                        | (((int32) packed[ro + blkBytes + 1L] & 255) << 8));
                     cfAll[cb + 2] = GgufFile.halfBitsToF32(
-                        ((int32) packed[ro + 68L] & 255)
-                        | (((int32) packed[ro + 69L] & 255) << 8));
+                        ((int32) packed[ro + blkBytes * 2L] & 255)
+                        | (((int32) packed[ro + blkBytes * 2L + 1L] & 255) << 8));
                     cfAll[cb + 3] = GgufFile.halfBitsToF32(
-                        ((int32) packed[ro + 102L] & 255)
-                        | (((int32) packed[ro + 103L] & 255) << 8));
+                        ((int32) packed[ro + blkBytes * 3L] & 255)
+                        | (((int32) packed[ro + blkBytes * 3L + 1L] & 255) << 8));
                     cfAll[cb + 4] = GgufFile.halfBitsToF32(
-                        ((int32) packed[ro + 136L] & 255)
-                        | (((int32) packed[ro + 137L] & 255) << 8));
+                        ((int32) packed[ro + blkBytes * 4L] & 255)
+                        | (((int32) packed[ro + blkBytes * 4L + 1L] & 255) << 8));
                     cfAll[cb + 5] = GgufFile.halfBitsToF32(
-                        ((int32) packed[ro + 170L] & 255)
-                        | (((int32) packed[ro + 171L] & 255) << 8));
+                        ((int32) packed[ro + blkBytes * 5L] & 255)
+                        | (((int32) packed[ro + blkBytes * 5L + 1L] & 255) << 8));
                     cfAll[cb + 6] = GgufFile.halfBitsToF32(
-                        ((int32) packed[ro + 204L] & 255)
-                        | (((int32) packed[ro + 205L] & 255) << 8));
+                        ((int32) packed[ro + blkBytes * 6L] & 255)
+                        | (((int32) packed[ro + blkBytes * 6L + 1L] & 255) << 8));
                     cfAll[cb + 7] = GgufFile.halfBitsToF32(
-                        ((int32) packed[ro + 238L] & 255)
-                        | (((int32) packed[ro + 239L] & 255) << 8));
+                        ((int32) packed[ro + blkBytes * 7L] & 255)
+                        | (((int32) packed[ro + blkBytes * 7L + 1L] & 255) << 8));
                 }
                 Barrier.workgroup();
 
@@ -4827,19 +4936,41 @@ public final class WmmaKernel {
     public static void q80WmmaDeqMw8Launch(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> deq,
             KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
-        int64 tilesM8 = rows / 128L;
-        int64 tilesN8 = outDim / 128L;
-        KernelStream s = QuantKernel.stream();
-        q80WmmaDeqMw8Kernel.launch(s,
-            grid: [(uint32) (tilesM8 * tilesN8)], block: [256])
-            (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
-             (uint32) tilesN8, cols / 256L, 0);
+        WmmaKernel.symWmmaDeqMw8Launch(y, packed, deq, xp, rows, outDim,
+            cols, 34L);
         return;
     }
 
     public static void q80WmmaDeqMw8PartLaunch(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> deq,
             KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
+        WmmaKernel.symWmmaDeqMw8PartLaunch(y, packed, deq, xp, rows,
+            outDim, cols, 34L);
+        return;
+    }
+
+    /** The symmetric-legacy deq GEMM entry: Q8_0 (34), Q5_0 (22) and
+     *  Q4_0 (18) differ only in the byte stride between the per-32 d
+     *  scales the cf prefold reads; the widened int8 they multiply is
+     *  the same tile-major layout for all three. */
+    public static void symWmmaDeqMw8Launch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols,
+            int64 blkBytes) {
+        int64 tilesM8 = rows / 128L;
+        int64 tilesN8 = outDim / 128L;
+        KernelStream s = QuantKernel.stream();
+        q80WmmaDeqMw8Kernel.launch(s,
+            grid: [(uint32) (tilesM8 * tilesN8)], block: [256])
+            (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
+             (uint32) tilesN8, cols / 256L, 0, blkBytes);
+        return;
+    }
+
+    public static void symWmmaDeqMw8PartLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> deq,
+            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols,
+            int64 blkBytes) {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
         if (WmmaKernel.deqMwSlice <= 0L) {
@@ -4856,7 +4987,8 @@ public final class WmmaKernel {
             q80WmmaDeqMw8Kernel.launch(s,
                 grid: [(uint32) (tilesM8 * n8)], block: [256])
                 (y, packed, deq, xp, (uint32) rows, (uint32) outDim,
-                 (uint32) n8, cols / 256L, (uint32) (base * 128L));
+                 (uint32) n8, cols / 256L, (uint32) (base * 128L),
+                 blkBytes);
             base = base + n8;
         }
         return;

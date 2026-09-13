@@ -21,6 +21,7 @@ import cajeta.io.file.Path;
 import dev.cajeta.llm.io.WmmaKernel;
 import cajeta.xpu.KernelManifest;
 import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelResourceDescriptor;
 import cajeta.lang.Optional;
 
@@ -1368,5 +1369,293 @@ public class LinearKernelRouteTest {
         System.stdout.println("   q2k-greedy[" + t + "]");
         return;
     }
+
+    /** `tiled` at an arbitrary shape: the int8 deq routes divide `cols`
+     *  by 256, and every shipped fixture is a whole multiple, so the
+     *  remainder case needs a width the constants cannot express. */
+    static #Linear tiledAt(int32 ty, String fixture, int32 ci, int32 co) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be = (int64) Quant.blockElems(ty);
+        int64 nBlocks = (int64) co * ((int64) ci / be);
+        int8[] fix #= File.readAllBytes(LinearKernelRouteTest.KQ + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        Linear lin = heap Linear(ci, co);
+        lin.bindPacked(#raw, ty);
+        return #lin;
+    }
+
+    static void checkBatchedAt(Linear lin, int32 rows, int32 ci, int32 co,
+            float64 tol, String what) {
+        int64 ciL = (int64) ci;
+        int64 coL = (int64) co;
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ciL, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L,
+            (int64) rows * coL);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L,
+            (int64) rows * coL);
+        QuantKernel.setRoutingEnabled(false);
+        int64 r = 0;
+        while (r < (int64) rows) {
+            lin.matvecInto(x, r * ciL, want, r * coL);
+            r = r + 1;
+        }
+        QuantKernel.setRoutingEnabled(true);
+        Linear.stageBatch(x, 0L, rows, ci, Linear.nextStageTag());
+        lin.matmulInto(rows, got, 0L);
+        boolean live = false;
+        int64 i = 0;
+        while (i < (int64) rows * coL) {
+            float32 g = got.flatGet(i);
+            float32 w = want.flatGet(i);
+            if (g != 0.0f) { live = true; }
+            float32 d = g - w;
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 m = w;
+            if (m < 0.0f) { m = 0.0f - m; }
+            if ((float64) d > (float64) m * tol + 0.01) {
+                Assert.fail(what + " at " + i + ": batched " + g
+                    + " vs serial " + w);
+            }
+            i = i + 1;
+        }
+        if (!live) {
+            Assert.fail(what + ": every batched output is zero");
+        }
+        return;
+    }
+
+    /** A column count that is NOT a whole 256-element super-block. The
+     *  Mw8 deq GEMMs derive `blocksPerRow` as `cols / 256`, which TRUNCATES
+     *  — at 384 columns that silently drops the last 128 of every row and
+     *  the batched answer is a short dot product. Qwen2.5-VL-72B is the
+     *  first checkpoint that reaches it: its ffn_down is 29568 wide, and
+     *  29568 = 115 * 256 + 128, so the Q8_0 half of those tensors routed
+     *  here and lost a column group per row.
+     *
+     *  The bar is the per-row serial path on the same weight — whether the
+     *  fix is a refusal back to coop or a tail-capable GEMM is an
+     *  implementation choice, and this test does not care which. */
+    @Test
+    public void int8DeqIsExactWhenColumnsAreNotAWholeSuperBlock() {
+        if (!Linear.wmmaBackend()) {
+            System.stdout.println("  (skipped: no batch GEMM on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        Linear lin #= LinearKernelRouteTest.tiledAt(Quant.GG_Q8_0,
+            "q8_0.bin", 384, 128);
+        Linear.setDeqPrefill(true);
+        Linear.resetRouteSaid();
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        LinearKernelRouteTest.checkBatchedAt(lin, 128, 384, 128, 0.01,
+            "q8_0 cols=384");
+        Diag.register(null);
+        Linear.setDeqPrefill(false);
+        // The instrument, not the answer: a green here means nothing
+        // unless SOME batched route actually ran on a 384-wide weight.
+        // Name the route so a later change that quietly moves it shows
+        // up as a diff rather than as a still-passing test.
+        System.stdout.println("   cols=384 routes: "
+            + cap.namesOf("batch-route"));
+        return;
+    }
+
+    /** 7.3.2 — a legacy symmetric weight on the int8 Mw8 GEMM must equal
+     *  the per-row serial path, and must be SEEN taking that route. Q4_0
+     *  widens to [-8,7] and Q5_0 to [-16,15], both exactly, so the only
+     *  error is the int8 GEMM's own float epilogue. */
+    /** 7.3.1 — the widen, on its own, as an INTEGER identity. Comparing
+     *  a routed GEMM against the serial path cannot answer "is the widen
+     *  right": the batched path packs its activations to q8_K and the
+     *  serial one does not, so every such comparison carries a float
+     *  tolerance that a real indexing bug can hide under and that
+     *  ordinary rounding can trip. Here both sides are int8 and the bar
+     *  is equality. */
+    void widenIsExact(int32 ty, String fixture, String name) {
+        if (!Device.kernelAvailable("q80WmmaDeqMw8Kernel")) {
+            System.stdout.println("  (skipped: no device widen)");
+            return;
+        }
+        int64 outDim = 32L;
+        int64 cols = 512L;
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 bpr = cols / 256L;
+        int64 nBlocks = outDim * (cols / 32L);
+        int8[] fix #= File.readAllBytes(LinearKernelRouteTest.KQ + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        KernelBuffer<int8> pk #= heap KernelBuffer<int8>((uint64) (nBlocks * bb));
+        pk.upload(raw);
+        KernelBuffer<int8> dq #= heap KernelBuffer<int8>((uint64) (outDim * cols));
+        if (ty == Quant.GG_Q5_0) {
+            WmmaKernel.q50WidenLaunch(dq, pk, outDim, cols);
+        } else {
+            WmmaKernel.q40WidenLaunch(dq, pk, outDim, cols);
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int8[] got #= heap int8[outDim * cols];
+        dq.download(got);
+        // The host twin of the same tile-major placement.
+        int8[] want #= heap int8[outDim * cols];
+        int64 tilesK = bpr * 16L;
+        int64 ii = 0;
+        while (ii < outDim) {
+            int64 sb = 0;
+            while (sb < bpr) {
+                int64 e = 0;
+                while (e < 256L) {
+                    int64 blk = e / 32L;
+                    int64 we = e % 32L;
+                    int64 base = ii * (bpr * (bb * 8L)) + sb * (bb * 8L)
+                        + blk * bb;
+                    int64 lo = we % 16L;
+                    int32 v = 0;
+                    if (ty == Quant.GG_Q5_0) {
+                        int32 qh = ((int32) raw[base + 2L] & 255)
+                            | (((int32) raw[base + 3L] & 255) << 8)
+                            | (((int32) raw[base + 4L] & 255) << 16)
+                            | (((int32) raw[base + 5L] & 255) << 24);
+                        int32 q = (int32) raw[base + 6L + lo] & 255;
+                        if (we < 16L) {
+                            v = ((q & 15) | (((qh >> (int32) lo) & 1) << 4)) - 16;
+                        } else {
+                            v = (((q >> 4) & 15)
+                                | (((qh >> ((int32) lo + 16)) & 1) << 4)) - 16;
+                        }
+                    } else {
+                        int32 q = (int32) raw[base + 2L + lo] & 255;
+                        if (we < 16L) { v = (q & 15) - 8; }
+                        else { v = ((q >> 4) & 15) - 8; }
+                    }
+                    int64 k = sb * 256L + e;
+                    want[((ii / 16L) * tilesK + k / 16L) * 256L
+                        + (ii % 16L) * 16L + (k % 16L)] = (int8) v;
+                    e = e + 1;
+                }
+                sb = sb + 1;
+            }
+            ii = ii + 1;
+        }
+        int64 i = 0;
+        int64 bad = 0;
+        while (i < outDim * cols) {
+            if (got[i] != want[i]) {
+                if (bad == 0) {
+                    System.stdout.println("   " + name + " first diff at "
+                        + i + ": device " + (int32) got[i]
+                        + " host " + (int32) want[i]);
+                }
+                bad = bad + 1;
+            }
+            i = i + 1;
+        }
+        if (bad != 0) {
+            Assert.fail(name + " widen: " + bad + " of " + (outDim * cols)
+                + " bytes differ");
+        }
+        System.stdout.println("   " + name + " widen exact over "
+            + (outDim * cols) + " bytes");
+        return;
+    }
+
+    @Test
+    public void legacyWidensAreExact() {
+        this.widenIsExact(Quant.GG_Q5_0, "q5_0.bin", "q5_0");
+        this.widenIsExact(Quant.GG_Q4_0, "q4_0.bin", "q4_0");
+        return;
+    }
+
+    /** The deviation the batched route shows against per-row serial,
+     *  reported rather than asserted. The serial path multiplies FULL
+     *  PRECISION activations; the batched one packs them to q8_K first,
+     *  so a nonzero figure here is expected and only its SIZE separates
+     *  activation rounding from an indexing bug. */
+    void symDeqSpread(int32 ty, String fixture, String name) {
+        if (!Device.kernelAvailable("q80WmmaDeqMw8Kernel")) {
+            System.stdout.println("  (skipped: no Mw8 deq kernel)");
+            return;
+        }
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        Linear lin #= LinearKernelRouteTest.tiled(ty, fixture);
+        Tensor<float32> x #= LinearKernelRouteTest.ramp(128L * ci, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L, 128L * co);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L, 128L * co);
+        QuantKernel.setRoutingEnabled(false);
+        int64 r = 0;
+        while (r < 128L) {
+            lin.matvecInto(x, r * ci, want, r * co);
+            r = r + 1;
+        }
+        QuantKernel.setRoutingEnabled(true);
+        Linear.setDeqPrefill(true);
+        Linear.resetRouteSaid();
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        Linear.stageBatch(x, 0L, 128, (int32) ci, Linear.nextStageTag());
+        lin.matmulInto(128, got, 0L);
+        Diag.register(null);
+        Linear.setDeqPrefill(false);
+        float32 worst = 0.0f;
+        float32 mag = 0.0f;
+        int64 i = 0;
+        while (i < 128L * co) {
+            float32 g = got.flatGet(i);
+            float32 w = want.flatGet(i);
+            float32 d = g - w;
+            if (d < 0.0f) { d = 0.0f - d; }
+            if (d > worst) { worst = d; }
+            float32 m = w;
+            if (m < 0.0f) { m = 0.0f - m; }
+            if (m > mag) { mag = m; }
+            i = i + 1;
+        }
+        System.stdout.println("   " + name + " worstAbs=" + worst
+            + " maxWant=" + mag + " routes=" + cap.namesOf("batch-route"));
+        if (!cap.sawContaining("batch-route", name + " deqMw8")) {
+            Assert.fail(name + ": expected the Mw8 deq route, saw "
+                + cap.namesOf("batch-route"));
+        }
+        // The bar is relative to the tensor's RANGE, not to the element.
+        // A per-element relative bar fails wherever the dot product
+        // cancels to near zero, which is a property of the activation,
+        // not of the kernel: measured 2026-09-13, all three formats sit
+        // at 0.2-0.3% of range while q4_0's outputs are 26x larger than
+        // q8_0's, so only q4_0 tripped an element-relative bar.
+        if ((float64) worst > (float64) mag * 0.01) {
+            Assert.fail(name + ": worst " + worst + " exceeds 1% of range "
+                + mag);
+        }
+        if (mag == 0.0f) { Assert.fail(name + ": serial output is all zero"); }
+        return;
+    }
+
+    @Test
+    public void legacyFormatsTakeTheSymmetricDeqRoute() {
+        this.symDeqSpread(Quant.GG_Q8_0, "q8_0.bin", "q8_0");
+        this.symDeqSpread(Quant.GG_Q5_0, "q5_0.bin", "q5_0");
+        this.symDeqSpread(Quant.GG_Q4_0, "q4_0.bin", "q4_0");
+        return;
+    }
+
 
 }

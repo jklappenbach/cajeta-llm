@@ -1882,8 +1882,17 @@ public final class Linear extends InfModule {
         if (this.packedTy != Quant.GG_Q5_K
                 && this.packedTy != Quant.GG_Q8_0
                 && this.packedTy != Quant.GG_Q2_K
-                && this.packedTy != Quant.GG_Q3_K) {
+                && this.packedTy != Quant.GG_Q3_K
+                && this.packedTy != Quant.GG_Q5_0
+                && this.packedTy != Quant.GG_Q4_0) {
             return "no batched GEMM kernel for this format";
+        }
+        // Only the 32-element legacy blocks can reach this: a k-quant
+        // tensor's ne[0] is a multiple of 256 by the GGUF invariant, so
+        // its deq route cannot see a remainder. Q8_0/Q5_0/Q4_0 can, and
+        // the GEMM would silently drop the tail (10.13.2).
+        if (!WmmaKernel.fitsMw8Cols((int64) this.inDim)) {
+            return "int8 Mw8 GEMM: cols not a multiple of the 256 super-block";
         }
         if (!Linear.deqFor(this.packedTy)) {
             return "only route is the int8 Mw8 GEMM (prefillWeights=int8); prefillWeights=packed";
@@ -1893,6 +1902,8 @@ public final class Linear extends InfModule {
         boolean mw8Avail =
             this.packedTy == Quant.GG_Q5_K ? Linear.avQ5Mw8
             : this.packedTy == Quant.GG_Q8_0 ? Linear.avQ80Mw8
+            : this.packedTy == Quant.GG_Q5_0 ? Linear.avQ80Mw8
+            : this.packedTy == Quant.GG_Q4_0 ? Linear.avQ80Mw8
             : this.packedTy == Quant.GG_Q2_K ? Linear.avQ2Mw8
             : Linear.avQ3Mw8;
         if (!mw8Avail) { return "Mw8 deq kernel not registered on this backend"; }
@@ -2019,9 +2030,16 @@ public final class Linear extends InfModule {
         boolean useDeq5 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q5_K && Linear.avQ5Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
+        // Q8_0, Q5_0 and Q4_0 share one GEMM; only the block stride the
+        // cf prefold walks differs, and the widen has already erased the
+        // value encoding.
+        boolean symTy = this.packedTy == Quant.GG_Q8_0
+            || this.packedTy == Quant.GG_Q5_0
+            || this.packedTy == Quant.GG_Q4_0;
         boolean useDeq8 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
-            && this.packedTy == Quant.GG_Q8_0 && Linear.avQ80Mw8
-            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
+            && symTy && Linear.avQ80Mw8
+            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
+            && WmmaKernel.fitsMw8Cols((int64) this.inDim);
         boolean useDeq2 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q2_K && Linear.avQ2Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
@@ -2179,18 +2197,27 @@ public final class Linear extends InfModule {
         } else if (useDeq8) {
             this.ensureDeq();
             this.ensureBatchOut((int32) mw8Rows);
+            int64 symBlk = 34L;
+            int32 symBit = 4194304;
+            String symNm = "q8_0";
+            if (this.packedTy == Quant.GG_Q5_0) {
+                symBlk = 22L; symBit = 8192; symNm = "q5_0";
+            }
+            if (this.packedTy == Quant.GG_Q4_0) {
+                symBlk = 18L; symBit = 16384; symNm = "q4_0";
+            }
             if (Linear.part32On) {
-                this.sayRoute(4194304, "q8_0 deqMw8Part");
-                WmmaKernel.q80WmmaDeqMw8PartLaunch(this.yBatch,
+                this.sayRoute(symBit, symNm + " deqMw8Part");
+                WmmaKernel.symWmmaDeqMw8PartLaunch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
                     mw8Rows, (int64) this.outDim,
-                    (int64) this.inDim);
+                    (int64) this.inDim, symBlk);
             } else {
-                this.sayRoute(4194304, "q8_0 deqMw8");
-                WmmaKernel.q80WmmaDeqMw8Launch(this.yBatch,
+                this.sayRoute(symBit, symNm + " deqMw8");
+                WmmaKernel.symWmmaDeqMw8Launch(this.yBatch,
                     this.packedDev, this.deqDev, Linear.btXp,
                     mw8Rows, (int64) this.outDim,
-                    (int64) this.inDim);
+                    (int64) this.inDim, symBlk);
             }
         } else if (useDeq2) {
             this.ensureDeq();
@@ -2371,6 +2398,12 @@ public final class Linear extends InfModule {
         if (ty == Quant.GG_Q6_K) { return true; }
         if (ty == Quant.GG_Q3_K) { return true; }
         if (ty == Quant.GG_Q8_0) { return true; }
+        // The legacy symmetric pair: both widen LOSSLESSLY (Q4_0 to
+        // [-8,7], Q5_0 to [-16,15]) and share Q8_0's GEMM at their own
+        // block stride, so the int8 route is available wherever it is
+        // for Q8_0. Q4_K_M files carry Q5_0 ffn_down tensors.
+        if (ty == Quant.GG_Q5_0) { return true; }
+        if (ty == Quant.GG_Q4_0) { return true; }
         return false;
     }
 
@@ -2387,7 +2420,10 @@ public final class Linear extends InfModule {
         boolean q58 = (this.packedTy == Quant.GG_Q5_K
             || this.packedTy == Quant.GG_Q8_0
             || this.packedTy == Quant.GG_Q2_K
-            || this.packedTy == Quant.GG_Q3_K) && Linear.deqFor(this.packedTy);
+            || this.packedTy == Quant.GG_Q3_K
+            || this.packedTy == Quant.GG_Q5_0
+            || this.packedTy == Quant.GG_Q4_0) && Linear.deqFor(this.packedTy)
+            && WmmaKernel.fitsMw8Cols((int64) this.inDim);
         if (!q4 && !q6 && !q58) { return; }
         this.ensureDevice();
         this.ensureDeq();
@@ -2588,6 +2624,12 @@ public final class Linear extends InfModule {
                 (int64) this.outDim, (int64) this.inDim);
         } else if (this.packedTy == Quant.GG_Q4_K) {
             WmmaKernel.q4kWidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (this.packedTy == Quant.GG_Q5_0) {
+            WmmaKernel.q50WidenLaunch(this.deqDev, this.packedDev,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (this.packedTy == Quant.GG_Q4_0) {
+            WmmaKernel.q40WidenLaunch(this.deqDev, this.packedDev,
                 (int64) this.outDim, (int64) this.inDim);
         } else {
             // Was a bare else into the Q4 widen — one format's bytes

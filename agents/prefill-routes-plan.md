@@ -896,3 +896,100 @@ output and a fake 70% decode speedup (it was skipping work). An UNDECLARED
 name in a @Kernel body appears to resolve to something rather than failing to
 compile. Same family as the differently-typed shadow fixed in cajeta 706f2117,
 but that check only fires on a REDECLARATION; this was no declaration at all.
+
+## Unit 7 — The formats and containers the 72B needs (spec §10.11, §10.13)
+
+Qwen2.5-VL-72B-Instruct-Q4_K_M is the first checkpoint this engine has met
+that is BOTH sharded and built from a tensor-type mix whose `ffn_down` is a
+legacy block type at a column count no int8 route can take. Three separate
+gaps surfaced together; they are separate units of work because they fail
+independently.
+
+### 7.1 Split GGUF (the container)
+
+- [x] **7.1.1 TDD** — split `toy-moe.gguf` with `llama-gguf-split --split`;
+      the split and single-file forms must present identical tensor surfaces,
+      byte-identical quantized payloads included.
+- [x] **7.1.2 TDD** — a missing shard must be REFUSED with a diagnostic that
+      names the expected path and how many of how many shards were found —
+      never a short load.
+- [x] **7.1.3 Coding** — `GgufFile` resolves `split.no` / `split.count` /
+      `split.tensors.count` and maps each tensor to its own shard.
+- [x] **7.1.4 Acceptance** — the UNMERGED
+      `Qwen.Qwen2.5-VL-72B-Instruct.Q4_K_M-00001-of-00004.gguf` loads and no
+      longer fails at `blk.21.attn_q.weight`.
+
+### 7.2 The column remainder (a correctness defect, not a feature)
+
+Every int8 deq GEMM derives `blocksPerRow` as `cols / 256` and the widen
+fills exactly that many super-blocks. `fitsMw8` checks `rows` and `outDim`
+and NEVER checked `cols`, so a column count with a remainder computes a
+SHORT dot product — no bounds error, no diagnostic, a wrong answer. The 72B
+reaches it: `ffn_down` is 29568 = 115*256 + 128 wide, and the run's own
+`batch-route` line reads `q8_0 deqMw8Part 8192 29568`.
+
+- [x] **7.2.1 TDD** — `int8DeqIsExactWhenColumnsAreNotAWholeSuperBlock`:
+      a Q8_0 weight 384 columns wide, batched against the per-row serial
+      path. Must assert the output is LIVE and name the route it took — the
+      first version of this test passed vacuously because `deqPrefill` was
+      off and it never reached the deq route at all.
+- [x] **7.2.2 Coding** — `WmmaKernel.fitsMw8Cols(cols)`, required by every
+      int8 deq route and named in `batchRefusal`.
+- [x] **7.2.3 Acceptance** — with the guard removed the test FAILS; with it
+      present the test passes and the route falls back to coop.
+
+### 7.3 The legacy symmetric pair on the int8 route
+
+Q4_0 widens losslessly to [-8,7] and Q5_0 to [-16,15]; both share Q8_0's
+GEMM at their own block stride, exactly as Q5_K already shares Q4_K's. Half
+of the 72B's `ffn_down` tensors are Q5_0 and today route to `coop`.
+
+- [x] **7.3.1 TDD** — a Q5_0 and a Q4_0 widen must agree with the host
+      block decoder bit for bit.
+- [x] **7.3.2 TDD** — batched vs per-row serial on both formats.
+- [x] **7.3.3 Coding** — `q40WidenKernel` / `q50WidenKernel`;
+      `symWmmaDeqMw8Launch` with `blkBytes` (34/22/18); `deqFor`,
+      `runDeqWiden`, `prewarmDeq` and `batchRefusal` extended.
+- [ ] **7.3.4 Acceptance** — Q8_0 prefill does not regress and its output
+      fingerprint does not move: the stride became a kernel argument, and
+      that touches the shipped Q8_0 path.
+
+### 7.4 The remainder fast path (what 7.2 costs back)
+
+7.2 restores correctness by sending the remainder shapes to `coop`, which is
+slower. Both checkpoints that hit it have a remainder of exactly 128:
+72B `ffn_down` 29568 and Qwen1.5-MoE `ffn_down_exps` 1408. Options are a
+zero-padded resident copy (weight AND activation, so the pad contributes
+nothing) or a scale side-array that makes the tail a widen-time concern.
+
+DESIGN SETTLED 2026-09-13, and the parameter 7.3 already added makes it nearly
+free. The GEMM reads `packed` for exactly one thing — the per-32 `d`, at
+`ro + blkBytes*j`. Hand it a COMPACT SCALE IMAGE instead of the weight and set
+`blkBytes = 2`: the same address math then walks a contiguous f16 array, so the
+strided 34/22/18-byte gather becomes a 16-byte-per-lane contiguous read, which
+should be faster, not slower. Padding is then trivial — the image is
+`outDim * (colsPad/16)` bytes (15 MB for the 72B's ffn_down against 242 MB of
+weight), and its tail entries are simply zero.
+
+- [ ] **7.4.1 TDD** — a padded weight and a padded activation must give the
+      same answer as the per-row serial path at cols=384, and the route must
+      be the deq route, not coop.
+- [ ] **7.4.2 Coding** — the widen emits a second output: the compact f16
+      scale image, zero in the pad.
+- [ ] **7.4.3 Coding** — the widen zero-fills the int8 tail tiles.
+- [ ] **7.4.4 Coding** — `q8kPack` becomes row-aware (`rows`, `n`, `nPad`) so
+      each row's blocks start on a block boundary and the tail block is
+      zero-filled. Today `nb = n/256` over the WHOLE staging, so at a
+      non-multiple inDim the blocks straddle row boundaries — this is why the
+      activation side cannot simply be widened. No extra copy pass: the pack
+      already reads the unpadded activations.
+- [ ] **7.4.5 Acceptance** — the 72B's ffn_down takes `q5_0 deqMw8Part` /
+      `q8_0 deqMw8Part` again, with the guard still refusing anything the
+      padding does not cover.
+
+### 7.5 Formats that still refuse
+
+- [ ] **7.5.1** Q4_1 and Q5_1 — affine per-32 legacy blocks, a hard refusal
+      today. Block decoders are ~15 lines each.
+- [ ] **7.5.2** The IQ family (IQ1..IQ4, TQ1_0, TQ2_0) — codebook types,
+      genuinely a separate spec. No checkpoint on this box uses one.
