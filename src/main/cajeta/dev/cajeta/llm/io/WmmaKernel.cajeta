@@ -1,5 +1,6 @@
 package dev.cajeta.llm.io;
 
+import cajeta.lang.Optional;
 import cajeta.lang.Cajeta;
 import cajeta.xpu.Barrier;
 import cajeta.xpu.CooperativeMatrix;
@@ -10,6 +11,7 @@ import cajeta.xpu.KernelManifest;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelThread;
 import cajeta.xpu.Shared;
+import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
@@ -1644,9 +1646,6 @@ public final class WmmaKernel {
                         }
                     }
                 }
-                // The scalar staging is published on its own, before any
-                // cross-lane read of cf/cg/rg/xs.
-                Barrier.workgroup();
 
                 uint32 H = 0;
                 while (H < 2) {
@@ -1815,7 +1814,6 @@ public final class WmmaKernel {
     // Profile-resolved launch geometry for q4kWmmaMwKernel, latched once.
     // 0 means "not yet resolved".
     static int32 mwBlock = 0;
-    static int64 mwSat = 0L;
     static void resolveMwGeom() {
         if (WmmaKernel.mwBlock != 0) { return; }
         int32 wave = Device.waveSize();
@@ -1835,13 +1833,6 @@ public final class WmmaKernel {
                 block = fb[0];
             }
         }
-        int32 wpb = wave > 0 ? block / wave : 8;
-        if (wpb <= 0) { wpb = 8; }
-        // Saturation target: one block's worth of waves per SIMD. 0-return
-        // (unknown device) falls back to the measured 32-WG grid window.
-        int64 sat = (int64) Device.dispatchBlocks(wpb);
-        if (sat <= 0L) { sat = WmmaKernel.partWgs; }
-        WmmaKernel.mwSat = sat;
         WmmaKernel.mwBlock = block;
         return;
     }
@@ -1849,8 +1840,8 @@ public final class WmmaKernel {
     /**
      * Profile-driven launch for q4kWmmaMwKernel: block from the kernel
      * manifest's feasibleBlocks (8 * wave-width fallback), grid swept in
-     * rowBase windows sized to the device saturation target
-     * (Device.dispatchBlocks), the measured 32-WG window as the fallback.
+     * rowBase slices of `sliceWgsFor` WGs — the device's resident-group
+     * capacity, the measured 32-WG window when no profile is readable.
      * A 6.2.2 note: the per-slice launch is where Scheduler.submit() would
      * record the submission (geometry + packed/xp read set, y write set)
      * and bind() validate it; kept a direct launch here until the bit-gate
@@ -1863,7 +1854,11 @@ public final class WmmaKernel {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
         uint32 blk = (uint32) WmmaKernel.mwBlock;
-        int64 sliceN8 = WmmaKernel.partWgs / tilesM8;
+        if (WmmaKernel.mwSlice <= 0L) {
+            WmmaKernel.mwSlice = WmmaKernel.sliceWgsFor("q4kWmmaMwKernel",
+                (int64) WmmaKernel.mwBlock);
+        }
+        int64 sliceN8 = WmmaKernel.mwSlice / tilesM8;
         if (sliceN8 < 1L) { sliceN8 = 1L; }
         KernelStream s = QuantKernel.stream();
         int64 base = 0L;
@@ -4169,12 +4164,97 @@ public final class WmmaKernel {
      * window keeps the activation slab MALL-resident. All slices
      * share every buffer; the stream keeps them in order.
      */
-    // 10.12.42: the partition width is SWEEPABLE — the 32-WG optimum
-    // was measured pre-retile (10.12.34) and the retile changed the
-    // kernel it was tuned for. `partw N` re-tunes it.
+    // The partition width. `partWgs` is the measured 32-WG literal and the
+    // no-device fallback; `sliceWgsFor` derives the slice from the profile
+    // when it can: the device's resident-group capacity for the kernel
+    // (manifest residentGroupsPerCu x Device.multiprocessorCount), so each
+    // slice fills whole rounds of the machine. On gfx1151 that is 80 for
+    // the 2-per-CU packed kernel and 40 for the 1-per-CU int8-deq kernel,
+    // and the sweep put both optima exactly there: a partial round idles
+    // a fifth of the CUs. `partw N` overrides it for a sweep.
     static int64 partWgs = 32L;
+    static int64 partWgsOverride = 0L;
+    static int64 mwSlice = 0L;
+    static int64 deqMwSlice = 0L;
     public static void setPartWgs(int64 n) {
         WmmaKernel.partWgs = n;
+        WmmaKernel.partWgsOverride = n;
+        WmmaKernel.mwSlice = 0L;
+        WmmaKernel.deqMwSlice = 0L;
+    }
+    public static void resetPartWgs() {
+        WmmaKernel.partWgs = 32L;
+        WmmaKernel.partWgsOverride = 0L;
+        WmmaKernel.mwSlice = 0L;
+        WmmaKernel.deqMwSlice = 0L;
+    }
+
+    public static int64 sliceWgsFor(String kernel, int64 block) {
+        int64 slice = WmmaKernel.partWgsOverride;
+        int64 source = 0L;
+        int64 mps = (int64) Device.multiprocessorCount();
+        int64 resident = 0L;
+        if (slice <= 0L) {
+            source = 2L;
+            slice = WmmaKernel.partWgs;
+            resident = WmmaKernel.residentGroupsPerMp(kernel, block);
+            if (mps > 0L && resident > 0L) {
+                slice = resident * mps;
+                source = 1L;
+            }
+        }
+        if (Diag.on()) {
+            Diag.emit("launch-geom", 0 - 1, kernel, slice, mps, resident,
+                source, block, 0L);
+        }
+        return slice;
+    }
+
+    /**
+     * Groups of `block` threads one driver multiprocessor holds at once
+     * for `kernel`, from the manifest footprint and the device ceilings.
+     * Not the manifest's residentGroupsPerCu: that divides total resident
+     * waves by the group's waves, but hardware places a group's waves
+     * across the SIMDs of ONE compute unit (4 on an RDNA CU, 4 on an SM),
+     * so the register ceiling is floor(waves per SIMD / waves per SIMD
+     * per group) per unit — on gfx1151 the int8-deq kernel's 3 waves per
+     * SIMD hold ONE 8-wave group per CU, not the manifest's three per WGP,
+     * and the sweep's optima (40 for it, 80 for the 192-VGPR packed
+     * kernel) fall exactly on this count. 0 = unknown device or footprint.
+     */
+    public static int64 residentGroupsPerMp(String kernel, int64 block) {
+        int64 wave = (int64) Device.waveSize();
+        int64 simds = (int64) Device.simdsPerMultiprocessor();
+        int64 regs = Device.registersPerMultiprocessor();
+        int64 lds = Device.sharedBytesPerMultiprocessor();
+        int64 threads = (int64) Device.threadsPerMultiprocessor();
+        if (wave <= 0L || simds <= 0L || regs <= 0L || block <= 0L) {
+            return 0L;
+        }
+        KernelManifest m #= KernelManifest.of(kernel);
+        if (m == null) { return 0L; }
+        Optional<int32> vg = m.vgpr();
+        if (!vg.isPresent() || vg.get() <= 0) { return 0L; }
+        Optional<int32> ld = m.ldsStaticBytes();
+        int64 ldsBytes = 0L;
+        if (ld.isPresent()) { ldsBytes = (int64) ld.get(); }
+        int64 unitSimds = simds;
+        if (unitSimds > 4L) { unitSimds = 4L; }
+        int64 units = simds / unitSimds;
+        int64 wavesPerGroup = (block + wave - 1L) / wave;
+        int64 perSimd = (wavesPerGroup + unitSimds - 1L) / unitSimds;
+        int64 wavesPerSimd = regs / simds / wave / (int64) vg.get();
+        int64 perUnit = wavesPerSimd / perSimd;
+        if (ldsBytes > 0L && lds > 0L) {
+            int64 byLds = lds / ldsBytes;
+            if (byLds < perUnit) { perUnit = byLds; }
+        }
+        int64 perMp = perUnit * units;
+        if (threads > 0L) {
+            int64 byThreads = threads / block;
+            if (byThreads < perMp) { perMp = byThreads; }
+        }
+        return perMp;
     }
 
     public static void q4kWmmaDeqMw8PartLaunch(KernelBuffer<float32> y,
@@ -4183,7 +4263,11 @@ public final class WmmaKernel {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
         // partWgs WGs per launch: tilesM8 * sliceN8 = partWgs -> sliceN8.
-        int64 sliceN8 = WmmaKernel.partWgs / tilesM8;
+        if (WmmaKernel.deqMwSlice <= 0L) {
+            WmmaKernel.deqMwSlice =
+                WmmaKernel.sliceWgsFor("q4kWmmaDeqMw8Kernel", 256L);
+        }
+        int64 sliceN8 = WmmaKernel.deqMwSlice / tilesM8;
         if (sliceN8 < 1L) { sliceN8 = 1L; }
         KernelStream s = QuantKernel.stream();
         int64 base = 0L;

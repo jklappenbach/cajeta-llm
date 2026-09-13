@@ -510,27 +510,43 @@ explicit staging barrier is restored (5/block) until a fold is proven. Spill
 204 B at vgpr=192 (the LDS budget lowered the VGPR cap). Kernel now: B at 4.5
 bpw via fromWords + A staged once per block in LDS (30.5 KB, literal stride
 144, wide fragment loads). NEXT: partWgs sweep (32/40/64/80, both arms).
+PROGRESS 2026-09-12: barrier fold PASSES the gate (the shadow was the sole
+cause; 4 barriers/block, gain within noise). partWgs SWEEP, two replicates
+≤1% apart: packed-mw 32/40/60/64/72/80 → 510/534/557/550/555/555; deq →
+638/688/633/628/693/690 (48 → 591). The pattern is WHOLE ROUNDS of resident
+capacity: gfx1151 = 20 WGPs × 8 SIMD32, 768 VGPR/lane/SIMD, 64 KB LDS per
+CU; packed-mw (192 VGPR, 31 KB LDS) holds 2 groups/CU = 80 slots, deq (256
+VGPR) 1/CU = 40. The manifest's residentGroupsPerCu says 3 for deq (total
+waves / group waves, ignoring per-SIMD placement inside one CU) and is ABSENT
+for the unpinned packed kernel, so the law is computed from shipped surfaces
+(`sliceWgsFor`/`residentGroupsPerMp`: manifest vgpr+ldsStaticBytes × Device
+registers/simds/wave/lds/threads); `partitionSliceFollowsResidentCapacity`
+pins 80/40 on gfx1151 and the `launch-geom` Diag record shows it under
+`trace`. No override: packed-mw 554 (+9%), deq 688 (+8%) = 0.52x llama —
+6.3.1's first gate is crossed by the deq route. HELD compiler follow-ups:
+manifest residency granularity, residency for feasible-block kernels, a
+CUs-per-multiprocessor surface. NEXT: port A-staging to the deq kernel.
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
       output (a fixed shape, e.g. 512×4096×4096 on a routable fixture) as a
       reference; the new multi-wave kernel matches it bit-for-bit (int8 MMA is
       exact — no f16-noise tolerance). Host-parity check too.
-- [ ] 6.1.2 Portability: a GPU-free `LaunchGeometryTest`-style assertion that
+- [~] 6.1.2 Portability (slice law tested; block assertion needs a public accessor; the `32` grep gate was run by hand — clean): a GPU-free `LaunchGeometryTest`-style assertion that
       the launcher's derived block == `Group.laneBlock()`-consistent value and
       grid covers all tiles; and that no `block:[32]`/`/32` literal remains in
       the new kernel+launcher (grep gate).
-- [ ] 6.1.3 Deployment: the launcher reads a non-null `manifest().feasibleBlocks()`
+- [~] 6.1.3 Deployment (manifest half done + `partitionSliceFollowsResidentCapacity`; the Scheduler.submit half rides with 6.2.2): the launcher reads a non-null `manifest().feasibleBlocks()`
       on gfx1151 and launches with `feasibleBlocks()[0]`; `Scheduler.submit`
       access sets match the manifest (no refusal).
 
 ### 6.2 Coding
-- [ ] 6.2.1 `q4kWmmaMwKernel` (packed route): multi-wave tile (N waves/wg
+- [~] 6.2.1 (built and bit-correct at 554; spill 204 B, not zero — despill regressed on deq, held) `q4kWmmaMwKernel` (packed route): multi-wave tile (N waves/wg
       cooperating on a larger output tile), int32 in-register accumulation
       across sub-blocks, Q4_K sub-block scales + dmin folded in the epilogue
       WITHOUT per-sub-block LDS round-trips/barriers. Wave width via
       `Group.width()`. ISA-verified zero spill (`--xpu-emit=isa`).
-- [ ] 6.2.2 Portable launcher `q4kWmmaMwLaunch`: manifest `feasibleBlocks` +
+- [~] 6.2.2 (launcher + slice law done; Scheduler.submit routing and the default flip pending) Portable launcher `q4kWmmaMwLaunch`: manifest `feasibleBlocks` +
       `Device` geometry → block/grid (measured-literal fallback); route through
       `Scheduler.submit`; wire into Linear's packed Q4_K route behind a flag
       (`setQ4Mw`), default off until 6.3 passes, then default on.
@@ -543,6 +559,6 @@ bpw via fromWords + A staged once per block in LDS (30.5 KB, literal stride
       parity ≥ 1.0x (stretch). Re-profile: q4kWmmaMwKernel share + occupancy
       (`residentGroupsPerCu` up vs the single-wave kernel). ppl unchanged
       (6.1.1), decode within noise, no new spill.
-- [ ] 6.3.2 Portability re-derive: the launcher reproduces gfx1151's measured
+- [x] 6.3.2 (80/40 reproduced from the profile; SM expectation: simds=4 → the unit is the SM, 65536 regs) Portability re-derive: the launcher reproduces gfx1151's measured
       block/grid from the profile (not a literal); note the NVIDIA-path
       expectation (wave32, different simdCount) without a device to run it.
