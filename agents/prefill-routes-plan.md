@@ -993,3 +993,15 @@ weight), and its tail entries are simply zero.
       today. Block decoders are ~15 lines each.
 - [ ] **7.5.2** The IQ family (IQ1..IQ4, TQ1_0, TQ2_0) — codebook types,
       genuinely a separate spec. No checkpoint on this box uses one.
+
+SCOPE NOTE on 7.5.1 (2026-09-13). "Supported" for a new quant is FOUR things,
+not one: the block decoder in `Quant`, a host mat-vec, the bind gate in
+`Linear.canBindPacked`, and a device route. Adding only the decoder makes the
+file LOAD and is a TRAP, not support — it is exactly the 2026-08-26 failure
+this repo already recorded, where a Q5_0 tensor with no packed path fell to
+`ckpt.loadF32` and dequantized 40 ffn_down tensors into 38.8 GB of host f32,
+78 GB RSS, 30+ minutes, before a single token. Q4_1/Q5_1 are affine
+(`w = d*q + m`) so they cannot share the symmetric GEMM 7.3 added; they need
+the rank-1 min term the k-quant kernels carry. No checkpoint on this box uses
+either, and llama.cpp treats both as legacy. Do the whole stack or leave the
+refusal honest.
