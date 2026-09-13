@@ -360,7 +360,10 @@ plan's acceptance and in the bench memory.
       bit-for-bit (they are int8/f16 tile kernels with exact references).
 
 ### 4.2 Coding
-- [~] 4.2.1 `q4kWmmaDeqMw8Kernel` (256 VGPR, 124 B): cut live registers —
+- [x] 4.2.1 RESOLVED 2026-09-13 by the 2x4 wave re-shape, not by a despill:
+      the kernel now reports vgpr=211 spill=0 and is FASTER (688 -> 877),
+      so the trade below never had to be made.
+      `q4kWmmaDeqMw8Kernel` (256 VGPR, 124 B): cut live registers —
       the eight persistent f32 accumulators (~64 VGPRs) are the named
       price; drain half per chunk or narrow the N tile — ISA-verified
       (`cajeta --xpu-emit=isa`, `vgpr_spill_count = 0`).
@@ -373,7 +376,8 @@ plan's acceptance and in the bench memory.
       version). A tile-narrowing despill (fewer facc without more reloads)
       would change the tile + launcher + the 6.1.1 reference — deferred.
       Lesson: spill≠slow; the despill must not trade spill for reloads.
-- [ ] 4.2.2 `q2kWmmaDeqMw8Kernel` (256 VGPR, 108 B, 25 KB LDS): same
+- [x] 4.2.2 RESOLVED 2026-09-13 by the same re-shape: spill=0, LDS unchanged.
+      `q2kWmmaDeqMw8Kernel` (256 VGPR, 108 B, 25 KB LDS): same
       treatment; LDS is its occupancy limiter, so the register cut must
       not move work into LDS.
 - [ ] 4.2.3 `q6kF16CoopN256GKernel` (192 VGPR, 68 B): the coop route
