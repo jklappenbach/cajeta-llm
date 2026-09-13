@@ -798,3 +798,23 @@ FINAL, vs llama's BEST EVER on this box (any backend, any day):
            where llama's tg64 starts empty, so the gap is smaller than it looks.
 The 2.47x Q8_0 figure was against llama's ROCm backend, which handles Q8_0
 badly (585 vs its own 1160 on Q4_K). Against its best, Q8_0 is 1.59x.
+
+DECODE, APPLES-TO-APPLES 2026-09-13. The "behind on every format" reading was
+a DEPTH MISMATCH, not a deficit: llama-bench's tg64 generates from an EMPTY
+context while ours decodes after a 512-token prefill, so we were paying a
+512-token KV attention per token and llama was not. llama-bench takes `-d`
+(n-depth), which prefills before measuring generation. Both engines at depth
+512, quiet box (load 0.3-1.2), cajeta best of 2:
+  format   cajeta   llama vulkan   ratio
+  Q2_K     55.29    59.43          0.93x
+  Q3_K_M   47.82    47.56          1.01x
+  Q4_K_M   41.97    40.12          1.05x
+  Q5_K_M   35.67    36.68          0.97x
+  Q6_K     31.87    32.12          0.99x
+  Q8_0     25.78    25.87          1.00x
+So decode is at PARITY (0.93x-1.05x), not 0.87x-0.97x behind. One real gap
+remains: Q2_K at 0.93x, the most bandwidth-bound format, where the dequant
+cost per weight byte is highest. Q5_K at 0.97x is marginal.
+LESSON: llama-bench's tg figure is depth 0 by default. Any decode comparison
+must pass -d to match the context the other engine is carrying, or it measures
+two different workloads.
