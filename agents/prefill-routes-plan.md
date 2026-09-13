@@ -1088,3 +1088,32 @@ fitsMw8Cols), ffn_down being excluded at 29568. That is
 80 x (67M + 8.4M + 8.4M + 67M + 242M + 242M) = 50.8 G params, hence
 ~50.8 GB of widen on top of 45 GB of packed weights. Over the box before
 the KV cache. DO NOT run auto on the 72B until the widen is budgeted.
+
+## 72B vs llama.cpp, measured 2026-09-13 (quiet box, matched depth)
+
+  llama-bench -p 128 -n 16 -d 128 -r 2, build 5306f4b, ROCm, ngl 99
+  44.15 GiB, 72.71 B params
+
+                      llama.cpp        cajeta-llm (packedw)   ratio
+  prefill pp128@d128  88.87 +- 0.42    26.2                   0.30x
+  decode  tg16@d128   4.43 +- 0.00     4.61                   1.04x
+
+DECODE IS AHEAD and is not where the work is: every token reads all
+44 GiB, so both engines sit on the same bandwidth ceiling and 4.4 tok/s
+is about what 44 GiB against ~212 GB/s predicts.
+
+PREFILL IS 3.3x BEHIND, and the cause is route availability, not kernel
+quality. The run's own trace: `dotAccum ty=12` (Q4_K on the fallback the
+code comments measured at 1290 ms of a 2844 ms launch), `coop q8_0` and
+`coop q5_0` both at 8192x29568, `q4 plain`, `q6 epi`. On the dense
+formats at 512-token prefill this engine runs 1.03x-1.59x AHEAD of
+llama's best; none of that machinery is reachable on this checkpoint.
+
+Two specified items stand between here and that machinery, and 7.4 is
+the bigger lever because ffn_down is 242M params per layer against 67M
+for an attention projection:
+  7.4    the 256-column remainder keeps both ffn_down formats off int8
+  8.3.1  auto cannot load the model at all until the widen is budgeted
+
+METHOD DEBT: our figure is ONE run; llama's is 2 reps with a deviation.
+Take ours as min-of-repeats before claiming any improvement.
