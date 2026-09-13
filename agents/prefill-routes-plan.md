@@ -547,6 +547,31 @@ under the 80-slot slice the old note asked for: 192 VGPR / 212 B spill →
 519 at 80, 497 at 40, vs 688 unpinned — spill dominates at any partition;
 REVERTED, note extended in the kernel. 6.2.3 (Q6_K): the slice law
 transfers; the A-staging technique does not (refuted on deq).
+PROGRESS 2026-09-12 (ISA analysis of q4kWmmaDeqMw8Kernel): llama.cpp on gfx1151
+runs the SAME v_wmma_i32_16x16x16_iu8 (RDNA3 → AMD_WMMA_AVAILABLE), the same
+128×128 tile, 8 waves, and the same per-32-k float epilogue — per-element
+arithmetic is at parity. Per 32-k step, one wave: 16 WMMA = 256 VALU-port
+cycles, scaledAccumInto2S = 229 (43% of the port), addressing 43, 18
+global_load_b128, 33 ds ops (64 rgAll dwords), 44 blocking s_waitcnt; issue
+floor caps matrix use at 46%, measured 24%. STRUCTURAL difference: our wave
+owns 8 token tiles × 1 column tile (18 loads, 66 LDS dwords, no row-scale
+reuse) vs llama's 2×4 (12 loads, 24 dwords, 4× reuse). Ranked cuts: (1)
+re-shape to 2×4 [source-only, in flight]; (2) integer-fold the 6-bit
+sub-block scale via v_mad_i32_i24 into an int32 accumulator, float drain
+once per block: −776 of 2414 VALU slots/block (−17% of the floor), exact
+(|dot| < 2^23, Σ ≤ 3.1e7 < 2^31) but needs a NEW CooperativeMatrix verb
+`scaledAccumI32(iacc, scale)` lowered to llvm.amdgcn.mad.i24 (a plain mul
+lands quarter-rate v_mul_lo and is a net loss) — HELD for the compiler;
+(3) staging: software f16 decode loop (needs an f16→f32 intrinsic, HELD),
+flatten xsA..xsH → xsAll[128] (~85 slots/block) and mask the `ps` top byte
+so the 4 byte loads combine (~40 VALU + 9 VMEM/block) [both in flight].
+PROGRESS 2026-09-12: cuts (1)+(3ii)+(3iii) LANDED on q4kWmmaDeqMw8Kernel —
+each wave now owns 2 token tiles × 4 column tiles (4 wave-rows × 2
+wave-columns tile the 128×128), 12 operand loads per 32-k step (4 A + 8 B,
+was 18), 4 (cf,cg) pairs + 2 rg/xs slices (was 1 + 8), xsA..xsH → xsAll[128]
+(no divergent 8-arm store), `ps` top byte masked so the 4 byte loads combine.
+Bit-gate PASS, SPILL-FREE (was 124 B), 8B Q4_K_M prefill 512: 688 → 877
+tok/s (+27%, three runs 872-877; packed-mw control 556) = 0.66x llama 1320.
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
