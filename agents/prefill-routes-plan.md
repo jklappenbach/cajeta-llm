@@ -1005,3 +1005,62 @@ this repo already recorded, where a Q5_0 tensor with no packed path fell to
 the rank-1 min term the k-quant kernels carry. No checkpoint on this box uses
 either, and llama.cpp treats both as legacy. Do the whole stack or leave the
 refusal honest.
+
+## Unit 8 — Dense weight residency (why the 72B does not load)
+
+MEASURED 2026-09-13 on a 122 GB box. Qwen2.5-VL-72B-Q4_K_M is 47.4 GB.
+
+  default (auto/int8) route : killed by system memory pressure mid-load
+  packedw route (no widen)  : process RSS 43 GB, system used 109 GB,
+                              available fell 41 -> 13 GB, killed by hand
+                              before it OOMed the box a second time
+
+It never reached a token either way.
+
+Three layers stack, and only the first is a policy choice:
+
+  1. `GgufFile.loadPacked` returns `#int8[]` - `heap int8[bytes]` then
+     `m.read(...)` into it. Every dense tensor is COPIED OUT of the
+     mapping and stays fully resident.
+  2. `Linear.ensureDevice` allocates a KernelBuffer the size of that
+     array, uploads, and never frees the host copy. On unified memory
+     both live in system RAM, so a model costs 2x its file before any
+     derived form exists. This is the "RSS 2x file" already recorded on
+     2026-09-06 - now with a cause.
+  3. `prewarmDeq` adds the int8 widen at ONE BYTE PER WEIGHT, called
+     unconditionally per layer from CausalLM. There is no budget:
+     `devWeightBytes` is consulted only inside ExpertBank.
+
+MoE ALREADY DOES THIS RIGHT and is the model to copy. ExpertBank holds
+the slab as its own MappedFile and says so: "reads go through the page
+cache, so the OS is the eviction policy and a slab larger than RAM still
+binds and runs". Experts are offset views, never copied out; an expert
+that never fires is a page range never touched; and admission is
+budgeted per slot with a one-shot refusal.
+
+NOT YET INSTRUMENTED: process RSS was 43 GB while the system reported
+109 GB used with no other large process. That gap is CONSISTENT WITH
+device buffers living outside process RSS, but it was not measured -
+sample the amdgpu GTT/VRAM counters during a load before believing it.
+
+The 17 uses of `this.packed` split cleanly, which is what makes this
+tractable: eight are the host mat-vec fallback (Linear.cajeta:883-904),
+and every other use needs only `.count()`.
+
+- [ ] **8.1.1 TDD** — a bound Linear reports the same packed byte count
+      after the host array is released as before.
+- [ ] **8.1.2 TDD** — the host mat-vec path after release fails with a
+      diagnostic that NAMES the tensor, never silently reads empty.
+- [ ] **8.1.3 Coding** — record `packedBytes` at bind; move the ten
+      `.count()` uses onto it.
+- [ ] **8.1.4 Coding** — release the host array after a successful
+      upload, behind an EngineOptions flag defaulting OFF.
+- [ ] **8.1.5 Acceptance** — the 72B loads and generates with the flag
+      on; measure resident bytes with it off and on.
+- [ ] **8.2.1** Then the real fix: stream the upload in chunks so the
+      full host array never exists (`slice` + `hostStore` on a Unified
+      buffer is zero-copy on an APU), and re-read from the mapping for
+      the host path, as ExpertBank does.
+- [ ] **8.3.1** Budget the widen against available memory. The auto
+      policy today asks whether widening PAYS for a format; it never
+      asks whether it FITS.
