@@ -572,6 +572,11 @@ was 18), 4 (cf,cg) pairs + 2 rg/xs slices (was 1 + 8), xsA..xsH → xsAll[128]
 (no divergent 8-arm store), `ps` top byte masked so the 4 byte loads combine.
 Bit-gate PASS, SPILL-FREE (was 124 B), 8B Q4_K_M prefill 512: 688 → 877
 tok/s (+27%, three runs 872-877; packed-mw control 556) = 0.66x llama 1320.
+PROGRESS 2026-09-12: the same 2×4 re-shape on q6kWmmaDeqMw8Kernel (Q6 has 16
+one-step j iterations and no min term: 2 A + 4 B loads + 8 mma per j, cf
+stride 16 → column-tile offset 256; xsA..xsH → xsAll[128]; no unmasked byte
+assembly to fix): bit-identical to the Mw4 sibling (new gate, exact), route
+877 → 884 (+1%, its 11% share), no spill.
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
@@ -596,7 +601,7 @@ tok/s (+27%, three runs 872-877; packed-mw control 556) = 0.66x llama 1320.
       `Device` geometry → block/grid (measured-literal fallback); route through
       `Scheduler.submit`; wire into Linear's packed Q4_K route behind a flag
       (`setQ4Mw`), default off until 6.3 passes, then default on.
-- [~] 6.2.3 (slice law applied to the Q6_K deq launcher, neutral; the packed Q6 route itself untouched) Apply the same to the Q6_K packed route (`q6kWmmaEpiKernel`,
+- [x] 6.2.3 (slice law on the Q6_K deq launcher, neutral; the 2×4 wave re-shape transfers: q6kWmmaDeqMw8Kernel bit-identical to its Mw4 sibling under `multiWaveQ6kDeqMw8AgreesWithDeqMw4`, route 877 → 884; A-staging does not transfer) Apply the same to the Q6_K packed route (`q6kWmmaEpiKernel`,
       14.5%) if the technique transfers, or record why Q6_K differs.
 
 ### 6.3 Acceptance
