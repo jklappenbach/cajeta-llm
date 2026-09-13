@@ -586,8 +586,9 @@ scaledAccumI32 (mad.i24 int-fold, −17% floor) and a native f16→f32.
 Packed-mw kernel: 4×2 re-shape (its B unpack is VALU per column tile, so
 2×4 would quadruple it) LANDED: bit-gate PASS, spill 204 → 168 B, 555 → 566 (+2%);
 the `ps` top-byte mask on it: 566 → 573 (+1%). Packed route 573 = 0.43x, deq
-route 884 = 0.67x llama 1320. NEXT (all compiler-side, HELD for the branch
-call): scaledAccumI32 int-fold verb (−17% of the issue floor), f16→f32
+route 884 = 0.67x llama 1320. NEXT (compiler-side; the compiler tree is on main
+and clean of anything related — a stale session-start snapshot was misread as
+uncommitted ownership work): scaledAccumI32 int-fold verb (−17% of the issue floor), f16→f32
 intrinsic, loop-unroll directive; then re-profile.
 
 ### 6.1 TDD
