@@ -1047,20 +1047,44 @@ The 17 uses of `this.packed` split cleanly, which is what makes this
 tractable: eight are the host mat-vec fallback (Linear.cajeta:883-904),
 and every other use needs only `.count()`.
 
-- [ ] **8.1.1 TDD** — a bound Linear reports the same packed byte count
+- [x] **8.1.1 TDD** — a bound Linear reports the same packed byte count
       after the host array is released as before.
-- [ ] **8.1.2 TDD** — the host mat-vec path after release fails with a
+- [x] **8.1.2 TDD** — the host mat-vec path after release fails with a
       diagnostic that NAMES the tensor, never silently reads empty.
-- [ ] **8.1.3 Coding** — record `packedBytes` at bind; move the ten
+- [x] **8.1.3 Coding** — record `packedBytes` at bind; move the ten
       `.count()` uses onto it.
-- [ ] **8.1.4 Coding** — release the host array after a successful
+- [x] **8.1.4 Coding** — release the host array after a successful
       upload, behind an EngineOptions flag defaulting OFF.
-- [ ] **8.1.5 Acceptance** — the 72B loads and generates with the flag
+- [x] **8.1.5 Acceptance** — the 72B loads and generates with the flag
       on; measure resident bytes with it off and on.
-- [ ] **8.2.1** Then the real fix: stream the upload in chunks so the
+- [x] **8.2.1** Then the real fix: stream the upload in chunks so the
       full host array never exists (`slice` + `hostStore` on a Unified
       buffer is zero-copy on an APU), and re-read from the mapping for
       the host path, as ExpertBank does.
 - [ ] **8.3.1** Budget the widen against available memory. The auto
       policy today asks whether widening PAYS for a format; it never
       asks whether it FITS.
+
+UNIT 8 RESULT 2026-09-13. The 72B loads and generates. `rc=0`, 16 tokens,
+prefill 26.2 tok/s, decode 4.61 tok/s, `residentKb` 30079376 (28.7 GB).
+
+              before (heap copy)   after (streamed)
+  peak RSS    43 GB, still rising  29 GB
+  GTT         not sampled          67 GB
+  available   13 GB and falling    50 GB
+  outcome     killed               rc=0
+
+3.2.3 IS CLOSED BY THIS RUN. Every tensor format in the 72B routes and
+nothing refuses: `dotAccum ty=12`, `coop q8_0 8192 29568`,
+`coop q5_k 1024 8192`, `coop q5_0 8192 29568`, `q4 plain 8192 8192`,
+`q6 epi 1024 8192`. The two 29568-wide ffn_down formats are on coop
+because 7.2's guard sends them there, which is correct and is what 7.4
+wins back.
+
+That was `packedw`. The DEFAULT (auto/int8) route still will not fit and
+8.3.1 is why, by arithmetic rather than by another OOM: the tensors that
+widen are attn q/k/v/o and ffn gate/up (inDim 8192, so they pass
+fitsMw8Cols), ffn_down being excluded at 29568. That is
+80 x (67M + 8.4M + 8.4M + 67M + 242M + 242M) = 50.8 G params, hence
+~50.8 GB of widen on top of 45 GB of packed weights. Over the box before
+the KV cache. DO NOT run auto on the 72B until the widen is budgeted.
