@@ -584,7 +584,11 @@ unrolled (llama's is; that is where its load batching comes from) and the
 kernel language has no unroll directive — third HELD compiler item beside
 scaledAccumI32 (mad.i24 int-fold, −17% floor) and a native f16→f32.
 Packed-mw kernel: 4×2 re-shape (its B unpack is VALU per column tile, so
-2×4 would quadruple it) LANDED: bit-gate PASS, spill 204 → 168 B, 555 → 566 (+2%).
+2×4 would quadruple it) LANDED: bit-gate PASS, spill 204 → 168 B, 555 → 566 (+2%);
+the `ps` top-byte mask on it: 566 → 573 (+1%). Packed route 573 = 0.43x, deq
+route 884 = 0.67x llama 1320. NEXT (all compiler-side, HELD for the branch
+call): scaledAccumI32 int-fold verb (−17% of the issue floor), f16→f32
+intrinsic, loop-unroll directive; then re-profile.
 
 ### 6.1 TDD
 - [x] 6.1.1 Bit-correctness gate: pin the current `q4kWmmaKernel` Q4_K prefill
