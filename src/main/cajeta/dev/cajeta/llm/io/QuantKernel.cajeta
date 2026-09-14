@@ -4241,6 +4241,482 @@ public final class QuantKernel {
 
     /** Shape-selected Q5_0 coop launch — X3 (32x64 warp tile) below
      *  K=8192, X1 (64x32) above, the split the Q4_K router measured. */
+    /**
+     * 7.5.1 — Q4_1 coop GEMM, 64x32 warp tile. The compute half is the
+     * same eight-accumulator tile every coop kernel here uses; only the
+     * staging differs, and for an AFFINE format the staged value is
+     * d*q + m with the nibble UNBIASED. Layout: Q4_1 { f16 d; f16 m;
+     * u8 qs[16] } = 20 bytes = 5 dwords, so it needs no repack — the
+     * ggml block is already dword-aligned.
+     */
+    @Kernel
+    public static void q41F16CoopX1Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 128;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 2;
+        uint32 warpC = sg / 2;
+        // `blocksPerRow` is 32-ELEMENT blocks (cols/32), not
+        // superblocks — this format has no 256 structure, and the
+        // compute tile only needs cols % 64 == 0 (BK=64). That is
+        // what lets Qwen-72B's ffn_down (29568 = 924 blocks) batch.
+        int64 rowWords = blocksPerRow * 5L;
+        int64 kBlocks = blocksPerRow;
+        int64 cols = kBlocks * 32L;
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a20; a20.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a21; a21.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a30; a30.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a31; a31.splat(0.0f);
+        int64 kb = 0;
+        while (kb < kBlocks) {
+            int64 kbh = kb + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int64 ro = rowBase + kbh * 5L;
+            float32 d = GgufFile.halfBitsToF32(packed[ro] & 65535);
+            float32 m = GgufFile.halfBitsToF32((packed[ro] >> 16) & 65535);
+            Vector<int32,4> qv = packed.vload<4>(ro + 1L);
+            int32 e = 0;
+            while (e < 4) {
+                int32 w = qv[e];
+                int32 bi = 0;
+                while (bi < 4) {
+                    int32 by = (w >> (8 * bi)) & 255;
+                    int32 jj = 4 * e + bi;
+                    int64 j = (int64) jj;
+                    sa[sBase + j] = (float16)
+                        (d * (float32) (by & 15) + m);
+                    sa[sBase + j + 16L] = (float16)
+                        (d * (float32) ((by >> 4) & 15) + m);
+                    bi = bi + 1;
+                }
+                e = e + 1;
+            }
+            Barrier.workgroup();
+            int32 ks = 0;
+            while (ks < 4) {
+                uint32 ko = (uint32) (16 * ks);
+                uint32 ab = (warpR * 64) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 128
+                    + warpC * 32)) * cols + kb * 32L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                CooperativeMatrix<float16,16,16,0> t2;
+                CooperativeMatrix<float16,16,16,0> t3;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                t2.load(sa, ab + 2304, 0, 72);
+                t3.load(sa, ab + 3456, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                a20.mma(t2, u0);
+                a21.mma(t2, u1);
+                a30.mma(t3, u0);
+                a31.mma(t3, u1);
+                ks = ks + 1;
+            }
+            Barrier.workgroup();
+            kb = kb + 2L;
+        }
+        uint32 rb = to * 128 + warpR * 64;
+        uint32 cb = tt * 128 + warpC * 32;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+        a20.store(y, cb * outDim + rb + 32, 1, outDim);
+        a21.store(y, (cb + 16) * outDim + rb + 32, 1, outDim);
+        a30.store(y, cb * outDim + rb + 48, 1, outDim);
+        a31.store(y, (cb + 16) * outDim + rb + 48, 1, outDim);
+    }
+
+    /**
+     * 7.5.1 — Q4_1 coop GEMM, 32x64 warp tile. The compute half is the
+     * same eight-accumulator tile every coop kernel here uses; only the
+     * staging differs, and for an AFFINE format the staged value is
+     * d*q + m with the nibble UNBIASED. Layout: Q4_1 { f16 d; f16 m;
+     * u8 qs[16] } = 20 bytes = 5 dwords, so it needs no repack — the
+     * ggml block is already dword-aligned.
+     */
+    @Kernel
+    public static void q41F16CoopX3Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 128;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 4;
+        uint32 warpC = sg / 4;
+        // `blocksPerRow` is 32-ELEMENT blocks (cols/32), not
+        // superblocks — this format has no 256 structure, and the
+        // compute tile only needs cols % 64 == 0 (BK=64). That is
+        // what lets Qwen-72B's ffn_down (29568 = 924 blocks) batch.
+        int64 rowWords = blocksPerRow * 5L;
+        int64 kBlocks = blocksPerRow;
+        int64 cols = kBlocks * 32L;
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a02; a02.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a03; a03.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a12; a12.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a13; a13.splat(0.0f);
+        int64 kb = 0;
+        while (kb < kBlocks) {
+            int64 kbh = kb + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int64 ro = rowBase + kbh * 5L;
+            float32 d = GgufFile.halfBitsToF32(packed[ro] & 65535);
+            float32 m = GgufFile.halfBitsToF32((packed[ro] >> 16) & 65535);
+            Vector<int32,4> qv = packed.vload<4>(ro + 1L);
+            int32 e = 0;
+            while (e < 4) {
+                int32 w = qv[e];
+                int32 bi = 0;
+                while (bi < 4) {
+                    int32 by = (w >> (8 * bi)) & 255;
+                    int32 jj = 4 * e + bi;
+                    int64 j = (int64) jj;
+                    sa[sBase + j] = (float16)
+                        (d * (float32) (by & 15) + m);
+                    sa[sBase + j + 16L] = (float16)
+                        (d * (float32) ((by >> 4) & 15) + m);
+                    bi = bi + 1;
+                }
+                e = e + 1;
+            }
+            Barrier.workgroup();
+            int32 ks = 0;
+            while (ks < 4) {
+                uint32 ko = (uint32) (16 * ks);
+                uint32 ab = (warpR * 32) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 128
+                    + warpC * 64)) * cols + kb * 32L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                CooperativeMatrix<float16,16,16,1> u2;
+                CooperativeMatrix<float16,16,16,1> u3;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                u2.load(xh, bb2 + 32 * cst, 1, cst);
+                u3.load(xh, bb2 + 48 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a02.mma(t0, u2);
+                a03.mma(t0, u3);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                a12.mma(t1, u2);
+                a13.mma(t1, u3);
+                ks = ks + 1;
+            }
+            Barrier.workgroup();
+            kb = kb + 2L;
+        }
+        uint32 rb = to * 128 + warpR * 32;
+        uint32 cb = tt * 128 + warpC * 64;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a02.store(y, (cb + 32) * outDim + rb, 1, outDim);
+        a03.store(y, (cb + 48) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+        a12.store(y, (cb + 32) * outDim + rb + 16, 1, outDim);
+        a13.store(y, (cb + 48) * outDim + rb + 16, 1, outDim);
+    }
+
+    public static void q41F16CoopAutoLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            int64 rows, int64 outDim, int64 cols) {
+        int64 wgL = (outDim / 128L) * (rows / 128L);
+        KernelStream s = QuantKernel.stream();
+        if (cols > 8192L) {
+            q41F16CoopX1Kernel.launch(s,
+                grid: [(uint32) wgL], block: [256])
+                (y, packed, xh, (uint32) rows, (uint32) outDim,
+                 (uint32) (outDim / 128L), cols / 32L);
+            return;
+        }
+        q41F16CoopX3Kernel.launch(s,
+            grid: [(uint32) wgL], block: [256])
+            (y, packed, xh, (uint32) rows, (uint32) outDim,
+             (uint32) (outDim / 128L), cols / 32L);
+        return;
+    }
+
+    /**
+     * 7.5.1 — Q5_1 coop GEMM, 64x32 warp tile. Q5_0's fifth-bit staging
+     * with Q4_1's affine reconstruction: the quant is 0..31 unbiased and
+     * the block's min is added back. Layout: Q5_1 { f16 d; f16 m;
+     * u32 qh; u8 qs[16] } = 24 bytes = 6 dwords, no repack.
+     */
+    @Kernel
+    public static void q51F16CoopX1Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 128;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 2;
+        uint32 warpC = sg / 2;
+        // `blocksPerRow` is 32-ELEMENT blocks (cols/32), not
+        // superblocks — this format has no 256 structure, and the
+        // compute tile only needs cols % 64 == 0 (BK=64). That is
+        // what lets Qwen-72B's ffn_down (29568 = 924 blocks) batch.
+        int64 rowWords = blocksPerRow * 6L;
+        int64 kBlocks = blocksPerRow;
+        int64 cols = kBlocks * 32L;
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a20; a20.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a21; a21.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a30; a30.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a31; a31.splat(0.0f);
+        int64 kb = 0;
+        while (kb < kBlocks) {
+            int64 kbh = kb + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int64 ro = rowBase + kbh * 6L;
+            float32 d = GgufFile.halfBitsToF32(packed[ro] & 65535);
+            float32 m = GgufFile.halfBitsToF32((packed[ro] >> 16) & 65535);
+            int32 qh = packed[ro + 1L];
+            Vector<int32,4> qv = packed.vload<4>(ro + 2L);
+            int32 e = 0;
+            while (e < 4) {
+                int32 w = qv[e];
+                int32 bi = 0;
+                while (bi < 4) {
+                    int32 by = (w >> (8 * bi)) & 255;
+                    int32 jj = 4 * e + bi;
+                    int64 j = (int64) jj;
+                    int32 h0 = ((qh >> jj) << 4) & 16;
+                    int32 h1 = (qh >> (jj + 12)) & 16;
+                    sa[sBase + j] = (float16)
+                        (d * (float32) ((by & 15) | h0) + m);
+                    sa[sBase + j + 16L] = (float16)
+                        (d * (float32) (((by >> 4) & 15) | h1) + m);
+                    bi = bi + 1;
+                }
+                e = e + 1;
+            }
+            Barrier.workgroup();
+            int32 ks = 0;
+            while (ks < 4) {
+                uint32 ko = (uint32) (16 * ks);
+                uint32 ab = (warpR * 64) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 128
+                    + warpC * 32)) * cols + kb * 32L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                CooperativeMatrix<float16,16,16,0> t2;
+                CooperativeMatrix<float16,16,16,0> t3;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                t2.load(sa, ab + 2304, 0, 72);
+                t3.load(sa, ab + 3456, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                a20.mma(t2, u0);
+                a21.mma(t2, u1);
+                a30.mma(t3, u0);
+                a31.mma(t3, u1);
+                ks = ks + 1;
+            }
+            Barrier.workgroup();
+            kb = kb + 2L;
+        }
+        uint32 rb = to * 128 + warpR * 64;
+        uint32 cb = tt * 128 + warpC * 32;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+        a20.store(y, cb * outDim + rb + 32, 1, outDim);
+        a21.store(y, (cb + 16) * outDim + rb + 32, 1, outDim);
+        a30.store(y, cb * outDim + rb + 48, 1, outDim);
+        a31.store(y, (cb + 16) * outDim + rb + 48, 1, outDim);
+    }
+
+    /**
+     * 7.5.1 — Q5_1 coop GEMM, 32x64 warp tile. Q5_0's fifth-bit staging
+     * with Q4_1's affine reconstruction: the quant is 0..31 unbiased and
+     * the block's min is added back. Layout: Q5_1 { f16 d; f16 m;
+     * u32 qh; u8 qs[16] } = 24 bytes = 6 dwords, no repack.
+     */
+    @Kernel
+    public static void q51F16CoopX3Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 128;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 4;
+        uint32 warpC = sg / 4;
+        // `blocksPerRow` is 32-ELEMENT blocks (cols/32), not
+        // superblocks — this format has no 256 structure, and the
+        // compute tile only needs cols % 64 == 0 (BK=64). That is
+        // what lets Qwen-72B's ffn_down (29568 = 924 blocks) batch.
+        int64 rowWords = blocksPerRow * 6L;
+        int64 kBlocks = blocksPerRow;
+        int64 cols = kBlocks * 32L;
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a02; a02.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a03; a03.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a12; a12.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a13; a13.splat(0.0f);
+        int64 kb = 0;
+        while (kb < kBlocks) {
+            int64 kbh = kb + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int64 ro = rowBase + kbh * 6L;
+            float32 d = GgufFile.halfBitsToF32(packed[ro] & 65535);
+            float32 m = GgufFile.halfBitsToF32((packed[ro] >> 16) & 65535);
+            int32 qh = packed[ro + 1L];
+            Vector<int32,4> qv = packed.vload<4>(ro + 2L);
+            int32 e = 0;
+            while (e < 4) {
+                int32 w = qv[e];
+                int32 bi = 0;
+                while (bi < 4) {
+                    int32 by = (w >> (8 * bi)) & 255;
+                    int32 jj = 4 * e + bi;
+                    int64 j = (int64) jj;
+                    int32 h0 = ((qh >> jj) << 4) & 16;
+                    int32 h1 = (qh >> (jj + 12)) & 16;
+                    sa[sBase + j] = (float16)
+                        (d * (float32) ((by & 15) | h0) + m);
+                    sa[sBase + j + 16L] = (float16)
+                        (d * (float32) (((by >> 4) & 15) | h1) + m);
+                    bi = bi + 1;
+                }
+                e = e + 1;
+            }
+            Barrier.workgroup();
+            int32 ks = 0;
+            while (ks < 4) {
+                uint32 ko = (uint32) (16 * ks);
+                uint32 ab = (warpR * 32) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 128
+                    + warpC * 64)) * cols + kb * 32L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                CooperativeMatrix<float16,16,16,1> u2;
+                CooperativeMatrix<float16,16,16,1> u3;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                u2.load(xh, bb2 + 32 * cst, 1, cst);
+                u3.load(xh, bb2 + 48 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a02.mma(t0, u2);
+                a03.mma(t0, u3);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                a12.mma(t1, u2);
+                a13.mma(t1, u3);
+                ks = ks + 1;
+            }
+            Barrier.workgroup();
+            kb = kb + 2L;
+        }
+        uint32 rb = to * 128 + warpR * 32;
+        uint32 cb = tt * 128 + warpC * 64;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a02.store(y, (cb + 32) * outDim + rb, 1, outDim);
+        a03.store(y, (cb + 48) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+        a12.store(y, (cb + 32) * outDim + rb + 16, 1, outDim);
+        a13.store(y, (cb + 48) * outDim + rb + 16, 1, outDim);
+    }
+
+    public static void q51F16CoopAutoLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            int64 rows, int64 outDim, int64 cols) {
+        int64 wgL = (outDim / 128L) * (rows / 128L);
+        KernelStream s = QuantKernel.stream();
+        if (cols > 8192L) {
+            q51F16CoopX1Kernel.launch(s,
+                grid: [(uint32) wgL], block: [256])
+                (y, packed, xh, (uint32) rows, (uint32) outDim,
+                 (uint32) (outDim / 128L), cols / 32L);
+            return;
+        }
+        q51F16CoopX3Kernel.launch(s,
+            grid: [(uint32) wgL], block: [256])
+            (y, packed, xh, (uint32) rows, (uint32) outDim,
+             (uint32) (outDim / 128L), cols / 32L);
+        return;
+    }
+
     public static void q50F16CoopAutoLaunchNoSync(KernelBuffer<float32> y,
             KernelBuffer<int32> packed, KernelBuffer<float16> xh,
             int64 rows, int64 outDim, int64 cols) {
@@ -5396,7 +5872,9 @@ public final class QuantKernel {
      */
     public static int32 coopBlockWords(int32 ty) {
         if (ty == Quant.GG_Q4_0) { return 5; }
+        if (ty == Quant.GG_Q4_1) { return 5; }
         if (ty == Quant.GG_Q5_0) { return 6; }
+        if (ty == Quant.GG_Q5_1) { return 6; }
         if (ty == Quant.GG_Q8_0) { return 9; }
         if (ty == Quant.GG_Q2_K) { return 21; }
         if (ty == Quant.GG_Q3_K) { return 28; }
@@ -5437,6 +5915,12 @@ public final class QuantKernel {
         } else if (ty == Quant.GG_Q4_0) {
             QuantKernel.q40F16CoopAutoLaunchNoSync(y, packed, xh, rows,
                 outDim, cols);
+        } else if (ty == Quant.GG_Q4_1) {
+            QuantKernel.q41F16CoopAutoLaunchNoSync(y, packed, xh, rows,
+                outDim, cols);
+        } else if (ty == Quant.GG_Q5_1) {
+            QuantKernel.q51F16CoopAutoLaunchNoSync(y, packed, xh, rows,
+                outDim, cols);
         } else if (ty == Quant.GG_Q3_K) {
             QuantKernel.q3kF16CoopAutoLaunchNoSync(y, packed, xh, rows,
                 outDim, cols);
@@ -5468,6 +5952,7 @@ public final class QuantKernel {
     public static boolean coopColsOk(int32 ty, int64 cols) {
         if (!QuantKernel.coopSupports(ty)) { return false; }
         if (ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
+                || ty == Quant.GG_Q4_1 || ty == Quant.GG_Q5_1
                 || ty == Quant.GG_Q8_0) {
             return cols % 64L == 0L;
         }
@@ -10988,7 +11473,8 @@ public final class QuantKernel {
         return ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
             || ty == Quant.GG_Q6_K || ty == Quant.GG_Q8_0
             || ty == Quant.GG_Q2_K || ty == Quant.GG_Q3_K
-            || ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0;
+            || ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
+            || ty == Quant.GG_Q4_1 || ty == Quant.GG_Q5_1;
     }
 
     // ── Q4_0 / Q5_0 f32-activation kernels (2026-08-26) ────────────────
@@ -11121,6 +11607,175 @@ public final class QuantKernel {
             }
             y[yOff + i] = acc;
         }
+    }
+
+    /**
+     * 7.5.1 — `y[yOff + i] = W[i]·x` for one row per work item, W packed
+     * Q4_1.
+     *
+     * AFFINE, so the block contributes TWO terms: d*sum(q*x) with the
+     * nibble unbiased (0..15, no -8), plus m*sum(x). The activation sum
+     * rides the same eight vector loads the dot already makes, so the
+     * min costs one more accumulator and no extra traffic.
+     */
+    @Kernel
+    public static void q41MatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 20L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 20L;
+                float32 dv = QuantKernel.f16AtDev(packed, ro);
+                float32 mv = QuantKernel.f16AtDev(packed, ro + 2L);
+                Vector<int8,16> q = packed.vload<16>(ro + 4L);
+                Vector<int8,16> lo = q & 15;
+                Vector<int8,16> hi = (q >> 4) & 15;
+                int64 xo = xOff + b * 32L;
+                Vector<float32,4> xv0 = x.vload<4>(xo);
+                Vector<float32,4> xv1 = x.vload<4>(xo + 4L);
+                Vector<float32,4> xv2 = x.vload<4>(xo + 8L);
+                Vector<float32,4> xv3 = x.vload<4>(xo + 12L);
+                Vector<float32,4> xv4 = x.vload<4>(xo + 16L);
+                Vector<float32,4> xv5 = x.vload<4>(xo + 20L);
+                Vector<float32,4> xv6 = x.vload<4>(xo + 24L);
+                Vector<float32,4> xv7 = x.vload<4>(xo + 28L);
+                Vector<int16,8> l0 = lo.widenLo();
+                Vector<int16,8> l1 = lo.widenHi();
+                Vector<int16,8> h0 = hi.widenLo();
+                Vector<int16,8> h1 = hi.widenHi();
+                Vector<float32,4> p = l0.widenLo().toF32() * xv0;
+                p = p + l0.widenHi().toF32() * xv1;
+                p = p + l1.widenLo().toF32() * xv2;
+                p = p + l1.widenHi().toF32() * xv3;
+                p = p + h0.widenLo().toF32() * xv4;
+                p = p + h0.widenHi().toF32() * xv5;
+                p = p + h1.widenLo().toF32() * xv6;
+                p = p + h1.widenHi().toF32() * xv7;
+                Vector<float32,4> xsum = xv0 + xv1 + xv2 + xv3;
+                xsum = xsum + xv4 + xv5 + xv6 + xv7;
+                float32 dot = p[0] + p[1] + p[2] + p[3];
+                float32 xs = xsum[0] + xsum[1] + xsum[2] + xsum[3];
+                acc = acc + dv * dot + mv * xs;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
+    public static void q41MatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s = QuantKernel.stream();
+        q41MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, x, ur, cols / 32L, xOff, yOff);
+        return;
+    }
+
+    public static void q41MatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        QuantKernel.q41MatVecLaunchNoSync(y, packed, x, rows, cols, xOff,
+            yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
+    /**
+     * 7.5.1 — Q5_1: Q4_1's affine fold with Q5_0's fifth bit. The high
+     * bit is element j reading bit j (or j+16) of one u32 — a different
+     * shift per lane, which the vector ops cannot express — so it rides
+     * a scalar fold, +16*x[j] per set bit, as the Q5_0 kernel does.
+     */
+    @Kernel
+    public static void q51MatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rowBytes = blocksPerRow * 24L;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = i * rowBytes + b * 24L;
+                float32 dv = QuantKernel.f16AtDev(packed, ro);
+                float32 mv = QuantKernel.f16AtDev(packed, ro + 2L);
+                Vector<int8,4> qhb = packed.vload<4>(ro + 4L);
+                int32 qh = ((int32) qhb[0] & 255)
+                    | (((int32) qhb[1] & 255) << 8)
+                    | (((int32) qhb[2] & 255) << 16)
+                    | (((int32) qhb[3] & 255) << 24);
+                Vector<int8,16> q = packed.vload<16>(ro + 8L);
+                Vector<int8,16> lo = q & 15;
+                Vector<int8,16> hi = (q >> 4) & 15;
+                int64 xo = xOff + b * 32L;
+                Vector<float32,4> xv0 = x.vload<4>(xo);
+                Vector<float32,4> xv1 = x.vload<4>(xo + 4L);
+                Vector<float32,4> xv2 = x.vload<4>(xo + 8L);
+                Vector<float32,4> xv3 = x.vload<4>(xo + 12L);
+                Vector<float32,4> xv4 = x.vload<4>(xo + 16L);
+                Vector<float32,4> xv5 = x.vload<4>(xo + 20L);
+                Vector<float32,4> xv6 = x.vload<4>(xo + 24L);
+                Vector<float32,4> xv7 = x.vload<4>(xo + 28L);
+                Vector<int16,8> l0 = lo.widenLo();
+                Vector<int16,8> l1 = lo.widenHi();
+                Vector<int16,8> h0 = hi.widenLo();
+                Vector<int16,8> h1 = hi.widenHi();
+                Vector<float32,4> p = l0.widenLo().toF32() * xv0;
+                p = p + l0.widenHi().toF32() * xv1;
+                p = p + l1.widenLo().toF32() * xv2;
+                p = p + l1.widenHi().toF32() * xv3;
+                p = p + h0.widenLo().toF32() * xv4;
+                p = p + h0.widenHi().toF32() * xv5;
+                p = p + h1.widenLo().toF32() * xv6;
+                p = p + h1.widenHi().toF32() * xv7;
+                Vector<float32,4> xsum = xv0 + xv1 + xv2 + xv3;
+                xsum = xsum + xv4 + xv5 + xv6 + xv7;
+                float32 dot = p[0] + p[1] + p[2] + p[3];
+                float32 xs = xsum[0] + xsum[1] + xsum[2] + xsum[3];
+                float32 hs = 0.0f;
+                int32 j = 0;
+                while (j < 16) {
+                    hs = hs + (float32) ((qh >> j) & 1)
+                        * x[xo + (int64) j];
+                    hs = hs + (float32) ((qh >> (j + 16)) & 1)
+                        * x[xo + (int64) (j + 16)];
+                    j = j + 1;
+                }
+                acc = acc + dv * (dot + 16.0f * hs) + mv * xs;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+        }
+    }
+
+    public static void q51MatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        uint32 ur = (uint32) rows;
+        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        KernelStream s = QuantKernel.stream();
+        q51MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+            (y, packed, x, ur, cols / 32L, xOff, yOff);
+        return;
+    }
+
+    public static void q51MatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        QuantKernel.q51MatVecLaunchNoSync(y, packed, x, rows, cols, xOff,
+            yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
     }
 
     public static void q50MatVecLaunchNoSync(KernelBuffer<float32> y,
@@ -11366,13 +12021,15 @@ public final class QuantKernel {
      *  device mat-vec for widths the q8_K integer route cannot serve. */
     public static boolean hasF32WaveKernel(int32 ty) {
         return ty == Quant.GG_Q8_0 || ty == Quant.GG_Q5_0
-            || ty == Quant.GG_Q4_0;
+            || ty == Quant.GG_Q4_0 || ty == Quant.GG_Q4_1
+            || ty == Quant.GG_Q5_1;
     }
 
     public static boolean hasF32Kernel(int32 ty) {
         return ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
             || ty == Quant.GG_Q6_K || ty == Quant.GG_Q8_0
-            || ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0;
+            || ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
+            || ty == Quant.GG_Q4_1 || ty == Quant.GG_Q5_1;
     }
 
     /** Launch the kernel for `ty` over device-resident buffers. */
@@ -11410,6 +12067,12 @@ public final class QuantKernel {
         } else if (ty == Quant.GG_Q5_0) {
             QuantKernel.q50MatVecLaunchNoSync(y, packed, x, rows, cols,
                 xOff, yOff);
+        } else if (ty == Quant.GG_Q4_1) {
+            QuantKernel.q41MatVecLaunchNoSync(y, packed, x, rows, cols,
+                xOff, yOff);
+        } else if (ty == Quant.GG_Q5_1) {
+            QuantKernel.q51MatVecLaunchNoSync(y, packed, x, rows, cols,
+                xOff, yOff);
         } else if (ty == Quant.GG_MXFP4) {
             QuantKernel.mxfp4MatVecFast3Launch(y, packed, x, rows, cols,
                 xOff, yOff);
@@ -11439,6 +12102,10 @@ public final class QuantKernel {
             QuantKernel.q40MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else if (ty == Quant.GG_Q5_0) {
             QuantKernel.q50MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
+        } else if (ty == Quant.GG_Q4_1) {
+            QuantKernel.q41MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
+        } else if (ty == Quant.GG_Q5_1) {
+            QuantKernel.q51MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else if (ty == Quant.GG_MXFP4) {
             QuantKernel.mxfp4MatVecFast3LaunchSync(y, packed, x, rows, cols, xOff, yOff);
         } else {

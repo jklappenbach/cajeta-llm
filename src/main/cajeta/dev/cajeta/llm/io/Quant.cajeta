@@ -38,7 +38,13 @@ public final class Quant {
     }
 
     public static final int32 GG_Q4_0 = 2;
+    // The AFFINE legacy pair (7.5.1): w = d*q + m, where the symmetric
+    // trio is w = d*(q - bias). The min is per 32-element block and rides
+    // beside the scale, so every consumer needs a rank-1 term the
+    // symmetric path does not have.
+    public static final int32 GG_Q4_1 = 3;
     public static final int32 GG_Q5_0 = 6;
+    public static final int32 GG_Q5_1 = 7;
     public static final int32 GG_Q8_0 = 8;
     public static final int32 GG_Q2_K = 10;
     public static final int32 GG_Q3_K = 11;
@@ -53,6 +59,7 @@ public final class Quant {
 
     public static boolean supported(int32 ty) {
         return ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
+            || ty == Quant.GG_Q4_1 || ty == Quant.GG_Q5_1
             || ty == Quant.GG_Q8_0
             || ty == Quant.GG_Q2_K || ty == Quant.GG_Q3_K
             || ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
@@ -63,6 +70,7 @@ public final class Quant {
     /** Elements per block for `ty`; -1 when unsupported. */
     public static int32 blockElems(int32 ty) {
         if (ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
+                || ty == Quant.GG_Q4_1 || ty == Quant.GG_Q5_1
                 || ty == Quant.GG_Q8_0
                 || ty == Quant.GG_MXFP4) { return 32; }
         if (Quant.supported(ty)) { return 256; }
@@ -72,7 +80,9 @@ public final class Quant {
     /** Packed bytes per block for `ty`; -1 when unsupported. */
     public static int32 blockBytes(int32 ty) {
         if (ty == Quant.GG_Q4_0) { return 18; }
+        if (ty == Quant.GG_Q4_1) { return 20; }
         if (ty == Quant.GG_Q5_0) { return 22; }
+        if (ty == Quant.GG_Q5_1) { return 24; }
         if (ty == Quant.GG_Q8_0) { return 34; }
         if (ty == Quant.GG_Q2_K) { return 84; }
         if (ty == Quant.GG_Q3_K) { return 110; }
@@ -122,6 +132,8 @@ public final class Quant {
             int64 ro = rawOff + b * bb;
             int64 oo = outOff + b * be;
             if (ty == Quant.GG_Q4_0) { Quant.q40Block(raw, ro, out, oo); }
+            else if (ty == Quant.GG_Q4_1) { Quant.q41Block(raw, ro, out, oo); }
+            else if (ty == Quant.GG_Q5_1) { Quant.q51Block(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q5_0) { Quant.q50Block(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q8_0) { Quant.q80Block(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q2_K) { Quant.q2kBlock(raw, ro, out, oo); }
@@ -287,6 +299,130 @@ public final class Quant {
             out[oo + (int64) (j + 16)] =
                 d * (float32) ((((q >> 4) & 15) | h1) - 16);
             j = j + 1;
+        }
+    }
+
+    // ── Q4_1: { f16 d; f16 m; u8 qs[16] } — AFFINE. The nibble is
+    // UNBIASED (0..15) and the block's own min is added back, so the
+    // reconstruction is d*q + m rather than d*(q - 8). Element order is
+    // Q4_0's: byte j's low nibble is element j, its high nibble j+16.
+
+    static void q41Block(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        float32 m = Quant.f16At(raw, ro + 2L);
+        int32 j = 0;
+        while (j < 16) {
+            int32 q = Quant.u8(raw, ro + 4L + (int64) j);
+            out[oo + (int64) j] = d * (float32) (q & 15) + m;
+            out[oo + (int64) (j + 16)] = d * (float32) (q >> 4) + m;
+            j = j + 1;
+        }
+    }
+
+    // ── Q5_1: { f16 d; f16 m; u8 qh[4]; u8 qs[16] } — Q5_0's fifth-bit
+    // machinery with Q4_1's affine reconstruction. The quant is 0..31
+    // unbiased; `qh` bit j feeds element j and bit j+16 element j+16,
+    // exactly as Q5_0.
+
+    static void q51Block(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        float32 m = Quant.f16At(raw, ro + 2L);
+        int32 qh = Quant.u8(raw, ro + 4L)
+            | (Quant.u8(raw, ro + 5L) << 8)
+            | (Quant.u8(raw, ro + 6L) << 16)
+            | (Quant.u8(raw, ro + 7L) << 24);
+        int32 j = 0;
+        while (j < 16) {
+            int32 q = Quant.u8(raw, ro + 8L + (int64) j);
+            int32 h0 = ((qh >> j) << 4) & 16;
+            int32 h1 = (qh >> (j + 12)) & 16;
+            out[oo + (int64) j] = d * (float32) ((q & 15) | h0) + m;
+            out[oo + (int64) (j + 16)] =
+                d * (float32) (((q >> 4) & 15) | h1) + m;
+            j = j + 1;
+        }
+    }
+
+    /**
+     * Host mat-vec straight off Q4_1 blocks. The affine term factors out
+     * of the dot: sum_j (d*q_j + m)*x_j = d*sum(q_j*x_j) + m*sum(x_j),
+     * so the min costs ONE extra accumulator per block rather than an
+     * add per element — and that rank-1 shape is what every device route
+     * for this format has to carry.
+     */
+    public static void q41MatVecIntoAt(int8[] packed, int64 pOff,
+            int64 rows, int64 cols,
+            float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int64 blocksPerRow = cols / 32L;
+        int64 rowBytes = blocksPerRow * 20L;
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = pOff + i * rowBytes + b * 20L;
+                float32 dv = Quant.f16At(packed, ro);
+                float32 mv = Quant.f16At(packed, ro + 2L);
+                float32 dot = 0.0f;
+                float32 xs = 0.0f;
+                int64 xb = xOff + b * 32L;
+                int32 j = 0;
+                while (j < 16) {
+                    int32 q = Quant.u8(packed, ro + 4L + (int64) j);
+                    float32 x0 = x[xb + (int64) j];
+                    float32 x1 = x[xb + (int64) (j + 16)];
+                    dot = dot + (float32) (q & 15) * x0;
+                    dot = dot + (float32) (q >> 4) * x1;
+                    xs = xs + x0 + x1;
+                    j = j + 1;
+                }
+                acc = acc + dv * dot + mv * xs;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
+        }
+    }
+
+    /** Host mat-vec straight off Q5_1 blocks — Q4_1's affine fold with
+     *  Q5_0's fifth bit. */
+    public static void q51MatVecIntoAt(int8[] packed, int64 pOff,
+            int64 rows, int64 cols,
+            float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int64 blocksPerRow = cols / 32L;
+        int64 rowBytes = blocksPerRow * 24L;
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = pOff + i * rowBytes + b * 24L;
+                float32 dv = Quant.f16At(packed, ro);
+                float32 mv = Quant.f16At(packed, ro + 2L);
+                int32 qh = Quant.u8(packed, ro + 4L)
+                    | (Quant.u8(packed, ro + 5L) << 8)
+                    | (Quant.u8(packed, ro + 6L) << 16)
+                    | (Quant.u8(packed, ro + 7L) << 24);
+                float32 dot = 0.0f;
+                float32 xs = 0.0f;
+                int64 xb = xOff + b * 32L;
+                int32 j = 0;
+                while (j < 16) {
+                    int32 q = Quant.u8(packed, ro + 8L + (int64) j);
+                    int32 h0 = ((qh >> j) << 4) & 16;
+                    int32 h1 = (qh >> (j + 12)) & 16;
+                    float32 x0 = x[xb + (int64) j];
+                    float32 x1 = x[xb + (int64) (j + 16)];
+                    dot = dot + (float32) ((q & 15) | h0) * x0;
+                    dot = dot + (float32) (((q >> 4) & 15) | h1) * x1;
+                    xs = xs + x0 + x1;
+                    j = j + 1;
+                }
+                acc = acc + dv * dot + mv * xs;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
         }
     }
 
