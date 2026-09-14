@@ -1506,9 +1506,9 @@ public class LinearKernelRouteTest {
         pk.upload(raw);
         KernelBuffer<int8> dq #= heap KernelBuffer<int8>((uint64) (outDim * cols));
         if (ty == Quant.GG_Q5_0) {
-            WmmaKernel.q50WidenLaunch(dq, pk, outDim, cols);
+            WmmaKernel.q50WidenLaunch(dq, pk, outDim, cols, cols);
         } else {
-            WmmaKernel.q40WidenLaunch(dq, pk, outDim, cols);
+            WmmaKernel.q40WidenLaunch(dq, pk, outDim, cols, cols);
         }
         KernelStream s = QuantKernel.stream();
         s.sync();
@@ -1658,4 +1658,82 @@ public class LinearKernelRouteTest {
     }
 
 
+
+    /** 7.4.1 — the remainder FAST PATH. 7.2 made a column count with a
+     *  remainder correct by REFUSING it back to the coop GEMM; the
+     *  padded widen and the row-aware activation pack must now keep it
+     *  on the int8 deq route and still agree with the per-row serial
+     *  path. cols=384 = 256 + 128 is the 72B's ffn_down remainder in
+     *  miniature. */
+    void padRemainderRoute(int32 ty, String fixture, String name) {
+        if (!Device.kernelAvailable("q80WmmaDeqMw8Kernel")) {
+            System.stdout.println("  (skipped: no Mw8 deq kernel)");
+            return;
+        }
+        int64 ci = 384L;
+        int64 co = 128L;
+        Linear lin #= LinearKernelRouteTest.tiledAt(ty, fixture,
+            (int32) ci, (int32) co);
+        Tensor<float32> x #= LinearKernelRouteTest.ramp(128L * ci, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L, 128L * co);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L, 128L * co);
+        QuantKernel.setRoutingEnabled(false);
+        int64 r = 0;
+        while (r < 128L) {
+            lin.matvecInto(x, r * ci, want, r * co);
+            r = r + 1;
+        }
+        QuantKernel.setRoutingEnabled(true);
+        Linear.setDeqPrefill(true);
+        Linear.resetRouteSaid();
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        Linear.stageBatch(x, 0L, 128, (int32) ci, Linear.nextStageTag());
+        lin.matmulInto(128, got, 0L);
+        Diag.register(null);
+        Linear.setDeqPrefill(false);
+        float32 worst = 0.0f;
+        float32 mag = 0.0f;
+        boolean live = false;
+        int64 i = 0;
+        while (i < 128L * co) {
+            float32 g = got.flatGet(i);
+            float32 w = want.flatGet(i);
+            if (g != 0.0f) { live = true; }
+            float32 d = g - w;
+            if (d < 0.0f) { d = 0.0f - d; }
+            if (d > worst) { worst = d; }
+            float32 m = w;
+            if (m < 0.0f) { m = 0.0f - m; }
+            if (m > mag) { mag = m; }
+            i = i + 1;
+        }
+        System.stdout.println("   " + name + " cols=384 worstAbs=" + worst
+            + " maxWant=" + mag + " routes=" + cap.namesOf("batch-route"));
+        if (!cap.sawContaining("batch-route", name + " deqMw8")) {
+            Assert.fail(name + " cols=384: expected the Mw8 deq route, saw "
+                + cap.namesOf("batch-route"));
+        }
+        if (!live) { Assert.fail(name + " cols=384: every output is zero"); }
+        if (mag == 0.0f) {
+            Assert.fail(name + " cols=384: serial output is all zero");
+        }
+        // The bar is the tensor's RANGE, as in legacyFormatsTakeThe-
+        // SymmetricDeqRoute: the batched path packs its activations to
+        // q8_K and the serial one does not, so an element-relative bar
+        // fails wherever the dot product cancels to near zero.
+        if ((float64) worst > (float64) mag * 0.01) {
+            Assert.fail(name + " cols=384: worst " + worst
+                + " exceeds 1% of range " + mag);
+        }
+        return;
+    }
+
+    @Test
+    public void columnRemainderStaysOnTheDeqRoute() {
+        this.padRemainderRoute(Quant.GG_Q8_0, "q8_0.bin", "q8_0");
+        this.padRemainderRoute(Quant.GG_Q5_0, "q5_0.bin", "q5_0");
+        this.padRemainderRoute(Quant.GG_Q4_0, "q4_0.bin", "q4_0");
+        return;
+    }
 }

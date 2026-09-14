@@ -483,6 +483,23 @@ load-bearing rather than stylistic.
 ### 5.1 TDD
 - [ ] 5.1.1 `run-tests.sh` green on CPU and gfx1151.
 
+FINDING 2026-09-13, from the gfx1151 sweep that gated 7.4 — ONE failure,
+and it is not the engine's:
+`LaunchGeometryTest.targetBlocksSaturatesEverySimdExactlyOnce` expects
+`Device.simdCount() / wavesPerBlock` = 80/2 = 40 and gets 80. The
+compiler's geometry surface answers `dispatchBlocks(n) = simds *
+wavesPerSimdTarget / n`, and this box reports `wavesPerSimdTarget=2`
+(`simds=80 dispatchBlocks2=80 dispatchBlocks8=20`), so 80 IS
+`simds * 2 / 2`. The test encodes one-wave-per-SIMD, which the surface
+stopped meaning.
+Two readings, and they need a measurement rather than a guess: either
+the assertion is stale and the contract is now "cover every SIMD
+`wavesPerSimdTarget` times" (rename and assert
+`blocks * wavesPerBlock == simds * wavesPerSimdTarget`), or the engine
+really is dispatching twice the workgroups it wants and the test is the
+only thing that noticed. 396 passed, 1 failed, 1 skipped, identical in
+both the test-profile and the release/bounded pass.
+
 ### 5.2 Coding
 - [ ] 5.2.1 Update `llm-vs-llamacpp-bench-2026-09-06` memory and the cajeta
       repo's bench page with the after rows; archive this plan.
@@ -1061,21 +1078,48 @@ should be faster, not slower. Padding is then trivial — the image is
 `outDim * (colsPad/16)` bytes (15 MB for the 72B's ffn_down against 242 MB of
 weight), and its tail entries are simply zero.
 
-- [ ] **7.4.1 TDD** — a padded weight and a padded activation must give the
+- [x] **7.4.1 TDD** — a padded weight and a padded activation must give the
       same answer as the per-row serial path at cols=384, and the route must
       be the deq route, not coop.
-- [ ] **7.4.2 Coding** — the widen emits a second output: the compact f16
-      scale image, zero in the pad.
-- [ ] **7.4.3 Coding** — the widen zero-fills the int8 tail tiles.
-- [ ] **7.4.4 Coding** — `q8kPack` becomes row-aware (`rows`, `n`, `nPad`) so
+      `LinearKernelRouteTest.columnRemainderStaysOnTheDeqRoute`, all three
+      symmetric formats. RED first: `routes=[coop q8_0]`. Green:
+      `[q8_0 deqMw8Part]` / `[q5_0 deqMw8Part]` / `[q4_0 deqMw8Part]` with
+      worst-vs-range 0.21% / 0.33% / 0.29% — the same activation-rounding
+      band 7.3's spread test already recorded, on the RANGE bar it
+      established (an element-relative bar fails where the dot cancels).
+- [x] **7.4.2 Coding** — the widen emits a second output: the compact f16
+      scale image, zero in the pad. `symScaleImageKernel` +
+      `Linear.scaleDev`; the GEMM's header source is now the image at
+      `blkBytes = 2` for ALL THREE formats, so 34/22/18 survive only in the
+      widen. Bit-gate: every deqMw8 fingerprint, q8_0's included, is
+      unchanged (`fold=557943202053999872`).
+- [x] **7.4.3 Coding** — the widen zero-fills the int8 tail tiles.
+      `deqPadZeroKernel`, launched only when `colsPad != cols`. The widens
+      now walk 32-element blocks on the SOURCE (`nb32`) and 16-wide k-tiles
+      on the DESTINATION (`tilesK`), which is what lets the two strides
+      differ.
+- [x] **7.4.4 Coding** — `q8kPack` becomes row-aware (`rows`, `n`, `nPad`) so
       each row's blocks start on a block boundary and the tail block is
       zero-filled. Today `nb = n/256` over the WHOLE staging, so at a
       non-multiple inDim the blocks straddle row boundaries — this is why the
       activation side cannot simply be widened. No extra copy pass: the pack
       already reads the unpadded activations.
-- [ ] **7.4.5 Acceptance** — the 72B's ffn_down takes `q5_0 deqMw8Part` /
+      `q8kPackKernel` takes `(blocks, nbRow, nReal)` and `Quant.q8kPackPad`
+      is its host twin; at `nPad == n` both are the flat pack block for
+      block, so the k-quant routes see no change at all.
+- [~] **7.4.5 Acceptance** — the 72B's ffn_down takes `q5_0 deqMw8Part` /
       `q8_0 deqMw8Part` again, with the guard still refusing anything the
       padding does not cover.
+      HALF MEASURED, on the OTHER checkpoint the remainder reaches.
+      Qwen1.5-MoE `ffn_down_exps` is 1408 = 5*256 + 128 and both symmetric
+      formats now route there:
+      `batch-route q8_0 deqMw8Part 2048 1408` and
+      `batch-route q5_0 deqMw8Part 2048 1408` (before: q5_0 read
+      `coop q5_0 2048 1408`). The guard did not go away — it moved to
+      `fitsMw8ColsSym`, whole 32-element blocks, and only for the three
+      formats the padding covers; everything else still needs a whole
+      super-block. The 72B leg itself waits on 8.3.1: auto/int8 on that
+      checkpoint is exactly the widen budget that unit exists to settle.
 
 ### 7.5 Formats that still refuse
 

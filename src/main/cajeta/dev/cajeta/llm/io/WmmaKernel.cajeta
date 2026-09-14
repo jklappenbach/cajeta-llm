@@ -4226,6 +4226,15 @@ public final class WmmaKernel {
         return cols % 256L == 0L;
     }
 
+    /** 7.4 — the same question for the legacy symmetric formats, which
+     *  the padded widen and the row-aware activation pack now carry at
+     *  a remainder. Both sides round the column count up to a whole
+     *  super-block, so what is left to require is whole 32-element
+     *  blocks — the GGUF invariant for a legacy quant. */
+    public static boolean fitsMw8ColsSym(int64 cols) {
+        return cols % 32L == 0L;
+    }
+
     public static void q4kWmmaDeqMw8Launch(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> deq,
             KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
@@ -4585,25 +4594,28 @@ public final class WmmaKernel {
 
     /**
      * 10.12.45.D — the Q8_0 "widen": a pure tile-major re-layout — the
-     * values are ALREADY signed int8. Eight 34-byte blocks make one
-     * 256-element superblock; the per-32 d scales stay packed and ride
-     * the GEMM's cf prefold.
+     * values are ALREADY signed int8. The per-32 d scales stay packed
+     * and ride the GEMM's cf prefold.
+     *
+     * 7.4.3: the SOURCE walks 32-element blocks (`nb32` of them a row,
+     * the GGUF invariant) while the DESTINATION walks `tilesK` 16-wide
+     * k-tiles, which may be wider. A column count with a remainder
+     * writes only the blocks it has; `deqPadZeroKernel` zeroes the rest.
      */
     @Kernel
     public static void q80WidenKernel(KernelBuffer<int8> deq,
-            KernelBuffer<int8> packed, uint32 total, int64 blocksPerRow) {
+            KernelBuffer<int8> packed, uint32 total, int64 nb32,
+            int64 tilesK) {
         uint32 tid = KernelThread.globalIdX();
         if (tid < total) {
-            uint32 perRow = (uint32) blocksPerRow * 256;
+            uint32 perRow = (uint32) nb32 * 32;
             uint32 ii = tid / perRow;
             uint32 rem = tid % perRow;
-            uint32 b = rem / 256;
-            uint32 e = rem % 256;
-            int64 ro = (int64) ii * (blocksPerRow * 272L)
-                + (int64) b * 272L + (int64) ((e / 32) * 34)
-                + 2L + (int64) (e % 32);
-            int64 tilesK = blocksPerRow * 16L;
-            int64 k = (int64) b * 256L + (int64) e;
+            uint32 j = rem / 32;
+            uint32 e = rem % 32;
+            int64 ro = (int64) ii * (nb32 * 34L) + (int64) j * 34L
+                + 2L + (int64) e;
+            int64 k = (int64) j * 32L + (int64) e;
             int64 tI = (int64) (ii / 16);
             int64 iIn = (int64) (ii % 16);
             deq[(tI * tilesK + k / 16L) * 256L
@@ -4612,13 +4624,15 @@ public final class WmmaKernel {
     }
 
     public static void q80WidenLaunch(KernelBuffer<int8> deq,
-            KernelBuffer<int8> packed, int64 outDim, int64 cols) {
-        int64 bpr = cols / 256L;
-        int64 total = outDim * bpr * 256L;
+            KernelBuffer<int8> packed, int64 outDim, int64 cols,
+            int64 colsPad) {
+        int64 nb32 = cols / 32L;
+        int64 total = outDim * nb32 * 32L;
         KernelStream s = QuantKernel.stream();
         q80WidenKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
             block: [256])
-            (deq, packed, (uint32) total, bpr);
+            (deq, packed, (uint32) total, nb32, colsPad / 16L);
+        WmmaKernel.deqPadZeroLaunch(deq, outDim, cols, colsPad);
         return;
     }
 
@@ -4630,22 +4644,19 @@ public final class WmmaKernel {
      */
     @Kernel
     public static void q40WidenKernel(KernelBuffer<int8> deq,
-            KernelBuffer<int8> packed, uint32 total, int64 blocksPerRow) {
+            KernelBuffer<int8> packed, uint32 total, int64 nb32,
+            int64 tilesK) {
         uint32 tid = KernelThread.globalIdX();
         if (tid < total) {
-            uint32 perRow = (uint32) blocksPerRow * 128;
+            uint32 perRow = (uint32) nb32 * 16;
             uint32 ii = tid / perRow;
             uint32 rem = tid % perRow;
-            uint32 b = rem / 128;
-            uint32 byteIdx = rem % 128;
-            uint32 bi = byteIdx / 16;
-            uint32 j = byteIdx % 16;
-            int64 ro = (int64) ii * (blocksPerRow * 144L)
-                + (int64) b * 144L + (int64) bi * 18L
-                + 2L + (int64) j;
+            uint32 j = rem / 16;
+            uint32 q = rem % 16;
+            int64 ro = (int64) ii * (nb32 * 18L) + (int64) j * 18L
+                + 2L + (int64) q;
             int32 rb = (int32) packed[ro] & 255;
-            int64 tilesK = blocksPerRow * 16L;
-            int64 kLo = (int64) b * 256L + (int64) (bi * 32 + j);
+            int64 kLo = (int64) j * 32L + (int64) q;
             int64 kHi = kLo + 16L;
             int64 tI = (int64) (ii / 16);
             int64 iIn = (int64) (ii % 16);
@@ -4657,13 +4668,15 @@ public final class WmmaKernel {
     }
 
     public static void q40WidenLaunch(KernelBuffer<int8> deq,
-            KernelBuffer<int8> packed, int64 outDim, int64 cols) {
-        int64 bpr = cols / 256L;
-        int64 total = outDim * bpr * 128L;
+            KernelBuffer<int8> packed, int64 outDim, int64 cols,
+            int64 colsPad) {
+        int64 nb32 = cols / 32L;
+        int64 total = outDim * nb32 * 16L;
         KernelStream s = QuantKernel.stream();
         q40WidenKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
             block: [256])
-            (deq, packed, (uint32) total, bpr);
+            (deq, packed, (uint32) total, nb32, colsPad / 16L);
+        WmmaKernel.deqPadZeroLaunch(deq, outDim, cols, colsPad);
         return;
     }
 
@@ -4675,27 +4688,24 @@ public final class WmmaKernel {
      */
     @Kernel
     public static void q50WidenKernel(KernelBuffer<int8> deq,
-            KernelBuffer<int8> packed, uint32 total, int64 blocksPerRow) {
+            KernelBuffer<int8> packed, uint32 total, int64 nb32,
+            int64 tilesK) {
         uint32 tid = KernelThread.globalIdX();
         if (tid < total) {
-            uint32 perRow = (uint32) blocksPerRow * 128;
+            uint32 perRow = (uint32) nb32 * 16;
             uint32 ii = tid / perRow;
             uint32 rem = tid % perRow;
-            uint32 b = rem / 128;
-            uint32 byteIdx = rem % 128;
-            uint32 bi = byteIdx / 16;
-            uint32 j = byteIdx % 16;
-            int64 bb = (int64) ii * (blocksPerRow * 176L)
-                + (int64) b * 176L + (int64) bi * 22L;
+            uint32 j = rem / 16;
+            uint32 q = rem % 16;
+            int64 bb = (int64) ii * (nb32 * 22L) + (int64) j * 22L;
             int32 qh = ((int32) packed[bb + 2L] & 255)
                 | (((int32) packed[bb + 3L] & 255) << 8)
                 | (((int32) packed[bb + 4L] & 255) << 16)
                 | (((int32) packed[bb + 5L] & 255) << 24);
-            int32 rb = (int32) packed[bb + 6L + (int64) j] & 255;
-            int32 h0 = ((qh >> j) & 1) << 4;
-            int32 h1 = ((qh >> (j + 16)) & 1) << 4;
-            int64 tilesK = blocksPerRow * 16L;
-            int64 kLo = (int64) b * 256L + (int64) (bi * 32 + j);
+            int32 rb = (int32) packed[bb + 6L + (int64) q] & 255;
+            int32 h0 = ((qh >> q) & 1) << 4;
+            int32 h1 = ((qh >> (q + 16)) & 1) << 4;
+            int64 kLo = (int64) j * 32L + (int64) q;
             int64 kHi = kLo + 16L;
             int64 tI = (int64) (ii / 16);
             int64 iIn = (int64) (ii % 16);
@@ -4708,14 +4718,98 @@ public final class WmmaKernel {
     }
 
     public static void q50WidenLaunch(KernelBuffer<int8> deq,
-            KernelBuffer<int8> packed, int64 outDim, int64 cols) {
-        int64 bpr = cols / 256L;
-        int64 total = outDim * bpr * 128L;
+            KernelBuffer<int8> packed, int64 outDim, int64 cols,
+            int64 colsPad) {
+        int64 nb32 = cols / 32L;
+        int64 total = outDim * nb32 * 16L;
         KernelStream s = QuantKernel.stream();
         q50WidenKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
             block: [256])
-            (deq, packed, (uint32) total, bpr);
+            (deq, packed, (uint32) total, nb32, colsPad / 16L);
+        WmmaKernel.deqPadZeroLaunch(deq, outDim, cols, colsPad);
         return;
+    }
+
+    /**
+     * 7.4.3 — zero the k-tiles a padded widen does not write. The pad
+     * is whole 16-wide tiles (a legacy block is 32 elements, so `cols`
+     * is always a multiple of 16), and one tile is 256 contiguous
+     * bytes, so this is a linear write over `(outDim/16) * padTiles`
+     * tiles and never touches a real one.
+     */
+    @Kernel
+    public static void deqPadZeroKernel(KernelBuffer<int8> deq, uint32 total,
+            int64 tilesK, int64 tilesKReal, int64 padTiles) {
+        uint32 tid = KernelThread.globalIdX();
+        if (tid < total) {
+            int64 t = (int64) tid / 256L;
+            int64 off = (int64) tid % 256L;
+            int64 rowTile = t / padTiles;
+            int64 pt = t % padTiles;
+            deq[(rowTile * tilesK + tilesKReal + pt) * 256L + off] = (int8) 0;
+        }
+    }
+
+    public static void deqPadZeroLaunch(KernelBuffer<int8> deq, int64 outDim,
+            int64 cols, int64 colsPad) {
+        if (colsPad == cols) { return; }
+        int64 tilesK = colsPad / 16L;
+        int64 tilesKReal = cols / 16L;
+        int64 padTiles = tilesK - tilesKReal;
+        int64 total = (outDim / 16L) * padTiles * 256L;
+        KernelStream s = QuantKernel.stream();
+        deqPadZeroKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
+            block: [256])
+            (deq, (uint32) total, tilesK, tilesKReal, padTiles);
+        return;
+    }
+
+    /**
+     * 7.4.2 — the COMPACT SCALE IMAGE: one f16 per 32-element block,
+     * `colsPad/32` a row, zero in the pad. The symmetric deq GEMM reads
+     * the weight for exactly one thing, the per-32 `d` at
+     * `ro + blkBytes*j`, so handing it this image at `blkBytes = 2`
+     * turns a strided 34/22/18-byte gather into a contiguous read AND
+     * gives the padded columns a scale to read at all.
+     */
+    @Kernel
+    public static void symScaleImageKernel(KernelBuffer<int8> img,
+            KernelBuffer<int8> packed, uint32 total, uint32 nb32,
+            uint32 nb32Pad, int64 blkBytes) {
+        uint32 tid = KernelThread.globalIdX();
+        if (tid < total) {
+            uint32 ii = tid / nb32Pad;
+            uint32 j = tid % nb32Pad;
+            int8 lo = (int8) 0;
+            int8 hi = (int8) 0;
+            if (j < nb32) {
+                int64 ro = (int64) ii * ((int64) nb32 * blkBytes)
+                    + (int64) j * blkBytes;
+                lo = packed[ro];
+                hi = packed[ro + 1L];
+            }
+            img[(int64) tid * 2L] = lo;
+            img[(int64) tid * 2L + 1L] = hi;
+        }
+    }
+
+    public static void symScaleImageLaunch(KernelBuffer<int8> img,
+            KernelBuffer<int8> packed, int64 outDim, int64 cols,
+            int64 colsPad, int64 blkBytes) {
+        int64 nb32 = cols / 32L;
+        int64 nb32Pad = colsPad / 32L;
+        int64 total = outDim * nb32Pad;
+        KernelStream s = QuantKernel.stream();
+        symScaleImageKernel.launch(s,
+            grid: [(uint32) ((total + 255L) / 256L)], block: [256])
+            (img, packed, (uint32) total, (uint32) nb32, (uint32) nb32Pad,
+             blkBytes);
+        return;
+    }
+
+    /** Bytes in the compact scale image for a padded symmetric tensor. */
+    public static int64 symScaleImageBytes(int64 outDim, int64 colsPad) {
+        return outDim * (colsPad / 32L) * 2L;
     }
 
     /**
@@ -5760,7 +5854,7 @@ public final class WmmaKernel {
         xDev.upload(xph);
         KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
             (uint64) (outDim * cols));
-        WmmaKernel.q80WidenLaunch(deqDev, wDev, outDim, cols);
+        WmmaKernel.q80WidenLaunch(deqDev, wDev, outDim, cols, cols);
         WmmaKernel.q80WmmaDeqMw8Launch(yDev, wDev, deqDev, xDev, rows,
             outDim, cols);
         KernelStream s = QuantKernel.stream();

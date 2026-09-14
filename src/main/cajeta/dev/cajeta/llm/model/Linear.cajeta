@@ -82,6 +82,10 @@ public final class Linear extends InfModule {
     // never prefills under "int8" never pays the ~2x bytes. Decode never
     // reads it.
     KernelBuffer<int8> deqDev;
+    // 7.4.2: the compact f16 scale image that replaces the packed
+    // weight as the symmetric deq GEMM's header source — one f16 per
+    // 32-element block, zero in the padded tail.
+    KernelBuffer<int8> scaleDev;
     KernelBuffer<float32> yDev;
     boolean unified;
     boolean q8;
@@ -696,6 +700,7 @@ public final class Linear extends InfModule {
         this.coopW = null;
         this.coopDev = null;
         this.deqDev = null;
+        this.scaleDev = null;
         this.yDev = null;
         this.yScratch = null;
         this.unified = false;
@@ -1230,7 +1235,6 @@ public final class Linear extends InfModule {
     // coop route nothing ever reads it, and packing rows x inDim floats
     // per stage is a full pass over the activations. Measured 2026-08-26.
     static boolean btXpDone;
-    static int64 btXpN;
     static int8[] btXph;
     static int32 btCap;      // rows the stage is sized for
     static int32 btDim;      // inDim the stage is sized for
@@ -1616,7 +1620,9 @@ public final class Linear extends InfModule {
         if (Linear.btCap > wr) { wr = Linear.btCap; }
         int32 wn = n;
         if (Linear.btDim > wn) { wn = Linear.btDim; }
-        int64 pb = Quant.q8kPackedBytes((int64) wn);
+        // 7.4.4: the row stride is the PADDED one — a column count with
+        // a remainder still gives every row a whole number of blocks.
+        int64 pb = Quant.q8kPackedBytes(Quant.q8kPadCols((int64) wn));
         // An in-flight NoSync GEMM may still read the old btXp.
         QuantKernel.stream().sync();
         Linear.btXph #= heap int8[(int64) wr * pb];
@@ -1687,7 +1693,8 @@ public final class Linear extends InfModule {
         // it. Row 0 still lands at offset 0, so the output is plausible
         // and wrong: the first prefill token came back as 55110 instead
         // of 198.
-        int64 pb = Quant.q8kPackedBytes((int64) n);
+        int64 nPad = Quant.q8kPadCols((int64) n);
+        int64 pb = Quant.q8kPackedBytes(nPad);
         int64 span = (int64) rows * (int64) n;
         if (Linear.devPack) {
             // PACK ON THE DEVICE. The host packer was 877 ms of a 7.9 s
@@ -1707,7 +1714,8 @@ public final class Linear extends InfModule {
             }
             int64 t1 = Clock.nanoTime();
             Linear.btXf.upload(fh, span);
-            QuantKernel.q8kPackLaunch(Linear.btXp, Linear.btXf, span);
+            QuantKernel.q8kPackRowsLaunch(Linear.btXp, Linear.btXf,
+                (int64) rows, (int64) n, nPad);
             Linear.btXhSrc #= Linear.btXf;
             Linear.btXhDone = false;
             Linear.btXpDone = true;
@@ -1718,8 +1726,8 @@ public final class Linear extends InfModule {
             int64 t0 = Clock.nanoTime();
             int64 r = 0;
             while (r < (int64) rows) {
-                Quant.q8kPack(sb, base + r * (int64) n, (int64) n,
-                    Linear.btXph, r * pb);
+                Quant.q8kPackPad(sb, base + r * (int64) n, (int64) n,
+                    nPad, Linear.btXph, r * pb);
                 r = r + 1;
             }
             int64 t1 = Clock.nanoTime();
@@ -1932,11 +1940,17 @@ public final class Linear extends InfModule {
                 && this.packedTy != Quant.GG_Q4_0) {
             return "no batched GEMM kernel for this format";
         }
-        // Only the 32-element legacy blocks can reach this: a k-quant
-        // tensor's ne[0] is a multiple of 256 by the GGUF invariant, so
-        // its deq route cannot see a remainder. Q8_0/Q5_0/Q4_0 can, and
-        // the GEMM would silently drop the tail (10.13.2).
-        if (!WmmaKernel.fitsMw8Cols((int64) this.inDim)) {
+        // Only the 32-element legacy blocks can reach a remainder: a
+        // k-quant tensor's ne[0] is a multiple of 256 by the GGUF
+        // invariant. Those three are padded to a whole super-block on
+        // both sides (7.4), so all they still require is whole blocks;
+        // for the rest an unpadded remainder would silently drop the
+        // tail (10.13.2).
+        if (this.symPacked()) {
+            if (!WmmaKernel.fitsMw8ColsSym((int64) this.inDim)) {
+                return "int8 Mw8 GEMM: cols not a multiple of the 32-element block";
+            }
+        } else if (!WmmaKernel.fitsMw8Cols((int64) this.inDim)) {
             return "int8 Mw8 GEMM: cols not a multiple of the 256 super-block";
         }
         if (!Linear.deqFor(this.packedTy)) {
@@ -2075,16 +2089,13 @@ public final class Linear extends InfModule {
         boolean useDeq5 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q5_K && Linear.avQ5Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
-        // Q8_0, Q5_0 and Q4_0 share one GEMM; only the block stride the
-        // cf prefold walks differs, and the widen has already erased the
-        // value encoding.
-        boolean symTy = this.packedTy == Quant.GG_Q8_0
-            || this.packedTy == Quant.GG_Q5_0
-            || this.packedTy == Quant.GG_Q4_0;
+        // Q8_0, Q5_0 and Q4_0 share one GEMM; the widen has already
+        // erased the value encoding, and 7.4.2 gave all three the same
+        // two-byte scale stride.
         boolean useDeq8 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
-            && symTy && Linear.avQ80Mw8
+            && this.symPacked() && Linear.avQ80Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
-            && WmmaKernel.fitsMw8Cols((int64) this.inDim);
+            && WmmaKernel.fitsMw8ColsSym((int64) this.inDim);
         boolean useDeq2 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q2_K && Linear.avQ2Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
@@ -2242,27 +2253,29 @@ public final class Linear extends InfModule {
         } else if (useDeq8) {
             this.ensureDeq();
             this.ensureBatchOut((int32) mw8Rows);
-            int64 symBlk = 34L;
             int32 symBit = 4194304;
             String symNm = "q8_0";
             if (this.packedTy == Quant.GG_Q5_0) {
-                symBlk = 22L; symBit = 8192; symNm = "q5_0";
+                symBit = 8192; symNm = "q5_0";
             }
             if (this.packedTy == Quant.GG_Q4_0) {
-                symBlk = 18L; symBit = 16384; symNm = "q4_0";
+                symBit = 16384; symNm = "q4_0";
             }
+            // 7.4.2: the header source is the compact scale image, not
+            // the weight — one f16 per 32-element block, so the stride
+            // is 2 for all three formats and the padded columns have a
+            // scale to read.
+            int64 symCols = this.deqCols();
             if (Linear.part32On) {
                 this.sayRoute(symBit, symNm + " deqMw8Part");
                 WmmaKernel.symWmmaDeqMw8PartLaunch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
-                    mw8Rows, (int64) this.outDim,
-                    (int64) this.inDim, symBlk);
+                    this.scaleDev, this.deqDev, Linear.btXp,
+                    mw8Rows, (int64) this.outDim, symCols, 2L);
             } else {
                 this.sayRoute(symBit, symNm + " deqMw8");
                 WmmaKernel.symWmmaDeqMw8Launch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
-                    mw8Rows, (int64) this.outDim,
-                    (int64) this.inDim, symBlk);
+                    this.scaleDev, this.deqDev, Linear.btXp,
+                    mw8Rows, (int64) this.outDim, symCols, 2L);
             }
         } else if (useDeq2) {
             this.ensureDeq();
@@ -2408,7 +2421,6 @@ public final class Linear extends InfModule {
         Linear.btXhSrc #= src;
         Linear.btXhDone = false;
         Linear.btXpDone = false;
-        Linear.btXpN = (int64) rows * (int64) n;
         Linear.btTag = tag;
         Linear.btRows = rows;
         Linear.btN = n;
@@ -2421,8 +2433,9 @@ public final class Linear extends InfModule {
     static void ensureBtXp() {
         if (Linear.btXpDone || Linear.btXhSrc == null) { return; }
         int64 t0 = Clock.nanoTime();
-        QuantKernel.q8kPackLaunchNoSync(Linear.btXp, Linear.btXhSrc,
-            Linear.btXpN);
+        QuantKernel.q8kPackRowsLaunchNoSync(Linear.btXp, Linear.btXhSrc,
+            (int64) Linear.btRows, (int64) Linear.btN,
+            Quant.q8kPadCols((int64) Linear.btN));
         Linear.btXpDone = true;
         Linear.btPackNs = Linear.btPackNs + (Clock.nanoTime() - t0);
         return;
@@ -2468,7 +2481,7 @@ public final class Linear extends InfModule {
             || this.packedTy == Quant.GG_Q3_K
             || this.packedTy == Quant.GG_Q5_0
             || this.packedTy == Quant.GG_Q4_0) && Linear.deqFor(this.packedTy)
-            && WmmaKernel.fitsMw8Cols((int64) this.inDim);
+            && this.deqColsOk();
         if (!q4 && !q6 && !q58) { return; }
         this.ensureDevice();
         this.ensureDeq();
@@ -2642,11 +2655,45 @@ public final class Linear extends InfModule {
      *  source. Both widens write the same tile-major layout. */
     void ensureDeq() {
         if (this.deqDev != null) { return; }
-        int64 n = (int64) this.outDim * (int64) this.inDim;
+        int64 cp = this.deqCols();
+        int64 n = (int64) this.outDim * cp;
         this.devWBytes = this.devWBytes + n;
         this.deqDev #= heap KernelBuffer<int8>((uint64) n);
+        if (this.symPacked()) {
+            int64 sb = WmmaKernel.symScaleImageBytes((int64) this.outDim, cp);
+            this.devWBytes = this.devWBytes + sb;
+            this.scaleDev #= heap KernelBuffer<int8>((uint64) sb);
+        }
         this.runDeqWiden();
         return;
+    }
+
+    /** Q8_0, Q5_0 and Q4_0 — one GEMM, one widen shape, and the only
+     *  formats whose column count can carry a remainder. */
+    boolean symPacked() {
+        return this.packedTy == Quant.GG_Q8_0
+            || this.packedTy == Quant.GG_Q5_0
+            || this.packedTy == Quant.GG_Q4_0;
+    }
+
+    /** Whether the int8 route can tile this column count at all — the
+     *  padded requirement for the legacy trio, the whole super-block
+     *  for everyone else. */
+    boolean deqColsOk() {
+        if (this.symPacked()) {
+            return WmmaKernel.fitsMw8ColsSym((int64) this.inDim);
+        }
+        return WmmaKernel.fitsMw8Cols((int64) this.inDim);
+    }
+
+    /** 7.4 — the width the widened copy and the packed activations are
+     *  BOTH tiled at. A k-quant's `ne[0]` is a multiple of 256 by the
+     *  GGUF invariant, so only the legacy formats ever pad. */
+    int64 deqCols() {
+        if (this.symPacked()) {
+            return Quant.q8kPadCols((int64) this.inDim);
+        }
+        return (int64) this.inDim;
     }
 
     /** ensureDeq's widen pass, separated so stageExpertWindow can
@@ -2660,7 +2707,8 @@ public final class Linear extends InfModule {
                 (int64) this.outDim, (int64) this.inDim);
         } else if (this.packedTy == Quant.GG_Q8_0) {
             WmmaKernel.q80WidenLaunch(this.deqDev, this.packedDev,
-                (int64) this.outDim, (int64) this.inDim);
+                (int64) this.outDim, (int64) this.inDim, this.deqCols());
+            this.runScaleImage(34L);
         } else if (this.packedTy == Quant.GG_Q2_K) {
             WmmaKernel.q2kWidenLaunch(this.deqDev, this.packedDev,
                 (int64) this.outDim, (int64) this.inDim);
@@ -2672,16 +2720,27 @@ public final class Linear extends InfModule {
                 (int64) this.outDim, (int64) this.inDim);
         } else if (this.packedTy == Quant.GG_Q5_0) {
             WmmaKernel.q50WidenLaunch(this.deqDev, this.packedDev,
-                (int64) this.outDim, (int64) this.inDim);
+                (int64) this.outDim, (int64) this.inDim, this.deqCols());
+            this.runScaleImage(22L);
         } else if (this.packedTy == Quant.GG_Q4_0) {
             WmmaKernel.q40WidenLaunch(this.deqDev, this.packedDev,
-                (int64) this.outDim, (int64) this.inDim);
+                (int64) this.outDim, (int64) this.inDim, this.deqCols());
+            this.runScaleImage(18L);
         } else {
             // Was a bare else into the Q4 widen — one format's bytes
             // through another's decoder (10.12.45's hazard class).
             throw heap LlmException("ensureDeq: no widen for packed "
                 + "type " + this.packedTy);
         }
+        return;
+    }
+
+    /** The widen's second output (7.4.2), re-run with it so a restaged
+     *  expert window rebuilds both. */
+    void runScaleImage(int64 blkBytes) {
+        WmmaKernel.symScaleImageLaunch(this.scaleDev, this.packedDev,
+            (int64) this.outDim, (int64) this.inDim, this.deqCols(),
+            blkBytes);
         return;
     }
 
