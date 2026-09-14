@@ -51,6 +51,13 @@ public final class Quant {
     public static final int32 GG_Q4_K = 12;
     public static final int32 GG_Q5_K = 13;
     public static final int32 GG_Q6_K = 14;
+    // The IQ4 pair (7.5.2): NON-LINEAR, not codebook. The nibble indexes
+    // a 16-entry value table instead of mapping linearly, which is the
+    // only difference from Q4_0 (IQ4_NL) and Q4_K's scale bookkeeping
+    // (IQ4_XS). The IQ1/IQ2/IQ3 types are the codebook family and are a
+    // different problem: kilobytes of grid tables, not a 16-byte one.
+    public static final int32 GG_IQ4_NL = 20;
+    public static final int32 GG_IQ4_XS = 23;
     // MXFP4 (OCP microscaling FP4): 32-elem blocks, one E8M0 scale byte
     // + 16 packed-nibble bytes = 17 bytes. GGML tensor type 39.
     public static final int32 GG_MXFP4 = 39;
@@ -64,6 +71,7 @@ public final class Quant {
             || ty == Quant.GG_Q2_K || ty == Quant.GG_Q3_K
             || ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
             || ty == Quant.GG_Q6_K
+            || ty == Quant.GG_IQ4_NL || ty == Quant.GG_IQ4_XS
             || ty == Quant.GG_MXFP4;
     }
 
@@ -71,7 +79,7 @@ public final class Quant {
     public static int32 blockElems(int32 ty) {
         if (ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
                 || ty == Quant.GG_Q4_1 || ty == Quant.GG_Q5_1
-                || ty == Quant.GG_Q8_0
+                || ty == Quant.GG_Q8_0 || ty == Quant.GG_IQ4_NL
                 || ty == Quant.GG_MXFP4) { return 32; }
         if (Quant.supported(ty)) { return 256; }
         return -1;
@@ -89,6 +97,8 @@ public final class Quant {
         if (ty == Quant.GG_Q4_K) { return 144; }
         if (ty == Quant.GG_Q5_K) { return 176; }
         if (ty == Quant.GG_Q6_K) { return 210; }
+        if (ty == Quant.GG_IQ4_NL) { return 18; }
+        if (ty == Quant.GG_IQ4_XS) { return 136; }
         if (ty == Quant.GG_MXFP4) { return 17; }
         return -1;
     }
@@ -140,6 +150,8 @@ public final class Quant {
             else if (ty == Quant.GG_Q3_K) { Quant.q3kBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q4_K) { Quant.q4kBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q5_K) { Quant.q5kBlock(raw, ro, out, oo); }
+            else if (ty == Quant.GG_IQ4_NL) { Quant.iq4nlBlock(raw, ro, out, oo); }
+            else if (ty == Quant.GG_IQ4_XS) { Quant.iq4xsBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_MXFP4) { Quant.mxfp4Block(raw, ro, out, oo); }
             else { Quant.q6kBlock(raw, ro, out, oo); }
             b = b + 1;
@@ -419,6 +431,154 @@ public final class Quant {
                     j = j + 1;
                 }
                 acc = acc + dv * dot + mv * xs;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
+        }
+    }
+
+    /**
+     * 7.5.2 — the IQ4 value table, `kvalues_iq4nl`. Sixteen signed
+     * levels, spaced non-linearly so the dense middle of a weight
+     * distribution gets finer steps than the tails; both IQ4 types index
+     * it with a plain nibble. Every entry fits int8, which is what lets
+     * the device side decode through one byte-permute LUT.
+     */
+    public static int32 iq4Kv(int32 j) {
+        if (j == 0) { return -127; }
+        if (j == 1) { return -104; }
+        if (j == 2) { return -83; }
+        if (j == 3) { return -65; }
+        if (j == 4) { return -49; }
+        if (j == 5) { return -35; }
+        if (j == 6) { return -22; }
+        if (j == 7) { return -10; }
+        if (j == 8) { return 1; }
+        if (j == 9) { return 13; }
+        if (j == 10) { return 25; }
+        if (j == 11) { return 38; }
+        if (j == 12) { return 53; }
+        if (j == 13) { return 69; }
+        if (j == 14) { return 89; }
+        return 113;
+    }
+
+    // ── IQ4_NL: { f16 d; u8 qs[16] } — Q4_0's block, byte for byte, with
+    // the nibble indexing iq4Kv instead of mapping to q - 8.
+
+    static void iq4nlBlock(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        int32 j = 0;
+        while (j < 16) {
+            int32 q = Quant.u8(raw, ro + 2L + (int64) j);
+            out[oo + (int64) j] =
+                d * (float32) Quant.iq4Kv(q & 15);
+            out[oo + (int64) (j + 16)] =
+                d * (float32) Quant.iq4Kv(q >> 4);
+            j = j + 1;
+        }
+    }
+
+    // ── IQ4_XS: { f16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128] } —
+    // 256 elements in eight 32-element sub-blocks, each with a SIX-BIT
+    // scale split four low bits in `scales_l` and two high in
+    // `scales_h`, biased -32. The values are IQ4_NL's table.
+
+    static void iq4xsBlock(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro);
+        int32 sh = Quant.u8(raw, ro + 2L) | (Quant.u8(raw, ro + 3L) << 8);
+        int32 ib = 0;
+        while (ib < 8) {
+            int32 sl = Quant.u8(raw, ro + 4L + (int64) (ib / 2));
+            int32 ls = ((sl >> (4 * (ib % 2))) & 15)
+                | (((sh >> (2 * ib)) & 3) << 4);
+            float32 dl = d * (float32) (ls - 32);
+            int64 qb = ro + 8L + (int64) (ib * 16);
+            int64 ob = oo + (int64) (ib * 32);
+            int32 j = 0;
+            while (j < 16) {
+                int32 q = Quant.u8(raw, qb + (int64) j);
+                out[ob + (int64) j] =
+                    dl * (float32) Quant.iq4Kv(q & 15);
+                out[ob + (int64) (j + 16)] =
+                    dl * (float32) Quant.iq4Kv(q >> 4);
+                j = j + 1;
+            }
+            ib = ib + 1;
+        }
+    }
+
+    /** Host mat-vec straight off IQ4_NL blocks — the oracle for the
+     *  device twin, in the same loop order. */
+    public static void iq4nlMatVecIntoAt(int8[] packed, int64 pOff,
+            int64 rows, int64 cols,
+            float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int64 blocksPerRow = cols / 32L;
+        int64 rowBytes = blocksPerRow * 18L;
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = pOff + i * rowBytes + b * 18L;
+                float32 dv = Quant.f16At(packed, ro);
+                float32 dot = 0.0f;
+                int64 xb = xOff + b * 32L;
+                int32 j = 0;
+                while (j < 16) {
+                    int32 q = Quant.u8(packed, ro + 2L + (int64) j);
+                    dot = dot + (float32) Quant.iq4Kv(q & 15)
+                        * x[xb + (int64) j];
+                    dot = dot + (float32) Quant.iq4Kv(q >> 4)
+                        * x[xb + (int64) (j + 16)];
+                    j = j + 1;
+                }
+                acc = acc + dv * dot;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
+        }
+    }
+
+    /** Host mat-vec straight off IQ4_XS blocks. The per-32 scale folds
+     *  per sub-block, as Q4_K's does. */
+    public static void iq4xsMatVecIntoAt(int8[] packed, int64 pOff,
+            int64 rows, int64 cols,
+            float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int64 blocksPerRow = cols / 256L;
+        int64 rowBytes = blocksPerRow * 136L;
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                int64 ro = pOff + i * rowBytes + b * 136L;
+                float32 dv = Quant.f16At(packed, ro);
+                int32 sh = Quant.u8(packed, ro + 2L)
+                    | (Quant.u8(packed, ro + 3L) << 8);
+                int32 ib = 0;
+                while (ib < 8) {
+                    int32 sl = Quant.u8(packed, ro + 4L + (int64) (ib / 2));
+                    int32 ls = ((sl >> (4 * (ib % 2))) & 15)
+                        | (((sh >> (2 * ib)) & 3) << 4);
+                    float32 dl = dv * (float32) (ls - 32);
+                    int64 qb = ro + 8L + (int64) (ib * 16);
+                    int64 xb = xOff + b * 256L + (int64) (ib * 32);
+                    float32 dot = 0.0f;
+                    int32 j = 0;
+                    while (j < 16) {
+                        int32 q = Quant.u8(packed, qb + (int64) j);
+                        dot = dot + (float32) Quant.iq4Kv(q & 15)
+                            * x[xb + (int64) j];
+                        dot = dot + (float32) Quant.iq4Kv(q >> 4)
+                            * x[xb + (int64) (j + 16)];
+                        j = j + 1;
+                    }
+                    acc = acc + dl * dot;
+                    ib = ib + 1;
+                }
                 b = b + 1;
             }
             y[yOff + i] = acc;
