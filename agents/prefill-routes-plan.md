@@ -1552,6 +1552,46 @@ HEADROOM, not a blocker: 9.3.1 already clears the bar. The route record
 on this checkpoint reads `resident: a GEMM per expert group`, so the
 layer is 180 device GEMMs where llama.cpp issues three.
 
+MEASURED 2026-09-14, and it is MEMORY as well as launches. Julian asked
+whether the engine touches weight memory twice instead of sharing it
+with the GPU, and whether RSS would show it. RssAnon is 822 MB against a
+9.5 GB model: no host copy exists, and RSS is structurally blind to
+device memory anyway (hipMalloc on this part is GTT, pinned outside the
+process). The kernel's own per-process figure, `drm-memory-gtt` in
+fdinfo, is 17.41 GB for this checkpoint at 512 rows with the widen OFF,
+against ~9.3 GB for one copy of the weights. Qwen3-30B and Mixtral sit
+at 1.04-1.06x their files. The excess is the SLOT PATH, all of it, and
+it decomposes with no residue (aligned snapshot, ledger vs kernel):
+
+  ensureCoopW    per-slot dword repacks of the Q8_0/Q5_0 down
+                 slices -- a SECOND device copy of those weights,
+                 one per expert per layer touched         3.84 GB
+  ROCr rounding  the repacks are 2,162,688 and 3,244,032 B: one
+                 byte over a 2 MB block each, and ROCr hands out
+                 GTT in whole 2 MB blocks, so each costs two.
+                 1,422 of them: 2.18 GB predicted, 2.2 measured  2.18 GB
+  ensureBatchOut per-slot yBatch                          1.06 GB
+  runtime base   queues, code objects; every model        ~0.6 GB
+
+The same path is the throughput cost: at prompt=8 it issues 999
+hipStreamSynchronize and 437 hipMemcpyDtoH where Qwen3-30B issues 9 and
+5, which is the 22%-GPU-busy decode profile from the other side.
+
+INSTRUMENTS, both new today: `CAJETA_XPU_ALLOC_TRACE=1` (compiler
+runtime) prints every device alloc/free with its cajeta site and the
+live total; `/proc/PID/fdinfo/* drm-memory-gtt` is the kernel's
+per-process truth. Probe and shim under tmp/u9/{grain,shim}.
+
+WHAT 9.4 THEREFORE BUYS: the id-GEMM reads the slab directly, so the
+repacks, their rounding and the per-slot yBatch all go -- ~7 GB of GTT
+on a 9 GB model -- along with the 180-launch layer.
+
+- [ ] **9.4.0 Coding** — until then, no repack may straddle a 2 MB
+      block: `ensureCoopW` sizes `coopDev` up to the block multiple
+      it will be charged for anyway, so the ledger and the kernel
+      agree, and the waste is visible as bytes the engine asked for
+      rather than bytes it did not.
+
 - [ ] **9.4.1 TDD** — an expert bank at Q8_0 and one at Q5_0 agree with
       the per-expert path, and are seen on `idPath`.
 - [ ] **9.4.2 Coding** — widen an expert slab to int8 + its f16 scale
