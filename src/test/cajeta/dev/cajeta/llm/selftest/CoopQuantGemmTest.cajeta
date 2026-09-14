@@ -188,6 +188,174 @@ public class CoopQuantGemmTest {
         }
     }
 
+    /**
+     * The BN=256 pair, which the shipped auto route does NOT dispatch:
+     * X1/X3 replaced it on 2026-08-26 after it lost 55-70%. It stayed in
+     * the tree as a probe arm, and on the Q6 side it had no launch site
+     * at all, so it was unreachable, ungated, and — being unbounded —
+     * capped at 192 VGPRs and spilling into its own k-loop.
+     *
+     * `useGlobalB` picks the twin that reads B straight from global
+     * instead of staging it through LDS. Both must agree with
+     * dequantize-then-multiply on exactly the bar the shipped route
+     * meets; a retired kernel that is still compiled and still launchable
+     * is still a kernel, and an unchecked one is how a wrong answer waits.
+     *
+     * ROWS is 256 here, not the suite's 128: these kernels tile tokens by
+     * 256 and a 128-token launch computes `nTokTiles = 0`.
+     */
+    static void checkN256(int32 ty, String fixture, boolean useGlobalB) {
+        if (!CoopQuantGemmTest.coopHere()) {
+            System.stdout.println("  (skipped: backend "
+                + Device.activeBackend() + " has no coop kernel)");
+            return;
+        }
+        int64 rows = 256L;
+        int64 cols = CoopQuantGemmTest.COLS;
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be = (int64) Quant.blockElems(ty);
+        int64 blocksPerRow = cols / be;
+        int64 nBlocks = CoopQuantGemmTest.OUT * blocksPerRow;
+
+        int8[] fix #= File.readAllBytes(CoopQuantGemmTest.DIR + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        Assert.isTrue(fixBlocks > 0L);
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        float32[] x #= heap float32[rows * cols];
+        int64 i = 0;
+        while (i < rows * cols) {
+            x[i] = (float32) ((i * 31L + 7L) % 61L - 30L) * 0.0625f;
+            i = i + 1;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>(
+            (uint64) (nBlocks * bb));
+        wD.upload(raw);
+        KernelBuffer<float32> xfD #= heap KernelBuffer<float32>(
+            (uint64) (rows * cols));
+        xfD.upload(x);
+        KernelBuffer<float16> xhD #= heap KernelBuffer<float16>(
+            (uint64) (rows * cols));
+        QuantKernel.f32ToF16LaunchNoSync(xhD, xfD, rows * cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>(
+            (uint64) (rows * CoopQuantGemmTest.OUT));
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+
+        int64 dw = (int64) QuantKernel.coopBlockWords(ty);
+        KernelBuffer<int8> padD #= heap KernelBuffer<int8>(
+            (uint64) (nBlocks * dw * 4L));
+        if (QuantKernel.coopNeedsRepack(ty)) {
+            if (ty == Quant.GG_Q3_K || ty == Quant.GG_Q6_K) {
+                QuantKernel.blockPadLaunch(padD, wD, nBlocks, (int32) bb,
+                    (int32) (dw * 4L));
+            } else {
+                QuantKernel.blockRepack2Launch(padD, wD, nBlocks,
+                    (int32) bb, (int32) (dw * 4L));
+            }
+        }
+        KernelBuffer<int32> wW #= QuantKernel.coopNeedsRepack(ty)
+            ? padD.wordView() : wD.wordView();
+
+        if (ty == Quant.GG_Q6_K) {
+            if (useGlobalB) {
+                QuantKernel.q6kF16CoopN256GLaunch(yD, wW, xhD, rows,
+                    CoopQuantGemmTest.OUT, cols);
+            } else {
+                QuantKernel.q6kF16CoopN256Launch(yD, wW, xhD, rows,
+                    CoopQuantGemmTest.OUT, cols);
+            }
+        } else {
+            if (useGlobalB) {
+                QuantKernel.q4kF16CoopN256GLaunch(yD, wW, xhD, rows,
+                    CoopQuantGemmTest.OUT, cols);
+            } else {
+                QuantKernel.q4kF16CoopN256Launch(yD, wW, xhD, rows,
+                    CoopQuantGemmTest.OUT, cols);
+            }
+        }
+        s.sync();
+        float32[] got #= heap float32[rows * CoopQuantGemmTest.OUT];
+        yD.download(got);
+
+        float32[] w #= heap float32[nBlocks * be];
+        Quant.dequantize(ty, raw, 0L, nBlocks, w, 0L);
+
+        boolean live = false;
+        float64 worst = 0.0;
+        int64 worstAt = -1L;
+        float32 worstGot = 0.0f;
+        float32 worstWant = 0.0f;
+        int64 t = 0;
+        while (t < rows) {
+            int64 o = 0;
+            while (o < CoopQuantGemmTest.OUT) {
+                float32 acc = 0.0f;
+                int64 k = 0;
+                while (k < cols) {
+                    acc = acc + w[o * cols + k] * x[t * cols + k];
+                    k = k + 1;
+                }
+                float32 g = got[t * CoopQuantGemmTest.OUT + o];
+                if (g != 0.0f) { live = true; }
+                float32 diff = acc - g;
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = acc < 0.0f ? 0.0f - acc : acc;
+                float64 rel = (float64) diff
+                    / ((float64) mag * 0.01 + 0.01);
+                if (rel > worst) {
+                    worst = rel;
+                    worstAt = t * CoopQuantGemmTest.OUT + o;
+                    worstGot = g;
+                    worstWant = acc;
+                }
+                o = o + 1;
+            }
+            t = t + 1;
+        }
+        String nm = "N256";
+        if (useGlobalB) { nm = "N256G"; }
+        if (worst > 1.0) {
+            Assert.fail("coop " + nm + " ty=" + ty + " at ["
+                + (worstAt / CoopQuantGemmTest.OUT) + ","
+                + (worstAt % CoopQuantGemmTest.OUT) + "]: kernel "
+                + worstGot + " vs host dequant-and-multiply " + worstWant);
+        }
+        if (!live) {
+            Assert.fail("coop " + nm + " ty=" + ty + ": every output is "
+                + "zero, which is what a kernel that never ran produces");
+        }
+        System.stdout.println("   " + nm + " ty=" + ty + " worst rel "
+            + worst);
+    }
+
+    @Test
+    public void coopN256Q6KMatchesHost() {
+        CoopQuantGemmTest.checkN256(Quant.GG_Q6_K, "q6_k.bin", false);
+    }
+
+    @Test
+    public void coopN256GlobalBQ6KMatchesHost() {
+        CoopQuantGemmTest.checkN256(Quant.GG_Q6_K, "q6_k.bin", true);
+    }
+
+    @Test
+    public void coopN256Q4KMatchesHost() {
+        CoopQuantGemmTest.checkN256(Quant.GG_Q4_K, "q4_k.bin", false);
+    }
+
+    @Test
+    public void coopN256GlobalBQ4KMatchesHost() {
+        CoopQuantGemmTest.checkN256(Quant.GG_Q4_K, "q4_k.bin", true);
+    }
+
     @Test
     public void coopGemmQ4KMatchesHost() {
         CoopQuantGemmTest.checkFormat(Quant.GG_Q4_K, "q4_k.bin");
