@@ -110,6 +110,45 @@ run_suite() {
     return $rc
 }
 
+# 4.1.1 — the spill gate, on the COMPILER'S OWN enumeration.
+#
+# QuantKernelTest.noShippedGemmKernelSpills pins the kernels the routes
+# dispatch, but a list can only check what it names: a NEW kernel that
+# arrives spilling is invisible to it. The compiler already warns
+# [xpu-kernel-spill] once per kernel it lowered, so gating on that warning
+# covers every kernel by construction and cannot narrow.
+#
+# What we own FAILS; what we do not own is REPORTED. A spilling stdlib
+# kernel is a finding for the compiler repo and must not be absorbed into
+# a waiver list here, where nobody would look at it again.
+spill_gate() {
+    local errlog="$1" label="$2" all mine theirs
+    [ -s "$errlog" ] || return 0
+    all=$(sed -n 's/.*\[xpu-kernel-spill\] \([^ ]*\) on \([^:]*\): \([0-9]*\) bytes.*/  \1 on \2: \3 bytes/p' \
+          "$errlog" | sort -u)
+    if [ -z "$all" ]; then
+        echo ">> ${label}: no kernel spills"
+        return 0
+    fi
+    theirs=$(printf '%s\n' "$all" | grep -v ' dev\.cajeta\.llm\.' || true)
+    mine=$(printf '%s\n' "$all" | grep ' dev\.cajeta\.llm\.' || true)
+    if [ -n "$theirs" ]; then
+        echo ">> NOTE (${label}): kernels OUTSIDE this repo spill. A finding for"
+        echo ">>       the compiler repo; not gated here."
+        printf '%s\n' "$theirs"
+    fi
+    if [ -n "$mine" ]; then
+        echo ">> FAIL (${label}): a kernel in this repo spills."
+        printf '%s\n' "$mine"
+        echo ">>       A block the compiler cannot see as constant is budgeted"
+        echo ">>       for 1024 threads, which caps gfx1151 at 192 VGPRs."
+        echo ">>       Declare the structural bound: @Occupancy(maxThreads = N)."
+        return 1
+    fi
+    echo ">> ${label}: no kernel in this repo spills"
+    return 0
+}
+
 # Ownership-migration switches (ownership/transfer-of-borrow compiler):
 # the return-side (OWNED_BIND) and captured-borrow checks land warn-first
 # there, and this library has NOT done its migration pass yet — the chat
@@ -260,7 +299,10 @@ echo ">> dev.cajeta.logging: $logging_cja"
 echo ">> building llama library .cja"
 "$CAJETA" --emit=cja -o "$out/llama.cja" \
     --classpath="$codec_cja,$jinja_cja,$logging_cja" \
-    dev.cajeta.llm.Llm.run "$here/src/main/cajeta" "$out" >/dev/null
+    dev.cajeta.llm.Llm.run "$here/src/main/cajeta" "$out" \
+    >/dev/null 2>"$out/lib.err" || { cat "$out/lib.err" >&2; exit 1; }
+cat "$out/lib.err" >&2
+spill_gate "$out/lib.err" "llama library"
 
 echo ">> building + running the test binary"
 # XPU_BACKEND (default cpu): the engine's device paths (device-resident weight
@@ -280,7 +322,10 @@ echo ">> building + running the test binary"
 "$CAJETA" --emit=exe --profile=test --xpu-backend="${XPU_BACKEND:-cpu}" \
     --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja,$logging_cja" \
     -o "$out/llamatests" \
-    dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
+    dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" \
+    >/dev/null 2>"$out/test.err" || { cat "$out/test.err" >&2; exit 1; }
+cat "$out/test.err" >&2
+spill_gate "$out/test.err" "test binary"
 
 run_suite "$out/llamatests" "test profile"
 

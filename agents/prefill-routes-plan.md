@@ -359,13 +359,29 @@ plan's acceptance and in the bench memory.
 ## Unit 4 — No shipped GEMM kernel spills (spec §5)
 
 ### 4.1 TDD
-- [ ] 4.1.1 `QuantKernelTest`: `KernelManifest.of("q4kWmmaDeqMw8Kernel")`,
-      `("q2kWmmaDeqMw8Kernel")`, `("q6kF16CoopN256GKernel")` report
-      `spillBytes == 0` on gfx1151 (skips where the backend has no
-      footprint); the same test lists every registered GEMM kernel and
-      fails on any non-zero spill, so the check cannot silently narrow.
-- [ ] 4.1.2 Each kernel's existing correctness test still passes
-      bit-for-bit (they are int8/f16 tile kernels with exact references).
+- [x] 4.1.1 DONE 2026-09-13, as TWO gates, because one could not carry both
+      halves. `QuantKernelTest.noShippedGemmKernelSpills` reads
+      `KernelManifest.of(...)` for the ten kernels the routes dispatch and
+      asserts `spillBytes == 0`; a kernel with no footprint is skipped, a
+      kernel with NO MANIFEST fails, and the test counts what it looked at
+      and fails at zero, so a rename cannot empty it. That covers what it
+      names and nothing more — a NEW kernel arriving spilling is invisible
+      to a list. The non-narrowing half is therefore gated at BUILD time in
+      `run-tests.sh` on the compiler's own `[xpu-kernel-spill]` warning,
+      which is emitted once per kernel it lowered and so enumerates by
+      construction. `dev.cajeta.llm.*` FAILS the build; anything else is
+      REPORTED, not waived — see the finding below.
+      Gate proven to fire AND not to fire (tmp/u3/gate-check.sh) against the
+      real before- and after- build logs, not a hand-written fixture.
+- [x] 4.1.2 DONE 2026-09-13. `theDeqWmmaKernelMatchesTheStagedWmmaKernelExactly`,
+      `multiWavePackedQ4kAgreesWithDeqMw8` (2.98e-08),
+      `multiWaveQ6kDeqMw8AgreesWithDeqMw4` (5.96e-08) and
+      `deqMw8FingerprintsAcrossFormats` all pass, and all six fingerprints
+      are BIT-IDENTICAL to the pre-change run: q8_0 557943202053999872,
+      q2_k 555448914295820688, q3_k 554782903441251872,
+      q5_k 554552225166775392, q6_k 557609487829326320,
+      q4_k 554826083512649792. The pin moved register allocation, not
+      arithmetic, and the folds say so rather than a tolerance.
 
 ### 4.2 Coding
 - [x] 4.2.1 RESOLVED 2026-09-13 by the 2x4 wave re-shape, not by a despill:
@@ -388,9 +404,45 @@ plan's acceptance and in the bench memory.
       `q2kWmmaDeqMw8Kernel` (256 VGPR, 108 B, 25 KB LDS): same
       treatment; LDS is its occupancy limiter, so the register cut must
       not move work into LDS.
-- [ ] 4.2.3 `q6kF16CoopN256GKernel` (192 VGPR, 68 B): the coop route
-      Unit 2 puts on HIP — fix before Unit 2's acceptance leg on Q6_K-
-      bearing formats, or record that Q6_K keeps its native route.
+- [x] 4.2.3 RESOLVED 2026-09-13, and the cause was not register pressure.
+      192 VGPR is not this kernel's appetite, it is a CAP. The compiler
+      budgets registers from the largest CONSTANT block across a kernel's
+      launch sites and erases the bound when any site's block is not a
+      literal (`Compiler.cpp:2512-2552`); an unbounded kernel is budgeted
+      for 1024 threads, which on gfx1151 is 32 waves and caps it at exactly
+      192 VGPRs. The correlation across all 67 GEMM kernels is total: every
+      kernel with `threadsPerGroup = None` sat at 192, and that set IS the
+      set that spilled.
+      `q6kF16CoopN256GKernel` had no launch site AT ALL — declared, lowered,
+      registered, spilling, never dispatched, while its q4 twin
+      (`q4kF16CoopN256GKernel`, literal `block: [256]`) sat at 217 VGPR and
+      zero spill on the same shape.
+      Fix: `@Occupancy(maxThreads = 512)` — the structural truth (the kernel
+      is 8 waves, so 8 x the 64-wide maximum), which the amdgpu lowering
+      turns into `amdgpu-flat-work-group-size`, "the VGPR-budget lever on
+      RDNA". 192/68 B -> 217/0.
+      NOT a despill: no register was cut, no tile narrowed, nothing traded
+      for reloads. That is why 4.2.1's lesson does not apply here.
+
+FINDING 2026-09-13 — three STDLIB kernels spill, badly, and nothing was
+watching. `cajeta.math.Ewise.matmulBf16` 1232 B/work-item (vgpr=256),
+`matmulF32` 3076 B (vgpr=50), `matmulF64` 6152 B (vgpr=84) on
+amdgpu/gfx1151. They are not this repo's and are not gated here, but they
+have been printing on every amdgpu build of this project and were read as
+noise. `matmulF32` at vgpr=50 with 3 KB of scratch is not a register-
+pressure story at all; something is spilling an array. Belongs to the
+compiler repo.
+
+FINDING 2026-09-13 — a kernel cannot both read its block from the manifest
+and be pinned by it. `q4kWmmaMwLaunch` resolves its block from
+`KernelManifest.of("q4kWmmaMwKernel")`, which makes the launch-site block a
+runtime value, which erases the flat-work-group-size bound, which caps the
+kernel at 192 VGPRs — in the manifest the launcher just read. The escape is
+that `@Occupancy` is author-declared and evaluated BEFORE the launch-site
+scan (`AmdgpuRegistration.cpp:109-115`), so declaring the structural bound
+as intent is compatible with resolving the quantity at runtime. That split
+is what tile-manifest §14.1 asks for; this is the first case where it was
+load-bearing rather than stylistic.
 
 ### 4.3 Acceptance
 - [ ] 4.3.1 Before/after duration on each kernel's own route (`MmqProbe` /
@@ -617,7 +669,16 @@ intrinsic, loop-unroll directive; then re-profile.
       access sets match the manifest (no refusal).
 
 ### 6.2 Coding
-- [~] 6.2.1 (built and bit-correct at 554; spill 204 B, not zero — despill regressed on deq, held) `q4kWmmaMwKernel` (packed route): multi-wave tile (N waves/wg
+- [x] 6.2.1 (built and bit-correct at 554; spill CLOSED 2026-09-13 by 4.2.3's
+      finding, not by a despill: the launcher takes its block from the
+      kernel's OWN manifest, so the block is never a literal, so the bound
+      is erased and the kernel is capped at 192 VGPRs. The portability
+      machinery Unit 6 built to stop hard-coding 256 is exactly what cost it
+      64 registers — a kernel that derives its geometry from the manifest
+      is, for that reason, one the manifest cannot pin. `@Occupancy(maxThreads
+      = 512)` declares the bound as intent and leaves the profile free to
+      pick the quantity within it: 192/168 B -> 236/0, bit-identical)
+      `q4kWmmaMwKernel` (packed route): multi-wave tile (N waves/wg
       cooperating on a larger output tile), int32 in-register accumulation
       across sub-blocks, Q4_K sub-block scales + dmin folded in the epilogue
       WITHOUT per-sub-block LDS round-trips/barriers. Wave width via
