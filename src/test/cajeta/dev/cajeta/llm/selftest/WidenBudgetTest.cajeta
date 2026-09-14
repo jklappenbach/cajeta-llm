@@ -1,0 +1,261 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import cajeta.xpu.Device;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.WidenBudget;
+
+/**
+ * Plan 8.3.1 — the int8 widen is budgeted.
+ *
+ * `prefillWeights` decides whether widening PAYS for a format. Nothing
+ * asked whether it FITS: on Qwen2.5-VL-72B that is 50.8 GB of widen over
+ * 45 GB of packed weights on a 122 GB box, and the answer was an OOM kill
+ * mid-load rather than a route decision.
+ *
+ * Both directions are tested. A budget check that silently refused
+ * everything would pass a fires-only suite while turning the int8 route
+ * off for the whole fleet, and a check that never fired would pass a
+ * does-not-fire-only suite while changing nothing.
+ */
+public class WidenBudgetTest {
+
+    /** Route + answer at one shape under one budget. Returns the routes
+     *  the tap saw, so the caller asserts on the DECISION rather than on
+     *  a number that a fallback would also produce. */
+    static #String routeUnderBudget(int64 budget) {
+        int64 ci = 512L;
+        int64 co = 128L;
+        Linear lin #= LinearKernelRouteTest.tiledAt(Quant.GG_Q8_0,
+            "q8_0.bin", (int32) ci, (int32) co);
+        Tensor<float32> x #= LinearKernelRouteTest.ramp(128L * ci, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L, 128L * co);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L, 128L * co);
+        QuantKernel.setRoutingEnabled(false);
+        int64 r = 0;
+        while (r < 128L) {
+            lin.matvecInto(x, r * ci, want, r * co);
+            r = r + 1;
+        }
+        QuantKernel.setRoutingEnabled(true);
+        WidenBudget.reset();
+        WidenBudget.setBudget(budget);
+        Linear.setDeqPrefill(true);
+        Linear.resetRouteSaid();
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        Linear.stageBatch(x, 0L, 128, (int32) ci, Linear.nextStageTag());
+        lin.matmulInto(128, got, 0L);
+        Diag.register(null);
+        Linear.setDeqPrefill(false);
+        WidenBudget.setBudget(0L - 1L);
+        WidenBudget.reset();
+        // The answer must survive whichever route ran: a refusal falls
+        // back to the coop f16 GEMM, which is a different kernel and the
+        // same product. Range bar, as the legacy spread test uses.
+        float32 worst = 0.0f;
+        float32 mag = 0.0f;
+        int64 i = 0;
+        while (i < 128L * co) {
+            float32 g = got.flatGet(i);
+            float32 w = want.flatGet(i);
+            float32 d = g - w;
+            if (d < 0.0f) { d = 0.0f - d; }
+            if (d > worst) { worst = d; }
+            float32 m = w;
+            if (m < 0.0f) { m = 0.0f - m; }
+            if (m > mag) { mag = m; }
+            i = i + 1;
+        }
+        if (mag == 0.0f) { Assert.fail("serial output is all zero"); }
+        if ((float64) worst > (float64) mag * 0.01) {
+            Assert.fail("budget " + budget + ": worst " + worst
+                + " exceeds 1% of range " + mag);
+        }
+        String routes #= cap.namesOf("batch-route");
+        return #routes;
+    }
+
+    /** 8.3.1 — the check FIRES: a budget that cannot cover the widen
+     *  sends the tensor to the coop GEMM instead, and says so. */
+    @Test
+    public void aWidenTooBigForTheBudgetIsRefused() {
+        if (!Linear.wmmaBackend()) {
+            System.stdout.println("  (skipped: no batch GEMM on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        String routes #= WidenBudgetTest.routeUnderBudget(1L);
+        System.stdout.println("   budget=1 routes=" + routes);
+        if (routes.contains("deqMw8")) {
+            Assert.fail("a 1-byte budget still took the widen route: "
+                + routes);
+        }
+        return;
+    }
+
+    /** 8.3.1 — and does NOT fire: the same shape, a budget that covers
+     *  it, takes the int8 route exactly as before. Without this the
+     *  refusal above is consistent with a check that refuses
+     *  everything. */
+    @Test
+    public void aWidenInsideTheBudgetStillRuns() {
+        if (!Linear.wmmaBackend()) {
+            System.stdout.println("  (skipped: no batch GEMM on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        String routes #= WidenBudgetTest.routeUnderBudget(1073741824L);
+        System.stdout.println("   budget=1GiB routes=" + routes);
+        if (!routes.contains("deqMw8")) {
+            Assert.fail("a 1 GiB budget refused a 128x512 widen: "
+                + routes);
+        }
+        return;
+    }
+
+    /** 8.3.1 — the charge is what was ALLOCATED: the padded int8 copy
+     *  plus the symmetric scale image, not the tensor's nominal size. */
+    @Test
+    public void theBudgetIsChargedWhatTheWidenAllocates() {
+        if (!Linear.wmmaBackend()) {
+            System.stdout.println("  (skipped: no batch GEMM on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        WidenBudget.reset();
+        WidenBudget.setBudget(1073741824L);
+        int64 ci = 512L;
+        int64 co = 128L;
+        Linear lin #= LinearKernelRouteTest.tiledAt(Quant.GG_Q8_0,
+            "q8_0.bin", (int32) ci, (int32) co);
+        Tensor<float32> x #= LinearKernelRouteTest.ramp(128L * ci, 0L);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L, 128L * co);
+        Linear.setDeqPrefill(true);
+        Linear.stageBatch(x, 0L, 128, (int32) ci, Linear.nextStageTag());
+        lin.matmulInto(128, got, 0L);
+        Linear.setDeqPrefill(false);
+        int64 want = co * ci
+            + WmmaKernel.symScaleImageBytes(co, ci);
+        int64 used = WidenBudget.usedBytes();
+        WidenBudget.setBudget(0L - 1L);
+        WidenBudget.reset();
+        System.stdout.println("   charged " + used + " want " + want);
+        if (used != want) {
+            Assert.fail("widen charged " + used + ", allocated " + want);
+        }
+        return;
+    }
+
+    /**
+     * 8.3.1 — AUTO is a LIVE measurement with a reserve, and the
+     * instrument is alive.
+     *
+     * A budget snapshotted at load time would be measured before the
+     * packed weights are resident: on the 72B that is half of an empty
+     * box, it authorises 62 GB of widen, and the OOM happens anyway.
+     * So the test that matters is that `fits` MOVES with the reserve
+     * rather than answering from a stored number.
+     */
+    @Test
+    public void autoAdmissionIsLiveAndKeepsAReserve() {
+        int64 avail = WidenBudget.availableBytes();
+        int64 total = WidenBudget.totalBytes();
+        System.stdout.println("   available=" + avail + " total=" + total
+            + " reserve=" + WidenBudget.reserveBytes());
+        if (avail <= 0L || total <= 0L) {
+            System.stdout.println("  (skipped: no /proc/meminfo)");
+            return;
+        }
+        if (avail > total) {
+            Assert.fail("available " + avail + " exceeds total " + total);
+        }
+        WidenBudget.setBudget(0L - 1L);
+        // Default reserve: an eighth of physical memory, floored at 1 GiB.
+        int64 want = total / 8L;
+        if (want < 1073741824L) { want = 1073741824L; }
+        if (WidenBudget.reserveBytes() != want) {
+            Assert.fail("reserve " + WidenBudget.reserveBytes()
+                + " is not MemTotal/8 " + want);
+        }
+        // A small widen fits; one that would eat into the reserve does
+        // not. Both answers come from the same live read, so this is the
+        // fires / does-not-fire pair for the AUTO path itself.
+        if (!WidenBudget.fits(1048576L)) {
+            Assert.fail("a 1 MiB widen was refused with " + avail
+                + " available");
+        }
+        WidenBudget.setReserve(avail);
+        if (WidenBudget.fits(1048576L)) {
+            Assert.fail("a reserve of everything still admitted 1 MiB");
+        }
+        WidenBudget.setReserve(0L);
+        if (!WidenBudget.fits(1048576L)) {
+            Assert.fail("clearing the reserve did not restore admission");
+        }
+        return;
+    }
+
+    /**
+     * 8.3.1 — the SECOND ceiling. MEASURED 2026-09-14 on the 72B: 60 s
+     * into an AUTO load, MemAvailable was 25.6 GB against a 15.4 GB
+     * reserve — nowhere near refusing — while GTT sat at 93 GiB of 96.
+     * The driver's pool runs out first on a UMA part, so a budget that
+     * watches only the system pool is watching the wrong ceiling.
+     */
+    @Test
+    public void gttHeadroomIsACeilingOfItsOwn() {
+        int64 total = WidenBudget.gttTotalBytes();
+        int64 free = WidenBudget.gttFreeBytes();
+        System.stdout.println("   gttTotal=" + total + " gttFree=" + free
+            + " gttReserve=" + WidenBudget.gttReserveBytes()
+            + " driverFree=" + Device.freeMemoryBytes()
+            + " driverTotal=" + Device.memoryBytes());
+        if (total <= 0L) {
+            System.stdout.println("  (skipped: no amdgpu GTT counters)");
+            return;
+        }
+        if (free < 0L || free > total) {
+            Assert.fail("gtt free " + free + " out of range for total "
+                + total);
+        }
+        WidenBudget.setBudget(0L - 1L);
+        WidenBudget.setReserve(1L);
+        // A widen larger than the whole GTT pool cannot fit even with
+        // the system reserve set to a single byte — so a refusal here is
+        // the GTT ceiling talking and nothing else.
+        if (WidenBudget.fits(total + 1L)) {
+            Assert.fail("a widen bigger than the whole GTT pool fit");
+        }
+        if (!WidenBudget.fits(1048576L)) {
+            Assert.fail("a 1 MiB widen was refused with " + free
+                + " GTT free");
+        }
+        WidenBudget.setReserve(0L);
+        return;
+    }
+
+    /** 8.3.1 — mode 0 is "never widen", and it is not the default. A
+     *  zero default would have turned the int8 route off fleet-wide. */
+    @Test
+    public void zeroMeansNeverWidenAndIsNotTheDefault() {
+        if (!WidenBudget.autoMode()) {
+            Assert.fail("the default budget is not AUTO: "
+                + WidenBudget.budgetBytes());
+        }
+        WidenBudget.setBudget(0L);
+        if (WidenBudget.fits(1L)) {
+            Assert.fail("budget 0 admitted a 1-byte widen");
+        }
+        WidenBudget.setBudget(0L - 1L);
+        return;
+    }
+}

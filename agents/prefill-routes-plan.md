@@ -1129,10 +1129,23 @@ weight), and its tail entries are simply zero.
       `q8kPackKernel` takes `(blocks, nbRow, nReal)` and `Quant.q8kPackPad`
       is its host twin; at `nPad == n` both are the flat pack block for
       block, so the k-quant routes see no change at all.
-- [~] **7.4.5 Acceptance** — the 72B's ffn_down takes `q5_0 deqMw8Part` /
+- [x] **7.4.5 Acceptance** — the 72B's ffn_down takes `q5_0 deqMw8Part` /
       `q8_0 deqMw8Part` again, with the guard still refusing anything the
       padding does not cover.
-      HALF MEASURED, on the OTHER checkpoint the remainder reaches.
+      MEASURED 2026-09-14 ON THE 72B ITSELF, once 8.3.1 made the int8
+      policy survivable on it (`deq widenMb=16384`, rc=0):
+
+        batch-route q8_0 deqMw8Part 8192 29568
+        batch-route q5_0 deqMw8Part 8192 29568
+
+      Both 29568-wide ffn_down formats are back on the int8 route; Unit
+      8's run recorded them as `coop q8_0 8192 29568` / `coop q5_0 8192
+      29568`, which is what 7.2's guard did and what 7.4 wins back. Both
+      coop AND deq appear for those shapes in the same run, because the
+      widen budget ran out partway and the later layers fell back — the
+      mixed regime a sticky per-tensor refusal is supposed to produce.
+
+      ALSO MEASURED, on the other checkpoint the remainder reaches.
       Qwen1.5-MoE `ffn_down_exps` is 1408 = 5*256 + 128 and both symmetric
       formats now route there:
       `batch-route q8_0 deqMw8Part 2048 1408` and
@@ -1217,9 +1230,49 @@ and every other use needs only `.count()`.
       full host array never exists (`slice` + `hostStore` on a Unified
       buffer is zero-copy on an APU), and re-read from the mapping for
       the host path, as ExpertBank does.
-- [ ] **8.3.1** Budget the widen against available memory. The auto
+- [x] **8.3.1** Budget the widen against available memory. The auto
       policy today asks whether widening PAYS for a format; it never
       asks whether it FITS.
+      DONE 2026-09-14. `WidenBudget` + `EngineOptions.widenBudget`
+      (-1 auto / 0 never / N bytes), consulted by every deq route and by
+      `prewarmDeq`, charged where the allocation happens, refused
+      ONE-SHOT per tensor the way ExpertBank admits experts. A refusal
+      falls back to the coop GEMM — still batched, still correct — and
+      says so once, naming format and shape.
+
+      TWO THINGS THE MEASUREMENT CHANGED, both of which a reasoned
+      design would have got wrong:
+
+      (a) AUTO IS LIVE, NOT A SNAPSHOT. The first cut took half of
+      MemAvailable at load. That is measured before the 45 GB of packed
+      weights are resident — half of an empty box — so it authorises
+      ~62 GB of widen and the OOM happens anyway. Re-reading per
+      admission is self-correcting: each widen that lands lowers what
+      the next one sees. One procfs read per tensor, once, at load.
+
+      (b) THERE ARE TWO CEILINGS AND GTT IS THE TIGHTER ONE. 60 s into
+      an AUTO load of the 72B: MemAvailable 25.6 GB against a 15.4 GB
+      reserve — nowhere near refusing — while GTT sat at 93 GiB of a
+      96 GiB pool. On a UMA part every KernelBuffer is GTT, the driver's
+      pool is smaller than RAM (96 vs 122.8 GiB), and it runs out first.
+      A budget watching only the system pool watches the wrong ceiling.
+      `fits()` now takes the tighter of the two, each with an
+      eighth-of-pool reserve.
+
+      ACCEPTANCE, on the 72B itself, `deq widenMb=16384`: rc=0, load
+      40.7 s, prefill 19.95 tok/s, decode 4.93 tok/s, RSS 7.9 GB. The
+      int8 policy has never before reached a token on this checkpoint.
+      The budget refused exactly where told —
+      `widen-refused q4_k 242221056 ... 29568 8192` with 15.9 GiB of the
+      16 GiB ceiling spent.
+
+      OPEN, and recorded rather than guessed: prefill under a partial
+      widen is 19.95 tok/s against 26.2 for `packedw` (Unit 8's number).
+      A partial widen is WORSE than none on this checkpoint. Whether
+      that is the mixed route, the page cache the widen displaces, or
+      deqMw8Part simply losing to coop at 29568 needs a widenMb sweep,
+      which is a measurement and not a guess. It does not block the
+      budget: the budget's job is that the run survives, and it does.
 
 UNIT 8 RESULT 2026-09-13. The 72B loads and generates. `rc=0`, 16 tokens,
 prefill 26.2 tok/s, decode 4.61 tok/s, `residentKb` 30079376 (28.7 GB).

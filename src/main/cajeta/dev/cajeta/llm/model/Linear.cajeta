@@ -86,6 +86,10 @@ public final class Linear extends InfModule {
     // weight as the symmetric deq GEMM's header source — one f16 per
     // 32-element block, zero in the padded tail.
     KernelBuffer<int8> scaleDev;
+    // 8.3.1: the widen did not fit the budget. Sticky — a tensor
+    // refused once is never retried, or a budget that frees up mid-run
+    // widens half a model's layers and not the other half.
+    boolean deqRefused;
     KernelBuffer<float32> yDev;
     boolean unified;
     boolean q8;
@@ -701,6 +705,7 @@ public final class Linear extends InfModule {
         this.coopDev = null;
         this.deqDev = null;
         this.scaleDev = null;
+        this.deqRefused = false;
         this.yDev = null;
         this.yScratch = null;
         this.unified = false;
@@ -2069,7 +2074,8 @@ public final class Linear extends InfModule {
         // outDim x inDim bytes PER EXPERT, which at bank scale would
         // double the residency budget for a kernel the plain WMMA
         // form serves from the packed slab directly (unit 41c).
-        boolean useDeq = useWmma && Linear.deqFor(this.packedTy) && !this.slotMode;
+        boolean useDeq = useWmma && Linear.deqFor(this.packedTy)
+            && !this.slotMode && this.deqAdmitted();
         // Q6_K on the matrix cores too (10.12.23): 10.12.22 measured the
         // dotAccum fallback at 1290 ms of the 2844 ms launch — 32 calls
         // costing ~as much as all 192 WMMA calls.
@@ -2088,20 +2094,24 @@ public final class Linear extends InfModule {
         int64 mw8Rows = ((int64) rows + 127L) / 128L * 128L;
         boolean useDeq5 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q5_K && Linear.avQ5Mw8
-            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
+            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
+            && this.deqAdmitted();
         // Q8_0, Q5_0 and Q4_0 share one GEMM; the widen has already
         // erased the value encoding, and 7.4.2 gave all three the same
         // two-byte scale stride.
         boolean useDeq8 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
             && this.symPacked() && Linear.avQ80Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
-            && WmmaKernel.fitsMw8ColsSym((int64) this.inDim);
+            && WmmaKernel.fitsMw8ColsSym((int64) this.inDim)
+            && this.deqAdmitted();
         boolean useDeq2 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q2_K && Linear.avQ2Mw8
-            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
+            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
+            && this.deqAdmitted();
         boolean useDeq3 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
             && this.packedTy == Quant.GG_Q3_K && Linear.avQ3Mw8
-            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim);
+            && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
+            && this.deqAdmitted();
         if (useDeq) {
             this.ensureDeq();
             if (Linear.q4Mw8On && Linear.avQ4Mw8
@@ -2188,7 +2198,7 @@ public final class Linear extends InfModule {
             }
         } else if (useWmma6) {
             if (Linear.deqFor(this.packedTy) && Linear.q6Mw4On && Linear.avQ6Mw4
-                    && !this.slotMode
+                    && !this.slotMode && this.deqAdmitted()
                     && WmmaKernel.fitsMw4((int64) rows,
                         (int64) this.outDim)) {
                 this.ensureDeq();
@@ -2484,6 +2494,11 @@ public final class Linear extends InfModule {
             && this.deqColsOk();
         if (!q4 && !q6 && !q58) { return; }
         this.ensureDevice();
+        // 8.3.1: the prewarm is where the 72B's 50.8 GB of widen was
+        // actually spent — called per layer from CausalLM with nothing
+        // asking whether the bytes exist. It asks now, and a refusal
+        // here is the same sticky refusal the routes read.
+        if (!this.deqAdmitted()) { return; }
         this.ensureDeq();
         return;
     }
@@ -2521,6 +2536,9 @@ public final class Linear extends InfModule {
         WmmaKernel.concatI8Launch(this.fusedPackedDev, b.packedDev,
             bn, an);
         int64 n = this.fusedOut * (int64) this.inDim;
+        // 8.3.1: the fused widen is a widen too — same bytes per weight,
+        // charged the same way.
+        WidenBudget.charge(n + an + bn);
         this.fusedDeqDev #= heap KernelBuffer<int8>((uint64) n);
         WmmaKernel.q4kWidenLaunch(this.fusedDeqDev, this.fusedPackedDev,
             this.fusedOut, (int64) this.inDim);
@@ -2547,6 +2565,7 @@ public final class Linear extends InfModule {
         WmmaKernel.concatI8Launch(this.fusedPackedDev, c.packedDev,
             cn, an + bn);
         int64 n = this.fusedOut * (int64) this.inDim;
+        WidenBudget.charge(n + an + bn + cn);
         this.fusedDeqDev #= heap KernelBuffer<int8>((uint64) n);
         WmmaKernel.q4kWidenLaunch(this.fusedDeqDev, this.fusedPackedDev,
             this.fusedOut, (int64) this.inDim);
@@ -2602,6 +2621,12 @@ public final class Linear extends InfModule {
                 || b.packedTy != Quant.GG_Q4_K) {
             return false;
         }
+        // 8.3.1: the fused widen is bigger than either tensor's own, so
+        // it asks first — and steps aside to the per-projection routes,
+        // which ask for themselves.
+        if (this.fusedDeqDev == null && !this.fusedAdmitted(b, null)) {
+            return false;
+        }
         this.ensureFused2(b);
         if (!WmmaKernel.fitsMw8((int64) rows, this.fusedOut)) {
             return false;
@@ -2636,6 +2661,9 @@ public final class Linear extends InfModule {
             // half the layers by MODEL layout, not by accident.
             return false;
         }
+        if (this.fusedDeqDev == null && !this.fusedAdmitted(kL, vL)) {
+            return false;
+        }
         this.ensureFused3(kL, vL);
         if (!WmmaKernel.fitsMw8((int64) rows, this.fusedOut)) {
             return false;
@@ -2657,6 +2685,9 @@ public final class Linear extends InfModule {
         if (this.deqDev != null) { return; }
         int64 cp = this.deqCols();
         int64 n = (int64) this.outDim * cp;
+        // 8.3.1: charged where it is ALLOCATED, so the budget counts
+        // bytes that exist rather than bytes a route considered.
+        WidenBudget.charge(this.widenBytes());
         this.devWBytes = this.devWBytes + n;
         this.deqDev #= heap KernelBuffer<int8>((uint64) n);
         if (this.symPacked()) {
@@ -2666,6 +2697,59 @@ public final class Linear extends InfModule {
         }
         this.runDeqWiden();
         return;
+    }
+
+    /** What {@link #ensureDeq} will allocate: the widened int8 copy at
+     *  the padded width, plus the symmetric scale image. */
+    int64 widenBytes() {
+        int64 cp = this.deqCols();
+        int64 n = (int64) this.outDim * cp;
+        if (this.symPacked()) {
+            n = n + WmmaKernel.symScaleImageBytes((int64) this.outDim, cp);
+        }
+        return n;
+    }
+
+    /**
+     * 8.3.1 — does the widen FIT? `deqFor` already answered whether it
+     * PAYS for this format; nothing asked whether the bytes exist, and on
+     * the 72B that arithmetic is 50.8 GB of widen over 45 GB of packed
+     * weights on a 122 GB box.
+     *
+     * Refusal is STICKY and one-shot per tensor, the shape ExpertBank
+     * uses for expert admission: a tensor refused once is never retried,
+     * because a budget that frees up mid-run would otherwise widen half a
+     * model's layers and not the other half. The fallback is the coop f16
+     * GEMM — still batched, still correct.
+     */
+    boolean deqAdmitted() {
+        if (this.deqDev != null) { return true; }
+        if (this.deqRefused) { return false; }
+        int64 need = this.widenBytes();
+        if (WidenBudget.fits(need)) { return true; }
+        this.deqRefused = true;
+        String tn #= GgufFile.typeName(this.packedTy);
+        WidenBudget.refuse(tn, need, (int64) this.outDim,
+            (int64) this.inDim);
+        return false;
+    }
+
+    /** 8.3.1 for the FUSED widen, which is the concatenated group's
+     *  packed copy plus its int8 copy — larger than any one tensor's,
+     *  and allocated behind its own `fusedDeqDev` rather than through
+     *  `ensureDeq`. `c` may be null (the two-way group). */
+    boolean fusedAdmitted(Linear b, Linear c) {
+        int64 outs = (int64) this.outDim + (int64) b.outDim;
+        int64 packed = this.packedBytes + b.packedBytes;
+        if (c != null) {
+            outs = outs + (int64) c.outDim;
+            packed = packed + c.packedBytes;
+        }
+        int64 need = outs * (int64) this.inDim + packed;
+        if (WidenBudget.fits(need)) { return true; }
+        String tn #= GgufFile.typeName(this.packedTy);
+        WidenBudget.refuse(tn + " fused", need, outs, (int64) this.inDim);
+        return false;
     }
 
     /** Q8_0, Q5_0 and Q4_0 — one GEMM, one widen shape, and the only

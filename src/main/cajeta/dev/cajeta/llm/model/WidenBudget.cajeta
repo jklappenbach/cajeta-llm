@@ -1,0 +1,297 @@
+package dev.cajeta.llm.model;
+
+import cajeta.io.file.File;
+import cajeta.io.file.OpenMode;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.Diag;
+
+/**
+ * Plan 8.3.1 — whether the int8 widen FITS, which is a different question
+ * from whether it PAYS.
+ *
+ * `Linear.deqFor` decides per format whether widening a weight into its
+ * `[outDim x colsPad]` int8 copy is worth the bytes. Nothing asked whether
+ * the bytes exist. On Qwen2.5-VL-72B that arithmetic is 50.8 GB of widen
+ * over 45 GB of packed weights on a 122 GB box — 70 GB once 7.4 lets
+ * ffn_down widen too — and the answer was an OOM kill mid-load rather
+ * than a route decision.
+ *
+ * THREE MODES, one mechanism each:
+ *
+ *   budget < 0   AUTO. Admit while the box can still spare the bytes AND
+ *                keep {@link #reserveBytes} free. LIVE, re-read per
+ *                admission.
+ *   budget == 0  never widen; every route falls back to the coop GEMM.
+ *   budget > 0   an explicit aggregate ceiling in bytes: charge against
+ *                it and refuse past it.
+ *
+ * AUTO IS LIVE, NOT A SNAPSHOT, and that is the whole design. A budget
+ * fixed at load time is measured before the packed weights are resident,
+ * so on the 72B "half of what is available" is half of an empty box —
+ * it authorises 62 GB of widen and the OOM happens anyway. Re-reading
+ * MemAvailable per admission is self-correcting: every widen that lands
+ * lowers what the next one sees, and admissions stop when the box is
+ * within the reserve of full. The cost is one procfs read per tensor,
+ * once, at load.
+ *
+ * AVAILABLE, NOT TOTAL, for the same reason. `Device.memoryBytes()`
+ * documents itself as a capacity — "allocation can still fail earlier
+ * under pressure, and on UMA this pool is shared with the host page
+ * cache" — and on this class of part that page cache is where the packed
+ * weights are read from. It answers 96 GiB of GTT on a box with 116 GiB
+ * available; budgeting against a capacity is what produced the OOM.
+ */
+public final class WidenBudget {
+    // UNMETERED-AUTO IS THE DEFAULT, and deliberately: a Linear built
+    // without an engine — every route test, every probe — must widen as
+    // it did before 8.3.1 on a box with memory to spare, and must still
+    // refuse on a box without.
+    static int64 budget = 0L - 1L;
+    static int64 used;
+    static int64 refusals;
+    static int64 refusedBytes;
+    static int64 reserve;
+    // 0 = not probed yet, -1 = no readable card, else the card index
+    // PLUS ONE — card0 is a real index on a discrete part, so storing it
+    // raw would read as "not probed" and re-scan on every admission.
+    static int32 drmCard;
+    static boolean said;
+
+    public static void setBudget(int64 bytes) {
+        WidenBudget.budget = bytes;
+        return;
+    }
+
+    /** Bytes AUTO keeps free. 0 (the default) derives it from MemTotal. */
+    public static void setReserve(int64 bytes) {
+        WidenBudget.reserve = bytes;
+        return;
+    }
+
+    public static int64 budgetBytes() { return WidenBudget.budget; }
+    public static int64 usedBytes() { return WidenBudget.used; }
+    public static int64 refusalCount() { return WidenBudget.refusals; }
+    public static int64 refusedByteCount() { return WidenBudget.refusedBytes; }
+
+    /** Forget every charge and every refusal — the shape a test needs,
+     *  and the shape a second `load` in one process needs. */
+    public static void reset() {
+        WidenBudget.used = 0L;
+        WidenBudget.refusals = 0L;
+        WidenBudget.refusedBytes = 0L;
+        WidenBudget.said = false;
+        return;
+    }
+
+    public static boolean autoMode() { return WidenBudget.budget < 0L; }
+
+    /**
+     * What AUTO keeps free: an explicit reserve when one was set, else an
+     * eighth of physical memory, floored at 1 GiB.
+     *
+     * A FRACTION, not a constant, because the same number has to be right
+     * on a 122 GB workstation and a 16 GB laptop: 15 GB of headroom on
+     * the first and 2 GB on the second, which is the shape of what the
+     * KV cache, the activations and the OS actually need in each case.
+     */
+    public static int64 reserveBytes() {
+        if (WidenBudget.reserve > 0L) { return WidenBudget.reserve; }
+        int64 total = WidenBudget.totalBytes();
+        int64 eighth = total / 8L;
+        if (eighth < 1073741824L) { return 1073741824L; }
+        return eighth;
+    }
+
+    /**
+     * Would a widen of `bytes` fit RIGHT NOW? Pure — {@link #charge} is
+     * what commits, so a route that asks and then does not widen has not
+     * spent anything.
+     *
+     * TWO CEILINGS, and the tighter one wins. MEASURED 2026-09-14 on the
+     * 72B: 60 s into an AUTO load, MemAvailable was 25.6 GB — still well
+     * clear of a 15.4 GB reserve — while GTT sat at 93 GiB of a 96 GiB
+     * total. The driver's pool would have refused the next widen before
+     * the budget did, which is the OOM this unit exists to prevent
+     * wearing a different hat. A UMA part charges a device allocation to
+     * BOTH pools and either can run out first.
+     */
+    public static boolean fits(int64 bytes) {
+        if (WidenBudget.budget == 0L) { return false; }
+        if (!WidenBudget.autoMode()) {
+            return WidenBudget.used + bytes <= WidenBudget.budget;
+        }
+        int64 avail = WidenBudget.availableBytes();
+        int64 gttFree = WidenBudget.gttFreeBytes();
+        // Nothing measurable: keep the pre-8.3.1 behaviour rather than
+        // trade a measured hazard on one box for an unmeasured
+        // regression on every platform without procfs.
+        if (avail <= 0L && gttFree < 0L) { return true; }
+        if (avail > 0L && avail - bytes < WidenBudget.reserveBytes()) {
+            return false;
+        }
+        if (gttFree >= 0L
+                && gttFree - bytes < WidenBudget.gttReserveBytes()) {
+            return false;
+        }
+        return true;
+    }
+
+    /** An eighth of the GTT pool, floored at 1 GiB — the same shape as
+     *  {@link #reserveBytes}, against the other ceiling. */
+    public static int64 gttReserveBytes() {
+        int64 total = WidenBudget.gttTotalBytes();
+        if (total <= 0L) { return 0L; }
+        int64 eighth = total / 8L;
+        if (eighth < 1073741824L) { return 1073741824L; }
+        return eighth;
+    }
+
+    /**
+     * Device bytes still free, or -1 when nothing can answer.
+     *
+     * THE DRIVER FIRST. `Device.freeMemoryBytes` is the same single call
+     * that answers `memoryBytes` — `hipMemGetInfo` / `cuMemGetInfo` hand
+     * back free and total together — so it is the driver's own
+     * accounting, it is portable to CUDA, and on this part its total is
+     * byte-identical to the sysfs GTT pool. The sysfs pair stays as the
+     * fallback for an amdgpu box whose runtime cannot be asked.
+     */
+    public static int64 gttFreeBytes() {
+        int64 dev = Device.freeMemoryBytes();
+        if (dev > 0L) { return dev; }
+        int64 total = WidenBudget.gttTotalBytes();
+        if (total <= 0L) { return 0L - 1L; }
+        int64 used = WidenBudget.gttUsedBytes();
+        if (used < 0L) { return 0L - 1L; }
+        return total - used;
+    }
+
+    public static int64 gttTotalBytes() {
+        int64 dev = Device.memoryBytes();
+        if (dev > 0L) { return dev; }
+        return WidenBudget.gttCounter("mem_info_gtt_total");
+    }
+
+    public static int64 gttUsedBytes() {
+        return WidenBudget.gttCounter("mem_info_gtt_used");
+    }
+
+    /**
+     * One amdgpu sysfs counter, or -1. The card index is not fixed (this
+     * box answers on card1, a discrete part on card0), so the first
+     * readable one is latched and every later read goes straight to it —
+     * this runs once per tensor at load, not on any hot path.
+     */
+    static int64 gttCounter(String leaf) {
+        if (WidenBudget.drmCard < 0) { return 0L - 1L; }
+        if (WidenBudget.drmCard > 0) {
+            return WidenBudget.readCounter(WidenBudget.drmCard - 1, leaf);
+        }
+        int32 c = 0;
+        while (c < 8) {
+            int64 v = WidenBudget.readCounter(c, "mem_info_gtt_total");
+            if (v > 0L) {
+                WidenBudget.drmCard = c + 1;
+                return WidenBudget.readCounter(c, leaf);
+            }
+            c = c + 1;
+        }
+        WidenBudget.drmCard = 0 - 1;
+        return 0L - 1L;
+    }
+
+    static int64 readCounter(int32 card, String leaf) {
+        String path #= "/sys/class/drm/card" + card + "/device/" + leaf;
+        File f #= File.open(path, OpenMode.READ);
+        if (f == null) { return 0L - 1L; }
+        int8[] st #= heap int8[64];
+        int64 n = f.read(st, 0, 64);
+        f.close();
+        int64 v = 0;
+        boolean any = false;
+        int64 i = 0;
+        while (i < n) {
+            if (st[i] >= 48 && st[i] <= 57) {
+                v = v * 10L + (int64) (st[i] - 48);
+                any = true;
+            }
+            i = i + 1;
+        }
+        if (any) { return v; }
+        return 0L - 1L;
+    }
+
+    public static void charge(int64 bytes) {
+        WidenBudget.used = WidenBudget.used + bytes;
+        return;
+    }
+
+    /**
+     * Record a refusal and say so ONCE. The engine has one route
+     * diagnostic per decision by construction (Unit 1), and a widen that
+     * silently does not happen is exactly the class of quiet fallback
+     * that cost the 2026-09-06 sweep five checkpoints.
+     */
+    public static void refuse(String what, int64 bytes, int64 outDim,
+            int64 inDim) {
+        WidenBudget.refusals = WidenBudget.refusals + 1L;
+        WidenBudget.refusedBytes = WidenBudget.refusedBytes + bytes;
+        if (WidenBudget.said) { return; }
+        WidenBudget.said = true;
+        Diag.emit("widen-refused", 0 - 1, what, bytes,
+            WidenBudget.availableBytes(), WidenBudget.reserveBytes(),
+            outDim, inDim, WidenBudget.used);
+        return;
+    }
+
+    /**
+     * MemAvailable in bytes, or 0 when it cannot be read — the kernel's
+     * own estimate of what a new allocation can take without swapping,
+     * which already accounts for the reclaimable page cache the packed
+     * weights are mapped through.
+     */
+    public static int64 availableBytes() {
+        return WidenBudget.meminfo(65);       // MemAvailable
+    }
+
+    /** MemTotal in bytes, or 0 when it cannot be read. */
+    public static int64 totalBytes() {
+        return WidenBudget.meminfo(84);       // MemTotal
+    }
+
+    /**
+     * `Mem` + `k` + `:` from /proc/meminfo, in bytes. The fourth byte is
+     * the only difference between the two keys this needs ('A' vailable,
+     * 'T' otal), so one scanner serves both. Streaming read: procfs
+     * files fstat as size 0.
+     */
+    static int64 meminfo(int32 k) {
+        File f #= File.open("/proc/meminfo", OpenMode.READ);
+        if (f == null) { return 0L; }
+        int8[] st #= heap int8[4096];
+        int64 n = f.read(st, 0, 4096);
+        f.close();
+        int64 i = 0;
+        while (i < n - 4L) {
+            boolean hit = st[i] == 77 && st[i + 1L] == 101
+                && st[i + 2L] == 109 && st[i + 3L] == (int8) k;
+            if (hit) {
+                int64 j = i + 4L;
+                int64 v = 0;
+                boolean any = false;
+                while (j < n && st[j] != 10) {
+                    if (st[j] >= 48 && st[j] <= 57) {
+                        v = v * 10L + (int64) (st[j] - 48);
+                        any = true;
+                    }
+                    j = j + 1L;
+                }
+                if (any) { return v * 1024L; }
+                return 0L;
+            }
+            i = i + 1L;
+        }
+        return 0L;
+    }
+}
