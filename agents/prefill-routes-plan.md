@@ -549,9 +549,83 @@ load-bearing rather than stylistic.
       repo's bench page with the after rows; archive this plan.
 
 ### 5.3 Acceptance
-- [ ] 5.3.1 The 2026-09-06 sweep recipe rerun: no `per-row` on any
+- [~] 5.3.1 The 2026-09-06 sweep recipe rerun: no `per-row` on any
       checkpoint; every prefill ratio ≥ 0.17x; decode within noise; load
       not worse. Table in this section.
+      RERUN 2026-09-14 on a quiet box (Julian: "box is clear"). THREE OF
+      FOUR CRITERIA PASS AND ONE FAILS, on one checkpoint.
+
+      Prefill tok/s at 512, cajeta against llama.cpp's BEST backend on
+      this box (the 2026-09-06/13 reference rows, same build 5306f4b):
+
+        model                       2026-09-06    now    llama    ratio
+        8B Q8_0                           13.2   1571      914    1.72x
+        8B Q6_K                          217.7   1314     1033    1.27x
+        8B Q2_K                           17.9   1256     1123    1.12x
+        8B Q4_K_M                        235.9   1437     1320    1.09x
+        8B Q5_K_M                         15.0   1405     1314    1.07x
+        8B Q3_K_M                         16.8   1374     1349    1.02x
+        30B-A3B Q4_K_M                   538.0   1254     1295    0.97x
+        72B Q4_K_M (widenMb=16384)           -   33.1      ~90    0.37x
+        Mixtral Q4_K_M                    16.9    249      542    0.46x
+        Qwen1.5-MoE Q4_K_M                71.3     87     2342    0.04x
+
+      SIX OF TEN NOW BEAT llama.cpp's best backend. The 2026-09-06 memory
+      recorded "prefill is the gap"; on the dense 8B set it is not any
+      more.
+
+      no `per-row`      PASS. All nine sweep checkpoints report
+                        `prefill-mode batched`, and so does the 72B.
+                        Checked in a SEPARATE pass from the timings,
+                        because `trace` installs a Diag sink and a
+                        number that goes in this table should not have
+                        been measured with a printf in the loop.
+      ratio >= 0.17x    **FAIL on Qwen1.5-MoE: 0.04x.** It is batched,
+                        so this is route QUALITY, not route absence: its
+                        1408-wide expert tensors take `q4 plain` and
+                        `dotAccum` (the fallback the code comments
+                        measured at 1290 ms of a 2844 ms launch) while
+                        `q5_0/q8_0 deqMw8Part 2048 1408` — the ones 7.4
+                        padded — take the fast route. 60 experts x 24
+                        layers of small tensors, and the fast path is
+                        gated on `MoeFfn.zeroSyncReady`'s
+                        `widthN % 256 == 0`, which 1408 fails.
+      decode in noise   PASS. Every model within ~1% (e.g. 8B Q4_K_M
+                        41.5 -> 41.7, 30B 85.9 -> 85.4).
+      load not worse    PASS, and the first reading was wrong. The
+                        512x128 legs showed Mixtral 13.4 -> 19.8 s, but
+                        those ran at `cached=0.0%` against warm
+                        predecessors. Warm load legs, steady state:
+                        30B 7.23 -> 6.44 s, Mixtral 13.39 -> 10.35 s,
+                        Qwen1.5-MoE 4.71 -> 3.79 s. All better.
+
+      TWO DEFECTS THE RERUN FOUND, one of them 8.3.1's:
+
+      (a) THE BENCH REPORTED A NUMBER FOR A RUN THAT NEVER RAN. The first
+      72B leg, under AUTO, printed 6246 tok/s of prefill and 280 tok/s of
+      decode — both physically impossible on a 44 GiB model, whose decode
+      cannot exceed ~4.4 tok/s at 212 GB/s. Behind them were **133380**
+      dispatches that found no registered kernel, each returning WITHOUT
+      writing its output, so every timing loop completed in no time.
+      `Device.launchFailures()` had existed all along and nothing asked.
+      The bench now prints `VOID:` and refuses the leg, and `leg.sh`
+      records `void`/`nolaunch` per row. Same shape as the
+      `kernelAvailable` defect 5.1.1 found: a launch that does not happen
+      must not look like success.
+
+      (b) 8.3.1's AUTO RESERVE WAS TOO THIN, and (a) is what it looked
+      like. AUTO admitted **48.7 GB** of widen on the 72B, drove GTT into
+      the high 80s of a 96 GiB pool, and the HIP runtime could then not
+      register the kernels it had not yet loaded — the pool is not ours
+      alone, and a budget that spends to a thin margin starves the thing
+      that executes the kernels it exists to feed. The GTT reserve is now
+      a QUARTER of the pool, floored at 2 GiB, pinned by a test. The
+      control: the same checkpoint at an explicit 16 GiB ceiling
+      completed with ZERO launch failures, which is the 33.1 tok/s row
+      above.
+
+      WHAT REMAINS for this item is one number: Qwen1.5-MoE's prefill.
+      That is a real gap with a named cause, not a measurement artifact.
 
 ## Unit 6 — Multi-wave packed Q4_K GEMM for prefill parity
 
