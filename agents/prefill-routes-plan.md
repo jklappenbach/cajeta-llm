@@ -1057,9 +1057,31 @@ of the 72B's `ffn_down` tensors are Q5_0 and today route to `coop`.
 - [x] **7.3.3 Coding** — `q40WidenKernel` / `q50WidenKernel`;
       `symWmmaDeqMw8Launch` with `blkBytes` (34/22/18); `deqFor`,
       `runDeqWiden`, `prewarmDeq` and `batchRefusal` extended.
-- [ ] **7.3.4 Acceptance** — Q8_0 prefill does not regress and its output
+- [x] **7.3.4 Acceptance** — Q8_0 prefill does not regress and its output
       fingerprint does not move: the stride became a kernel argument, and
       that touches the shipped Q8_0 path.
+      MEASURED 2026-09-13 on a quiet box (Julian: "It's quiet"), 8B Q8_0,
+      prompt=512, 5 rounds, arm order alternating. TWO INTERNALLY
+      CONTROLLED LEGS, because Units 4 and 8 landed between the two
+      changes and one before/after across all of them would have credited
+      7.3/7.4 with Unit 4's despill:
+
+        leg          changed arm `deq`      control `packedw`
+        7273         -0.26%                 -0.65%     (d4d8146 -> 2fdbce1)
+        df70         +8.31%                 -0.53%     (df7070f -> HEAD)
+
+      (means of rounds 2-5; round 1 of each leg is the cold outlier the
+      `bench-first-model-runs-cold` note predicts, at -5.1% and -1.5%.
+      All-five means: -1.22% and +6.36% — same conclusion either way.)
+
+      7.2 + 7.3 do not regress Q8_0: the changed arm moved LESS than its
+      own control. 7.4 PAYS +8.3%, every round the same sign
+      (+7.42 / +7.82 / +8.97 / +9.03), against a control that never moves
+      more than 1.4pp — the compact scale image turned a strided 34-byte
+      gather into a contiguous 16-byte-per-lane read, which is exactly
+      what 7.4's design note predicted and the first direct evidence for
+      it. The fingerprint half was already gated: every deqMw8
+      fingerprint is bit-identical, q8_0's included.
 
 ### 7.4 The remainder fast path (what 7.2 costs back)
 
