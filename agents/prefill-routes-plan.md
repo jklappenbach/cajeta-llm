@@ -545,8 +545,18 @@ load-bearing rather than stylistic.
       nothing.
 
 ### 5.2 Coding
-- [ ] 5.2.1 Update `llm-vs-llamacpp-bench-2026-09-06` memory and the cajeta
+- [~] 5.2.1 Update `llm-vs-llamacpp-bench-2026-09-06` memory and the cajeta
       repo's bench page with the after rows; archive this plan.
+      MEMORY DONE 2026-09-14: the 2026-09-14 rerun is recorded there and
+      the description now says the 2026-09-06 headline ("prefill is the
+      gap") is SUPERSEDED for prefill — six of ten checkpoints beat
+      llama.cpp's best backend, and only Qwen1.5-MoE is still far
+      behind. The after rows are in `tmp/llmbench/rows.jsonl`
+      (stamp 20260914-*), which is what the bench page renders from.
+      ARCHIVE BLOCKED, correctly: the plan closes when every unit is
+      [x], and three are not — 5.3.1 (Qwen1.5-MoE 0.04x), 3.3.1 (its
+      number), 7.5.2 (the codebook tier). Unit 9 is the one that
+      unblocks the first two.
 
 ### 5.3 Acceptance
 - [~] 5.3.1 The 2026-09-06 sweep recipe rerun: no `per-row` on any
@@ -1379,6 +1389,53 @@ this repo already recorded, where a Q5_0 tensor with no packed path fell to
 the rank-1 min term the k-quant kernels carry. No checkpoint on this box uses
 either, and llama.cpp treats both as legacy. Do the whole stack or leave the
 refusal honest.
+
+## Unit 9 — PROPOSED: the MoE expert width remainder (Qwen1.5-MoE 0.04x)
+
+NOT STARTED. Written up 2026-09-14 because 5.3.1 measured the gap and
+named its cause, and an option left only in prose is an option lost.
+This is the ONLY thing between this plan and a clean close.
+
+5.3.1: Qwen1.5-MoE prefills at 87 tok/s against llama.cpp's 2342 —
+0.04x, the one checkpoint under the 0.17x bar. It BATCHES, so this is
+route quality, not route absence.
+
+THE CAUSE IS 7.4'S PROBLEM ONE LAYER UP. Its expert width is
+1408 = 5*256 + 128, and the MoE fast path is gated on a whole
+super-block exactly as the dense int8 route was before 7.4:
+
+  MoeFfn.cajeta:707   if (this.widthN % 256 != 0) return false;   (zeroSyncReady)
+  MoeFfn.cajeta:890   q8kPackLaunchNoSync(xpGyDev, gyDev, usedN * wid)
+                      — the FLAT pack, so at wid % 256 != 0 the blocks
+                      straddle expert rows: 7.4.4's defect verbatim
+  MoeFfn.cajeta:897   idDownCombineTail(..., wid / 256L, ...)       — truncates
+  MoeFfn.cajeta:697   buffer sized (u * wid / 256L) * 320L          — truncates
+
+And the machinery to fix it already exists, built by 7.4.4:
+`QuantKernel.q8kPackRowsLaunchNoSync(out, x, rows, n, nPad)` packs each
+row on a block boundary with a zero-filled tail, and is the flat pack
+block-for-block when nPad == n.
+
+- [ ] **9.1.1 TDD** — an expert bank at width 1408 must agree with the
+      per-row serial path, and must be SEEN on the fast route. The MoE
+      forward tests already have the shape (`q8ExpertSlabPrefillsBatched`).
+- [ ] **9.1.2 TDD** — a width that is a whole super-block must be
+      BIT-IDENTICAL before and after, since nPad == n makes the pack the
+      same bytes. This is the does-not-fire half.
+- [ ] **9.2.1 Coding** — `MoeFfn` pads the expert width: row-aware pack,
+      `widPad/256` everywhere `wid/256` is passed as blocks-per-row,
+      buffers sized at the padded width.
+- [ ] **9.2.2 Coding** — relax `zeroSyncReady`'s width gate from
+      `% 256` to `% 32`, the same honest narrowing 7.4 made to
+      `fitsMw8ColsSym`.
+- [ ] **9.3.1 Acceptance** — Qwen1.5-MoE prefill ratio >= 0.17x, which
+      closes 5.3.1. Mixtral (width 14336, already a whole super-block)
+      must not move: it is the control.
+
+RISK, stated up front: this is the MoE hot path, including the fused
+down+combine tail, and the failure mode of getting it wrong is a wrong
+answer rather than a crash. The dense version of this change (7.4) took
+a bit-identical fingerprint gate to trust, and this one should too.
 
 ## Unit 8 — Dense weight residency (why the 72B does not load)
 
