@@ -423,6 +423,11 @@ plan's acceptance and in the bench memory.
       RDNA". 192/68 B -> 217/0.
       NOT a despill: no register was cut, no tile narrowed, nothing traded
       for reloads. That is why 4.2.1's lesson does not apply here.
+      CAVEAT, carried forward: the spill is fixed, the STRANDING is not.
+      `q6kF16CoopN256GKernel` is still reachable from no launch site, so it
+      ships as device code nothing dispatches. Wiring it into the Q6_K path
+      is a behaviour change that needs its own bit-gate and belongs to
+      whoever picks up the Q6_K coop route, not to a despill commit.
 
 FINDING 2026-09-13 — three STDLIB kernels spill, badly, and nothing was
 watching. `cajeta.math.Ewise.matmulBf16` 1232 B/work-item (vgpr=256),
@@ -445,9 +450,33 @@ is what tile-manifest §14.1 asks for; this is the first case where it was
 load-bearing rather than stylistic.
 
 ### 4.3 Acceptance
-- [ ] 4.3.1 Before/after duration on each kernel's own route (`MmqProbe` /
-      `DecodeProbe` shape it runs at), not worse beyond noise; prefill
-      tok/s row for the routes that use them.
+- [x] 4.3.1 MEASURED 2026-09-13 on a quiet box (load 1.3, GTT 1.1 GB, no
+      other cajeta process). Llama-3.1-8B Q4_K_M, prompt=512 gen=1, five
+      interleaved rounds with the arm order ALTERNATING each round, one
+      warmup discarded, best-of-5 per arm. before = 3306af2 in a worktree,
+      after = 1713e04; both built with the same compiler and the same
+      pinned dep repos (codec 0.8.1 / jinja 0.1.0 / logging 0.7.0 /
+      unit 0.2.5, verified identical in both build logs) so the earlier dep
+      confound could not recur. Routes confirmed by `trace` BEFORE timing:
+      the q4mw arm dispatches `q4 mw`, the control `q4 deqMw8Part`.
+
+        route                    before   after    delta
+        packedw q4mw (changed)    692.7   760.0    +9.7%
+        deq          (control)   1460.0  1448.2    -0.8%
+
+      The control is what makes the other row mean anything: the untouched
+      route moved -0.8% across the same session, so the changed route's
+      +9.7% is about twelve times the drift. Occupancy DID fall as predicted
+      (192 -> 236 VGPR is 8 waves/SIMD down to 6) and removing the spill
+      still paid for it.
+
+      A second effect worth keeping: the after arm is far TIGHTER — 750.5 to
+      760.0 (1.3% spread) against 657.2 to 692.7 (5.4%). Scratch traffic was
+      generating run-to-run variance, not only cost.
+
+      NOT MEASURED, and not faked: `q6kF16CoopN256GKernel` has no route to
+      time. Q6_K runs `q6 epi` today, which this commit did not touch.
+      Raw rounds: tmp/u4/ab-u4.log; harness tmp/u4/ab-u4.sh.
 
 ## Unit 5 — Whole-spec acceptance (spec §6)
 
