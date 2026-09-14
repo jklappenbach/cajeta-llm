@@ -1,0 +1,230 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.MoeFfn;
+
+/**
+ * Plan 9.1 — the shared expert runs BATCHED on the resident route.
+ *
+ * Before this unit `forwardBatchRes` refused any checkpoint carrying a
+ * shared expert, which put the expert banks AND the shexp on the host —
+ * the shexp one row at a time, three mat-vecs and a host GLU per row.
+ * On Qwen1.5-MoE the profiler put that at 1.08 s of a 2.17 s prefill
+ * and 19,476 mat-vec launches where llama.cpp issues 72 GEMMs.
+ *
+ * The agreement claim is made on the DIFFERENCE between the shexp
+ * fixture and the shexp-less one, which share their router and their
+ * expert banks byte for byte: that difference IS the shared expert's
+ * contribution, so the expert-bank quantization cancels and what is left
+ * is the thing under test.
+ */
+public class MoeSharedBatchTest {
+
+    static final int32 H = MoeForwardTest.H;
+    static final int32 ROWS = 3;
+
+    public MoeSharedBatchTest() { return; }
+
+    /** The three probe rows 28.1 uses: the 27.1.1 pair plus a third
+     *  whose selections differ from both. */
+    static #Tensor<float32> probeRows() {
+        int64[] bs = heap int64[1];
+        bs[0] = (int64) (MoeSharedBatchTest.ROWS * MoeSharedBatchTest.H);
+        Tensor<float32> x #= Tensor.zeros<float32>(bs);
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase();
+        Tensor<float32> p0 #= MoeForwardTest.probeRow(false);
+        Tensor<float32> p1 #= MoeForwardTest.probeRow(true);
+        float32[] pb = p0.hostBuffer();
+        int64 po = p0.hostBase();
+        float32[] qb = p1.hostBuffer();
+        int64 qo = p1.hostBase();
+        int32 h = MoeSharedBatchTest.H;
+        int32 j = 0;
+        while (j < h) {
+            xb[xo + (int64) j] = pb[po + (int64) j];
+            xb[xo + (int64) (h + j)] = qb[qo + (int64) j];
+            xb[xo + (int64) (2 * h + j)] =
+                (float32) ((5 * j) % 31 - 15) / 64.0f;
+            j = j + 1;
+        }
+        return #x;
+    }
+
+    /** The resident batch output of `path` for the probe rows, or null
+     *  when the route refused. */
+    static #float32[] residentOut(String path, PrefillTap tap) {
+        // A POSITIVE budget, because `ensureSlab` reads <= 0 as "off":
+        // the slabs are what every indirected route reads, and -1 (the
+        // unmetered sentinel elsewhere) refuses them. Restored before
+        // returning, so a later test cannot pass on this one's budget.
+        int64 rb0 = ExpertBank.residencyBudget();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        ExpertBank.resetResidency();
+        CausalLM m #= MoeForwardTest.bindPath(path);
+        MoeFfn moe = m.moeAt(0);
+        Tensor<float32> x #= MoeSharedBatchTest.probeRows();
+        int64 n = (int64) (MoeSharedBatchTest.ROWS * MoeSharedBatchTest.H);
+        KernelBuffer<float32> xDev #= heap KernelBuffer<float32>((uint64) n);
+        float32[] xb = x.hostBuffer();
+        float32[] flat = heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            flat[i] = xb[x.hostBase() + i];
+            i = i + 1;
+        }
+        xDev.upload(flat, n);
+        Diag.register(tap);
+        boolean ok = moe.forwardBatchRes(xDev, MoeSharedBatchTest.ROWS, 0);
+        Diag.register(null);
+        if (!ok) {
+            ExpertBank.setResidencyBudget(rb0);
+            return null;
+        }
+        float32[] out = heap float32[n];
+        moe.batchObDev().download(out, n);
+        ExpertBank.setResidencyBudget(rb0);
+        return #out;
+    }
+
+    /** The host per-row output of `path`, routing pinned off so the
+     *  shexp goes through the f32 host mat-vec. */
+    static #float32[] hostRowOut(String path) {
+        CausalLM m #= MoeForwardTest.bindPath(path);
+        MoeFfn moe = m.moeAt(0);
+        Tensor<float32> x #= MoeSharedBatchTest.probeRows();
+        int64[] bs = heap int64[1];
+        bs[0] = (int64) (MoeSharedBatchTest.ROWS * MoeSharedBatchTest.H);
+        Tensor<float32> o #= Tensor.zeros<float32>(bs);
+        QuantKernel.setRoutingEnabled(false);
+        int32 r = 0;
+        while (r < MoeSharedBatchTest.ROWS) {
+            int64 off = (int64) (r * MoeSharedBatchTest.H);
+            moe.forwardRow(x, off, o, off, 0);
+            r = r + 1;
+        }
+        QuantKernel.setRoutingEnabled(true);
+        int64 n = bs[0];
+        float32[] out = heap float32[n];
+        float32[] ob = o.hostBuffer();
+        int64 i = 0;
+        while (i < n) {
+            out[i] = ob[o.hostBase() + i];
+            i = i + 1;
+        }
+        return #out;
+    }
+
+    static void diff(float32[] a, float32[] b, float32[] d, int64 n) {
+        int64 i = 0;
+        while (i < n) {
+            d[i] = a[i] - b[i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /**
+     * 9.1.1 — the batched shared expert computes the same thing the
+     * per-row one does. Both arms are read as (shexp model − shexp-less
+     * model), so the expert banks cancel and only the shared sublayer
+     * is compared.
+     */
+    @Test
+    public void batchedSharedExpertAgreesWithThePerRowPath() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no resident MoE route on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        PrefillTap tap = heap PrefillTap();
+        float32[] ra #= MoeSharedBatchTest.residentOut(
+            MoeForwardTest.FIX, tap);
+        float32[] rb #= MoeSharedBatchTest.residentOut(
+            MoeForwardTest.NOSH, tap);
+        if (ra == null || rb == null) {
+            Assert.fail("the resident MoE route refused: "
+                + tap.namesOf("moe-batch-route"));
+        }
+        float32[] ha #= MoeSharedBatchTest.hostRowOut(MoeForwardTest.FIX);
+        float32[] hb #= MoeSharedBatchTest.hostRowOut(MoeForwardTest.NOSH);
+
+        int64 n = (int64) (MoeSharedBatchTest.ROWS * MoeSharedBatchTest.H);
+        float32[] dr = heap float32[n];
+        float32[] dh = heap float32[n];
+        MoeSharedBatchTest.diff(ra, rb, dr, n);
+        MoeSharedBatchTest.diff(ha, hb, dh, n);
+
+        // The claim is vacuous if the shexp contributes nothing.
+        float64 mag = 0.0;
+        int64 i = 0;
+        while (i < n) {
+            float64 v = dh[i];
+            if (v < 0.0) { v = 0.0 - v; }
+            if (v > mag) { mag = v; }
+            i = i + 1;
+        }
+        Assert.isTrue(mag > 0.000001);
+
+        // Cosine, not elementwise: the device arm quantizes its
+        // activations to Q8 and the host arm does not, so the bar is
+        // direction, at the tolerance 15.2.3 set for this detector.
+        float64 cos = Metrics.cosine(dr, dh, (int32) n);
+        System.stdout.println("   shexp contribution cosine: " + cos
+            + "  peak " + mag);
+        Assert.isTrue(cos > 0.999);
+    }
+
+    /**
+     * 9.1.2 — the route says which one it took. The host fallback and
+     * the resident route are otherwise indistinguishable from outside,
+     * which is how a shexp checkpoint spent four units on the host
+     * while `prefill-mode batched` and `expert-cache batch` both read
+     * green.
+     */
+    @Test
+    public void theBatchRouteRecordNamesWhatItTook() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no resident MoE route on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        PrefillTap on = heap PrefillTap();
+        float32[] r #= MoeSharedBatchTest.residentOut(
+            MoeForwardTest.FIX, on);
+        Assert.isTrue(r != null);
+        if (!on.sawContaining("moe-batch-route", "resident")) {
+            Assert.fail("took the resident route but did not say so: "
+                + on.namesOf("moe-batch-route"));
+        }
+
+        // The does-not-fire half: with the batched shexp off, the same
+        // checkpoint refuses and the record names the gate.
+        MoeFfn.setSharedBatch(false);
+        PrefillTap off = heap PrefillTap();
+        float32[] r2 #= MoeSharedBatchTest.residentOut(
+            MoeForwardTest.FIX, off);
+        MoeFfn.setSharedBatch(true);
+        Assert.isTrue(r2 == null);
+        if (!off.sawContaining("moe-batch-route", "shared expert")) {
+            Assert.fail("refused without naming the gate: "
+                + off.namesOf("moe-batch-route"));
+        }
+        System.stdout.println("   moe-batch-route on="
+            + on.namesOf("moe-batch-route") + " off="
+            + off.namesOf("moe-batch-route"));
+        return;
+    }
+}

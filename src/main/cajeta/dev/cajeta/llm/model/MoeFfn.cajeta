@@ -102,6 +102,10 @@ public final class MoeFfn extends InfModule {
     static boolean fusedRouterOn = true;   // unit 50 A/B arm
     static boolean fusedDownOn = true;     // unit 51 A/B arm
     static boolean fusedNormRouterOn = true;   // unit 59 A/B arm
+    static boolean sharedBatchOn = true;       // unit 9 A/B arm
+    public static void setSharedBatch(boolean on) {
+        MoeFfn.sharedBatchOn = on;
+    }
     public static void setFusedDown(boolean on) { MoeFfn.fusedDownOn = on; }
     public static void setFusedRouter(boolean on) { MoeFfn.fusedRouterOn = on; }
     public static void setFusedNormRouter(boolean on) { MoeFfn.fusedNormRouterOn = on; }
@@ -183,6 +187,9 @@ public final class MoeFfn extends InfModule {
     ExpertBank gateB;
     ExpertBank upB;
     ExpertBank downB;
+    KernelBuffer<float32> shGateWDev;   // the shexp gate vector, [hidden]
+    KernelBuffer<float32> shZDev;       // its per-row logit, [rows]
+    int64 shZCap;
     Linear sharedGateProj;     // null when the model has no shexp
     Linear sharedUpProj;
     Linear sharedDownProj;
@@ -457,6 +464,19 @@ public final class MoeFfn extends InfModule {
      *  guarantees ensureRouterDev and the batch buffers. */
     void routeBatchCore(KernelBuffer<float32> xDev, int32 rows,
             int32[] selAll, float32[] wAll) {
+        this.routeBatchCore(xDev, rows, selAll, wAll, true);
+        return;
+    }
+
+    /**
+     * `count` false defers the route observation to the caller. A
+     * `forwardBatchRes` that routes and THEN refuses (an expert not
+     * admitted) hands the batch to `forwardBatch`, which routes it
+     * again — and a histogram counted here would count those rows
+     * twice.
+     */
+    void routeBatchCore(KernelBuffer<float32> xDev, int32 rows,
+            int32[] selAll, float32[] wAll, boolean count) {
         int64 en = (int64) this.expertsN;
         int64 h = (int64) this.hidden;
         QuantKernel.routerBatchF32LaunchNoSync(this.lgBatchDev,
@@ -469,7 +489,7 @@ public final class MoeFfn extends InfModule {
         while (r < rows) {
             this.routeFromLogits(this.lgBatchH, (int64) r * en,
                 this.sc.sel, this.sc.w);
-            this.noteRoutesHost(this.sc.sel, 1);
+            if (count) { this.noteRoutesHost(this.sc.sel, 1); }
             int32 k = 0;
             while (k < this.usedN) {
                 selAll[r * this.usedN + k] = this.sc.sel[k];
@@ -1033,6 +1053,89 @@ public final class MoeFfn extends InfModule {
     }
 
     /**
+     * Whether the shared expert can run BATCHED on the device — the
+     * gate {@link #forwardBatchRes} asks before it commits, so a
+     * refusal costs nothing already spent.
+     */
+    boolean sharedBatchReady() {
+        if (this.sharedGateProj == null) { return true; }
+        if (!MoeFfn.sharedBatchOn) { return false; }
+        if (!Linear.devicePackOn()) { return false; }
+        return this.sharedGateProj.isBatchRouted()
+            && this.sharedUpProj.isBatchRouted()
+            && this.sharedDownProj.isBatchRouted();
+    }
+
+    /**
+     * Unit 9: the shared expert over the WHOLE batch, accumulated into
+     * `ob` on the device.
+     *
+     * The per-row {@link #addSharedRow} is three mat-vecs, a host GLU
+     * and a host sigmoid PER ROW: on Qwen1.5-MoE that is 512*3*24 =
+     * 36,864 mat-vec launches for one 512-token prefill, against
+     * llama.cpp's 72 GEMMs, and the profiler put it at 1.08 s of a
+     * 2.17 s prefill. This is the dense resident MLP chain
+     * (`CausalLM.forwardRowsBatched`) applied to the same three
+     * projections, plus the learned gate as a one-expert router GEMM.
+     */
+    void addSharedBatchDev(KernelBuffer<float32> xDev, int32 rows,
+            int32 act) {
+        if (this.sharedGateProj == null) { return; }
+        int64 h = (int64) this.hidden;
+        int64 sw = (int64) this.sharedW;
+        Linear.stageBatchFromDevice(xDev, rows, this.hidden,
+            Linear.nextStageTag());
+        this.sharedGateProj.matmulBatchKeep(rows);
+        this.sharedUpProj.matmulBatchKeep(rows);
+        Prim.gluDevice(this.sharedGateProj.yBatch,
+            this.sharedUpProj.yBatch, (int64) rows * sw, act);
+        Linear.stageBatchFromDevice(this.sharedGateProj.yBatch, rows,
+            this.sharedW, Linear.nextStageTag());
+        this.sharedDownProj.matmulBatchKeep(rows);
+        boolean gated = this.sharedGate != null;
+        this.ensureSharedGateDev(rows);
+        if (gated) {
+            QuantKernel.routerBatchF32LaunchNoSync(this.shZDev,
+                this.shGateWDev, xDev, (int64) rows, 1L, h);
+        }
+        Prim.addSigmoidRowsDevice(MoeFfn.obDev,
+            this.sharedDownProj.yBatch, this.shZDev, (int64) rows, h,
+            gated);
+        return;
+    }
+
+    void ensureSharedGateDev(int32 rows) {
+        if (this.shGateWDev == null && this.sharedGate != null) {
+            int64 h = (int64) this.hidden;
+            float32[] gw = heap float32[h];
+            float32[] gb = this.sharedGate.hostBuffer();
+            int64 go = this.sharedGate.hostBase();
+            int64 j = 0;
+            while (j < h) {
+                gw[j] = gb[go + j];
+                j = j + 1;
+            }
+            this.shGateWDev #= heap KernelBuffer<float32>((uint64) h);
+            this.shGateWDev.upload(gw, h);
+        }
+        if (this.shZCap < (int64) rows) {
+            this.shZDev #= heap KernelBuffer<float32>((uint64) rows);
+            this.shZCap = (int64) rows;
+        }
+        return;
+    }
+
+    /** One record per batched MoE decision, naming the route taken or
+     *  the gate that refused — the host fallback and the resident route
+     *  are otherwise indistinguishable from outside. */
+    void sayBatchRoute(String name) {
+        Diag.emit("moe-batch-route", 0 - 1, name, (int64) this.layerIdx,
+            (int64) this.expertsN, (int64) this.widthN,
+            (int64) this.hidden, (int64) this.sharedW, 0L);
+        return;
+    }
+
+    /**
      * The grouped batch forward (15.12): route every row, group the
      * (row, expert, weight) picks by expert, and serve each selected
      * expert ONCE — dequantize its bank bytes one time and GEMM the
@@ -1177,9 +1280,22 @@ public final class MoeFfn extends InfModule {
      */
     public boolean forwardBatchRes(KernelBuffer<float32> xDev,
             int32 rows, int32 act) {
-        if (!Linear.residentEnabled()) { return false; }
-        if (!QuantKernel.routingEnabled()) { return false; }
-        if (this.sharedW != 0) { return false; }
+        if (!Linear.residentEnabled()) {
+            this.sayBatchRoute("host: hidden state not resident");
+            return false;
+        }
+        if (!QuantKernel.routingEnabled()) {
+            this.sayBatchRoute("host: device routing off");
+            return false;
+        }
+        // Unit 9: a shared expert used to refuse the whole resident
+        // route, which put the experts AND the shexp on the host — the
+        // shexp one row at a time. It is a dense sublayer beside the
+        // banks, not a property of them, and runs batched below.
+        if (!this.sharedBatchReady()) {
+            this.sayBatchRoute("host: shared expert not batch-routed");
+            return false;
+        }
         int64 h0 = ExpertBank.residencyHits();
         int64 w0 = ExpertBank.residencyWindowed();
         int64 a0 = ExpertBank.residencyAdmissions();
@@ -1207,6 +1323,17 @@ public final class MoeFfn extends InfModule {
         // group maps and the chunk count, gather, pack, three GEMMs,
         // GLU, pack, scatter-combine. No sync, no download, no
         // upload; the host sees nothing until the logits.
+        // Bind the slabs BEFORE asking what the banks can serve. Every
+        // indirected route below reads `slabDev`, and a bank whose slab
+        // is not bound yet answers no — so without this the first batch
+        // of every layer refuses, takes the host path, and a prefill
+        // that is one chunk per layer never takes the fast route at
+        // all. `ensureSlab` is budget-gated and latches its own
+        // refusal, so a capped model falls through to the per-slot
+        // admission check exactly as before.
+        this.gateB.ensureSlab();
+        this.upB.ensureSlab();
+        this.downB.ensureSlab();
         boolean zeroSync = Linear.wmmaOn && !Linear.backendIsVulkan()
             && this.gateB.idMwReady() && this.upB.idMwReady()
             && this.downB.idMwReady();
@@ -1262,10 +1389,13 @@ public final class MoeFfn extends InfModule {
                 (int64) rows, (int64) this.usedN, h);
             MoeFfn.phaseSync();
             MoeFfn.fbTailNs = MoeFfn.fbTailNs + (Clock.nanoTime() - fbt0);
+            this.addSharedBatchDev(xDev, rows, act);
+            this.sayBatchRoute("resident: zero-sync id GEMMs");
             this.emitCacheRecord("batch", h0, w0, a0, b0);
             return true;
         }
-        this.routeBatchCore(xDev, rows, this.sc.selAll, this.sc.wAll);
+        this.routeBatchCore(xDev, rows, this.sc.selAll, this.sc.wAll,
+            false);
         MoeFfn.fbDevRoutes = MoeFfn.fbDevRoutes + 1L;
         int64 gp0 = Clock.nanoTime();
         this.groupPicks(rows);
@@ -1281,11 +1411,14 @@ public final class MoeFfn extends InfModule {
                 if (!this.gateB.isAdmitted(e)
                         || !this.upB.isAdmitted(e)
                         || !this.downB.isAdmitted(e)) {
+                    this.sayBatchRoute("host: an expert is not admitted");
                     return false;
                 }
             }
             e = e + 1;
         }
+        // The route is committed now, so the histogram counts it once.
+        this.noteRoutesHost(this.sc.selAll, rows);
         int64 fbp1 = Clock.nanoTime();
         MoeFfn.fbPreA = MoeFfn.fbPreA + (fbp1 - fbr1);
         this.ensureDevBatch(rows);
@@ -1431,6 +1564,12 @@ public final class MoeFfn extends InfModule {
             (int64) this.usedN, h);
         MoeFfn.phaseSync();
         MoeFfn.fbTailNs = MoeFfn.fbTailNs + (Clock.nanoTime() - fbt0);
+        this.addSharedBatchDev(xDev, rows, act);
+        if (idPath) {
+            this.sayBatchRoute("resident: id GEMMs");
+        } else {
+            this.sayBatchRoute("resident: a GEMM per expert group");
+        }
         this.emitCacheRecord("batch", h0, w0, a0, b0);
         return true;
     }

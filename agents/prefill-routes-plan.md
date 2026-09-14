@@ -353,7 +353,7 @@ plan's acceptance and in the bench memory.
       the widen budget's, which are a policy decision and say so.
 
 ### 3.3 Acceptance
-- [~] 3.3.1 Sweep legs for Mixtral, Qwen1.5-MoE (load ×3 + 512x128) and
+- [x] 3.3.1 Sweep legs for Mixtral, Qwen1.5-MoE (load ×3 + 512x128) and
       the 72B (512x128 ×1): no per-row, no timeout, load ratio vs
       llama.cpp recorded.
       PASS 2026-09-12 for the two available models (72B blocked, see 3.2.3):
@@ -366,6 +366,11 @@ plan's acceptance and in the bench memory.
       timeout, load 40.7 s. What is still owed is the 512x128 leg's
       NUMBER against llama.cpp, which is a throughput measurement and
       wants a quiet box rather than a suite-warm one. Queued with 5.3.1.
+      DONE 2026-09-14 (Unit 9), quiet box, 512x128 x2 reps, void=0:
+      Qwen1.5-MoE 873 tok/s = 0.373x of llama.cpp's best (vulkan 2342);
+      Mixtral 247.3 = 0.456x (hip 542); 30B-A3B 1278.4 = 0.987x (vulkan
+      1295); 72B 33.1 = 0.37x (hip ~90, the widenMb=16384 row 8.3.1
+      recorded). No per-row, no timeout, load ratios in rows.jsonl.
 
 ## Unit 4 — No shipped GEMM kernel spills (spec §5)
 
@@ -559,7 +564,7 @@ load-bearing rather than stylistic.
       unblocks the first two.
 
 ### 5.3 Acceptance
-- [~] 5.3.1 The 2026-09-06 sweep recipe rerun: no `per-row` on any
+- [x] 5.3.1 The 2026-09-06 sweep recipe rerun: no `per-row` on any
       checkpoint; every prefill ratio ≥ 0.17x; decode within noise; load
       not worse. Table in this section.
       RERUN 2026-09-14 on a quiet box (Julian: "box is clear"). THREE OF
@@ -590,16 +595,17 @@ load-bearing rather than stylistic.
                         because `trace` installs a Diag sink and a
                         number that goes in this table should not have
                         been measured with a printf in the loop.
-      ratio >= 0.17x    **FAIL on Qwen1.5-MoE: 0.04x.** It is batched,
-                        so this is route QUALITY, not route absence: its
-                        1408-wide expert tensors take `q4 plain` and
-                        `dotAccum` (the fallback the code comments
-                        measured at 1290 ms of a 2844 ms launch) while
-                        `q5_0/q8_0 deqMw8Part 2048 1408` — the ones 7.4
-                        padded — take the fast route. 60 experts x 24
-                        layers of small tensors, and the fast path is
-                        gated on `MoeFfn.zeroSyncReady`'s
-                        `widthN % 256 == 0`, which 1408 fails.
+      ratio >= 0.17x    FAILED on Qwen1.5-MoE at 0.04x; CLOSED by
+                        Unit 9 the same day at **0.373x** (873 tok/s
+                        against llama.cpp's 2342). The cause named here
+                        first — the 1408 width remainder — WAS WRONG,
+                        and the profiler said so: that gate is the last
+                        of four and the model never reaches the code it
+                        breaks. The live cause was
+                        `forwardBatchRes`'s `sharedW != 0` bail, which
+                        put the whole MoE layer on the host with the
+                        shared expert running ONE ROW AT A TIME. See
+                        Unit 9.
       decode in noise   PASS. Every model within ~1% (e.g. 8B Q4_K_M
                         41.5 -> 41.7, 30B 85.9 -> 85.4).
       load not worse    PASS, and the first reading was wrong. The
@@ -634,8 +640,14 @@ load-bearing rather than stylistic.
       completed with ZERO launch failures, which is the 33.1 tok/s row
       above.
 
-      WHAT REMAINS for this item is one number: Qwen1.5-MoE's prefill.
-      That is a real gap with a named cause, not a measurement artifact.
+      CLOSED 2026-09-14 by Unit 9. Every checkpoint is now >= 0.17x:
+
+        model                       before Unit 9    after    ratio
+        Qwen1.5-MoE Q4_K_M                   86.7      873    0.373x
+        Mixtral Q4_K_M (control)            248.7    247.3    0.456x
+        30B-A3B Q4_K_M (control)           1253.8   1278.4    0.987x
+
+      The dense rows are untouched by Unit 9 and stand as measured.
 
 ## Unit 6 — Multi-wave packed Q4_K GEMM for prefill parity
 
@@ -1390,52 +1402,183 @@ the rank-1 min term the k-quant kernels carry. No checkpoint on this box uses
 either, and llama.cpp treats both as legacy. Do the whole stack or leave the
 refusal honest.
 
-## Unit 9 — PROPOSED: the MoE expert width remainder (Qwen1.5-MoE 0.04x)
+## Unit 9 — Qwen1.5-MoE prefill (0.04x): what the profiler found
 
-NOT STARTED. Written up 2026-09-14 because 5.3.1 measured the gap and
-named its cause, and an option left only in prose is an option lost.
-This is the ONLY thing between this plan and a clean close.
+REWRITTEN 2026-09-14 after profiling the checkpoint. The first draft of
+this unit named the expert width remainder (1408 = 5*256 + 128) as the
+cause. THAT WAS WRONG as a diagnosis of the 0.04x — it is a real latent
+defect, but it is the LAST of four gates, not the first, and the model
+never reaches the code it breaks. The measured causes, in order.
 
-5.3.1: Qwen1.5-MoE prefills at 87 tok/s against llama.cpp's 2342 —
-0.04x, the one checkpoint under the 0.17x bar. It BATCHES, so this is
-route quality, not route absence.
+MEASURED, `prompt=128 gen=1`, cajeta profiler, hip backend:
 
-THE CAUSE IS 7.4'S PROBLEM ONE LAYER UP. Its expert width is
-1408 = 5*256 + 128, and the MoE fast path is gated on a whole
-super-block exactly as the dense int8 route was before 7.4:
+  device kernel time, whole run   800 ms over 6.44 s wall
+  device kernel time, prefill     ~470 ms over 2174 ms wall  (~22%)
 
-  MoeFfn.cajeta:707   if (this.widthN % 256 != 0) return false;   (zeroSyncReady)
-  MoeFfn.cajeta:890   q8kPackLaunchNoSync(xpGyDev, gyDev, usedN * wid)
-                      — the FLAT pack, so at wid % 256 != 0 the blocks
-                      straddle expert rows: 7.4.4's defect verbatim
-  MoeFfn.cajeta:897   idDownCombineTail(..., wid / 256L, ...)       — truncates
-  MoeFfn.cajeta:697   buffer sized (u * wid / 256L) * 320L          — truncates
+So four fifths of prefill is NOT the GPU computing. The launch counts
+say why — one 128-token prefill step, 24 layers:
 
-And the machinery to fix it already exists, built by 7.4.4:
-`QuantKernel.q8kPackRowsLaunchNoSync(out, x, rows, n, nPad)` packs each
-row on a block boundary with a zero-filled tail, and is the flat pack
-block-for-block when nPad == n.
+  q4kQ8BatchMatMulKernel   2950 launches   avg 100 us
+  q4kQ8WaveMatVecKernel   19476 launches   avg  10 us   <- MAT-VEC
+  q80WmmaDeqMw8Kernel      1452 launches
+  q6kQ8WaveMatVecKernel    3855 launches
 
-- [ ] **9.1.1 TDD** — an expert bank at width 1408 must agree with the
-      per-row serial path, and must be SEEN on the fast route. The MoE
-      forward tests already have the shape (`q8ExpertSlabPrefillsBatched`).
-- [ ] **9.1.2 TDD** — a width that is a whole super-block must be
-      BIT-IDENTICAL before and after, since nPad == n makes the pack the
-      same bytes. This is the does-not-fire half.
-- [ ] **9.2.1 Coding** — `MoeFfn` pads the expert width: row-aware pack,
-      `widPad/256` everywhere `wid/256` is passed as blocks-per-row,
-      buffers sized at the padded width.
-- [ ] **9.2.2 Coding** — relax `zeroSyncReady`'s width gate from
-      `% 256` to `% 32`, the same honest narrowing 7.4 made to
-      `fitsMw8ColsSym`.
-- [ ] **9.3.1 Acceptance** — Qwen1.5-MoE prefill ratio >= 0.17x, which
-      closes 5.3.1. Mixtral (width 14336, already a whole super-block)
-      must not move: it is the control.
+llama.cpp runs this layer as SIX launches: three `mul_mat_id` (one per
+bank, all experts, ids indirected) and three ordinary `mul_mat` for the
+shared expert. We run roughly five hundred.
 
-RISK, stated up front: this is the MoE hot path, including the fused
+Host frames over the same run (sampling):
+
+  MoeFfn.forwardBatch          total 3.59 s     <- the HOST path
+    MoeFfn.addSharedRow        total 1.08 s
+      Linear.matvecIntoDevice  total 0.94 s
+    ExpertBank.admitAndRun     total 2.04 s
+  Prim.gluRowHost              self  204 ms
+  KernelStream.sync            self  331 ms (260 syncs)
+
+### The four gates, in the order the code hits them
+
+**9.G1 `forwardBatchRes` refuses any model with a shared expert.**
+`MoeFfn.cajeta:1182  if (this.sharedW != 0) { return false; }`
+Qwen1.5-MoE carries `ffn_gate_shexp`/`ffn_up_shexp`/`ffn_down_shexp`, so
+`sharedW = 5632` and the WHOLE resident MoE route is off. Everything
+below follows from this one line: the layer downloads its activations to
+the host, gathers rows on the host, dispatches per expert, GLUs on the
+host, and uploads the sum back.
+
+**9.G2 The shared expert runs ONE ROW AT A TIME.**
+`MoeFfn.cajeta:1562  while (sr < rows) { this.addSharedRow(...); }`
+Each call is three `Linear.matvecInto` (2048x5632, 2048x5632,
+5632x2048), a host GLU and a host sigmoid. At 512-token prefill that is
+512 * 3 * 24 = 36,864 mat-vec launches where llama.cpp issues 72 GEMMs.
+This is the 19,476 `q4kQ8WaveMatVecKernel` launches above, and 1.08 s of
+a 2.17 s prefill.
+
+**9.G3 The expert down bank has no id-GEMM for its format.**
+`ExpertBank.idMwReady()` and `idGemmReady()` both require
+`packedTy == 12 || packedTy == 14` (Q4_K, Q6_K). This checkpoint's
+`ffn_down_exps` is **Q5_0 in 12 layers and Q8_0 in the other 12**
+(gate/up are Q4_K throughout). So even with 9.G1 lifted, `zeroSync` and
+`idPath` are both false and the resident route falls to its per-expert
+`gemmKeepAt` loop — 180 device GEMMs per layer instead of three.
+
+The machinery to fix this EXISTS and is 7.4's: `q80WmmaDeqMw8Kernel` is
+one generic int8 GEMM that already serves BOTH q8_0 and q5_0 after
+`q80WidenKernel`/`q50WidenKernel` + `symScaleImageKernel` widen them.
+The profile shows it doing exactly that, per expert. What is missing is
+the INDIRECTED form of it over a widened slab.
+
+**9.G4 The width remainder — the original Unit 9.**
+`wid = 1408`, and `q8kPackLaunchNoSync(xpBgDev, bgDev, np * wid)` packs
+Q8_K blocks of 256 flat across expert rows, while `wid / 256L` truncates
+5.5 to 5. Both are on the `idPath`/`zeroSync` branches only, so this is
+a WRONG ANSWER waiting behind 9.G3, not a live defect today. 7.4.4 built
+the fix already: `QuantKernel.q8kPackRowsLaunchNoSync(out, x, rows, n,
+nPad)`, which is the flat pack block-for-block when `nPad == n`.
+
+### 9.1 — the shared expert, batched and resident   DONE 2026-09-14
+
+- [x] **9.1.1 TDD** — a shexp fixture prefilled over several rows agrees
+      with the per-row path (the arm is `MoeFfn.setSharedBatch`).
+      `MoeSharedBatchTest.batchedSharedExpertAgreesWithThePerRowPath`
+      reads BOTH arms as (shexp model − shexp-less model), so the expert
+      banks cancel and only the shared sublayer is compared: cosine
+      0.999958, peak contribution 0.153.
+- [x] **9.1.2 TDD** — and is SEEN on the resident route: a
+      `moe-batch-route` record naming `resident`, not a refusal. The
+      existing `q8ExpertSlabPrefillsBatched` gates on `prefill-mode
+      batched` and `expert-cache batch`, which the HOST path also emits
+      — it cannot tell these two apart. It also sets the residency
+      budget to -1, which `ensureSlab` reads as OFF, so no slab ever
+      bound in it either. Vacuous twice over.
+- [x] **9.1.3 TDD** — the negative arm, driven by the A/B switch rather
+      than a fixture with an unroutable shexp: with `setSharedBatch`
+      off the same checkpoint refuses and the record names the gate.
+      Both refusals go through the one `sharedBatchReady` predicate.
+- [x] **9.2.1 Coding** — `moe-batch-route`, one record per batch
+      decision naming the route taken or the gate that refused.
+- [x] **9.2.2 Coding** — `addSharedBatchDev`: gate/up through
+      `matmulBatchKeep`, `Prim.gluDevice`, down through
+      `stageBatchFromDevice` + `matmulBatchKeep`, the sigmoid gate
+      through `routerBatchF32LaunchNoSync` at one expert, and
+      `Prim.addSigmoidRowsDevice` accumulating into `obDev`.
+- [x] **9.2.3 Coding** — `forwardBatchRes` takes a shexp model when
+      `sharedBatchReady()`, refusing by the same predicate otherwise.
+- [x] **9.2.4 Coding** — bind the slabs BEFORE deciding the route.
+      Every indirected route reads `slabDev`, and nothing in
+      `forwardBatchRes` bound it: the first batch of every layer
+      refused, took the host path, and a prefill that is one chunk per
+      layer never took the fast route at all. Found by a test that
+      failed with "an expert is not admitted".
+- [x] **9.2.5 Coding** — the route histogram counted twice. A
+      `forwardBatchRes` that routes and THEN refuses hands the batch to
+      `forwardBatch`, which routes it again; `routeBatchCore` now defers
+      the observation to a caller that has committed. Latent before this
+      unit (the refusal was at the top), live after it.
+- [x] **9.3.1 Acceptance** — MEASURED, 512x128, two reps, quiet box,
+      `void=0 nolaunch=0`:
+
+        Qwen1.5-MoE prefill   86.7  ->  873 tok/s      10.1x
+        vs llama.cpp best     0.037x -> 0.373x   (bar 0.17x)
+        decode                24.65 -> 24.66 tok/s   unchanged
+
+      CORRECTNESS, teacher-forced perplexity over 512 prefill + 256 eval
+      tokens of real prose, one variable (`pplprobe ... hostmoe`):
+
+        hostmoe (pre-unit-9)  meanNll 1.71681   ppl 5.56675
+        resident (unit 9)     meanNll 1.71712   ppl 5.56847   +0.031%
+
+      The greedy stream DOES tip on the bench's synthetic prompt. That
+      is the expected result, not a defect: `PplProbe` states the
+      standard — "token identity is explicitly NOT asserted (near-ties
+      may legitimately tip)" — and 0.031% of perplexity is route
+      numerics.
+
+      CONTROLS, same session, warm reps:
+
+        Mixtral        248.7 -> 247.3 tok/s   -0.5%   (no shexp)
+        Qwen3-30B     1253.8 -> 1278.4 tok/s  +2.0%   (no shexp)
+
+      Qwen3-30B's gain is 9.2.4: its first chunk per layer used to
+      refuse too.
+
+      NOT CLAIMED: load fell 7.6-8.5 s to 3.8 s across the same change.
+      The page cache was 100% warm on the new run and unrecorded on the
+      old one, so this is unattributed.
+
+### 9.4 — an indirected GEMM for the symmetric expert banks
+
+HEADROOM, not a blocker: 9.3.1 already clears the bar. The route record
+on this checkpoint reads `resident: a GEMM per expert group`, so the
+layer is 180 device GEMMs where llama.cpp issues three.
+
+- [ ] **9.4.1 TDD** — an expert bank at Q8_0 and one at Q5_0 agree with
+      the per-expert path, and are seen on `idPath`.
+- [ ] **9.4.2 Coding** — widen an expert slab to int8 + its f16 scale
+      image once, under `WidenBudget`, and an id-indirected form of the
+      widened-int8 GEMM.
+- [ ] **9.4.3 Coding** — `idMwReady`/`idGemmReady` admit a widened bank.
+
+### 9.5 — the width remainder (the original Unit 9)
+
+- [ ] **9.5.1 TDD** — an expert bank at width 1408 agrees with the
+      per-row serial path, and a whole-super-block width is
+      BIT-IDENTICAL before and after (the does-not-fire half).
+- [ ] **9.5.2 Coding** — row-aware pack and `widPad/256` everywhere
+      `wid/256` is passed as blocks-per-row; buffers at the padded
+      width; `zeroSyncReady`'s gate from `% 256` to `% 32`.
+- [ ] **9.5.3 Acceptance** — 5.3.1's bar is already met by 9.1, so the
+      bar here is 9.4+9.5's own: the `moe-batch-route` record reads
+      `resident: id GEMMs` rather than `a GEMM per expert group`, and
+      the prefill ratio is measured and recorded whatever it is.
+      Mixtral (width 14336, a whole super-block) must not move: it is
+      the control, and 9.1 left it at -0.5%.
+
+RISK, unchanged: this is the MoE hot path including the fused
 down+combine tail, and the failure mode of getting it wrong is a wrong
 answer rather than a crash. The dense version of this change (7.4) took
-a bit-identical fingerprint gate to trust, and this one should too.
+a bit-identical fingerprint gate to trust, and 9.5 should too.
+
 
 ## Unit 8 — Dense weight residency (why the 72B does not load)
 
