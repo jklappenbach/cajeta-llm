@@ -481,24 +481,57 @@ load-bearing rather than stylistic.
 ## Unit 5 — Whole-spec acceptance (spec §6)
 
 ### 5.1 TDD
-- [ ] 5.1.1 `run-tests.sh` green on CPU and gfx1151.
+- [x] 5.1.1 `run-tests.sh` green on CPU and gfx1151.
+      DONE 2026-09-14. **420 passed, 0 failed, 1 skipped, rc=0 on BOTH
+      backends**, in both the test-profile and the release/bounded pass.
+      The CPU leg had never completed before this, and finishing it cost
+      five real defects — which is the argument for the item.
 
-FINDING 2026-09-13, from the gfx1151 sweep that gated 7.4 — ONE failure,
-and it is not the engine's:
-`LaunchGeometryTest.targetBlocksSaturatesEverySimdExactlyOnce` expects
-`Device.simdCount() / wavesPerBlock` = 80/2 = 40 and gets 80. The
-compiler's geometry surface answers `dispatchBlocks(n) = simds *
-wavesPerSimdTarget / n`, and this box reports `wavesPerSimdTarget=2`
-(`simds=80 dispatchBlocks2=80 dispatchBlocks8=20`), so 80 IS
-`simds * 2 / 2`. The test encodes one-wave-per-SIMD, which the surface
-stopped meaning.
-Two readings, and they need a measurement rather than a guess: either
-the assertion is stale and the contract is now "cover every SIMD
-`wavesPerSimdTarget` times" (rename and assert
-`blocks * wavesPerBlock == simds * wavesPerSimdTarget`), or the engine
-really is dispatching twice the workgroups it wants and the test is the
-only thing that noticed. 396 passed, 1 failed, 1 skipped, identical in
-both the test-profile and the release/bounded pass.
+      1. THE GEOMETRY LAW WAS STALE, not the engine.
+      `targetBlocksSaturatesEverySimdExactlyOnce` expected
+      `simdCount / wavesPerBlock` = 40 and got 80. 6.3.2 had already
+      MEASURED the one-wave-per-SIMD law under-filling by ~16% and asked
+      for a 2x oversubscription; the geometry surface answers
+      `simds * wavesPerSimdTarget / n` and this box reports
+      `wavesPerSimdTarget=2`, so 80 is exactly what 6.3.2 wanted. The
+      test outlived the measurement. Re-anchored to the invariant that
+      survives — `blocks * wavesPerBlock == simds * wavesPerSimdTarget`,
+      i.e. COVERAGE not count, which still fails if targetBlocks stops
+      following dispatchBlocks — and renamed
+      `targetBlocksCoversEverySimdToItsWaveTarget`. Measured: 80 x 2 =
+      160 = 80 x 2.
+
+      2. A DEVICE-TUNING TEST WITH NO DEVICE GUARD made the cpu suite
+      look hung. `tunesThePartitionWidthOnThisDevice` guarded only on
+      the 8B existing, so on cpu it ran sixteen 512-token CPU prefills
+      of an 8B for a launch width the backend does not have. Eight
+      minutes of no output is how a missing guard presents.
+
+      3. FOUR TESTS GUARDED ON THE WRONG PREDICATE. They asked
+      `Device.kernelAvailable(...)` or `Linear.wmmaBackend()`; both are
+      TRUE on cpu (every kernel compiles portably, and vulkan made
+      wmmaBackend unconditional). The predicate the ROUTE consults is
+      `Linear.waveMv()`. Guarding on anything else skipped nowhere and
+      reported correct cpu behaviour as a defect.
+
+      4. THE ONE THAT MATTERED — `kernelAvailable` LIED, and the engine
+      answered with zeros. On cpu it returned true for kernels the CPU
+      thunk registry does not have, so the Q8_0 Mw8 route was SELECTED,
+      both launches printed "no registered CPU kernel" and returned
+      without writing, and the engine read back an unwritten buffer.
+      Two tests reported it as a 1e37 tolerance failure, which is what a
+      silent wrong answer looks like from outside. Fixed in cajeta
+      0df863df: cpu now answers from the registry it launches through.
+      The function whose entire purpose is "let a route degrade rather
+      than issue a loud no-op" was the reason the route did not degrade.
+
+      5. A BATCHED-ROUTE ASSERTION on the MoE expert slab, same class
+      as 3.
+
+      NOT VACUOUS: gfx1151 reports 1 in-test device skip, cpu 59 — and
+      the cpu skips are all named device routes, which is the honest
+      shape for that backend rather than a suite that quietly does
+      nothing.
 
 ### 5.2 Coding
 - [ ] 5.2.1 Update `llm-vs-llamacpp-bench-2026-09-06` memory and the cajeta
