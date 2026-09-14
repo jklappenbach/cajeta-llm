@@ -338,13 +338,19 @@ plan's acceptance and in the bench memory.
       proportional); load is now dominated by the deliberate warm-up
       prefill (standalone prefill(128) = 2.52 s). Profiling the warm-up
       to confirm no per-expert component hides inside it before closing.
-- [~] 3.2.3 Qwen2.5-VL-72B Q4_K_L: with Unit 2 in place, confirm every
+- [x] 3.2.3 Qwen2.5-VL-72B Q4_K_L: with Unit 2 in place, confirm every
       tensor format routes; fix the remaining refusal if the diagnostic
       names one.
-      BLOCKED 2026-09-12: no Qwen2.5-VL-72B on the box (~40 GB download,
-      not started unprompted). Mixtral (8 experts) + Qwen1.5-MoE (60
-      experts) already witness mixed-format MoE routing; the 72B adds the
-      Q4_K_L mixed Q4/Q5/Q6/Q8 dense-attn case. Needs the model fetched.
+      WAS BLOCKED 2026-09-12 on the model not being on the box. It is now,
+      and the confirmation is Unit 8's load plus 8.3.1's: rc=0, and every
+      tensor format routes with nothing refusing —
+      `dotAccum ty=12`, `coop q8_0 8192 29568`, `coop q5_k 1024 8192`,
+      `coop q5_0 8192 29568`, `q4 plain 8192 8192`, `q6 epi 1024 8192`
+      under `packedw`, and under `deq` the two 29568-wide ffn_down
+      formats moved onto `q8_0/q5_0 deqMw8Part` once 7.4 padded the
+      remainder and 8.3.1 made the widen survivable. No diagnostic names
+      a refusal this unit has to fix: the only refusals the 72B emits are
+      the widen budget's, which are a policy decision and say so.
 
 ### 3.3 Acceptance
 - [~] 3.3.1 Sweep legs for Mixtral, Qwen1.5-MoE (load ×3 + 512x128) and
@@ -355,6 +361,11 @@ plan's acceptance and in the bench memory.
       Qwen1.5-MoE 512 prefill 71 tok/s batched (was timeout), load ~4.3 s
       (×3 stable, was 31.6 s). Neither per-row, neither timeout. Load ratios
       recorded in rows.jsonl. Blocked only on the 72B leg (no model).
+      2026-09-14: the model is on the box and its ROUTING half is
+      answered (3.2.3) — the 72B prefills batched, no per-row, no
+      timeout, load 40.7 s. What is still owed is the 512x128 leg's
+      NUMBER against llama.cpp, which is a throughput measurement and
+      wants a quiet box rather than a suite-warm one. Queued with 5.3.1.
 
 ## Unit 4 — No shipped GEMM kernel spills (spec §5)
 
