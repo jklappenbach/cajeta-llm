@@ -7,6 +7,7 @@ import dev.cajeta.llm.io.Checkpoint;
 import cajeta.io.file.MappedFile;
 import cajeta.math.Tensor;
 import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.io.WmmaKernel;
@@ -40,6 +41,16 @@ public final class ExpertBank {
     // it. One admission, one charge, one upload per bank. ──
     KernelBuffer<int8> slabDev;
     KernelBuffer<int32> slabW;         // unit 44: word view of the slab
+    // Unit 9.4: the slab widened ONCE to int8 with its f16 scale image,
+    // bound beside the packed slab under WidenBudget. What the
+    // symmetric id-GEMM reads; null = not bound or refused.
+    KernelBuffer<int8> deqSlabDev;
+    KernelBuffer<int8> scaleSlabDev;
+    boolean widenRefused;
+    static boolean widenSlabOn = true;   // unit 9.4 A/B arm
+    public static void setWidenSlab(boolean on) {
+        ExpertBank.widenSlabOn = on;
+    }
     boolean slabRefused;
     int64 stride;      // bytes per expert
     int64[] touched;   // bytes served per expert (15.16's instrument)
@@ -535,7 +546,12 @@ public final class ExpertBank {
             KernelBuffer<int32> mapT0, KernelBuffer<int32> mapM1,
             KernelBuffer<int32> meta, int32 nChunksMax, int32 groups) {
         if (!this.idMwReady()) { return false; }
-        if (this.packedTy == 12) {
+        if (this.deqSlabDev != null) {
+            WmmaKernel.symWmmaDeqMw8IdLaunchNoSync(y, this.scaleSlabDev,
+                this.deqSlabDev, xp, mapE, mapT0, mapM1, meta,
+                (int64) nChunksMax, (int64) this.rowsN,
+                Quant.q8kPadCols((int64) this.colsN), (int64) this.rowsN);
+        } else if (this.packedTy == 12) {
             WmmaKernel.q4kWmmaIdMwLaunchNoSync(y, this.slabDev,
                 this.slabW, xp, mapE, mapT0, mapM1, meta,
                 (int64) nChunksMax, (int64) this.rowsN,
@@ -600,8 +616,79 @@ public final class ExpertBank {
     /** Whether {@link #gemmIdBatchMw} can serve this bank. */
     public boolean idMwReady() {
         if (this.slabDev == null || this.slabW == null) { return false; }
+        if (this.rowsN % 128 != 0) { return false; }
+        if (this.deqSlabDev != null) { return true; }
+        // The k-quant id kernels derive blocks-per-row from cols/256:
+        // a remainder width would silently drop its last columns.
         return (this.packedTy == 12 || this.packedTy == 14)
-            && this.rowsN % 128 == 0;
+            && this.colsN % 256 == 0;
+    }
+
+    /**
+     * Unit 9.4: widen the whole bank slab once -- int8 weights at the
+     * padded width plus the compact f16 scale image -- so the
+     * symmetric id-GEMM reads one buffer per bank instead of a repack
+     * per touched expert. Sized from the file at bind, allocated once,
+     * reused for the life of the bank. Budgeted and refused one-shot
+     * like every other widen; a refusal leaves the per-slot path.
+     */
+    public boolean ensureWidenSlab() {
+        if (this.deqSlabDev != null) { return true; }
+        if (this.widenRefused || !ExpertBank.widenSlabOn) { return false; }
+        if (this.slabDev == null) { return false; }
+        if (this.rowsN % 128 != 0) { return false; }
+        int32 ty = this.packedTy;
+        if (ty != Quant.GG_Q8_0 && ty != Quant.GG_Q5_0
+                && ty != Quant.GG_Q4_0) {
+            return false;
+        }
+        int64 rows = (int64) this.expertsN * (int64) this.rowsN;
+        int64 cols = (int64) this.colsN;
+        int64 colsPad = Quant.q8kPadCols(cols);
+        int64 deqBytes = rows * colsPad;
+        int64 imgBytes = WmmaKernel.symScaleImageBytes(rows, colsPad);
+        int64 total = deqBytes + imgBytes;
+        if (!WidenBudget.fits(total)) {
+            this.widenRefused = true;
+            WidenBudget.refuse("expert slab " + GgufFile.typeName(ty), total,
+                rows, cols);
+            return false;
+        }
+        this.deqSlabDev #= heap KernelBuffer<int8>((uint64) deqBytes);
+        this.scaleSlabDev #= heap KernelBuffer<int8>((uint64) imgBytes);
+        WidenBudget.charge(total);
+        int64 blkBytes = 34L;
+        if (ty == Quant.GG_Q8_0) {
+            WmmaKernel.q80WidenLaunch(this.deqSlabDev, this.slabDev, rows,
+                cols, colsPad);
+        } else if (ty == Quant.GG_Q5_0) {
+            blkBytes = 22L;
+            WmmaKernel.q50WidenLaunch(this.deqSlabDev, this.slabDev, rows,
+                cols, colsPad);
+        } else {
+            blkBytes = 18L;
+            WmmaKernel.q40WidenLaunch(this.deqSlabDev, this.slabDev, rows,
+                cols, colsPad);
+        }
+        WmmaKernel.deqPadZeroLaunch(this.deqSlabDev, rows, cols, colsPad);
+        WmmaKernel.symScaleImageLaunch(this.scaleSlabDev, this.slabDev,
+            rows, cols, colsPad, blkBytes);
+        this.residentB = this.residentB + total;
+        ExpertBank.resUsed = ExpertBank.resUsed + total;
+        return true;
+    }
+
+    /** The widened slab and its scale image — BORROWS of interior
+     *  state for the bit gate; null until {@link #ensureWidenSlab}. */
+    public KernelBuffer<int8> deqSlab() { return this.deqSlabDev; }
+    public KernelBuffer<int8> scaleSlab() { return this.scaleSlabDev; }
+
+    /** The widened slab's bytes, 0 when unbound. */
+    public int64 widenSlabBytes() {
+        if (this.deqSlabDev == null) { return 0L; }
+        int64 rows = (int64) this.expertsN * (int64) this.rowsN;
+        int64 colsPad = Quant.q8kPadCols((int64) this.colsN);
+        return rows * colsPad + WmmaKernel.symScaleImageBytes(rows, colsPad);
     }
 
     /**
@@ -637,7 +724,9 @@ public final class ExpertBank {
     /** Whether {@link #gemmIdBatch} can serve this bank. */
     public boolean idGemmReady() {
         if (this.slabDev == null) { return false; }
-        return this.packedTy == 12 || this.packedTy == 14;
+        if (this.deqSlabDev != null) { return true; }
+        return (this.packedTy == 12 || this.packedTy == 14)
+            && this.colsN % 256 == 0;
     }
 
     /** Whether an indirected id-kernel exists for this bank's format

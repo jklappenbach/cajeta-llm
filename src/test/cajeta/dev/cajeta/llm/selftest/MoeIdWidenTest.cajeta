@@ -1,0 +1,367 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.Linear;
+
+/**
+ * Plan 9.4 / 9.5 — the symmetric expert banks take the id-GEMM over a
+ * slab widened ONCE, and the down pack respects expert rows.
+ *
+ * Before this unit a Q8_0 or Q5_0 expert bank had no id kernel, so the
+ * resident route fell to a GEMM per expert group: 1,422 per-slot
+ * repacks on Qwen1.5-MoE, each one byte over a 2 MB block, ~7 GB of GTT
+ * on a 9 GB model and 180 launches per layer where llama.cpp issues
+ * three.
+ */
+public class MoeIdWidenTest {
+
+    public MoeIdWidenTest() { return; }
+
+    /** 9.4.1 — a Q8_0 expert bank is SEEN on the id route, agrees with
+     *  the per-group route it replaces, and refuses by name with the
+     *  widen off. */
+    @Test
+    public void symmetricExpertBankTakesTheIdGemm() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no resident MoE route on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        PrefillTap on = heap PrefillTap();
+        float32[] a #= MoeSharedBatchTest.residentOut(
+            MoeForwardTest.Q8EXP, on);
+        if (a == null) {
+            Assert.fail("the resident route refused: "
+                + on.namesOf("moe-batch-route"));
+        }
+        if (!on.sawContaining("moe-batch-route", "id GEMMs")) {
+            Assert.fail("q8_0 experts did not take the id GEMM: "
+                + on.namesOf("moe-batch-route"));
+        }
+        ExpertBank.setWidenSlab(false);
+        PrefillTap off = heap PrefillTap();
+        float32[] b #= MoeSharedBatchTest.residentOut(
+            MoeForwardTest.Q8EXP, off);
+        ExpertBank.setWidenSlab(true);
+        if (b == null) {
+            Assert.fail("the per-group control refused: "
+                + off.namesOf("moe-batch-route"));
+        }
+        if (!off.sawContaining("moe-batch-route", "per expert group")) {
+            Assert.fail("widen off did not fall to the per-group route: "
+                + off.namesOf("moe-batch-route"));
+        }
+        int64 n = (int64) (MoeSharedBatchTest.ROWS * MoeSharedBatchTest.H);
+        float64 mag = 0.0;
+        int64 i = 0;
+        while (i < n) {
+            float64 v = b[i];
+            if (v < 0.0) { v = 0.0 - v; }
+            if (v > mag) { mag = v; }
+            i = i + 1;
+        }
+        Assert.isTrue(mag > 0.000001);
+        // The two arms differ in NUMERICS by construction — int8 MMA
+        // over Q8_K activations against the f16 coop route — on a toy
+        // whose activations sit near 1e-5, so this bar is direction
+        // only. Correctness is the bit gate below, which holds the new
+        // kernel to the dense one it indirects.
+        float64 cos = Metrics.cosine(a, b, (int32) n);
+        System.stdout.println("   id-GEMM vs per-group cosine: " + cos
+            + "  route on=" + on.namesOf("moe-batch-route")
+            + " off=" + off.namesOf("moe-batch-route"));
+        Assert.isTrue(cos > 0.99);
+    }
+
+    /**
+     * THE GATE. The symmetric id-GEMM is `q80WmmaDeqMw8Kernel`
+     * indirected: same int8 MMA, same per-(block, sub-block) fold,
+     * same accumulation order. Over three experts the indirection must
+     * land each on its own slab rows, and every float must agree with
+     * the dense kernel to within FMA contraction — the backend is free
+     * to fuse `mc*xs*cf + facc` differently in two kernels, so the bar
+     * is 1e-5 of peak rather than bit identity (MEASURED: 33,280 of
+     * 49,152 floats differ in the last ulp, none beyond). A wrong
+     * expert offset or pad column cannot pass it. A synthetic Q8_0
+     * slab at a REMAINDER width (384 -> 512 padded) so the pad columns
+     * are on trial too, widened the way ExpertBank does it. The dense
+     * kernel is also run twice against itself: the determinism control.
+     */
+    @Test
+    public void symIdGemmIsTheDenseSymGemmIndirected() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no WMMA on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        int64 E = 3;
+        int64 rows = 128;        // outDim per expert
+        int64 cols = 384;
+        int64 colsPad = Quant.q8kPadCols(cols);
+        int64 T = 128;           // tokens per expert group
+        int64 blk = 34;
+
+        // Real Q8_0 blocks, tiled cyclically into three experts.
+        int8[] src #= File.readAllBytes(
+            "src/test/fixtures/gguf/kquant/q8_0.bin");
+        int64 srcN = (int64) src.count();
+        int64 slabBytes = E * rows * (cols / 32L) * blk;
+        int8[] slabH = heap int8[slabBytes];
+        int64 i = 0;
+        while (i < slabBytes) {
+            slabH[i] = src[i % srcN];
+            i = i + 1;
+        }
+        KernelBuffer<int8> slab #= heap KernelBuffer<int8>(
+            (uint64) (slabBytes + 4L));
+        slab.upload(slabH, slabBytes);
+
+        int64 allRows = E * rows;
+        int64 deqBytes = allRows * colsPad;
+        int64 imgBytes = WmmaKernel.symScaleImageBytes(allRows, colsPad);
+        KernelBuffer<int8> deq #= heap KernelBuffer<int8>((uint64) deqBytes);
+        KernelBuffer<int8> img #= heap KernelBuffer<int8>((uint64) imgBytes);
+        WmmaKernel.q80WidenLaunch(deq, slab, allRows, cols, colsPad);
+        WmmaKernel.deqPadZeroLaunch(deq, allRows, cols, colsPad);
+        WmmaKernel.symScaleImageLaunch(img, slab, allRows, cols, colsPad,
+            blk);
+
+        // Activations: E groups of T tokens, every row distinct, packed
+        // on row boundaries at the padded width.
+        int64 nTok = E * T;
+        KernelBuffer<float32> x #= MoeIdWidenTest.rowsOf((int32) nTok,
+            (int32) cols);
+        int64 xRowBytes = (colsPad / 256L) * 320L;
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) (nTok * xRowBytes));
+        QuantKernel.q8kPackRowsLaunchNoSync(xp, x, nTok, cols, colsPad);
+
+        // Dense, one expert at a time, into its band of y1.
+        int64 yN = nTok * rows;
+        KernelBuffer<float32> y1 #= heap KernelBuffer<float32>((uint64) yN);
+        int64 e = 0;
+        while (e < E) {
+            KernelBuffer<int8> dq #= deq.slice((uint64) (e * rows * colsPad),
+                (uint64) (rows * colsPad));
+            int64 imgPer = rows * (colsPad / 32L) * 2L;
+            KernelBuffer<int8> im #= img.slice((uint64) (e * imgPer),
+                (uint64) imgPer);
+            KernelBuffer<int8> xe #= xp.slice((uint64) (e * T * xRowBytes),
+                (uint64) (T * xRowBytes));
+            KernelBuffer<float32> ye #= y1.slice((uint64) (e * T * rows),
+                (uint64) (T * rows));
+            WmmaKernel.symWmmaDeqMw8Launch(ye, im, dq, xe, T, rows,
+                colsPad, 2L);
+            e = e + 1;
+        }
+
+        // Indirected, one launch: two 64-token chunks per expert.
+        int32[] mE = heap int32[6];
+        int32[] mT0 = heap int32[6];
+        int32[] mM1 = heap int32[6];
+        int32 c = 0;
+        while (c < 6) {
+            mE[c] = c / 2;
+            mT0[c] = (c / 2) * (int32) T + (c % 2) * 64;
+            mM1[c] = (c / 2 + 1) * (int32) T;
+            c = c + 1;
+        }
+        int32[] meta = heap int32[4];
+        meta[0] = 6;
+        KernelBuffer<int32> mED #= heap KernelBuffer<int32>((uint64) 6);
+        KernelBuffer<int32> mT0D #= heap KernelBuffer<int32>((uint64) 6);
+        KernelBuffer<int32> mM1D #= heap KernelBuffer<int32>((uint64) 6);
+        KernelBuffer<int32> metaD #= heap KernelBuffer<int32>((uint64) 4);
+        mED.upload(mE, 6L);
+        mT0D.upload(mT0, 6L);
+        mM1D.upload(mM1, 6L);
+        metaD.upload(meta, 4L);
+        KernelBuffer<float32> y2 #= heap KernelBuffer<float32>((uint64) yN);
+        WmmaKernel.symWmmaDeqMw8IdLaunchNoSync(y2, img, deq, xp, mED, mT0D,
+            mM1D, metaD, 6L, rows, colsPad, rows);
+        QuantKernel.stream().sync();
+
+        // Determinism control: the dense kernel against itself.
+        KernelBuffer<float32> y3 #= heap KernelBuffer<float32>((uint64) yN);
+        e = 0;
+        while (e < E) {
+            KernelBuffer<int8> dq #= deq.slice((uint64) (e * rows * colsPad),
+                (uint64) (rows * colsPad));
+            int64 imgPer = rows * (colsPad / 32L) * 2L;
+            KernelBuffer<int8> im #= img.slice((uint64) (e * imgPer),
+                (uint64) imgPer);
+            KernelBuffer<int8> xe #= xp.slice((uint64) (e * T * xRowBytes),
+                (uint64) (T * xRowBytes));
+            KernelBuffer<float32> ye #= y3.slice((uint64) (e * T * rows),
+                (uint64) (T * rows));
+            WmmaKernel.symWmmaDeqMw8Launch(ye, im, dq, xe, T, rows,
+                colsPad, 2L);
+            e = e + 1;
+        }
+        QuantKernel.stream().sync();
+
+        float32[] a = heap float32[yN];
+        float32[] b = heap float32[yN];
+        float32[] a2 = heap float32[yN];
+        y1.download(a, yN);
+        y2.download(b, yN);
+        y3.download(a2, yN);
+        int64 selfBad = 0;
+        int64 ulp = 0;
+        float64 maxD = 0.0;
+        int64 maxAt = 0;
+        float64 maxE0 = 0.0;
+        float64 maxE1 = 0.0;
+        float64 maxE2 = 0.0;
+        float64 fp = 0.0;
+        float64 mag = 0.0;
+        i = 0;
+        while (i < yN) {
+            if (a[i] != a2[i]) { selfBad = selfBad + 1; }
+            float64 d = (float64) a[i] - (float64) b[i];
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > 0.0) { ulp = ulp + 1; }
+            if (d > maxD) { maxD = d; maxAt = i; }
+            int64 ex = i / (T * rows);
+            if (ex == 0L && d > maxE0) { maxE0 = d; }
+            if (ex == 1L && d > maxE1) { maxE1 = d; }
+            if (ex == 2L && d > maxE2) { maxE2 = d; }
+            fp = fp + (float64) a[i] * (float64) ((i % 97L) + 1L);
+            float64 v = a[i];
+            if (v < 0.0) { v = 0.0 - v; }
+            if (v > mag) { mag = v; }
+            i = i + 1;
+        }
+        // The instrument is alive: the dense reference is not zeros.
+        Assert.isTrue(mag > 0.001);
+        System.stdout.println("   sym id-GEMM gate: " + yN + " floats, "
+            + ulp + " differ, max |d| " + maxD + " at " + maxAt
+            + " (per expert " + maxE0 + " / " + maxE1 + " / " + maxE2
+            + "), peak " + mag + ", fingerprint " + fp
+            + ", dense-vs-dense mismatches " + selfBad);
+        Assert.equals(0L, selfBad);
+        if (maxD > mag * 0.00001) {
+            Assert.fail("id kernel diverges from the dense kernel at "
+                + maxAt + " (expert " + (maxAt / (T * rows)) + ", token "
+                + ((maxAt / rows) % T) + ", col " + (maxAt % rows) + "): "
+                + a[maxAt] + " vs " + b[maxAt] + ", |d| " + maxD
+                + " against peak " + mag);
+        }
+    }
+
+    static #KernelBuffer<float32> rowsOf(int32 rows, int32 n) {
+        int64 total = (int64) rows * (int64) n;
+        float32[] h = heap float32[total];
+        int64 i = 0;
+        while (i < total) {
+            h[i] = (float32) ((int32) (i * 7L % 61L) - 30) / 16.0f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> d #= heap KernelBuffer<float32>((uint64) total);
+        d.upload(h, total);
+        return #d;
+    }
+
+    /** 9.5.1's does-not-fire half: at a whole-block width the row-aware
+     *  pack is the flat pack, byte for byte. */
+    @Test
+    public void rowAwarePackIsTheFlatPackAtWholeBlocks() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no device pack on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        int32 rows = 3;
+        int32 n = 512;
+        KernelBuffer<float32> x #= MoeIdWidenTest.rowsOf(rows, n);
+        int64 bytes = (int64) rows * (int64) (n / 256) * 320L;
+        KernelBuffer<int8> flat #= heap KernelBuffer<int8>((uint64) bytes);
+        KernelBuffer<int8> rowed #= heap KernelBuffer<int8>((uint64) bytes);
+        // Both zero-filled first: a Q8_K block has spare bytes past its
+        // scale that no pack writes, and two fresh device buffers hold
+        // two different garbages there.
+        int8[] z = heap int8[bytes];
+        flat.upload(z, bytes);
+        rowed.upload(z, bytes);
+        QuantKernel.q8kPackLaunchNoSync(flat, x, (int64) rows * (int64) n);
+        QuantKernel.q8kPackRowsLaunchNoSync(rowed, x, (int64) rows,
+            (int64) n, (int64) n);
+        QuantKernel.stream().sync();
+        int8[] fb = heap int8[bytes];
+        int8[] rb = heap int8[bytes];
+        flat.download(fb, bytes);
+        rowed.download(rb, bytes);
+        int64 i = 0;
+        while (i < bytes) {
+            if (fb[i] != rb[i]) {
+                Assert.fail("flat and row-aware packs differ at byte " + i
+                    + " (block " + (i / 320L) + " offset " + (i % 320L)
+                    + "): " + fb[i] + " vs " + rb[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    /** 9.5.1's fires half: at a remainder width every row starts on a
+     *  block boundary and the tail block's padded elements quantize to
+     *  zero — quants and sub-block sums both. */
+    @Test
+    public void rowAwarePackZeroFillsTheRemainderTail() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no device pack on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        int32 rows = 2;
+        int32 n = 384;
+        int64 nPad = Quant.q8kPadCols((int64) n);
+        Assert.equals(512L, nPad);
+        KernelBuffer<float32> x #= MoeIdWidenTest.rowsOf(rows, n);
+        int64 bytes = (int64) rows * (nPad / 256L) * 320L;
+        KernelBuffer<int8> out #= heap KernelBuffer<int8>((uint64) bytes);
+        QuantKernel.q8kPackRowsLaunchNoSync(out, x, (int64) rows,
+            (int64) n, nPad);
+        QuantKernel.stream().sync();
+        int8[] ob = heap int8[bytes];
+        out.download(ob, bytes);
+        int32 r = 0;
+        while (r < rows) {
+            int64 blk1 = ((int64) r * 2L + 1L) * 320L;
+            int64 k = 128;
+            while (k < 256) {
+                Assert.equals(0L, (int64) ob[blk1 + k]);
+                k = k + 1;
+            }
+            int64 sb = 4;
+            while (sb < 8) {
+                int64 at = blk1 + 256L + sb * 4L;
+                Assert.equals(0L, (int64) ob[at]);
+                Assert.equals(0L, (int64) ob[at + 1L]);
+                Assert.equals(0L, (int64) ob[at + 2L]);
+                Assert.equals(0L, (int64) ob[at + 3L]);
+                sb = sb + 1;
+            }
+            // And the real half of that block is not: the row was not
+            // silently packed as all-zero.
+            int32 nz = 0;
+            k = 0;
+            while (k < 128) {
+                if (ob[blk1 + k] != 0) { nz = nz + 1; }
+                k = k + 1;
+            }
+            Assert.isTrue(nz > 64);
+            r = r + 1;
+        }
+    }
+}

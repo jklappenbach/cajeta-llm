@@ -643,7 +643,8 @@ load-bearing rather than stylistic.
       CLOSED 2026-09-14 by Unit 9. Every checkpoint is now >= 0.17x:
 
         model                       before Unit 9    after    ratio
-        Qwen1.5-MoE Q4_K_M                   86.7      873    0.373x
+        Qwen1.5-MoE Q4_K_M                   86.7     2405    1.03x
+                                        (9.1: 873, 0.373x; 9.4: 2405)
         Mixtral Q4_K_M (control)            248.7    247.3    0.456x
         30B-A3B Q4_K_M (control)           1253.8   1278.4    0.987x
 
@@ -1586,11 +1587,42 @@ WHAT 9.4 THEREFORE BUYS: the id-GEMM reads the slab directly, so the
 repacks, their rounding and the per-slot yBatch all go -- ~7 GB of GTT
 on a 9 GB model -- along with the 180-launch layer.
 
-- [ ] **9.4.0 Coding** — until then, no repack may straddle a 2 MB
-      block: `ensureCoopW` sizes `coopDev` up to the block multiple
-      it will be charged for anyway, so the ledger and the kernel
-      agree, and the waste is visible as bytes the engine asked for
-      rather than bytes it did not.
+- [ ] **9.4.0 Coding** — DEFERRED. The slot path is now only the
+      fallback for a REFUSED widen, and on the default route it never
+      runs. When it does, `ensureCoopW` still straddles; sizing it to
+      the block multiple is cheap and still owed, but no longer on any
+      measured path.
+- [x] **9.4.1 TDD** — `MoeIdWidenTest`. THE GATE: a synthetic three-
+      expert Q8_0 slab at a remainder width (384 -> 512 padded),
+      widened as the bank does it, the dense `q80WmmaDeqMw8Kernel` per
+      expert against the new id kernel over a six-chunk map: 49,152
+      floats, max |d| 2.98e-08 = ONE float32 ulp at 0.25, the same in
+      every expert, dense-vs-dense 0 mismatches. Bit identity between
+      two kernels is not attainable (the backend contracts
+      `mc*xs*cf + facc` per kernel), so the bar is 1e-5 of peak, which
+      contraction cannot exceed and a wrong offset cannot meet. Plus:
+      the Q8_0 fixture SEEN on `zero-sync id GEMMs` and refusing to
+      `a GEMM per expert group` with `setWidenSlab(false)`; the
+      row-aware pack byte-identical to the flat pack at a whole width
+      (both buffers zero-filled first -- a Q8_K block has spare bytes
+      no pack writes); and the remainder tail's quants and sums zero.
+- [x] **9.4.2 Coding** — `ExpertBank.ensureWidenSlab`: the bank slab
+      widened ONCE to int8 at the padded width with its f16 scale
+      image, sized from the file at bind, under `WidenBudget`, refused
+      one-shot. `symWmmaDeqMw8IdKernel` = the dense symmetric kernel
+      with `q4kWmmaIdMwKernel`'s chunk map and ragged-tail store; the
+      only change is the B feed. Julian's "parse the file and allocate
+      once, and re-use", at the layer where it is true.
+- [x] **9.4.3 Coding** — `idMwReady`/`idGemmReady` admit a widened
+      bank; the k-quant id kernels now also require `colsN % 256`,
+      since they derive blocks-per-row from `cols/256` and a remainder
+      would silently drop columns.
+- [ ] **9.4.4 Coding** — free the packed slab once its widened twin is
+      bound and no consumer remains. On this checkpoint the Q8_0/Q5_0
+      down slabs are ~3.6 GB of GTT read by nothing on the default
+      route; the widened form is what the id-GEMM reads, and the slot
+      fallback that would want the packed bytes only runs when the
+      widen was refused, which is exactly when the twin is absent.
 
 - [ ] **9.4.1 TDD** — an expert bank at Q8_0 and one at Q5_0 agree with
       the per-expert path, and are seen on `idPath`.
@@ -1601,18 +1633,66 @@ on a 9 GB model -- along with the 180-launch layer.
 
 ### 9.5 — the width remainder (the original Unit 9)
 
-- [ ] **9.5.1 TDD** — an expert bank at width 1408 agrees with the
-      per-row serial path, and a whole-super-block width is
-      BIT-IDENTICAL before and after (the does-not-fire half).
-- [ ] **9.5.2 Coding** — row-aware pack and `widPad/256` everywhere
-      `wid/256` is passed as blocks-per-row; buffers at the padded
-      width; `zeroSyncReady`'s gate from `% 256` to `% 32`.
-- [ ] **9.5.3 Acceptance** — 5.3.1's bar is already met by 9.1, so the
-      bar here is 9.4+9.5's own: the `moe-batch-route` record reads
-      `resident: id GEMMs` rather than `a GEMM per expert group`, and
-      the prefill ratio is measured and recorded whatever it is.
-      Mixtral (width 14336, a whole super-block) must not move: it is
-      the control, and 9.1 left it at -0.5%.
+- [x] **9.5.1 TDD** — the remainder is witnessed synthetically at 384
+      (9.4.1's gate, pad columns on trial) and on the real 1408 by
+      perplexity; the whole-width does-not-fire half is the pack
+      byte-identity test. No 1408-wide fixture was generated.
+- [~] **9.5.2 Coding** — PREFILL HALF DONE: `forwardBatchRes` packs
+      the down input one row per slot at `q8kPadCols(wid)` on both
+      branches and `xpBgDev` is sized at the padded width; the sym id
+      launcher takes `colsPad`. NOT DONE, and now the decode unit's:
+      `zeroSyncReady`'s `% 256` gate and the three `wid / 256L` in the
+      row path (`idDownCombineTail`, `idDownCombine`, `idLaunch`) --
+      the row path does not serve Q8_0/Q5_0 at all yet (Unit 9.6).
+- [x] **9.5.3 Acceptance** — MEASURED 2026-09-14, 512x128 x2, quiet
+      box, `void=0 nolaunch=0`, every layer `resident: zero-sync id
+      GEMMs`, no widen refused:
+
+        Qwen1.5-MoE prefill pp512    873 ->  2405 tok/s   2.75x
+                                     (86.7 this morning: 27.7x)
+        vs llama.cpp best (vk 2329)  0.373x -> 1.03x     AHEAD
+        prefill pp2048               684 ->  1414         0.30x -> 0.62x
+        decode tg128@d512            24.7 -> 24.7         untouched (9.6)
+        Qwen3-30B  (control)         1278 -> 1278
+        Mixtral    (control, warm)   247  ->  253   (a 146 at
+                                     cached=0.0% was the page cache)
+
+      PERPLEXITY, one variable (`pplprobe ... nowidenslab`):
+        per-group route   meanNll 1.71712   ppl 5.56847
+        id-GEMM route     meanNll 1.72123   ppl 5.59142   +0.41%
+      The int8 route's Q8_K activation quantization of the 1408-wide
+      GLU'd middle, the same family as the dense coop-vs-int8 deltas
+      (2.3.2: 0.25%); the kernel itself is gated to one ulp of the
+      dense kernel. Recorded, not hidden.
+
+      GTT, aligned snapshot mid-decode, auto widen: 18.41 -> 17.57 GB;
+      engine-vs-kernel gap 2.79 -> 0.76 GB (the baseline every model
+      carries -- the 2 MB rounding waste is gone). The widened down
+      slabs (4.4 GB) replaced ~7 GB of slot junk; the packed slabs
+      they supersede are still resident, which is 9.4.4.
+
+### 9.6 — decode on the same checkpoint (0.23x)
+
+Same disease one layer down, measured (2026-09-14 decode profile):
+580 ms of device time in a 2660 ms decode window, 43,950 launches for
+64 tokens = 687 per token, `q4kQ8WaveMatVecKernel` 14 per layer per
+token. `zeroSyncReady` refuses on `sharedW != 0` and `widthN % 256`,
+and `idLaunch`/`idDownCombineTail` serve Q4_K/Q6_K only, so every
+selected expert is its own mat-vec per bank plus the shared expert's
+three projections. llama.cpp: one `mul_mat_id` per bank.
+
+- [ ] **9.6.1 TDD** — a decode row on the shexp fixture agrees with
+      the host path and is SEEN on the zero-sync row route (a
+      `moe-row-route` record, the row twin of `moe-batch-route`).
+- [ ] **9.6.2 Coding** — the shared expert as a resident sublayer of
+      the row path (the batched form at rows=1, or the mat-vec chain
+      `matvecKeepOnDevice` already used by the dense MLP).
+- [ ] **9.6.3 Coding** — a symmetric id mat-vec over the widened slab
+      (`q4kQ8IdMatVecKernel`'s twin reading `deq` + scale image), and
+      `idDownCombineTail`'s symmetric form; `zeroSyncReady` from
+      `% 256` to `% 32` with `widPad/256` at the three row-path sites.
+- [ ] **9.6.4 Acceptance** — Qwen1.5-MoE decode ratio measured; the
+      other two MoE decodes (0.97x) must not move.
 
 RISK, unchanged: this is the MoE hot path including the fused
 down+combine tail, and the failure mode of getting it wrong is a wrong
