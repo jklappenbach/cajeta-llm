@@ -92,6 +92,9 @@ public final class MoeFfn extends InfModule {
     static int32[] map64T0H;
     static int32[] map64M1H;
     static KernelBuffer<int32> map64EDev;
+    static KernelBuffer<int32> map128EDev;
+    static KernelBuffer<int32> map128T0Dev;
+    static KernelBuffer<int32> map128M1Dev;
     static KernelBuffer<int32> map64T0Dev;
     static KernelBuffer<int32> map64M1Dev;
     // Unit 45: the device-routed batch — picks, weights and the chunk
@@ -107,6 +110,8 @@ public final class MoeFfn extends InfModule {
     static boolean sharedBatchOn = true;       // unit 9 A/B arm
     static boolean sharedRowOn = true;         // unit 9.6 A/B arm
     public static void setSharedRow(boolean on) { MoeFfn.sharedRowOn = on; }
+    static boolean wideIdOn = true;            // unit 10.2 A/B arm
+    public static void setWideId(boolean on) { MoeFfn.wideIdOn = on; }
     public static void setSharedBatch(boolean on) {
         MoeFfn.sharedBatchOn = on;
     }
@@ -1328,10 +1333,10 @@ public final class MoeFfn extends InfModule {
         // old set.
         QuantKernel.stream().sync();
         MoeFfn.fbEdbAllocs = MoeFfn.fbEdbAllocs + 1L;
-        // +64 rows of slack everywhere the id-GEMMs' padded tiles may
+        // +128 rows of slack everywhere the id-GEMMs' padded tiles may
         // READ past the last group (their stores are guarded): the
-        // multi-wave kernel's map strides 64.
-        int64 npp = np + 64L;
+        // wide kernel's map strides 128.
+        int64 npp = np + 128L;
         MoeFfn.gRowDev #= heap KernelBuffer<int32>((uint64) np);
         MoeFfn.gWDev #= heap KernelBuffer<float32>((uint64) np);
         MoeFfn.rowSlotDev #= heap KernelBuffer<int32>((uint64) np);
@@ -1353,6 +1358,10 @@ public final class MoeFfn extends InfModule {
         MoeFfn.map64EDev #= heap KernelBuffer<int32>((uint64) tiles);
         MoeFfn.map64T0Dev #= heap KernelBuffer<int32>((uint64) tiles);
         MoeFfn.map64M1Dev #= heap KernelBuffer<int32>((uint64) tiles);
+        int32 tiles8 = (int32) (np / 128L) + en + 1;
+        MoeFfn.map128EDev #= heap KernelBuffer<int32>((uint64) tiles8);
+        MoeFfn.map128T0Dev #= heap KernelBuffer<int32>((uint64) tiles8);
+        MoeFfn.map128M1Dev #= heap KernelBuffer<int32>((uint64) tiles8);
         MoeFfn.selAllDev #= heap KernelBuffer<int32>((uint64) np);
         MoeFfn.wAllDev #= heap KernelBuffer<float32>((uint64) np);
         MoeFfn.metaDev #= heap KernelBuffer<int32>((uint64) 4);
@@ -1462,7 +1471,8 @@ public final class MoeFfn extends InfModule {
             this.noteRoutesDev(MoeFfn.selAllDev, (int64) rows);
             QuantKernel.moeGroupLaunchNoSync(MoeFfn.gRowDev, MoeFfn.gWDev,
                 MoeFfn.rowSlotDev, MoeFfn.map64EDev, MoeFfn.map64T0Dev,
-                MoeFfn.map64M1Dev, MoeFfn.metaDev, MoeFfn.selAllDev,
+                MoeFfn.map64M1Dev, MoeFfn.map128EDev, MoeFfn.map128T0Dev,
+                MoeFfn.map128M1Dev, MoeFfn.metaDev, MoeFfn.selAllDev,
                 MoeFfn.wAllDev, (int64) np, en, (int64) this.usedN);
             MoeFfn.fbDevRoutes = MoeFfn.fbDevRoutes + 1L;
             MoeFfn.fbZeroSyncRoutes = MoeFfn.fbZeroSyncRoutes + 1L;
@@ -1478,12 +1488,34 @@ public final class MoeFfn extends InfModule {
             // Every expert is resident by construction (the slabs), and
             // the host no longer knows which were selected: a launch
             // counts the bank.
-            this.gateB.gemmIdBatchMw(MoeFfn.bgDev, MoeFfn.xpBxDev,
-                MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
-                MoeFfn.metaDev, nCMax, this.expertsN);
-            this.upB.gemmIdBatchMw(MoeFfn.buDev, MoeFfn.xpBxDev,
-                MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
-                MoeFfn.metaDev, nCMax, this.expertsN);
+            // 10.2: the wide tile when the step carries at least 64 rows
+            // per expert on average; a bank the wide kernel cannot serve
+            // keeps the 64-row one.
+            boolean wide = MoeFfn.wideIdOn && np >= 64 * this.expertsN;
+            int32 nC8Max = np / 128 + this.expertsN;
+            boolean wg8 = false;
+            boolean wu8 = false;
+            boolean wd8 = false;
+            if (wide) {
+                wg8 = this.gateB.gemmIdBatchWide(MoeFfn.bgDev, MoeFfn.xpBxDev,
+                    MoeFfn.map128EDev, MoeFfn.map128T0Dev, MoeFfn.map128M1Dev,
+                    MoeFfn.metaDev, nC8Max, this.expertsN);
+            }
+            if (!wg8) {
+                this.gateB.gemmIdBatchMw(MoeFfn.bgDev, MoeFfn.xpBxDev,
+                    MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
+                    MoeFfn.metaDev, nCMax, this.expertsN);
+            }
+            if (wide) {
+                wu8 = this.upB.gemmIdBatchWide(MoeFfn.buDev, MoeFfn.xpBxDev,
+                    MoeFfn.map128EDev, MoeFfn.map128T0Dev, MoeFfn.map128M1Dev,
+                    MoeFfn.metaDev, nC8Max, this.expertsN);
+            }
+            if (!wu8) {
+                this.upB.gemmIdBatchMw(MoeFfn.buDev, MoeFfn.xpBxDev,
+                    MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
+                    MoeFfn.metaDev, nCMax, this.expertsN);
+            }
             MoeFfn.phaseSync();
             MoeFfn.fbGemm1Ns = MoeFfn.fbGemm1Ns
                 + (Clock.nanoTime() - fbg10);
@@ -1496,9 +1528,16 @@ public final class MoeFfn extends InfModule {
             // width is whole.
             QuantKernel.q8kPackRowsLaunchNoSync(MoeFfn.xpBgDev, MoeFfn.bgDev,
                 (int64) np, wid, Quant.q8kPadCols(wid));
-            this.downB.gemmIdBatchMw(MoeFfn.beDev, MoeFfn.xpBgDev,
-                MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
-                MoeFfn.metaDev, nCMax, this.expertsN);
+            if (wide) {
+                wd8 = this.downB.gemmIdBatchWide(MoeFfn.beDev, MoeFfn.xpBgDev,
+                    MoeFfn.map128EDev, MoeFfn.map128T0Dev, MoeFfn.map128M1Dev,
+                    MoeFfn.metaDev, nC8Max, this.expertsN);
+            }
+            if (!wd8) {
+                this.downB.gemmIdBatchMw(MoeFfn.beDev, MoeFfn.xpBgDev,
+                    MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
+                    MoeFfn.metaDev, nCMax, this.expertsN);
+            }
             MoeFfn.phaseSync();
             MoeFfn.fbGemm2Ns = MoeFfn.fbGemm2Ns
                 + (Clock.nanoTime() - fbg20);
@@ -1509,7 +1548,18 @@ public final class MoeFfn extends InfModule {
             MoeFfn.phaseSync();
             MoeFfn.fbTailNs = MoeFfn.fbTailNs + (Clock.nanoTime() - fbt0);
             this.addSharedBatchDev(xDev, rows, act);
-            this.sayBatchRoute("resident: zero-sync id GEMMs");
+            if (wg8 || wu8 || wd8) {
+                String g8 = "-";
+                String u8 = "-";
+                String d8 = "-";
+                if (wg8) { g8 = "g"; }
+                if (wu8) { u8 = "u"; }
+                if (wd8) { d8 = "d"; }
+                this.sayBatchRoute("resident: zero-sync id GEMMs, wide "
+                    + g8 + u8 + d8);
+            } else {
+                this.sayBatchRoute("resident: zero-sync id GEMMs");
+            }
             this.emitCacheRecord("batch", h0, w0, a0, b0);
             return true;
         }
