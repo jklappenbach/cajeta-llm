@@ -2072,6 +2072,13 @@ the rebuilt toolchain; the first profile of the morning was not usable.
       element by element). Filtered suite 98/98. Gate tests: the
       Q6_K widen + image + wide kernel vs the packed 64-row kernel,
       and the f16-image form vs the 64-row widened kernel.
+      CONTROLS 2026-09-15 on the 10.3 binary, in-process: Qwen1.5-MoE
+      pp512 2420 tok/s and Qwen3-30B pp512 1259, both routes still
+      `zero-sync id GEMMs` with no `wide` (34 and 32 rows per expert,
+      under the 64 gate); Mixtral tg32 26.3 (unchanged path). Mixtral
+      pp2048 at chunk 512: 4213 ms = 486 tok/s (0.91x of 536.7), the
+      GEMMs 3.35 s of it, attention 0.54 s (11%, a 31 ms launch at
+      ctx 2048) -- Unit 11's two terms, on this checkpoint too.
 - [ ] **10.4 Acceptance** — route records name the wide kernel on every
       Mixtral layer at 512 rows; the filtered suite green; perplexity
       on Mixtral (256 decode positions after a 512 prefill) unchanged
