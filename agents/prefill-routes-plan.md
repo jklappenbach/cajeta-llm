@@ -1725,8 +1725,37 @@ three projections. llama.cpp: one `mul_mat_id` per bank.
       The bit gate read 384/384 wrong (max |d| 0.40 at peak 0.21) and
       the toy Q8_0 row cosine 0.958 before the route ran a single real
       token; after, 0/384 and 0.999956.
-- [~] **9.6.4 Acceptance** — Qwen1.5-MoE decode ratio measured; the
+- [x] **9.6.4 Acceptance** — Qwen1.5-MoE decode ratio measured; the
       other two MoE decodes (0.97x) must not move.
+      TIMING HALF, 2026-09-14 night, quiet box (loadavg 0.29-0.79),
+      `leg.sh`, cached=100% on the model under test:
+
+        Qwen1.5-MoE tg128@d512   24.7 -> 78.4 tok/s   (78.5/78.3/78.6/76.1)
+          vs llama.cpp best (vk fa1 107.4)   0.23x -> 0.73x    3.2x
+        Qwen1.5-MoE tg64@d2048   18.5 -> 39.3         (39.25/39.29)
+          vs llama.cpp best (vk fa1 87.6)    0.21x -> 0.45x    2.1x
+        Qwen1.5-MoE pp512        2405 -> 2400/2415/2411/2297   flat
+        Qwen3-30B   tg128@d512   85.0/84.5   (85.0/85.2/85.4 before)  flat
+        Qwen3-30B   pp512        1269/1275   (1273/1278)               flat
+        Mixtral     tg128@d512   25.4/25.5   (25.5/25.6)               flat
+        Mixtral     pp512        147/194 at cached=25.5% -- the page
+                                 cache, as in 9.5.3; not re-measured.
+      The very first rep of the night read 47.9 and never recurred in
+      six more; recorded as an outlier (the GPU sits at 766 MHz under
+      `auto` DPM between legs and this workload is launch-heavy).
+      The 512x128 greedy stream diverges from the host row at the
+      SECOND token on the synthetic prompt (198 322 27 ... -> 198 2 27
+      ...), the argmax flip 9.5.3 already saw between routes on that
+      prompt; the 2048x64 stream is byte-identical to the pre-9.6 logs.
+      Perplexity on real text is the oracle (above).
+      WHERE THE 12.8 ms/token GOES (profiler, d512, per token): GPU
+      ~90% busy, so kernel-bound now, not launch-bound. q4kQ8WaveMatVec
+      3.0 ms (6/layer: q/k/v/o + shexp gate/up), attnScore+attnCombine
+      2.6 ms (100 MB of KV -- 16 KV heads, no GQA), q6kQ8WaveMatVec
+      1.9 ms (shexp down), symQ8IdDownCombine 1.7 ms, q4kQ8IdGateUpGlu
+      1.5 ms, packs/biases/router/glu ~1 ms. llama.cpp's 9.3 ms/token
+      is mostly the attention difference: at d2048 cajeta loses 50% to
+      llama's 18%.
       NON-TIMING HALF, 2026-09-14 (test suite running alongside, so the
       tok/s here are not the claim):
         moe-row-route, prompt=128 gen=8: every layer, every token
@@ -1751,6 +1780,20 @@ three projections. llama.cpp: one `mul_mat_id` per bank.
         shexp middle, the same family and the 30B's standard route.
         Recorded, not hidden.
       TIMING HALF: owed (accept96-timing.sh, quiet box).
+- [ ] **9.6.5 Coding** — the q/k/v biases: Qwen1.5-MoE's attention
+      projections carry biases, `matvecQkvStagedKeep` refuses biases,
+      so each layer pays 3 mat-vecs + 3 `addBiasRows` where the 30B
+      pays one fused launch. A bias epilogue on `qkvWaveMatVecKernel`
+      (lane 0 adds b[row] before the store) removes 5 launches a layer,
+      120 a token. Surfaced by the 9.6.4 launch profile.
+- [ ] **9.6.6 Coding** — decode attention without GQA: Qwen1.5-MoE has
+      16 KV heads for 16 query heads, and `attnScore`+`attnCombine`
+      read its 100 MB of KV at d512 in 2.6 ms/token (~40 GB/s-
+      equivalent) against a 0.5 ms bus floor; the 30B shares each KV
+      head across 8 query heads and holds 0.95x at d2048 where this
+      model holds 0.45x. Not an MoE lever: profile the flash-decode
+      split at nKv == nHeads and read llama.cpp's fattn tile choice for
+      that shape. Surfaced by the 9.6.4 device profile.
 
 RISK, unchanged: this is the MoE hot path including the fused
 down+combine tail, and the failure mode of getting it wrong is a wrong
