@@ -2178,6 +2178,24 @@ where the GEMMs run at 10-25.
       chunk over a ~215-265 ms device chunk; on Mixtral ~60-170 over
       ~900. 11.3 removes it by giving every chunk the lazy authority
       the first one already has.
+      THE ATTENTION PROBE (`tmp/u10/src/.../AttnPrefillProbe`, 512 query
+      rows at the end of the context, min of five):
+        GQA1 16/16   ctx 512  0.51 ms  2.13 TFLOPS   131k pairs/head
+                     ctx 1024 1.84     1.75          393k
+                     ctx 1536 3.29     1.63          655k
+                     ctx 2048 5.30     1.42          917k
+        GQA4 32/8    ctx 512  0.89     2.41
+                     ctx 1024 2.64     2.44
+                     ctx 1536 4.49     2.39
+                     ctx 2048 6.57     2.29
+      The curve IS linear in the causal work: the 9.4x from ctx 512 to
+      2048 is the 7x more keys each query row attends, at a flat 1.4
+      to 2.4 TFLOPS. So 11.2 is a throughput unit, not a scaling
+      defect: the wave-per-query kernel streams K and V once per
+      query and llama.cpp's tile FA streams them once per 64 queries.
+      At pp2048 the attention is 24 x (0.51 + 1.84 + 3.29 + 5.30) =
+      262 ms on Qwen1.5-MoE, 18% of the prefill; on Mixtral 32 x 14.6
+      = 467 ms, 11%.
 - [ ] **11.2 Coding** — the flash prefill kernels at depth: skip KV
       tiles wholly above the causal diagonal, tile the KV walk so a
       query tile streams its keys once at bandwidth, the GQA1 shape
