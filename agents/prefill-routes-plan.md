@@ -2021,15 +2021,18 @@ the rebuilt toolchain; the first profile of the morning was not usable.
       Q6_K; ~50 ms -> ~20 per layer, the prefill 2.07 s -> ~1.0 s if
       the ragged tails behave, = ~500 tok/s against 542.7.
       The kernel gate for 10.2/10.3 is 10.2.0 below.
-- [ ] **10.2.0 TDD** — `MoeIdMw8Test`: the wide-tile id kernels against
+- [x] **10.2.0 TDD** — `MoeIdMw8Test`: the wide-tile id kernels against
       the shipped 64-row id kernels at Mixtral-shaped geometry scaled
       down in K (eight experts, ragged rows 5/32/48/17/128/100/156/64
       so every workgroup sees 1..8 active tiles and a ragged tail),
       both bank shapes, Q4_K packed and Q6_K widened: agreement at the
       reassociation bar with every output row live, and the row after
       each group untouched. The fixture varies activations per 16-row
-      tile and per expert. RED until 10.2/10.3 land.
-- [ ] **10.2 Coding** — `q4kWmmaIdMw8Kernel`: the dense packed-direct
+      tile and per expert. The Q4_K half passed on the kernel's first
+      build (12 chunks of 64, 9 of 128, outDim 256): agreement at the
+      bar on all 140,800 elements, every row live, the 128 poisoned
+      rows past the batch untouched.
+- [x] **10.2 Coding** — `q4kWmmaIdMw8Kernel`: the dense packed-direct
       `q4kWmmaMwKernel` (128 tokens x 128 rows per workgroup, eight
       token tiles per wave) indirected through a 128-row chunk map --
       expert offset, row base, ragged end, `nAct` 1..8, the tail tile
@@ -2039,13 +2042,25 @@ the rebuilt toolchain; the first profile of the morning was not usable.
       when the step's rows per expert make it worth it (the 64-row
       kernel stays for decode-sized batches), and the route record
       names which served each bank.
-- [ ] **10.3 Coding** — the Q6_K down banks widened: `q6kWidenLaunch`
-      to the tile-major int8 slab plus a per-16 f16 scale image
-      (d*sc folded), the packed slab released; `symWmmaDeqMw8IdKernel`
-      lifted to the 128-row tile with a scale granularity parameter
-      (32 for the symmetric formats, 16 for Q6_K), so one widened
-      wide-tile id kernel serves Q8_0/Q5_0/Q4_0 AND Q6_K. The widen
-      budget gate admits it or refuses by name.
+      MEASURED 2026-09-15, Mixtral pp512, same binary, `nowide` arm vs
+      default: 2063 ms -> 1382 ms (248 -> 370 tok/s, 0.68x of 542.7);
+      the route reads `wide gud` on the 16 Q4_K-down layers and
+      `wide gu-` on the 16 Q6_K-down layers. `q4kWmmaIdMw8Kernel`
+      averages 5.6 ms (max 9.4) where the 64-row kernel took 11-27;
+      `q6kWmmaIdMwKernel` is now 48% of the prefill at 37.8 ms per
+      launch, which is 10.3's whole case. Filtered suite 96/96.
+- [ ] **10.3 Coding** — the Q6_K down banks widened FOR PREFILL:
+      `q6kWidenLaunch` to the tile-major int8 slab plus a per-16 f32
+      scale image (d*sc folded, `q6kScaleImageKernel`), budget-gated
+      and refused by name; `symWmmaDeqIdMw8Kernel`, the widened feed
+      at the 128-row tile with a scale-granularity parameter (32 for
+      the symmetric formats' f16 image, 16 for Q6_K), so one kernel
+      serves Q8_0/Q5_0/Q4_0 AND Q6_K. The packed Q6_K slab STAYS:
+      decode reads it at 6.6 bpw, and a widened decode would read 9 --
+      a ~6% decode loss on Mixtral for 2.3 GB of GTT. The wide twin
+      costs +8.4 GB on Mixtral instead (27.7 -> ~36 GB GTT); the
+      trade is recorded here and the twin can be dropped after idle
+      steps later if memory is asked for.
 - [ ] **10.4 Acceptance** — route records name the wide kernel on every
       Mixtral layer at 512 rows; the filtered suite green; perplexity
       on Mixtral (256 decode positions after a 512 prefill) unchanged
