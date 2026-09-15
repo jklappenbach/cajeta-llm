@@ -172,26 +172,26 @@ every timing leg and wait for the go; filtered suite only
 ## Unit 2 — Reference material: fixtures, tables, names, arbiter files (spec §2, §3.5, §4.1, §9)
 
 ### 2.1 TDD
-- [ ] 2.1.1 `IqGridTest.everyTableChecksumsToTheGeneratorsValue`: the five
+- [x] 2.1.1 `IqGridTest.everyTableChecksumsToTheGeneratorsValue`: the five
       grids, `ksigns_iq2xs`, `kmask_iq2xs` and the packed forms (iq1s
       nibbles, the two-bit IQ2 alphabet) — a position-weighted checksum
       equal to the value `tmp/cbq/grids.c` printed, pinned in the test.
-- [ ] 2.1.2 `GgufFileTest.typeNameKnowsTheCodebookAndTernaryIds`: ids 16,
+- [x] 2.1.2 `GgufFileTest.typeNameKnowsTheCodebookAndTernaryIds`: ids 16,
       17, 18, 19, 21, 22, 29, 34, 35 name themselves; the loader's
       refusal text lists every `supported()` type.
-- [ ] 2.1.3 `QuantTest.dequantizeRefusesATypeWithNoBranch`, naming it.
-- [ ] 2.1.4 `QuantTest.theManifestCoversEveryFixture`: every `.bin` in the
+- [x] 2.1.3 `QuantTest.dequantizeRefusesATypeWithNoBranch`, naming it.
+- [x] 2.1.4 `QuantTest.theManifestCoversEveryFixture`: every `.bin` in the
       fixture directory has an entry with a matching block count.
 
 ### 2.2 Coding
-- [ ] 2.2.1 `tmp/cbq/gen.c` (from `tmp/q1fix/gen.c`): nine fixture pairs
+- [x] 2.2.1 `tmp/cbq/gen.c` (from `tmp/q1fix/gen.c`): nine fixture pairs
       over the same token_embd values, a synthetic positive importance
       vector handed to all seven IQ quantizers, the TQ1_0 fixture checked
       for distinct values in all three regions; committed with the
       manifest regenerated.
-- [ ] 2.2.2 `tmp/cbq/grids.c`: emits `io/IqGrid.cajeta` (byte-per-value
+- [x] 2.2.2 `tmp/cbq/grids.c`: emits `io/IqGrid.cajeta` (byte-per-value
       and packed forms as static arrays) and prints the checksums.
-- [ ] 2.2.3 `GgufFile.typeName` six ids; refusal text from `supported()`;
+- [x] 2.2.3 `GgufFile.typeName` six ids; refusal text from `supported()`;
       `Quant.dequantize` throws on a type with no branch.
 - [ ] 2.2.4 Arbiter files under `tmp/cbq/`: `llama-imatrix` over the
       Q8_0 8B on a calibration text distinct from the perplexity text;
@@ -201,9 +201,13 @@ every timing leg and wait for the go; filtered suite only
       Reference numbers per file — HIP and Vulkan pp512 / pp2048 /
       tg128 through `leg.sh`, `llama-perplexity` on the README text —
       announced, quiet box, recorded in 2.3.1.
-- [ ] 2.2.5 The two compiler findings filed in the cajeta repo:
+- [ ] 2.2.5 The compiler findings filed in the cajeta repo:
       `cajeta.xpu.Constant<T>` declared and unwired; `@FastMath` folding
-      `fpext(fptrunc x)` to x. Placement per Julian.
+      `fpext(fptrunc x)` to x; and, found here, a static field with an
+      array-literal initializer refused as "int32[] not assignable to
+      int32[]" (the literal compiles as a local, so `IqGrid` wraps every
+      table in a method). Drafted at `tmp/cbq/compiler-findings.md`;
+      placement per Julian.
 
 ### 2.3 Acceptance
 - [ ] 2.3.1 Fixtures, manifest and `IqGrid.cajeta` committed with their
