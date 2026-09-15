@@ -2114,11 +2114,13 @@ one 2048-row step (`chunk=2048`):
 So the depth gap is mostly PER-CHUNK cost, not attention: four
 512-row steps cost 4291 where one lone pp512 step costs 899 (+174 ms
 per step on Mixtral). The host tier of the Qwen1.5 pp2048 profile
-names it. First chunk: `MappedFile.read` 228 ms (17 reads, via
+names it, with one caveat: the host tier is windowed by trace time,
+and the first-chunk window may straddle the load's tail. First-chunk
+window: `MappedFile.read` 228 ms (17 reads, via
 `Linear.streamPackedFromMap`), `KernelBuffer` allocs + uploads 126 ms
--- lazy weight streaming and buffer growth INSIDE the timed prefill,
-because the load's warm-up runs one 512-row step at position 0 and
-never touches the state a 2048 context needs. Chunks 2-4:
+-- lazy weight streams and buffer growth that 11.1's per-step record
+must place inside or outside the timed step (no Linear ever drops
+its device weights, so a stream is a FIRST use). Chunks 2-4:
 `PagedKvCache.appendRowRaw` 138 ms (53 calls, the device K/V written
 back to the host cache per chunk), `AttnKernel.widenHalf` 53 ms (24
 lazy per-layer widens), more reads, 399 ms of `KernelStream.sync`
@@ -2130,25 +2132,55 @@ pays on both checkpoints; the attention kernels run at 1-2 TFLOPS
 where the GEMMs run at 10-25.
 
 - [ ] **11.1 TDD** — the host side first, since it is the larger
-      term: a `prefill-chunk` diag record per step naming the host
-      time in (a) lazy weight streaming, (b) buffer growth, (c) the K/V
-      writeback, (d) sync waits, so the bench can print the per-chunk
-      overhead and the test can assert the warm-up leaves (a) and (b)
-      at zero for a prompt up to `ctx`. Then the attention probe: the
-      flash prefill kernels per (rows, ctx) at 512/1024/1536/2048, GQA1
-      and GQA4, ms and fraction of the row x ctx work; the curve must
-      come out linear after 11.2.
+      term: a `prefill-chunk` diag record per step (rows, startPos,
+      lazy device builds ns, buffer growth ns, K/V writeback ns, step
+      wall ns), the bench printing the three sums as `prefill host
+      ms`, and `PrefillChunkTest` on the shexp toy: after the prewarm
+      the first step streams nothing; the steps after it grow
+      nothing; a mid-sequence chunk writes no K/V back inside the
+      layer loop. Then the attention probe: the flash prefill kernels
+      per (rows, ctx) at 512/1024/1536/2048, GQA1 and GQA4, ms and
+      fraction of the row x ctx work; the curve must come out linear
+      after 11.2.
+      MEASURED 2026-09-15 with the record, pp2048 at chunk 512 (the
+      first row is the load's warm-up step, the rest the timed prefill;
+      `wall` is host time, and a chunk that syncs inside the writeback
+      absorbs its own GPU wait there):
+        Qwen1.5-MoE   rows pos   lazy ms  grow ms  kvback ms  wall ms
+          warm-up      512   0     233.7     4.5        0     3191
+          chunk 1      512   0       0       0          0      202
+          chunk 2      512  512      0       0.2      312      326
+          chunk 3      512 1024      0       0        345      359
+          chunk 4      512 1536      0       0        385      398
+        Mixtral        512   0     317.5    10.5        0    10154
+          chunk 1      512   0       0       0          0      854
+          chunk 2      512  512      0       0        959      993
+          chunk 3      512 1024      0       0       1018     1052
+          chunk 4      512 1536      0       0       1070     1104
+      So the lazy streams and growth are INSIDE THE LOAD, as the
+      warm-up intends -- the earlier host-window reading was the load's
+      tail. What the timed prefill pays is the mid-sequence writeback:
+      per layer a stream sync, two plane downloads, two f16->f32 host
+      widens and 512 host row appends, with the GPU idle through the
+      host part. On Qwen1.5-MoE that is ~110-130 ms of host time per
+      chunk over a ~215-265 ms device chunk; on Mixtral ~60-170 over
+      ~900. 11.3 removes it by giving every chunk the lazy authority
+      the first one already has.
 - [ ] **11.2 Coding** — the flash prefill kernels at depth: skip KV
       tiles wholly above the causal diagonal, tile the KV walk so a
       query tile streams its keys once at bandwidth, the GQA1 shape
       given what 9.6.6 gave decode. llama.cpp's `fattn-mma`/Vulkan
       coopmat FA is the reference for the tile.
-- [ ] **11.3 Coding** — the per-chunk cost: the warm-up at load sized
-      to `ctx` (or the lazy weight streams and buffer growth moved into
-      load outright), the K/V writeback to the host cache off the
-      prefill path (deferred, or dropped where the device planes are
-      the truth), the per-layer `widenHalf` done once at bind. Target:
-      four 512-row steps within 5% of four lone pp512 steps.
+- [ ] **11.3 Coding** — the per-chunk cost: (a) `prewarmPrefillWeights`
+      covers MoE layers (router upload, the shared expert's device
+      side and batch outputs), so the load's warm-up step builds
+      nothing lazily either; (b) every chunk takes the lazy cache
+      authority (10.12.38) that only the first chunk had: no debt paid
+      at entry, no per-layer sync + download + append, one `adoptLazy`
+      after the loop, the host cache caught up on demand by the
+      existing `syncKvToHost`; the eager form stays behind the
+      `eagerauth` arm. Target: four 512-row steps within 5% of four
+      lone pp512 steps, the record's kvback column at zero.
 - [ ] **11.4 Acceptance** — filtered suite green; perplexity on
       Qwen1.5-MoE unchanged (5.576 flash); TIMING, announced, quiet
       box: Qwen1.5-MoE pp2048 >= 2070 tok/s (0.9x of 2297.6), pp512
