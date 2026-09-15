@@ -1918,6 +1918,150 @@ answer rather than a crash. The dense version of this change (7.4) took
 a bit-identical fingerprint gate to trust, and 9.5 should too.
 
 
+## Unit 10 — Mixtral prefill (0.46x): what the profiler found
+
+MEASURED 2026-09-15, `prompt=512 gen=1`, cajeta profiler, hip backend,
+the bench's own warm-up pass excluded (it runs the same 512-row shape
+once at load, on freshly committed pages). Prefill 2075 ms = 247 tok/s
+against llama.cpp HIP fa1 542.7 (0.455x); pp2048 9846 ms = 208 tok/s
+against 536.7 (0.39x). The route is the best one we have: every layer
+records `resident: zero-sync id GEMMs`, one launch per bank, and the
+device is busy for the whole prefill (90-110 ms of kernel time per 100
+ms window). So unlike Unit 9 this is not launches, syncs or a refused
+gate. It is the speed of the three indirected GEMM launches:
+
+  per layer, measured pass          launch      TFLOPS (0.120 TFLOP each)
+  gate   q4kWmmaIdMwKernel        11-16 ms       ~9.6
+  up     q4kWmmaIdMwKernel        11-14 ms       ~9.6
+  down   q4kWmmaIdMwKernel        21-27 ms       ~5.0   (Q4_K, 16 layers)
+  down   q6kWmmaIdMwKernel        39-50 ms       ~2.9   (Q6_K, 16 layers)
+  everything else                  ~6-7 ms       attention 0.9, q/k/v/o
+                                                 1.7, glu 0.7, packs 0.7,
+                                                 router 0.4, moe glue 0.4
+
+That is 1.85 s of the 2.07 s in three kernels. The same run holds the
+yardstick: the DENSE multi-wave kernel on the attention projections
+(`q4kWmmaDeqMw8Kernel`, 4096x4096 at 512 rows) runs at ~25 TFLOPS, the
+Q8_0 twin on k/v at ~23, and the 8B Q4_K_M prefill at 1440 tok/s is 23
+TFLOPS sustained across whole layers. llama.cpp's whole-model rate at
+542.7 tok/s is 14 TFLOPS, so its expert GEMMs run at 16-17. Ours run
+at 3 to 10, and the down bank (K = 14336) is the worst of the three at
+either format.
+
+The shape is the difference. Both id kernels take a 64-token chunk x
+128 output rows per workgroup: eight waves, each a 16-column slice of
+ONE expert across up to four 16-token tiles, the weight fragment
+decoded from packed words in registers, the activation tile loaded
+from global memory by every wave for every 16-wide K slice. The dense
+kernel that reaches 25 TFLOPS takes 128 tokens x 128 rows -- eight
+token tiles per wave, so every weight fragment feeds eight MMAs where
+the id kernel's feeds four -- and reads its B operand from the widened
+int8 slab, one load and no nibble work. llama.cpp's MMQ on RDNA3
+(`mmq.cuh`, `AMD_WMMA_AVAILABLE`) is 128 x 128 per workgroup too, eight
+waves at 32 rows x 64 tokens, and it stages BOTH operands through LDS
+once per 256-wide superblock: the Q4_K nibbles are unpacked to int8
+tiles by the whole workgroup and reused across all 128 tokens, the
+scales folded per (row, sub-block), the activations Q8_1 in LDS beside
+them. One launch per bank: `mmq_ids_helper` sorts token rows by expert
+into `ids_dst` + `expert_bounds` and the kernel indexes through them.
+The Q6_K id kernel pays on top of the tile: 16 word loads and ~40 ALU
+ops per fragment through a 64-bit funnel (the 210-byte block is not
+word aligned) against Q4_K's four and four, and a scale verb per
+16-wide slice where Q4_K folds per 32.
+
+INSTRUMENT FINDING, fixed in the compiler (cajeta 830a6f23): the
+profiler's pending-launch table held 256 launches. The zero-sync route
+enqueues a whole 32-layer step -- about a thousand launches -- before
+any dispatch record returns, so every launch past the 256th was
+published at host tier with its enqueue bracket standing in for a
+device span: the measured prefill read as thousands of 60 us kernels
+and a whole layer per millisecond, and the summary printed "2535 kept,
+0 dropped" over it. The table now holds 16384 and the summary names
+`gpu_pending_overflow` when it is non-zero. The numbers above are from
+the rebuilt toolchain; the first profile of the morning was not usable.
+
+- [ ] **10.1 TDD** — THE DISCRIMINATING PROBE, a `.cajeta` program under
+      `tmp/u10`: at Mixtral's two bank shapes (eight experts x 128 rows,
+      N=14336/K=4096 and N=4096/K=14336, ragged groups of 100-156 rows)
+      time four cells and report TFLOPS per cell: (a) `q4kWmmaIdMwKernel`
+      as shipped; (b) `symWmmaDeqMw8IdKernel` over the widened slab --
+      same 64-row tile, the B feed alone changed; (c) the dense
+      `q4kWmmaDeqMw8Kernel` per expert -- 128-token tile and widened
+      feed; (d) the dense packed-direct `q4kWmmaMwKernel` per expert --
+      128-token tile, packed feed. The 2x2 says whether the tile or the
+      feed carries the 2.5x, and whether a packed feed at the wide tile
+      is enough (it keeps GTT at 1.06x the file; a widened Mixtral is
+      ~45 GB). Same probe on Q6_K with its dense twins. Record the four
+      numbers here before 10.2 chooses.
+      The kernel gate for 10.2: bit identity against the shipped id
+      kernel at Mixtral's geometry (eight experts, ragged rows, both
+      shapes) and against the f64 sum; fixture rows vary per expert AND
+      per 16-row tile so a wrong map or a wrong tile shows.
+- [ ] **10.2 Coding** — the id GEMM at the wide tile: 128 tokens x 128
+      rows per workgroup, eight token tiles per wave, the chunk map at
+      128 rows (`moeGroupKernel` writes it beside the 64-row map; the
+      route picks by rows per expert), the B feed 10.1 chose. If the
+      probe says the packed feed cannot reach the widened one at the
+      wide tile, stage B through LDS once per superblock as llama.cpp
+      does and reuse it across the eight tiles -- the decode paid once
+      per 128 tokens, not once per wave.
+- [ ] **10.3 Coding** — the Q6_K twin at the same tile, its fragment
+      decode amortized the same way; and the ragged tail: experts with
+      fewer than 128 rows in the step keep the 64-row kernel (decode-
+      sized batches must not regress), the route record names which
+      kernel served each bank.
+- [ ] **10.4 Acceptance** — route records name the wide kernel on every
+      Mixtral layer at 512 rows; the filtered suite green; perplexity
+      on Mixtral (256 decode positions after a 512 prefill) unchanged
+      to 1e-3; GTT for Mixtral within 1.1x the file unless 10.1 chose
+      the widened feed (then say so here with the number). TIMING,
+      announced, quiet box: Mixtral pp512 >= 490 tok/s (0.9x of 542.7)
+      and pp2048 reported against 536.7; controls flat: Qwen1.5-MoE
+      pp512 (2408), Qwen3-30B pp512 (1262), Mixtral tg128 (25.5).
+
+## Unit 11 — Qwen1.5-MoE prefill at depth (pp2048 0.62x)
+
+MEASURED 2026-09-15, same toolchain. pp512 210.7 ms = 2430 tok/s
+(1.04x llama.cpp Vulkan fa1 2329) -- the control, at parity. pp2048
+1430 ms = 1432 tok/s against 2297.6 (0.62x; HIP 1628.9). The
+prefill runs as four 512-row chunks, and per chunk:
+
+  device busy                86% at pp512  ->  77% at pp2048
+  attention per layer      0.52 ms @ ctx 512 -> 4.7 ms @ ctx 2048
+                           (9.4x for 4x context; 240 ms = 17% of pp2048,
+                            6% of pp512)   `attnFlashPrefillKernel`
+  gate/up id GEMM          45 ms per chunk  ->  51
+  down sym id GEMM         29 ms per chunk  ->  36
+  not on the device        ~30 ms of 210    ->  ~330 ms of 1430, spread
+                           evenly through the chunks, not at their edges
+
+llama.cpp Vulkan holds 2297 at pp2048 against 2329 at pp512: its
+attention at depth costs it ~1.5%. Mixtral shows the same growth on
+the GQA4 kernel (0.9 ms at ctx 512, a 49 ms launch at 2048), so 11.2
+pays on both checkpoints; the attention kernels run at 1-2 TFLOPS
+where the GEMMs run at 10-25.
+
+- [ ] **11.1 TDD** — a timing probe of the flash prefill kernels per
+      (rows, ctx) at 512/1024/1536/2048, GQA1 and GQA4, reported as
+      ms and as a fraction of the row x ctx work: the curve must come
+      out linear after 11.2. The host-side probe: the profiler's host
+      tier over one pp2048 chunk, top frames between launches, to name
+      what the 23% idle is (candidates: `noteRoutesDev` pulling the
+      selections down per layer, `ensureDevBatch` regrowth, the chunk
+      handoff in `Scheduler`); the finding written here before 11.3.
+- [ ] **11.2 Coding** — the flash prefill kernels at depth: skip KV
+      tiles wholly above the causal diagonal, tile the KV walk so a
+      query tile streams its keys once at bandwidth, the GQA1 shape
+      given what 9.6.6 gave decode. llama.cpp's `fattn-mma`/Vulkan
+      coopmat FA is the reference for the tile.
+- [ ] **11.3 Coding** — the idle 11.1 named, removed on the zero-sync
+      route.
+- [ ] **11.4 Acceptance** — filtered suite green; perplexity on
+      Qwen1.5-MoE unchanged (5.576 flash); TIMING, announced, quiet
+      box: Qwen1.5-MoE pp2048 >= 2070 tok/s (0.9x of 2297.6), pp512
+      flat at 2408; Mixtral pp2048 re-read after 10.4; Qwen3-30B pp512
+      flat.
+
 ## Unit 8 — Dense weight residency (why the 72B does not load)
 
 MEASURED 2026-09-13 on a 122 GB box. Qwen2.5-VL-72B-Q4_K_M is 47.4 GB.
