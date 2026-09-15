@@ -1838,6 +1838,26 @@ three projections. llama.cpp: one `mul_mat_id` per bank.
       COMPILER FINDING (cajeta repo, owed): kernel lowering resolves a
       name declared in a sibling block instead of rejecting it; the
       block-scope shadow defect's third shape.
+      TIMING, quiet box (loadavg 0.09-1.09), cached=100%:
+        Qwen1.5-MoE tg128@d512   78.4 -> 80.7 tok/s (80.75/80.70/80.74)
+          vs llama.cpp best 107.4            0.73x -> 0.75x
+        Qwen1.5-MoE tg64@d2048   39.3 -> 39.9 (40.14/39.72)   0.46x
+        Qwen1.5-MoE pp512        2377/2408/2423                flat
+        Qwen3-30B   tg128@d512   85.1/85.1/84.9 (mode)         flat
+        Qwen3-30B   pp512        1259-1282                     flat
+      The 30B read a SLOW CLASS in 3 of 7 reps (71.1, 68.9, 68.4 --
+      14.0-14.6 ms/token against 11.75), the same class the 14:35 leg
+      recorded before any of tonight's changes (54.0, rep 1) and the
+      Qwen1.5 47.9 first rep of the night: bimodal, environmental,
+      filed as 9.6.7.
+- [ ] **9.6.7 Investigation** — bimodal decode reps: the 30B at 85 or
+      68-71, Qwen1.5-MoE at 78-81 or 48, whole-run classes rather than
+      noise, on a quiet box with the model 100% cached, before and
+      after tonight's kernels. Candidates: GPU DPM level for the run
+      (`pp_dpm_sclk` reads 766 MHz between legs under `auto`), the
+      pool the weights land in (VRAM carve-out vs GTT on the APU), CPU
+      frequency. Instrument: sample `pp_dpm_sclk` and the process's
+      fdinfo mid-decode per rep and correlate with the class.
 - [ ] **9.6.6 Coding** — decode attention without GQA: Qwen1.5-MoE has
       16 KV heads for 16 query heads, and `attnScore`+`attnCombine`
       read its 100 MB of KV at d512 in 2.6 ms/token (~40 GB/s-
