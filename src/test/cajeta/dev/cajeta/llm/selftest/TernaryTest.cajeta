@@ -1,0 +1,277 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.Linear;
+
+/**
+ * The ternary pair (codebook-quants spec §3.3, §5, §6, §7): TQ1_0 and
+ * TQ2_0 through every part of the stack, each held to the part below.
+ */
+public class TernaryTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+    static final int64 ROWS = 64L;
+    static final int64 COLS = 4096L;
+
+    public TernaryTest() { return; }
+
+    @Test
+    public void tq20MatchesReferenceExactly() {
+        QuantTest.checkFormat("tq2_0", Quant.GG_TQ2_0);
+        QuantTest.checkFormat("tq2_0-ternary", Quant.GG_TQ2_0);
+    }
+
+    @Test
+    public void tq10MatchesReferenceExactly() {
+        QuantTest.checkFormat("tq1_0", Quant.GG_TQ1_0);
+        QuantTest.checkFormat("tq1_0-ternary", Quant.GG_TQ1_0);
+    }
+
+    /** Dequantize-then-multiply against the block mat-vec. */
+    static void checkHost(String name, int32 ty) {
+        int8[] raw #= File.readAllBytes(TernaryTest.DIR + name + ".bin");
+        int64 blocks = (int64) raw.count() / (int64) Quant.blockBytes(ty);
+        int64 rows = 4L;
+        int64 cols = blocks / rows * 256L;
+        int64 n = rows * cols;
+        float32[] w #= heap float32[n];
+        Quant.dequantize(ty, raw, 0L, blocks, w, 0L);
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) {
+            x[c] = (float32) ((c % 13L) - 6L) * 0.125f;
+            c = c + 1;
+        }
+        float32[] want #= heap float32[rows];
+        int64 r = 0;
+        while (r < rows) {
+            float32 acc = 0.0f;
+            c = 0;
+            while (c < cols) {
+                acc = acc + w[r * cols + c] * x[c];
+                c = c + 1;
+            }
+            want[r] = acc;
+            r = r + 1;
+        }
+        float32[] got #= heap float32[rows];
+        if (ty == Quant.GG_TQ2_0) {
+            Quant.tq20MatVecIntoAt(raw, 0L, rows, cols, x, 0L, got, 0L);
+        } else {
+            Quant.tq10MatVecIntoAt(raw, 0L, rows, cols, x, 0L, got, 0L);
+        }
+        r = 0;
+        while (r < rows) {
+            float64 a = (float64) want[r];
+            float64 b = (float64) got[r];
+            float64 diff = a - b;
+            if (diff < 0.0) { diff = 0.0 - diff; }
+            float64 mag = a < 0.0 ? 0.0 - a : a;
+            if (mag < 1.0) { mag = 1.0; }
+            if (diff / mag > 1.0e-5) {
+                Assert.fail(name + " row " + r + ": host " + got[r]
+                    + " vs dequantized " + want[r]);
+            }
+            r = r + 1;
+        }
+        return;
+    }
+
+    @Test
+    public void hostMatVecMatchesTheDequantizedReference() {
+        TernaryTest.checkHost("tq2_0", Quant.GG_TQ2_0);
+        TernaryTest.checkHost("tq1_0", Quant.GG_TQ1_0);
+        TernaryTest.checkHost("tq2_0-ternary", Quant.GG_TQ2_0);
+        TernaryTest.checkHost("tq1_0-ternary", Quant.GG_TQ1_0);
+    }
+
+    /** Tile the fixture to ROWS x COLS. */
+    static #int8[] tiled(String fixture, int32 ty) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 nBlocks = TernaryTest.ROWS * (TernaryTest.COLS / 256L);
+        int8[] fix #= File.readAllBytes(TernaryTest.DIR + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        return #raw;
+    }
+
+    static #float32[] activations() {
+        float32[] x #= heap float32[TernaryTest.COLS];
+        int64 i = 0;
+        while (i < TernaryTest.COLS) {
+            x[i] = 0.03125f * (float32) ((i * 31L + 7L) % 61L - 30L);
+            i = i + 1;
+        }
+        return #x;
+    }
+
+    /** The q8_K-rounded activations a device kernel sees. */
+    static #float32[] rounded(int8[] xp) {
+        float32[] xq #= heap float32[TernaryTest.COLS];
+        int64 k = 0;
+        while (k < TernaryTest.COLS) {
+            int64 ab = k / 256L;
+            int64 base = ab * 320L;
+            int32 sb = ((int32) xp[base + 288L] & 255)
+                | (((int32) xp[base + 289L] & 255) << 8)
+                | (((int32) xp[base + 290L] & 255) << 16)
+                | (((int32) xp[base + 291L] & 255) << 24);
+            float32 sc = Cajeta.bitsToF32(sb);
+            xq[k] = sc * (float32) ((int32) xp[base + (k % 256L)]);
+            k = k + 1;
+        }
+        return #xq;
+    }
+
+    static #float32[] reference(int8[] raw, int32 ty, float32[] xq) {
+        int64 nBlocks = TernaryTest.ROWS * (TernaryTest.COLS / 256L);
+        float32[] w #= heap float32[nBlocks * 256L];
+        Quant.dequantize(ty, raw, 0L, nBlocks, w, 0L);
+        float32[] want #= heap float32[TernaryTest.ROWS];
+        int64 r = 0;
+        while (r < TernaryTest.ROWS) {
+            float32 acc = 0.0f;
+            int64 k = 0;
+            while (k < TernaryTest.COLS) {
+                acc = acc + w[r * TernaryTest.COLS + k] * xq[k];
+                k = k + 1;
+            }
+            want[r] = acc;
+            r = r + 1;
+        }
+        return #want;
+    }
+
+    static void compare(String what, float32[] want, float32[] got) {
+        int64 r = 0;
+        boolean live = false;
+        while (r < TernaryTest.ROWS) {
+            if (got[r] != 0.0f) { live = true; }
+            float32 a = want[r];
+            float32 g = got[r];
+            float32 diff = a - g;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = a < 0.0f ? 0.0f - a : a;
+            if (diff > mag * 0.0001f + 0.0005f) {
+                Assert.fail(what + " row " + r + ": " + g + " vs " + a);
+            }
+            r = r + 1;
+        }
+        Assert.isTrue(live);
+        return;
+    }
+
+    /** The integer host twin against the f32 host over the same rounded
+     *  activations, then the wave kernel against the twin. */
+    static void checkQ8(String fixture, int32 ty) {
+        int8[] raw #= TernaryTest.tiled(fixture, ty);
+        float32[] x #= TernaryTest.activations();
+        int8[] xq #= heap int8[TernaryTest.COLS];
+        float32[] xd #= heap float32[TernaryTest.COLS / 256L];
+        int32[] xbs #= heap int32[TernaryTest.COLS / 16L];
+        Quant.q8kQuantize(x, 0L, TernaryTest.COLS, xq, xd, xbs);
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(TernaryTest.COLS)];
+        Quant.q8kPack(x, 0L, TernaryTest.COLS, xp);
+        float32[] xr #= TernaryTest.rounded(xp);
+        float32[] want #= TernaryTest.reference(raw, ty, xr);
+        float32[] twin #= heap float32[TernaryTest.ROWS];
+        if (ty == Quant.GG_TQ2_0) {
+            Quant.tq20MatVecIntoQ8(raw, TernaryTest.ROWS, TernaryTest.COLS,
+                xq, xd, xbs, twin, 0L);
+        } else {
+            Quant.tq10MatVecIntoQ8(raw, TernaryTest.ROWS, TernaryTest.COLS,
+                xq, xd, xbs, twin, 0L);
+        }
+        TernaryTest.compare(fixture + " q8 twin", want, twin);
+
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int64 bpr = TernaryTest.COLS / 256L;
+        int64 nBlocks = TernaryTest.ROWS * bpr;
+        KernelBuffer<int8> wb #= heap KernelBuffer<int8>((uint64) raw.count());
+        wb.upload(raw);
+        KernelBuffer<int8> pd #= heap KernelBuffer<int8>((uint64)
+            (TernaryTest.ROWS * Quant.rowResidentBytes(ty, bpr)));
+        QuantKernel.splitLaunch(pd, wb, nBlocks, 0L, ty, bpr);
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        xpb.upload(xp);
+        KernelBuffer<float32> yd #= heap KernelBuffer<float32>(
+            (uint64) TernaryTest.ROWS);
+        if (ty == Quant.GG_TQ2_0) {
+            QuantKernel.tq20Q8WaveMatVecLaunch(yd, pd, xpb, TernaryTest.ROWS,
+                TernaryTest.COLS, 0L);
+        } else {
+            QuantKernel.tq10Q8WaveMatVecLaunch(yd, pd, xpb, TernaryTest.ROWS,
+                TernaryTest.COLS, 0L);
+        }
+        float32[] got #= heap float32[TernaryTest.ROWS];
+        yd.download(got);
+        TernaryTest.compare(fixture + " wave kernel", twin, got);
+        return;
+    }
+
+    @Test
+    public void tq20Q8TwinAndWaveKernelAgree() {
+        TernaryTest.checkQ8("tq2_0.bin", Quant.GG_TQ2_0);
+        TernaryTest.checkQ8("tq2_0-ternary.bin", Quant.GG_TQ2_0);
+    }
+
+    @Test
+    public void tq10Q8TwinAndWaveKernelAgree() {
+        TernaryTest.checkQ8("tq1_0.bin", Quant.GG_TQ1_0);
+        TernaryTest.checkQ8("tq1_0-ternary.bin", Quant.GG_TQ1_0);
+    }
+
+    @Test
+    public void coopGemmsMatchTheHost() {
+        CoopQuantGemmTest.checkFormat(Quant.GG_TQ2_0, "tq2_0.bin");
+        CoopQuantGemmTest.checkFormat(Quant.GG_TQ1_0, "tq1_0.bin");
+        Assert.equals(16, QuantKernel.coopBlockWords(Quant.GG_TQ2_0));
+        Assert.equals(13, QuantKernel.coopBlockWords(Quant.GG_TQ1_0));
+        Assert.isTrue(QuantKernel.coopColsOk(Quant.GG_TQ2_0, 4096L));
+        Assert.isFalse(QuantKernel.coopColsOk(Quant.GG_TQ2_0, 4160L));
+    }
+
+    /** A type is admitted by every part or by none (MXFP4 rides the
+     *  expert-bank path and is the one standing exception). */
+    @Test
+    public void theFourPartInvariant() {
+        int32 ty = 0;
+        while (ty < 64) {
+            if (ty != Quant.GG_MXFP4) {
+                boolean sup = Quant.supported(ty);
+                if (sup != QuantKernel.hasKernel(ty)) {
+                    Assert.fail("type " + ty + ": supported " + sup
+                        + " but hasKernel " + QuantKernel.hasKernel(ty));
+                }
+                if (sup != QuantKernel.coopSupports(ty)) {
+                    Assert.fail("type " + ty + ": supported " + sup
+                        + " but coopSupports " + QuantKernel.coopSupports(ty));
+                }
+                if (sup != Linear.packedSupported(ty, 4096)) {
+                    Assert.fail("type " + ty + ": supported " + sup
+                        + " but packedSupported "
+                        + Linear.packedSupported(ty, 4096));
+                }
+            }
+            ty = ty + 1;
+        }
+    }
+}

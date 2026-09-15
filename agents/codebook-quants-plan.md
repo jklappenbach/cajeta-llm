@@ -201,6 +201,17 @@ every timing leg and wait for the go; filtered suite only
       Reference numbers per file — HIP and Vulkan pp512 / pp2048 /
       tg128 through `leg.sh`, `llama-perplexity` on the README text —
       announced, quiet box, recorded in 2.3.1.
+      FILES MADE 2026-09-15 (`tmp/cbq/arbiters.sh`, imatrix over 64
+      chunks of llama.cpp's docs, `--allow-requantize` from the Q8_0 8B):
+
+        llama8b-iq1_s    2019632544   llama8b-iq3_xxs  3274917280
+        llama8b-iq1_m    2161976736   llama8b-iq3_xs   3518752160
+        llama8b-iq2_xxs  2399217056   llama8b-iq3_s    3682330016
+        llama8b-iq2_xs   2605786528   llama8b-iq3_m    3784828320
+        llama8b-iq2_s    2758493600   qwen15moe-iq3_xxs 6345614336
+        llama8b-iq2_m    2948285856   (imatrix over the Q4_K_M)
+
+      The reference legs (`tmp/cbq/reflegs.sh`) wait on a quiet box.
 - [ ] 2.2.5 The compiler findings filed in the cajeta repo:
       `cajeta.xpu.Constant<T>` declared and unwired; `@FastMath` folding
       `fpext(fptrunc x)` to x; and, found here, a static field with an
@@ -217,35 +228,42 @@ every timing leg and wait for the go; filtered suite only
 ## Unit 3 — TQ2_0 and TQ1_0: the four-part template on the new layout (spec §3.3, §5, §6, §7, §8.4)
 
 ### 3.1 TDD
-- [ ] 3.1.1 `QuantTest.tq20MatchesReferenceExactly`, `tq10…` — exact.
-- [ ] 3.1.2 `QuantTest.tqHostMatVecMatchesTheDequantizedReference`
+- [x] 3.1.1 `QuantTest.tq20MatchesReferenceExactly`, `tq10…` — exact.
+- [x] 3.1.2 `QuantTest.tqHostMatVecMatchesTheDequantizedReference`
       (`checkMatVec`, both), and the Q8 twins against the f32 host at the
       Q8 route's bar.
-- [ ] 3.1.3 `tq20Q8WaveMatVecKernel` / `tq10Q8WaveMatVecKernel` equal the
+- [x] 3.1.3 `tq20Q8WaveMatVecKernel` / `tq10Q8WaveMatVecKernel` equal the
       Q8 host twin exactly (the path is integer) over the split layout.
-- [ ] 3.1.4 `tq20/tq10F16CoopX1/X3` equal the host GEMM at the IQ4 bar;
+- [x] 3.1.4 `tq20/tq10F16CoopX1/X3` equal the host GEMM at the IQ4 bar;
       `coopBlockWords` 16 / 13; `coopColsOk` at 256.
-- [ ] 3.1.5 `QuantTest.theFourPartInvariant`: over every `supported()`
+- [x] 3.1.5 `QuantTest.theFourPartInvariant`: over every `supported()`
       type, `packedSupported`, `coopSupports`, `hasKernel` and the host
       chain agree — a type is admitted by all or by none.
-- [ ] 3.1.6 `KernelIsa`: no spill; the `v_dot4` count per block matches
+- [x] 3.1.6 `KernelIsa`: no spill; the `v_dot4` count per block matches
       the design.
+      READ 2026-09-15 off the test exe: tq20 wave 63 VGPRs, 32 v_dot4,
+      one b128 payload load; tq10 wave 149 VGPRs, 16 v_dot4 and 64
+      `global_load_d16` per block per lane — the scalar base-three
+      decode loads every byte it touches. Correct and spill-free; a
+      vector unpack (the ×3^n, ×3, >>8 sequence on 16 lanes) is the
+      follow-up if TQ1_0's legs fall short of TQ2_0's. Coop X1/X3:
+      137–139 VGPRs, 18 KB LDS, no spill, no scratch.
 
 ### 3.2 Coding
-- [ ] 3.2.1 `GG_TQ1_0` / `GG_TQ2_0`; `blockBytes` 54 / 66; `blockElems`
+- [x] 3.2.1 `GG_TQ1_0` / `GG_TQ2_0`; `blockBytes` 54 / 66; `blockElems`
       256; `payloadBytes` 52 / 64 with `scaleOffset` at the end;
       decoders; `dequantize` branches.
-- [ ] 3.2.2 `tq10MatVecIntoAt` / `tq20MatVecIntoAt` and `…IntoQ8`; the
+- [x] 3.2.2 `tq10MatVecIntoAt` / `tq20MatVecIntoAt` and `…IntoQ8`; the
       `Linear.matvecInto` host chain.
-- [ ] 3.2.3 `tq20Q8WaveMatVecKernel` (two-bit fields to int8 lanes,
+- [x] 3.2.3 `tq20Q8WaveMatVecKernel` (two-bit fields to int8 lanes,
       `dotAccum`), `tq10Q8WaveMatVecKernel` (×pow3, ×3, >>8 in integer);
       coop X1/X3 staging d·trit to f16; launchers; `matVecLaunch`,
       `hasKernel`, `coopBatchLaunch`, `coopBlockWords`, `coopRouteBit`.
-- [ ] 3.2.4 `Quant.supported()`, `splitOn`, `Linear.packedSupported` —
+- [x] 3.2.4 `Quant.supported()`, `splitOn`, `Linear.packedSupported` —
       last.
 
 ### 3.3 Acceptance
-- [ ] 3.3.1 Filtered suite green; ISA clean. End-to-end waits for Unit 4.
+- [x] 3.3.1 Filtered suite green; ISA clean. End-to-end waits for Unit 4.
 
 ## Unit 4 — The `bitnet` architecture and the converter (spec §8)
 
@@ -284,10 +302,12 @@ every timing leg and wait for the go; filtered suite only
       tensors as a scalar multiply after the projection.
 
 ### 4.3 Acceptance
-- [ ] 4.3.1 `1bitLLM/bitnet_b1_58-3B` converted at f16, tq1_0 and tq2_0
-      under `tmp/cbq/`; llama.cpp loads all three; `llama-quantize`
-      from our f16 to TQ1_0 and TQ2_0 gives projection tensors byte
-      for byte equal to ours (compared per tensor through `GgufFile`).
+- [ ] 4.3.1 `1bitLLM/bitnet_b1_58-large` (1536 × 4096, the one member of
+      the family a 256-weight block tiles; the 3B is 3200 × 8640)
+      converted at f16, tq1_0 and tq2_0 under `tmp/cbq/`; llama.cpp
+      loads all three; `llama-quantize` from our f16 to TQ1_0 and TQ2_0
+      gives projection tensors byte for byte equal to ours (compared per
+      tensor through `GgufFile`).
 - [ ] 4.3.2 Greedy agreement with llama.cpp CPU on both TQ files over
       fixed prompts; perplexity on the README text matches
       `llama-perplexity` at the same window.

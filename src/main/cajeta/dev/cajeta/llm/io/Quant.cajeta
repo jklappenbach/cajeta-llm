@@ -61,6 +61,11 @@ public final class Quant {
     // MXFP4 (OCP microscaling FP4): 32-elem blocks, one E8M0 scale byte
     // + 16 packed-nibble bytes = 17 bytes. GGML tensor type 39.
     public static final int32 GG_MXFP4 = 39;
+    // The ternary pair (codebook-quants Unit 3): 256 weights of -1/0/+1
+    // times one f16 d that sits at the END of the block. TQ2_0 is two
+    // bits a weight; TQ1_0 packs five trits a byte in base three.
+    public static final int32 GG_TQ1_0 = 34;
+    public static final int32 GG_TQ2_0 = 35;
 
     private Quant() { }
 
@@ -72,7 +77,8 @@ public final class Quant {
             || ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K
             || ty == Quant.GG_Q6_K
             || ty == Quant.GG_IQ4_NL || ty == Quant.GG_IQ4_XS
-            || ty == Quant.GG_MXFP4;
+            || ty == Quant.GG_MXFP4
+            || ty == Quant.GG_TQ1_0 || ty == Quant.GG_TQ2_0;
     }
 
     /** Elements per block for `ty`; -1 when unsupported. */
@@ -100,6 +106,8 @@ public final class Quant {
         if (ty == Quant.GG_IQ4_NL) { return 18; }
         if (ty == Quant.GG_IQ4_XS) { return 136; }
         if (ty == Quant.GG_MXFP4) { return 17; }
+        if (ty == Quant.GG_TQ1_0) { return 54; }
+        if (ty == Quant.GG_TQ2_0) { return 66; }
         return -1;
     }
 
@@ -124,6 +132,9 @@ public final class Quant {
 
     /** Byte offset of the scale field inside the file block. */
     public static int32 scaleOffset(int32 ty) {
+        if (ty == Quant.GG_TQ1_0 || ty == Quant.GG_TQ2_0) {
+            return Quant.blockBytes(ty) - 2;
+        }
         return 0;
     }
 
@@ -131,7 +142,8 @@ public final class Quant {
      *  with a nonzero `scaleBytes` joins as its kernels move; the
      *  predicate is gone once they all have. */
     public static boolean splitOn(int32 ty) {
-        return ty == Quant.GG_Q8_0;
+        return ty == Quant.GG_Q8_0 || ty == Quant.GG_TQ1_0
+            || ty == Quant.GG_TQ2_0;
     }
 
     /** Bytes of a resident row's scale prefix for `bpr` blocks: the
@@ -241,6 +253,8 @@ public final class Quant {
             else if (ty == Quant.GG_IQ4_NL) { Quant.iq4nlBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_IQ4_XS) { Quant.iq4xsBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_MXFP4) { Quant.mxfp4Block(raw, ro, out, oo); }
+            else if (ty == Quant.GG_TQ1_0) { Quant.tq10Block(raw, ro, out, oo); }
+            else if (ty == Quant.GG_TQ2_0) { Quant.tq20Block(raw, ro, out, oo); }
             else if (ty == Quant.GG_Q6_K) { Quant.q6kBlock(raw, ro, out, oo); }
             else {
                 throw heap LlmException("quant: no block decoder for "
@@ -273,6 +287,200 @@ public final class Quant {
             out[oo + (int64) j] = d * (float32) ((int32) raw[ro + 2L + (int64) j]);
             j = j + 1;
         }
+    }
+
+    // ── TQ1_0 { u8 qs[48]; u8 qh[4]; f16 d } and TQ2_0 { u8 qs[64]; f16 d }
+    //    (ggml-quants.c dequantize_row_tq1_0 / tq2_0): 256 trits of
+    //    -1/0/+1 times d. TQ1_0 packs five trits a byte in base three:
+    //    bytes 0..31 hold weights 32n+m, bytes 32..47 weights 160+16n+m,
+    //    the four tail bytes weights 240+4n+m, trit n extracted as
+    //    ((byte*3^n & 255)*3) >> 8. TQ2_0 holds weight j*4+32l+m in bits
+    //    2l of byte j+m, for j in {0,32}.
+
+    /** The 256 trits of a TQ1_0 block as -1/0/+1 into `t`. */
+    static void tq10Trits(int8[] raw, int64 ro, int32[] t) {
+        int32 p = 1;
+        int32 n = 0;
+        while (n < 5) {
+            int32 m = 0;
+            while (m < 32) {
+                int32 q = (Quant.u8(raw, ro + (int64) m) * p) & 255;
+                t[n * 32 + m] = ((q * 3) >> 8) - 1;
+                m = m + 1;
+            }
+            m = 0;
+            while (m < 16) {
+                int32 q = (Quant.u8(raw, ro + 32L + (int64) m) * p) & 255;
+                t[160 + n * 16 + m] = ((q * 3) >> 8) - 1;
+                m = m + 1;
+            }
+            if (n < 4) {
+                m = 0;
+                while (m < 4) {
+                    int32 q = (Quant.u8(raw, ro + 48L + (int64) m) * p) & 255;
+                    t[240 + n * 4 + m] = ((q * 3) >> 8) - 1;
+                    m = m + 1;
+                }
+            }
+            p = p * 3;
+            n = n + 1;
+        }
+        return;
+    }
+
+    /** The 256 trits of a TQ2_0 block as -1/0/+1 into `t`. */
+    static void tq20Trits(int8[] raw, int64 ro, int32[] t) {
+        int32 j = 0;
+        while (j < 64) {
+            int32 b = Quant.u8(raw, ro + (int64) j);
+            int32 h = (j / 32) * 128;
+            int32 m = j % 32;
+            t[h + m] = (b & 3) - 1;
+            t[h + 32 + m] = ((b >> 2) & 3) - 1;
+            t[h + 64 + m] = ((b >> 4) & 3) - 1;
+            t[h + 96 + m] = ((b >> 6) & 3) - 1;
+            j = j + 1;
+        }
+        return;
+    }
+
+    static void tq10Block(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro + 52L);
+        int32[] t #= heap int32[256];
+        Quant.tq10Trits(raw, ro, t);
+        int32 k = 0;
+        while (k < 256) {
+            out[oo + (int64) k] = (float32) t[k] * d;
+            k = k + 1;
+        }
+    }
+
+    static void tq20Block(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        float32 d = Quant.f16At(raw, ro + 64L);
+        int32[] t #= heap int32[256];
+        Quant.tq20Trits(raw, ro, t);
+        int32 k = 0;
+        while (k < 256) {
+            out[oo + (int64) k] = (float32) t[k] * d;
+            k = k + 1;
+        }
+    }
+
+    /** Host mat-vec straight off TQ1_0 blocks: the trit dot in
+     *  integer, then d once per block. */
+    public static void tq10MatVecIntoAt(int8[] packed, int64 pOff,
+            int64 rows, int64 cols,
+            float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int64 bpr = cols / 256L;
+        int32[] t #= heap int32[256];
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < bpr) {
+                int64 ro = pOff + (i * bpr + b) * 54L;
+                Quant.tq10Trits(packed, ro, t);
+                float32 d = Quant.f16At(packed, ro + 52L);
+                float32 s = 0.0f;
+                int32 k = 0;
+                while (k < 256) {
+                    s = s + (float32) t[k] * x[xOff + b * 256L + (int64) k];
+                    k = k + 1;
+                }
+                acc = acc + d * s;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** Host mat-vec straight off TQ2_0 blocks. */
+    public static void tq20MatVecIntoAt(int8[] packed, int64 pOff,
+            int64 rows, int64 cols,
+            float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int64 bpr = cols / 256L;
+        int32[] t #= heap int32[256];
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < bpr) {
+                int64 ro = pOff + (i * bpr + b) * 66L;
+                Quant.tq20Trits(packed, ro, t);
+                float32 d = Quant.f16At(packed, ro + 64L);
+                float32 s = 0.0f;
+                int32 k = 0;
+                while (k < 256) {
+                    s = s + (float32) t[k] * x[xOff + b * 256L + (int64) k];
+                    k = k + 1;
+                }
+                acc = acc + d * s;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** The integer twin over q8_K activations, the device kernel's
+     *  oracle: one int32 dot per block, d times the block scale once. */
+    public static void tq10MatVecIntoQ8(int8[] packed, int64 rows,
+            int64 cols, int8[] xq, float32[] xd, int32[] xbsums,
+            float32[] y, int64 yOff) {
+        int64 bpr = cols / 256L;
+        int32[] t #= heap int32[256];
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < bpr) {
+                int64 ro = (i * bpr + b) * 54L;
+                Quant.tq10Trits(packed, ro, t);
+                float32 d = Quant.f16At(packed, ro + 52L);
+                int32 sumi = 0;
+                int32 k = 0;
+                while (k < 256) {
+                    sumi = sumi + t[k] * (int32) xq[b * 256L + (int64) k];
+                    k = k + 1;
+                }
+                acc = acc + d * xd[b] * (float32) sumi;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
+        }
+        return;
+    }
+
+    public static void tq20MatVecIntoQ8(int8[] packed, int64 rows,
+            int64 cols, int8[] xq, float32[] xd, int32[] xbsums,
+            float32[] y, int64 yOff) {
+        int64 bpr = cols / 256L;
+        int32[] t #= heap int32[256];
+        int64 i = 0;
+        while (i < rows) {
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < bpr) {
+                int64 ro = (i * bpr + b) * 66L;
+                Quant.tq20Trits(packed, ro, t);
+                float32 d = Quant.f16At(packed, ro + 64L);
+                int32 sumi = 0;
+                int32 k = 0;
+                while (k < 256) {
+                    sumi = sumi + t[k] * (int32) xq[b * 256L + (int64) k];
+                    k = k + 1;
+                }
+                acc = acc + d * xd[b] * (float32) sumi;
+                b = b + 1;
+            }
+            y[yOff + i] = acc;
+            i = i + 1;
+        }
+        return;
     }
 
     // ── MXFP4: { u8 e (E8M0); u8 qs[16] (32 x E2M1 nibbles) } ───────────

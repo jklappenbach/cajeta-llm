@@ -347,14 +347,16 @@ formats are in scope for the route — expert slabs use the same kernels
   IQ3_M — ten files, every ftype mix — parked under `tmp/` like the
   IQ4 set; and an IQ3_XXS Qwen1.5-MoE-A2.7B from its Q4_K_M with a
   fresh imatrix, for the expert route (7.6).
-- **9.2** When the ternary set is needed, `1bitLLM/bitnet_b1_58-3B`
-  (f32 safetensors in three shards, `BitnetForCausalLM`, SiLU, tied
-  embeddings, 26 layers of 3200 × 8640, a 32002-entry LLaMA-2
-  SentencePiece vocab — the family llama.cpp's `bitnet` graph matches)
-  is converted with our converter at tq1_0 and tq2_0, and its f16
-  output is requantized by `llama-quantize` for the cross-check (8.9).
-  Microsoft's 2B-4T (`BitNetForCausalLM`, relu²) stays out until
-  mainline llama.cpp carries it.
+- **9.2** When the ternary set is needed, `1bitLLM/bitnet_b1_58-large`
+  (`BitnetForCausalLM`, SiLU, tied embeddings, 24 layers of 1536 ×
+  4096, 16 heads, a 32002-entry LLaMA-2 SentencePiece vocab — the family
+  llama.cpp's `bitnet` graph matches) is converted with our converter at
+  tq1_0 and tq2_0, and its f16 output is requantized by `llama-quantize`
+  for the cross-check (8.9). It is the only member of the family a
+  256-weight ternary block tiles: the 3B is 3200 × 8640 and the xl
+  2048 × 5460, and llama.cpp's own converter leaves such tensors at
+  f16. Microsoft's 2B-4T (2560 × 6912, `BitNetForCausalLM`, relu²)
+  stays out until mainline llama.cpp carries it.
 - **9.3** When parity is measured, it is `leg.sh` on a quiet box, pp512
   / pp2048 / tg against llama.cpp on the same file — HIP and Vulkan for
   IQ, CPU for TQ — announced first, per the standing rule.
@@ -449,10 +451,11 @@ formats are in scope for the route — expert slabs use the same kernels
   three shapes, alternating arms).
 - **12.4** Mixture-of-experts in the measured set. DECIDED: an IQ3_XXS
   Qwen1.5-MoE from the Q4_K_M with a fresh imatrix (9.1).
-- **12.5** Ternary arbiter. DECIDED: `1bitLLM/bitnet_b1_58-3B` through
-  our own converter (8.6–8.10, 9.2); Microsoft 2B-4T when mainline
-  llama.cpp gains relu² and the `BitNetForCausalLM` entry. The local
-  torch install does not import (`hipsparselt`), which is one more
+- **12.5** Ternary arbiter. DECIDED: a 1bitLLM checkpoint through our
+  own converter (8.6–8.10, 9.2) — `bitnet_b1_58-large`, since it is the
+  one whose widths 256-weight blocks divide; Microsoft 2B-4T when
+  mainline llama.cpp gains relu² and the `BitNetForCausalLM` entry. The
+  local torch install does not import (`hipsparselt`), which is one more
   reason the converter is ours.
 - **12.6** Decode kernels per format. DECIDED: one, the Q8 wave kernel;
   the f32-activation twins exist only for formats that predate the Q8
