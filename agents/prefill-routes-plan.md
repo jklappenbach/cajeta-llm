@@ -2225,9 +2225,10 @@ where the GEMMs run at 10-25.
         Qwen1.5-MoE pp2048  1445 -> 1037 ms  (1416 -> 1974 tok/s,
                             0.62x -> 0.86x of 2297.6); chunks 203 /
                             230 / 267 / 307 ms; pp512 flat at 2440.
-        Mixtral     pp2048  chunks 2-4 993/1052/1104 -> 957/987/1044;
-                            chunk 1 read 1517 in this run (855 before)
-                            -- re-measured below before it is believed.
+        Mixtral     pp2048  4149 -> 3893 / 3904 ms (486 -> 526 / 525
+                            tok/s, 0.91x -> 0.98x of 536.7); chunks
+                            857 / 928 / 993 / 1054 (a 1517 ms first
+                            chunk in one run did not reproduce).
       `PrefillChunkTest` 3/3, filtered suite 101/101. What remains at
       depth is the attention term (11.2): 262 ms of the 1037 on
       Qwen1.5-MoE, 467 of ~4200 on Mixtral.
