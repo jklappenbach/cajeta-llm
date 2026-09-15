@@ -197,11 +197,26 @@ public final class CausalLM extends InfModule {
      * a no-op under the packed policy.
      */
     public void prewarmPrefillWeights() {
-        if (!Linear.deqPrefillOn()) { return; }
+        boolean deq = Linear.deqPrefillOn();
         int32 l = 0;
         while (l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
-            if (Linear.fuseEnabled()) {
+            // 11.3: every device side a batched step touches is built
+            // here, whatever route it takes; the deq widens below are
+            // the route-specific part.
+            d.selfAttn.qProj.ensureDevice();
+            d.selfAttn.kProj.ensureDevice();
+            d.selfAttn.vProj.ensureDevice();
+            d.selfAttn.oProj.ensureDevice();
+            if (d.mlp != null) {
+                d.mlp.gateProj.ensureDevice();
+                d.mlp.upProj.ensureDevice();
+                d.mlp.downProj.ensureDevice();
+            }
+            if (d.moe != null) {
+                d.moe.prewarmBatch(this.maxSeq);
+            }
+            if (deq && Linear.fuseEnabled()) {
                 // 10.12.32: the fused buffers replace the per-tensor
                 // deq for the fused tensors — building both would
                 // double their footprint for nothing. Layers whose
@@ -219,7 +234,7 @@ public final class CausalLM extends InfModule {
                 if (d.mlp != null) {
                     d.mlp.gateProj.ensureFused2(d.mlp.upProj);
                 }
-            } else {
+            } else if (deq) {
                 d.selfAttn.qProj.prewarmDeq();
                 d.selfAttn.kProj.prewarmDeq();
                 d.selfAttn.vProj.prewarmDeq();
@@ -228,9 +243,11 @@ public final class CausalLM extends InfModule {
                     d.mlp.upProj.prewarmDeq();
                 }
             }
-            d.selfAttn.oProj.prewarmDeq();
-            if (d.mlp != null) {
-                d.mlp.downProj.prewarmDeq();
+            if (deq) {
+                d.selfAttn.oProj.prewarmDeq();
+                if (d.mlp != null) {
+                    d.mlp.downProj.prewarmDeq();
+                }
             }
             // 10.12.35: the yBatch buffers were allocated lazily by the
             // FIRST prefill — rocprofv3 put ~40 ms of hipMalloc inside
@@ -471,12 +488,18 @@ public final class CausalLM extends InfModule {
         }
         if (!resident) {
             // The host path reads K/V bytes, so the device planes owe the
-            // cache whatever they hold beyond it (10.11.2). Prefill, a
-            // non-Llama layout and a disabled route all land here.
-            int64 tsk0 = Clock.nanoTime();
-            this.syncKvToHost(seq);
-            CausalLM.hdSyncKvNs = CausalLM.hdSyncKvNs
-                + (Clock.nanoTime() - tsk0);
+            // cache whatever they hold beyond it (10.11.2). A non-Llama
+            // layout and a disabled route land here; a batched step that
+            // will attend on the device (11.3) keeps its lazy authority.
+            CausalLM.pcKvSync0 = CausalLM.hdSyncKvNs;
+            boolean batchedDev = rows > 1 && Linear.devicePackOn()
+                && this.dkvOf(seq) != null;
+            if (!batchedDev || CausalLM.eagerAuthOn) {
+                int64 tsk0 = Clock.nanoTime();
+                this.syncKvToHost(seq);
+                CausalLM.hdSyncKvNs = CausalLM.hdSyncKvNs
+                    + (Clock.nanoTime() - tsk0);
+            }
         }
         if (resident) {
             int64 tp0 = Clock.nanoTime();
@@ -1155,6 +1178,7 @@ public final class CausalLM extends InfModule {
     // QK-norm shapes). Wall time per section; the bench resets before
     // its decode loop and divides by tokens. ──
     static int64 hdSyncKvNs;  // syncKvToHost at forwardRows entry
+    static int64 pcKvSync0;   // its value when the current step entered
     static int64 hdProjNs;    // pre-norm + q/k/v proj + qk-norm + rope + append
     static int64 hdAttendNs;  // cache.attendRow (host attention over KV)
     static int64 hdOProjNs;   // oProj + residual add
@@ -1532,7 +1556,9 @@ public final class CausalLM extends InfModule {
             // cache rows at exactly `startPos`, so any debt a lazy first
             // chunk left must be paid before the layer loop's inline
             // appends. A no-op when nothing is owed.
-            if (startPos != 0) { this.syncKvToHost(seq); }
+            if (startPos != 0 && CausalLM.eagerAuthOn) {
+                this.syncKvToHost(seq);
+            }
         }
         int32 l = 0;
         while (l < this.model.numLayers) {
@@ -1623,7 +1649,7 @@ public final class CausalLM extends InfModule {
                 // for the host between layers. Mid-sequence prefill
                 // keeps the in-loop path (the planes hold absolute
                 // positions; a prefix download cannot reach them).
-                if (startPos != 0) {
+                if (startPos != 0 && CausalLM.eagerAuthOn) {
                     int64 kb0 = Clock.nanoTime();
                     KernelStream as = QuantKernel.stream();
                     as.sync();
@@ -1992,9 +2018,10 @@ public final class CausalLM extends InfModule {
             // prefill wrote are wrong; if it disagrees either way, they
             // are fine and the difference is the softmax reassociation
             // moving a near-tied argmax.
-            if (startPos == 0 && !CausalLM.eagerAuthOn) {
-                // Lazy authority (10.12.38): the planes hold the rows;
-                // the host cache stays behind until a host path asks.
+            if (!CausalLM.eagerAuthOn) {
+                // Lazy authority (10.12.38, every chunk since 11.3): the
+                // planes hold the rows; the host cache stays behind
+                // until a host path asks.
                 dkv.adoptLazy(seq, startPos + rows,
                     this.cache.lengthOf(seq, 0));
             } else {
@@ -2022,7 +2049,9 @@ public final class CausalLM extends InfModule {
         Diag.emit("prefill-chunk", seq, "step", (int64) rows,
             (int64) startPos, pcLazy,
             (CausalLM.pfGrowNs + Linear.growNs + MoeFfn.growNs) - pcGrow0,
-            CausalLM.pfKvBackNs - pcKv0, Clock.nanoTime() - pcT0);
+            (CausalLM.pfKvBackNs - pcKv0)
+                + (CausalLM.hdSyncKvNs - CausalLM.pcKvSync0),
+            Clock.nanoTime() - pcT0);
         return;
     }
 

@@ -2201,7 +2201,7 @@ where the GEMMs run at 10-25.
       query tile streams its keys once at bandwidth, the GQA1 shape
       given what 9.6.6 gave decode. llama.cpp's `fattn-mma`/Vulkan
       coopmat FA is the reference for the tile.
-- [ ] **11.3 Coding** — the per-chunk cost: (a) `prewarmPrefillWeights`
+- [x] **11.3 Coding** — the per-chunk cost: (a) `prewarmPrefillWeights`
       covers MoE layers (router upload, the shared expert's device
       side and batch outputs), so the load's warm-up step builds
       nothing lazily either; (b) every chunk takes the lazy cache
@@ -2211,6 +2211,26 @@ where the GEMMs run at 10-25.
       existing `syncKvToHost`; the eager form stays behind the
       `eagerauth` arm. Target: four 512-row steps within 5% of four
       lone pp512 steps, the record's kvback column at zero.
+      FOUND ON THE WAY: the generic row path paid the whole K/V debt
+      at every batched step's entry (`forwardRows`, "the host path
+      reads K/V bytes"), outside the record's window -- with every
+      chunk lazy that became a full-prefix catch-up per chunk and pp2048
+      got SLOWER (Qwen1.5 1445 -> 2244 ms) until the entry sync was
+      gated on the device-attended batch too; the record's kvback
+      column now covers that bracket, and the prewarm builds every
+      Linear's device side whatever the route (it returned early with
+      the deq flag off, building nothing).
+      MEASURED 2026-09-15, in-process, chunk 512, all host columns 0,
+      first tokens unchanged (75620 / 21969):
+        Qwen1.5-MoE pp2048  1445 -> 1037 ms  (1416 -> 1974 tok/s,
+                            0.62x -> 0.86x of 2297.6); chunks 203 /
+                            230 / 267 / 307 ms; pp512 flat at 2440.
+        Mixtral     pp2048  chunks 2-4 993/1052/1104 -> 957/987/1044;
+                            chunk 1 read 1517 in this run (855 before)
+                            -- re-measured below before it is believed.
+      `PrefillChunkTest` 3/3, filtered suite 101/101. What remains at
+      depth is the attention term (11.2): 262 ms of the 1037 on
+      Qwen1.5-MoE, 467 of ~4200 on Mixtral.
 - [ ] **11.4 Acceptance** — filtered suite green; perplexity on
       Qwen1.5-MoE unchanged (5.576 flash); TIMING, announced, quiet
       box: Qwen1.5-MoE pp2048 >= 2070 tok/s (0.9x of 2297.6), pp512
