@@ -98,6 +98,17 @@ every timing leg and wait for the go; filtered suite only
       `streamPackedFromMap` stream through one shared static staging
       buffer and split; `stageExpertWindowStaged` and `bindExpertSlot`
       split instead of repack; `coopW = payloadDev.wordView()`.
+      REVISED 2026-09-15 after 1.3.2: the two-array form lost 30 % of
+      Q8_0 decode (a second stream per wave, and a power-of-two row
+      stride camping on channels once the scales left the row — see the
+      spec's 1.4 and 12.3). The resident layout is PER ROW — the row's
+      scales padded to a dword, then its payloads — in ONE buffer:
+      `payloadDev` alone, `Quant.rowPrefixBytes/rowResidentBytes`, the
+      split kernel placing block `blockBase + b` by row, every Q8_0
+      kernel back to its original operand list, the scale read one
+      aligned dword (`scaleAtDev`), and `symScaleImageKernel` given the
+      row stride. `scalesDev`, `bindExpertSlicePair` and the second
+      slab are gone.
 - [x] 1.2.4 The eight Q8_0 kernels re-offset to `(payload, scales)`;
       `coopBlockWords(Q8_0) = 8`; `coopNeedsRepack(Q8_0)` false.
 - [x] 1.2.5 Formats not yet split keep their kernels and repack path
@@ -106,8 +117,30 @@ every timing leg and wait for the go; filtered suite only
 
 ### 1.3 Acceptance
 - [x] 1.3.1 Filtered suite green.
-- [ ] 1.3.2 8B Q8_0 legs (announced, quiet box): pp512 / tg128 within
+- [x] 1.3.2 8B Q8_0 legs (announced, quiet box): pp512 / tg128 within
       noise of the 2026-09-14 rows; bit gate first.
+      MEASURED 2026-09-15, `leg.sh cajeta <8B Q8_0> 512x128 3`, arms
+      alternating new/old/new/old, suite 150/150 before every arm:
+
+        two-array split (7d357eb)  pp 1614..1650   tg 17.2..18.4
+        old 95608c6                pp 1470..1657   tg 23.3..25.7
+        one-dword scale read       pp 1648..1658   tg 18.3..18.5
+        old 95608c6                pp 1633..1661   tg 25.71..25.74
+        ROW-SPLIT (shipped)        pp 1654..1661   tg 25.79..25.82
+        old 95608c6                pp 1645..1659   tg 25.69..25.74
+
+      The first layout lost 30 % of decode. Not the scale read (one
+      aligned dword changed nothing), not registers or ISA
+      (`tmp/cbq/isa/kernelisa`: 33 vs 32 VGPRs, no spill, the same load
+      and waitcnt mix), but the memory system: the profiler put the
+      whole delta inside `q80Q8WaveMatVecKernel` itself (161 -> 226 us
+      per launch), and `tmp/cbq/src/.../SplitProbe.cajeta` showed a
+      second stream per wave AND a power-of-two row stride camping on
+      channels once the scales left the row (file 217 GB/s, split
+      arrays 126, payload-only 144, per-row 220 on 4096x4096). The
+      per-row split is what ships: one buffer, the file's row stride,
+      dword-clean payloads, bit-exact, and 0.3 % faster than the file
+      layout in decode.
 - [x] 1.3.3 Qwen3-Coder-30B Q8_0: resident weight bytes equal the file's
       (ledger), against the two-copy number measured before the change;
       load time not worse. Both numbers recorded here.
@@ -133,8 +166,8 @@ every timing leg and wait for the go; filtered suite only
       more (a first cut copied it byte by byte and doubled the load
       time; fixed before this record). Host RSS reads 32.3 GB against
       23.8 because the mapping's pages stay resident in place of the
-      freed host array. The 8-token decode delta is below what this
-      instrument resolves; 1.3.2 settles it.
+      freed host array. The 8-token decode delta was the two-array
+      regression 1.3.2 found and the row-split layout removed.
 
 ## Unit 2 — Reference material: fixtures, tables, names, arbiter files (spec §2, §3.5, §4.1, §9)
 

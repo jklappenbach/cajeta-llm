@@ -61,11 +61,10 @@ public final class Linear extends InfModule {
     // call). The copies are 2·(inDim + outDim) floats against a weight read
     // of inDim·outDim/2 bytes; they go away when the activations themselves
     // become device-resident.
+    // For a `Quant.splitOn` format this holds the resident layout (spec
+    // §10): per row, the block scales padded to a dword, then the row's
+    // dword-clean payloads. For the others, the file's blocks verbatim.
     KernelBuffer<int8> payloadDev;
-    // The split scale array of a `Quant.splitOn` format (spec §10): one
-    // resident layout, the payload above dword-clean at its file bytes,
-    // the lone scale field here. Null for a format not yet split.
-    KernelBuffer<int8> scalesDev;
     // Dword view of payloadDev for the mmq route (created lazily, released
     // with the layer). Non-owning: payloadDev holds the storage.
     KernelBuffer<int32> packedW;
@@ -702,7 +701,6 @@ public final class Linear extends InfModule {
         this.inDim = inDim;
         this.outDim = outDim;
         this.payloadDev = null;
-        this.scalesDev = null;
         this.packedW = null;
         this.q6PadW = null;
         this.q6PadDev = null;
@@ -1419,18 +1417,6 @@ public final class Linear extends InfModule {
         this.winLen = len;
         this.slotMode = true;
         this.payloadDev #= #sliceV;
-        this.finishDeviceSetup();
-        return;
-    }
-
-    /** A slot over a split slab: views of both resident arrays. */
-    void bindExpertSlicePair(int32 ty, int64 len,
-            #KernelBuffer<int8> sliceP, #KernelBuffer<int8> sliceS) {
-        this.packedTy = ty;
-        this.winLen = len;
-        this.slotMode = true;
-        this.payloadDev #= #sliceP;
-        this.scalesDev #= #sliceS;
         this.finishDeviceSetup();
         return;
     }
@@ -2395,8 +2381,8 @@ public final class Linear extends InfModule {
             // (ensureBtXh / ensureBatchStage) before freeing a buffer an
             // in-flight GEMM may still read.
             QuantKernel.coopBatchLaunchNoSync(this.packedTy, this.yBatch,
-                this.coopW, this.scalesDev, Linear.btXh, padRows,
-                (int64) this.outDim, (int64) this.inDim);
+                this.coopW, Linear.btXh, padRows, (int64) this.outDim,
+                (int64) this.inDim);
         } else if (Linear.mmqOn && this.packedTy == Quant.GG_Q4_K
                 && Linear.backendIsVulkan()) {
             // The LDS-tiled dp4a GEMM (q4kQ8MmqKernel): reads dwords only,
@@ -2857,15 +2843,16 @@ public final class Linear extends InfModule {
     /** The widen's second output (7.4.2), re-run with it so a restaged
      *  expert window rebuilds both. */
     void runScaleImage(int64 blkBytes) {
+        int64 bpr = this.blocksPerRow();
         if (Quant.splitOn(this.packedTy)) {
-            WmmaKernel.symScaleImageLaunch(this.scaleDev, this.scalesDev,
+            WmmaKernel.symScaleImageLaunch(this.scaleDev, this.payloadDev,
                 (int64) this.outDim, (int64) this.inDim, this.deqCols(),
-                2L);
+                2L, Quant.rowResidentBytes(this.packedTy, bpr));
             return;
         }
         WmmaKernel.symScaleImageLaunch(this.scaleDev, this.payloadDev,
             (int64) this.outDim, (int64) this.inDim, this.deqCols(),
-            blkBytes);
+            blkBytes, bpr * blkBytes);
         return;
     }
 
@@ -3205,8 +3192,8 @@ public final class Linear extends InfModule {
         }
         if (Quant.splitOn(this.packedTy)) {
             Linear.splitStreamFromMap(this.srcMap, this.mapOff,
-                this.packedBytes, this.packedTy, this.payloadDev,
-                this.scalesDev);
+                this.packedBytes, this.packedTy, this.blocksPerRow(),
+                this.payloadDev);
             return;
         }
         int64 chunk = Linear.chunkFor(this.packedTy);
@@ -3230,11 +3217,11 @@ public final class Linear extends InfModule {
         return;
     }
 
-    /** Stream `n` file bytes of `ty` at `mapOff` in `map` through the
-     *  shared staging chunk into the split pair: no host array of the
-     *  tensor ever exists. */
+    /** Stream `n` file bytes of `ty` (rows of `bpr` blocks) at `mapOff`
+     *  in `map` through the shared staging chunk into the resident
+     *  array `dst`: no host array of the tensor ever exists. */
     static void splitStreamFromMap(MappedFile map, int64 mapOff, int64 n,
-            int32 ty, KernelBuffer<int8> payload, KernelBuffer<int8> scales) {
+            int32 ty, int64 bpr, KernelBuffer<int8> dst) {
         int64 chunk = Linear.chunkFor(ty);
         if (chunk > n) { chunk = n; }
         int8[] stage #= heap int8[chunk];
@@ -3248,7 +3235,7 @@ public final class Linear extends InfModule {
                 throw heap LlmException("split upload: short read at "
                     + (mapOff + off) + " - wanted " + m + ", got " + got);
             }
-            Linear.putChunk(stage, m, off / bb, ty, payload, scales);
+            Linear.putChunk(stage, m, off / bb, ty, bpr, dst);
             off = off + m;
         }
         return;
@@ -3290,19 +3277,26 @@ public final class Linear extends InfModule {
         return n;
     }
 
-    /** Allocate the resident buffers for `fileBytes` of `packedTy`. */
-    void allocResident(int64 fileBytes) {
-        int32 ty = this.packedTy;
-        if (!Quant.splitOn(ty)) {
-            this.payloadDev #= heap KernelBuffer<int8>((uint64) fileBytes);
-            return;
-        }
-        int64 nb = fileBytes / (int64) Quant.blockBytes(ty);
-        this.payloadDev #= heap KernelBuffer<int8>(
-            (uint64) (nb * (int64) Quant.payloadBytes(ty)));
-        this.scalesDev #= heap KernelBuffer<int8>(
-            (uint64) (nb * (int64) Quant.scaleBytes(ty)));
-        return;
+    /** Blocks per weight row. */
+    int64 blocksPerRow() {
+        return (int64) this.inDim / (int64) Quant.blockElems(this.packedTy);
+    }
+
+    /** Resident bytes of `fileBytes` of `packedTy` in the row-split
+     *  layout; the file's bytes unless a row has an odd block count. */
+    static int64 residentBytesOf(int32 ty, int64 fileBytes, int64 bpr) {
+        if (!Quant.splitOn(ty)) { return fileBytes; }
+        int64 rows = fileBytes / (int64) Quant.blockBytes(ty) / bpr;
+        return rows * Quant.rowResidentBytes(ty, bpr);
+    }
+
+    /** Allocate the resident buffer for `fileBytes` of `packedTy`;
+     *  returns its size. */
+    int64 allocResident(int64 fileBytes) {
+        int64 n = Linear.residentBytesOf(this.packedTy, fileBytes,
+            this.blocksPerRow());
+        this.payloadDev #= heap KernelBuffer<int8>((uint64) n);
+        return n;
     }
 
     /** Upload `n` file bytes from `host`, split when the format is. */
@@ -3311,18 +3305,18 @@ public final class Linear extends InfModule {
             this.payloadDev.upload(host, n);
             return;
         }
-        Linear.splitUploadTo(host, n, this.packedTy, this.payloadDev,
-            this.scalesDev);
+        Linear.splitUploadTo(host, n, this.packedTy, this.blocksPerRow(),
+            this.payloadDev);
         return;
     }
 
-    /** Stream `n` file bytes of `ty` from `host` through the shared
-     *  staging chunk into the split `(payload, scales)` pair. */
-    static void splitUploadTo(int8[] host, int64 n, int32 ty,
-            KernelBuffer<int8> payload, KernelBuffer<int8> scales) {
+    /** Stream `n` file bytes of `ty` (rows of `bpr` blocks) from `host`
+     *  through the shared staging chunk into the resident array `dst`. */
+    static void splitUploadTo(int8[] host, int64 n, int32 ty, int64 bpr,
+            KernelBuffer<int8> dst) {
         int64 chunk = Linear.chunkFor(ty);
         if (n <= chunk) {
-            Linear.putChunk(host, n, 0L, ty, payload, scales);
+            Linear.putChunk(host, n, 0L, ty, bpr, dst);
             return;
         }
         int8[] stage #= heap int8[chunk];
@@ -3336,28 +3330,22 @@ public final class Linear extends InfModule {
                 stage[i] = host[off + i];
                 i = i + 1L;
             }
-            Linear.putChunk(stage, m, off / bb, ty, payload, scales);
+            Linear.putChunk(stage, m, off / bb, ty, bpr, dst);
             off = off + m;
         }
         return;
     }
 
-    /** Split one staged chunk of `m` file bytes, starting at block
-     *  `blockBase`, into `payload` and `scales` on the device. */
+    /** Split one staged chunk of `m` file bytes, the first being block
+     *  `blockBase` of the tensor, into the resident array on the device. */
     static void putChunk(int8[] stage, int64 m, int64 blockBase, int32 ty,
-            KernelBuffer<int8> payload, KernelBuffer<int8> scales) {
+            int64 bpr, KernelBuffer<int8> dst) {
         Linear.ensureSplitStage(m);
         Linear.splitStage.upload(stage, m);
         Linear.splitChunks = Linear.splitChunks + 1L;
-        int64 bb = (int64) Quant.blockBytes(ty);
-        int64 pb = (int64) Quant.payloadBytes(ty);
-        int64 sb = (int64) Quant.scaleBytes(ty);
-        int64 nb = m / bb;
-        KernelBuffer<int8> pd #= payload.slice((uint64) (blockBase * pb),
-            (uint64) (nb * pb));
-        KernelBuffer<int8> sd #= scales.slice((uint64) (blockBase * sb),
-            (uint64) (nb * sb));
-        QuantKernel.splitLaunch(pd, sd, Linear.splitStage, nb, ty);
+        int64 nb = m / (int64) Quant.blockBytes(ty);
+        QuantKernel.splitLaunch(dst, Linear.splitStage, nb, blockBase, ty,
+            bpr);
         return;
     }
 
@@ -3372,10 +3360,6 @@ public final class Linear extends InfModule {
 
     KernelBuffer<int8> payloadForTest() {
         return this.payloadDev;
-    }
-
-    KernelBuffer<int8> scalesForTest() {
-        return this.scalesDev;
     }
 
     /** The host mat-vec needs the bytes themselves. Under a streamed
@@ -3405,8 +3389,7 @@ public final class Linear extends InfModule {
     void ensureDevice() {
         if (this.payloadDev != null) { return; }
         int64 ld0 = Clock.nanoTime();
-            this.devWBytes = this.devWBytes + this.packedBytes;
-            this.allocResident(this.packedBytes);
+            this.devWBytes = this.devWBytes + this.allocResident(this.packedBytes);
             if (this.packed != null) {
                 this.uploadSplit(this.packed, this.packedBytes);
             } else {
@@ -3549,7 +3532,8 @@ public final class Linear extends InfModule {
 
     void launchRows() {
         int64 rows = (int64) this.outDim;
-        int64 rowBytes = this.packedBytesTotal() / rows;
+        int64 rowBytes = Linear.residentBytesOf(this.packedTy,
+            this.packedBytesTotal(), this.blocksPerRow()) / rows;
         int64 chunk = rows;
         int64 want = Linear.effectiveChunkRows();
         if (want > 0L) { chunk = want; }
@@ -3566,17 +3550,8 @@ public final class Linear extends InfModule {
         }
         if (chunk >= rows) {
             Linear.nLaunches = Linear.nLaunches + 1L;
-            this.launchOne(this.payloadDev, this.scalesDev, rows, 0L);
+            this.launchOne(this.payloadDev, rows, 0L);
             return;
-        }
-        boolean split = Quant.splitOn(this.packedTy);
-        int64 blocksPerRow = (int64) this.inDim
-            / (int64) Quant.blockElems(this.packedTy);
-        int64 pRow = rowBytes;
-        int64 sRow = 0L;
-        if (split) {
-            pRow = blocksPerRow * (int64) Quant.payloadBytes(this.packedTy);
-            sRow = blocksPerRow * (int64) Quant.scaleBytes(this.packedTy);
         }
         int64 r0 = 0L;
         while (r0 < rows) {
@@ -3584,24 +3559,16 @@ public final class Linear extends InfModule {
             if (r0 + nr > rows) { nr = rows - r0; }
             Linear.nLaunches = Linear.nLaunches + 1L;
             KernelBuffer<int8> sub #= this.payloadDev.slice(
-                (uint64) (r0 * pRow), (uint64) (nr * pRow));
-            if (split) {
-                KernelBuffer<int8> subS #= this.scalesDev.slice(
-                    (uint64) (r0 * sRow), (uint64) (nr * sRow));
-                this.launchOne(sub, subS, nr, r0);
-            } else {
-                this.launchOne(sub, null, nr, r0);
-            }
+                (uint64) (r0 * rowBytes), (uint64) (nr * rowBytes));
+            this.launchOne(sub, nr, r0);
             r0 = r0 + nr;
         }
         return;
     }
 
-    /** One dispatch over `nr` rows of `w` (and its scales `ws` for a
-     *  split format) starting at output row `r0`. Whether it waits is
-     *  `oneSync`'s business, not this method's. */
-    void launchOne(KernelBuffer<int8> w, KernelBuffer<int8> ws, int64 nr,
-            int64 r0) {
+    /** One dispatch over `nr` rows of `w` starting at output row `r0`.
+     *  Whether it waits is `oneSync`'s business, not this method's. */
+    void launchOne(KernelBuffer<int8> w, int64 nr, int64 r0) {
         if (this.q8) {
             if (this.wave) {
                 if (Linear.oneSync) {
@@ -3660,10 +3627,10 @@ public final class Linear extends InfModule {
             }
         } else if (this.wave8) {
             if (Linear.oneSync) {
-                QuantKernel.q80Q8WaveMatVecLaunchNoSync(this.yDev, w, ws,
+                QuantKernel.q80Q8WaveMatVecLaunchNoSync(this.yDev, w,
                     Linear.stXp, nr, (int64) this.inDim, r0);
             } else {
-                QuantKernel.q80Q8WaveMatVecLaunch(this.yDev, w, ws,
+                QuantKernel.q80Q8WaveMatVecLaunch(this.yDev, w,
                     Linear.stXp, nr, (int64) this.inDim, r0);
             }
         } else if (this.wave40) {
@@ -3684,10 +3651,10 @@ public final class Linear extends InfModule {
             }
         } else if (this.wavef && this.packedTy == Quant.GG_Q8_0) {
             if (Linear.oneSync) {
-                QuantKernel.q80F32WaveMatVecLaunchNoSync(this.yDev, w, ws,
+                QuantKernel.q80F32WaveMatVecLaunchNoSync(this.yDev, w,
                     Linear.stX, nr, (int64) this.inDim, 0L, r0);
             } else {
-                QuantKernel.q80F32WaveMatVecLaunch(this.yDev, w, ws,
+                QuantKernel.q80F32WaveMatVecLaunch(this.yDev, w,
                     Linear.stX, nr, (int64) this.inDim, 0L, r0);
             }
         } else if (this.wavef && this.packedTy == Quant.GG_Q5_0) {
@@ -3707,10 +3674,10 @@ public final class Linear extends InfModule {
                     Linear.stX, nr, (int64) this.inDim, 0L, r0);
             }
         } else if (Linear.oneSync) {
-            QuantKernel.matVecLaunchNoSync(this.packedTy, this.yDev, w, ws,
+            QuantKernel.matVecLaunchNoSync(this.packedTy, this.yDev, w,
                 Linear.stX, nr, (int64) this.inDim, 0L, r0);
         } else {
-            QuantKernel.matVecLaunch(this.packedTy, this.yDev, w, ws,
+            QuantKernel.matVecLaunch(this.packedTy, this.yDev, w,
                 Linear.stX, nr, (int64) this.inDim, 0L, r0);
         }
         return;

@@ -134,14 +134,21 @@ formats are in scope for the route — expert slabs use the same kernels
   same header.
 - **One resident copy, at the file's byte count.** This tier exists to
   fit. The only field in any ggml block that breaks dword alignment is
-  the 2-byte f16 block scale, so the resident layout de-interleaves it:
-  one array of payloads, each a whole number of dwords, and one array
-  of scales. Every device kernel of a format takes `(payload, scales)`,
-  the decode mat-vec and the GEMM read the same two arrays, and no
-  weight holds a `packedDev` and a `coopDev` copy at once. The split
-  happens on the device at upload through a bounded staging chunk
-  (blocks are independent, so a tensor streams through in pieces), so
-  the peak is resident plus one chunk, never two copies.
+  the 2-byte f16 block scale, so the resident layout de-interleaves it
+  PER ROW: each row is its block scales back to back, padded to a
+  dword, then its payloads, each a whole number of dwords. One array,
+  one stream per wave, the file's row stride. Every device kernel of a
+  format reads that array, the decode mat-vec and the GEMM read the
+  same one, and no weight holds a `packedDev` and a `coopDev` copy at
+  once. The split happens on the device at upload through a bounded
+  staging chunk (blocks are independent, so a tensor streams through in
+  pieces), so the peak is resident plus one chunk, never two copies.
+  Measured on the Q8_0 wave mat-vec (gfx1151, 2026-09-15): two separate
+  arrays cost 11–42 % against the file layout because a wave walks two
+  streams, and a bare 32-byte payload alone still lost up to 34 %
+  because a 4096-column row then strides by a power of two and waves
+  camp on the same channels; the per-row form matched or beat the file
+  layout on every shape.
 - **Optimal and measured.** Wave-per-row coalesced decode, one gather
   per 8 weights, no per-lane byte reads. Parity is the same-file
   llama.cpp number on the same backend, never a Q4_K comparison.
@@ -265,11 +272,12 @@ formats are in scope for the route — expert slabs use the same kernels
 - **7.3** When `coopBlockWords` is asked, it returns the payload's
   dword stride in the de-interleaved layout — IQ2_XXS 16, IQ2_XS 18,
   IQ2_S 20, IQ3_XXS 24, IQ3_S 27, IQ1_S 12, IQ1_M 14, TQ1_0 13,
-  TQ2_0 16 — with the f16 scale in its own array (IQ1_M keeps its scale
-  words in the payload; it has no f16 field). `coopNeedsRepack` is
-  replaced by the one de-interleave every format with an f16 field
-  takes at upload. The decode kernel of §6 reads the same two arrays
-  (1.4).
+  TQ2_0 16 — and a row is its scale prefix (the row's f16 scales,
+  padded to a dword) followed by that many words per block (IQ1_M keeps
+  its scale words in the payload; it has no f16 field).
+  `coopNeedsRepack` is replaced by the one de-interleave every format
+  with an f16 field takes at upload. The decode kernel of §6 reads the
+  same array (1.4).
 - **7.4** When a route record prints, each type has its own bit in
   `Linear.coopRouteBit`, so "print once" is per type; today every type
   past Q3_K shares one bit.
@@ -360,11 +368,13 @@ formats are in scope for the route — expert slabs use the same kernels
 
 - **10.1** When any packed weight is uploaded, its resident layout is
   the file's blocks with the lone scale field — the f16 d, wherever in
-  the block it sits, or MXFP4's e8 byte — de-interleaved into a scales
-  array, so every payload is a whole number of dwords at exactly its
-  file bytes. A format whose block is already a dword multiple (Q4_1,
-  Q5_1, Q2_K, Q4_K, Q5_K, IQ4_XS, IQ1_M) keeps the file layout as the
-  degenerate case, with no scales array.
+  the block it sits, or MXFP4's e8 byte — de-interleaved per row: the
+  row's scales first, padded to a dword, then the row's payloads, each
+  a whole number of dwords. The row stride is the file's unless the row
+  has an odd block count, when it is two bytes longer. A format whose
+  block is already a dword multiple (Q4_1, Q5_1, Q2_K, Q4_K, Q5_K,
+  IQ4_XS, IQ1_M) keeps the file layout as the degenerate case, with an
+  empty prefix.
 - **10.2** When one of the six formats that hold two device copies
   today — Q4_0, Q5_0, Q8_0, Q3_K, Q6_K, IQ4_NL — is uploaded, it takes
   the same split, and `coopDev`, `ensureQ6Pad`, `blockRepack2Kernel`,
@@ -432,7 +442,11 @@ formats are in scope for the route — expert slabs use the same kernels
   prefill copies. DECIDED (Julian: "do it for all; I want
   simplification where we can get it"): one rule for every format, the
   six older formats migrated in this plan, the repack machinery
-  removed rather than kept beside the new path.
+  removed rather than kept beside the new path. The FORM of the split
+  was then decided by measurement, not taken from this text: the first
+  cut used two arrays and lost 30 % of Q8_0 decode; the per-row form of
+  1.4 restored it (`tmp/cbq/src/.../SplitProbe.cajeta`, four layouts,
+  three shapes, alternating arms).
 - **12.4** Mixture-of-experts in the measured set. DECIDED: an IQ3_XXS
   Qwen1.5-MoE from the Q4_K_M with a fresh imatrix (9.1).
 - **12.5** Ternary arbiter. DECIDED: `1bitLLM/bitnet_b1_58-3B` through

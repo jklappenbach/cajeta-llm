@@ -250,6 +250,19 @@ public final class QuantKernel {
         return GgufFile.halfBitsToF32(h);
     }
 
+    /** The `idx`-th f16 of a resident array, as ONE aligned dword load
+     *  with the half selected by shift: for block `wb` of row `i` in
+     *  the row-split layout, `idx = i * rowBytes / 2 + wb`. */
+    @Device
+    static float32 scaleAtDev(KernelBuffer<int8> scales, int64 idx) {
+        int64 so = idx * 2L;
+        Vector<int8,4> dh = scales.vload<4>(so - (so & 3L));
+        int32 w = ((int32) dh[0] & 255) | (((int32) dh[1] & 255) << 8)
+            | (((int32) dh[2] & 255) << 16) | (((int32) dh[3] & 255) << 24);
+        int32 sh = (int32) (so & 2L) * 8;
+        return GgufFile.halfBitsToF32((w >> sh) & 65535);
+    }
+
 
     /**
      * `y[yOff + i] = W[i]·x` for one row per work item, W packed Q6_K.
@@ -325,19 +338,19 @@ public final class QuantKernel {
      */
     @Kernel
     public static void q8MatVecKernel(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float32> x, uint32 rows, int64 blocksPerRow,
-            int64 xOff, int64 yOff) {
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
         uint32 gi = KernelThread.globalIdX();
         if (gi < rows) {
             int64 i = (int64) gi;
-            int64 rowBytes = blocksPerRow * 32L;
+            int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+            int64 rowBytes = prefix + blocksPerRow * 32L;
             float32 acc = 0.0f;
             int64 b = 0;
             while (b < blocksPerRow) {
-                int64 ro = i * rowBytes + b * 32L;
-                float32 dv = QuantKernel.f16AtDev(scales,
-                    (i * blocksPerRow + b) * 2L);
+                int64 ro = i * rowBytes + prefix + b * 32L;
+                float32 dv = QuantKernel.scaleAtDev(packed,
+                    i * rowBytes / 2L + b);
                 int64 xo = xOff + b * 32L;
                 Vector<int8,16> q0 = packed.vload<16>(ro);
                 Vector<int8,16> q1 = packed.vload<16>(ro + 16L);
@@ -5241,9 +5254,9 @@ public final class QuantKernel {
      */
     @Kernel
     public static void q80F16CoopX1Kernel(KernelBuffer<float32> y,
-            KernelBuffer<int32> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float16> xh, uint32 tokens, uint32 outDim,
-            uint32 nRowTiles, int64 blocksPerRow) {
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
         Shared<float16> sa = shared float16[128 * 72];
         uint32 lane = KernelThread.x();
         uint32 wg = KernelThread.globalIdX() / 256;
@@ -5259,7 +5272,8 @@ public final class QuantKernel {
         // superblocks — this format has no 256 structure, and the
         // compute tile only needs cols % 64 == 0 (BK=64). That is
         // what lets Qwen-72B's ffn_down (29568 = 924 blocks) batch.
-        int64 rowWords = blocksPerRow * 8L;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 8L;
         int64 kBlocks = blocksPerRow;
         int64 cols = kBlocks * 32L;
         CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
@@ -5275,9 +5289,10 @@ public final class QuantKernel {
             int64 kbh = kb + (int64) aHalf;
             int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
             int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
-            int64 ro = rowBase + kbh * 8L;
-            float32 d = QuantKernel.f16AtDev(scales,
-                (((int64) (to * 128 + aRow)) * blocksPerRow + kbh) * 2L);
+            int64 ro = rowBase + pw + kbh * 8L;
+            int32 dwd = packed[rowBase + kbh / 2L];
+            int32 dsh = (int32) (kbh & 1L) * 16;
+            float32 d = GgufFile.halfBitsToF32((dwd >> dsh) & 65535);
             Vector<int32,8> qv = packed.vload<8>(ro);
             int32 e = 0;
             while (e < 8) {
@@ -5347,9 +5362,9 @@ public final class QuantKernel {
      */
     @Kernel
     public static void q80F16CoopX3Kernel(KernelBuffer<float32> y,
-            KernelBuffer<int32> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float16> xh, uint32 tokens, uint32 outDim,
-            uint32 nRowTiles, int64 blocksPerRow) {
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
         Shared<float16> sa = shared float16[128 * 72];
         uint32 lane = KernelThread.x();
         uint32 wg = KernelThread.globalIdX() / 256;
@@ -5365,7 +5380,8 @@ public final class QuantKernel {
         // superblocks — this format has no 256 structure, and the
         // compute tile only needs cols % 64 == 0 (BK=64). That is
         // what lets Qwen-72B's ffn_down (29568 = 924 blocks) batch.
-        int64 rowWords = blocksPerRow * 8L;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 8L;
         int64 kBlocks = blocksPerRow;
         int64 cols = kBlocks * 32L;
         CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
@@ -5381,9 +5397,10 @@ public final class QuantKernel {
             int64 kbh = kb + (int64) aHalf;
             int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
             int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
-            int64 ro = rowBase + kbh * 8L;
-            float32 d = QuantKernel.f16AtDev(scales,
-                (((int64) (to * 128 + aRow)) * blocksPerRow + kbh) * 2L);
+            int64 ro = rowBase + pw + kbh * 8L;
+            int32 dwd = packed[rowBase + kbh / 2L];
+            int32 dsh = (int32) (kbh & 1L) * 16;
+            float32 d = GgufFile.halfBitsToF32((dwd >> dsh) & 65535);
             Vector<int32,8> qv = packed.vload<8>(ro);
             int32 e = 0;
             while (e < 8) {
@@ -5447,21 +5464,20 @@ public final class QuantKernel {
     /** Shape-selected Q8_0 coop launch — X3 (32x64 warp tile) below
      *  K=8192, X1 (64x32) above, the split the Q4_K router measured. */
     public static void q80F16CoopAutoLaunchNoSync(KernelBuffer<float32> y,
-            KernelBuffer<int32> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float16> xh, int64 rows, int64 outDim,
-            int64 cols) {
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            int64 rows, int64 outDim, int64 cols) {
         int64 wgL = (outDim / 128L) * (rows / 128L);
         KernelStream s = QuantKernel.stream();
         if (cols > 8192L) {
             q80F16CoopX1Kernel.launch(s,
                 grid: [(uint32) wgL], block: [256])
-                (y, packed, scales, xh, (uint32) rows, (uint32) outDim,
+                (y, packed, xh, (uint32) rows, (uint32) outDim,
                  (uint32) (outDim / 128L), cols / 32L);
             return;
         }
         q80F16CoopX3Kernel.launch(s,
             grid: [(uint32) wgL], block: [256])
-            (y, packed, scales, xh, (uint32) rows, (uint32) outDim,
+            (y, packed, xh, (uint32) rows, (uint32) outDim,
              (uint32) (outDim / 128L), cols / 32L);
         return;
     }
@@ -6315,47 +6331,53 @@ public final class QuantKernel {
     }
 
     /**
-     * The resident-layout split (codebook-quants spec §10): the lone
-     * scale field of every block to `scales`, the rest to `payload`,
-     * both contiguous per block. One wave per block, lane l copying
-     * bytes l, l+64, ...; runs once per tensor chunk at upload.
+     * The resident-layout split (codebook-quants spec §10): file block
+     * `blockBase + b` lands in its row's scale prefix and payload run of
+     * `out`. One wave per block, lane l copying bytes l, l+64, ...; runs
+     * once per tensor chunk at upload.
      */
     @Kernel
-    public static void splitKernel(KernelBuffer<int8> payload,
-            KernelBuffer<int8> scales, KernelBuffer<int8> src,
-            uint32 nBlocks, uint32 blockBytes, uint32 payloadBytes,
-            uint32 scaleBytes, uint32 scaleOffset) {
+    public static void splitKernel(KernelBuffer<int8> out,
+            KernelBuffer<int8> src, uint32 nBlocks, int64 blockBase,
+            uint32 blockBytes, uint32 payloadBytes, uint32 scaleBytes,
+            uint32 scaleOffset, int64 bpr, int64 prefix, int64 rowBytes) {
         uint32 lane = KernelThread.x();
         uint32 b = KernelThread.globalIdX() / 64;
         if (b < nBlocks) {
+            int64 gb = blockBase + (int64) b;
+            int64 row = gb / bpr;
+            int64 j = gb - row * bpr;
             int64 so = (int64) b * (int64) blockBytes;
-            int64 po = (int64) b * (int64) payloadBytes;
-            int64 sco = (int64) b * (int64) scaleBytes;
+            int64 sco = row * rowBytes + j * (int64) scaleBytes;
+            int64 po = row * rowBytes + prefix + j * (int64) payloadBytes;
             uint32 i = lane;
             while (i < blockBytes) {
                 int8 v = src[so + (int64) i];
                 if (i < scaleOffset) {
-                    payload[po + (int64) i] = v;
+                    out[po + (int64) i] = v;
                 } else if (i < scaleOffset + scaleBytes) {
-                    scales[sco + (int64) (i - scaleOffset)] = v;
+                    out[sco + (int64) (i - scaleOffset)] = v;
                 } else {
-                    payload[po + (int64) (i - scaleBytes)] = v;
+                    out[po + (int64) (i - scaleBytes)] = v;
                 }
                 i = i + 64;
             }
         }
     }
 
-    /** Split `nBlocks` file blocks of `ty` from `src` into the resident
-     *  `(payload, scales)` pair; synchronous. */
-    public static void splitLaunch(KernelBuffer<int8> payload,
-            KernelBuffer<int8> scales, KernelBuffer<int8> src,
-            int64 nBlocks, int32 ty) {
+    /** Split `nBlocks` file blocks of `ty` from `src`, the first being
+     *  block `blockBase` of a tensor with `bpr` blocks per row, into
+     *  the resident array `out`; synchronous. */
+    public static void splitLaunch(KernelBuffer<int8> out,
+            KernelBuffer<int8> src, int64 nBlocks, int64 blockBase,
+            int32 ty, int64 bpr) {
         KernelStream s = QuantKernel.stream();
+        int64 prefix = Quant.rowPrefixBytes(ty, bpr);
         splitKernel.launch(s, grid: [(uint32) nBlocks], block: [64])
-            (payload, scales, src, (uint32) nBlocks,
+            (out, src, (uint32) nBlocks, blockBase,
              (uint32) Quant.blockBytes(ty), (uint32) Quant.payloadBytes(ty),
-             (uint32) Quant.scaleBytes(ty), (uint32) Quant.scaleOffset(ty));
+             (uint32) Quant.scaleBytes(ty), (uint32) Quant.scaleOffset(ty),
+             bpr, prefix, Quant.rowResidentBytes(ty, bpr));
         s.sync();
         return;
     }
@@ -6439,13 +6461,11 @@ public final class QuantKernel {
             || ty == Quant.GG_Q6_K || ty == Quant.GG_IQ4_NL;
     }
 
-    /** Dispatch the coop (f16-staged) batched GEMM by weight type;
-     *  `scales` is the split scale array of a `Quant.splitOn` type and
-     *  unread otherwise. */
+    /** Dispatch the coop (f16-staged) batched GEMM by weight type. */
     public static void coopBatchLaunchNoSync(int32 ty,
             KernelBuffer<float32> y, KernelBuffer<int32> packed,
-            KernelBuffer<int8> scales, KernelBuffer<float16> xh,
-            int64 rows, int64 outDim, int64 cols) {
+            KernelBuffer<float16> xh, int64 rows, int64 outDim,
+            int64 cols) {
         if (ty == Quant.GG_Q4_K) {
             QuantKernel.q4kF16CoopAutoLaunchNoSync(y, packed, xh, rows,
                 outDim, cols);
@@ -6456,8 +6476,8 @@ public final class QuantKernel {
             QuantKernel.q5kF16CoopAutoLaunchNoSync(y, packed, xh, rows,
                 outDim, cols);
         } else if (ty == Quant.GG_Q8_0) {
-            QuantKernel.q80F16CoopAutoLaunchNoSync(y, packed, scales, xh,
-                rows, outDim, cols);
+            QuantKernel.q80F16CoopAutoLaunchNoSync(y, packed, xh, rows,
+                outDim, cols);
         } else if (ty == Quant.GG_Q5_0) {
             QuantKernel.q50F16CoopAutoLaunchNoSync(y, packed, xh, rows,
                 outDim, cols);
@@ -11343,21 +11363,21 @@ public final class QuantKernel {
      */
     @Kernel
     public static void q80Q8WaveMatVecKernel(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<int8> xp, uint32 rows, int64 blocksPerRow,
-            int64 yOff) {
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
         uint32 lane = KernelThread.x();
         uint32 row = KernelThread.globalIdX() / 32;
-        int64 rowBytes = blocksPerRow * 32L;
+        int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+        int64 rowBytes = prefix + blocksPerRow * 32L;
         float32 acc = 0.0f;
         if (row < rows) {
             int64 i = (int64) row;
             Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
             int64 wb = (int64) lane;
             while (wb < blocksPerRow) {
-                int64 ro = i * rowBytes + wb * 32L;
-                float32 d = QuantKernel.f16AtDev(scales,
-                    (i * blocksPerRow + wb) * 2L);
+                int64 ro = i * rowBytes + prefix + wb * 32L;
+                float32 d = QuantKernel.scaleAtDev(packed,
+                    i * rowBytes / 2L + wb);
                 Vector<int8,32> w = packed.vload<32>(ro);
                 int64 ab = wb / 8L;
                 Vector<int8,32> a = xp.vload<32>(ab * 320L
@@ -11395,22 +11415,22 @@ public final class QuantKernel {
     }
 
     public static void q80Q8WaveMatVecLaunchNoSync(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<int8> xp, int64 rows, int64 cols, int64 yOff) {
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
         uint32 ur = (uint32) rows;
         KernelStream s = QuantKernel.stream();
         // Q8_0 blocks are 32-wide, not 256 — the one launch in this
         // family whose blocksPerRow is cols / 32.
         q80Q8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
-            (y, packed, scales, xp, ur, cols / 32L, yOff);
+            (y, packed, xp, ur, cols / 32L, yOff);
         return;
     }
 
     public static void q80Q8WaveMatVecLaunch(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<int8> xp, int64 rows, int64 cols, int64 yOff) {
-        QuantKernel.q80Q8WaveMatVecLaunchNoSync(y, packed, scales, xp, rows,
-            cols, yOff);
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q80Q8WaveMatVecLaunchNoSync(y, packed, xp, rows, cols,
+            yOff);
         KernelStream s = QuantKernel.stream();
         s.sync();
         return;
@@ -11423,19 +11443,16 @@ public final class QuantKernel {
         Quant.q8kPack(x, xOff, cols, xp);
         float32[] yh #= heap float32[rows];
         KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
-        int64 nBlocks = (int64) packed.count() / 34L;
-        int8[] pay #= heap int8[nBlocks * 32L];
-        int8[] sc #= heap int8[nBlocks * 2L];
-        Quant.splitInto(Quant.GG_Q8_0, packed, 0L, nBlocks, pay, 0L, sc, 0L);
+        int64 bpr = cols / 32L;
+        int8[] res #= heap int8[rows * Quant.rowResidentBytes(Quant.GG_Q8_0,
+            bpr)];
+        Quant.splitInto(Quant.GG_Q8_0, packed, 0L, rows, bpr, res, 0L);
         KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
-            (uint64) pay.count());
-        KernelBuffer<int8> sb #= heap KernelBuffer<int8>(
-            (uint64) sc.count());
+            (uint64) res.count());
         KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
-        pb.upload(pay);
-        sb.upload(sc);
+        pb.upload(res);
         xpb.upload(xp);
-        QuantKernel.q80Q8WaveMatVecLaunch(yb, pb, sb, xpb, rows, cols, 0L);
+        QuantKernel.q80Q8WaveMatVecLaunch(yb, pb, xpb, rows, cols, 0L);
         yb.download(yh);
         int64 i = 0;
         while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
@@ -12535,23 +12552,21 @@ public final class QuantKernel {
     /** {@link #q4kMatVecLaunch} for Q8_0 — 34-byte blocks of 32 elements,
      *  so the block count per row is cols/32, not cols/256. */
     public static void q8MatVecLaunchNoSync(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float32> x, int64 rows, int64 cols, int64 xOff,
-            int64 yOff) {
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
         uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
         KernelStream s = QuantKernel.stream();
         q8MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
-            (y, packed, scales, x, ur, cols / 32L, xOff, yOff);
+            (y, packed, x, ur, cols / 32L, xOff, yOff);
         return;
     }
 
     public static void q8MatVecLaunch(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float32> x, int64 rows, int64 cols, int64 xOff,
-            int64 yOff) {
-        QuantKernel.q8MatVecLaunchNoSync(y, packed, scales, x, rows, cols,
-            xOff, yOff);
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        QuantKernel.q8MatVecLaunchNoSync(y, packed, x, rows, cols, xOff,
+            yOff);
         KernelStream s = QuantKernel.stream();
         s.sync();
         return;
@@ -12912,20 +12927,20 @@ public final class QuantKernel {
      */
     @Kernel
     public static void q80F32WaveMatVecKernel(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float32> x, uint32 rows, int64 blocksPerRow,
-            int64 xOff, int64 yOff) {
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
         uint32 lane = KernelThread.x();
         uint32 row = KernelThread.globalIdX() / 32;
-        int64 rowBytes = blocksPerRow * 32L;
+        int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+        int64 rowBytes = prefix + blocksPerRow * 32L;
         float32 acc = 0.0f;
         if (row < rows) {
             int64 i = (int64) row;
             int64 wb = (int64) lane;
             while (wb < blocksPerRow) {
-                int64 ro = i * rowBytes + wb * 32L;
-                float32 d = QuantKernel.f16AtDev(scales,
-                    (i * blocksPerRow + wb) * 2L);
+                int64 ro = i * rowBytes + prefix + wb * 32L;
+                float32 d = QuantKernel.scaleAtDev(packed,
+                    i * rowBytes / 2L + wb);
                 int64 xo = xOff + wb * 32L;
                 Vector<int8,16> q0 = packed.vload<16>(ro);
                 Vector<int8,16> q1 = packed.vload<16>(ro + 16L);
@@ -12952,21 +12967,19 @@ public final class QuantKernel {
     }
 
     public static void q80F32WaveMatVecLaunchNoSync(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float32> x, int64 rows, int64 cols, int64 xOff,
-            int64 yOff) {
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
         KernelStream s = QuantKernel.stream();
         q80F32WaveMatVecKernel.launch(s, grid: [(uint32) rows], block: [32])
-            (y, packed, scales, x, (uint32) rows, cols / 32L, xOff, yOff);
+            (y, packed, x, (uint32) rows, cols / 32L, xOff, yOff);
         return;
     }
 
     public static void q80F32WaveMatVecLaunch(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float32> x, int64 rows, int64 cols, int64 xOff,
-            int64 yOff) {
-        QuantKernel.q80F32WaveMatVecLaunchNoSync(y, packed, scales, x, rows,
-            cols, xOff, yOff);
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
+        QuantKernel.q80F32WaveMatVecLaunchNoSync(y, packed, x, rows, cols,
+            xOff, yOff);
         KernelStream s = QuantKernel.stream();
         s.sync();
         return;
@@ -13145,9 +13158,8 @@ public final class QuantKernel {
      * here — a caller that forgets gets stale output, not a diagnostic.
      */
     public static void matVecLaunchNoSync(int32 ty, KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float32> x, int64 rows, int64 cols, int64 xOff,
-            int64 yOff) {
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
         if (ty == Quant.GG_Q4_K) {
             QuantKernel.q4kMatVecLaunchNoSync(y, packed, x, rows, cols,
                 xOff, yOff);
@@ -13158,8 +13170,8 @@ public final class QuantKernel {
             QuantKernel.q6kMatVecLaunchNoSync(y, packed, x, rows, cols,
                 xOff, yOff);
         } else if (ty == Quant.GG_Q8_0) {
-            QuantKernel.q8MatVecLaunchNoSync(y, packed, scales, x, rows,
-                cols, xOff, yOff);
+            QuantKernel.q8MatVecLaunchNoSync(y, packed, x, rows, cols,
+                xOff, yOff);
         } else if (ty == Quant.GG_Q4_0) {
             QuantKernel.q40MatVecLaunchNoSync(y, packed, x, rows, cols,
                 xOff, yOff);
@@ -13193,9 +13205,8 @@ public final class QuantKernel {
     }
 
     public static void matVecLaunch(int32 ty, KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> scales,
-            KernelBuffer<float32> x, int64 rows, int64 cols, int64 xOff,
-            int64 yOff) {
+            KernelBuffer<int8> packed, KernelBuffer<float32> x,
+            int64 rows, int64 cols, int64 xOff, int64 yOff) {
         if (ty == Quant.GG_Q4_K) {
             QuantKernel.q4kMatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else if (ty == Quant.GG_Q5_K) {
@@ -13203,8 +13214,7 @@ public final class QuantKernel {
         } else if (ty == Quant.GG_Q6_K) {
             QuantKernel.q6kMatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else if (ty == Quant.GG_Q8_0) {
-            QuantKernel.q8MatVecLaunch(y, packed, scales, x, rows, cols,
-                xOff, yOff);
+            QuantKernel.q8MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else if (ty == Quant.GG_Q4_0) {
             QuantKernel.q40MatVecLaunch(y, packed, x, rows, cols, xOff, yOff);
         } else if (ty == Quant.GG_Q5_0) {
@@ -13246,27 +13256,20 @@ public final class QuantKernel {
         xb.upload(x);
         yb.upload(y);
         if (Quant.splitOn(ty)) {
-            int64 nBlocks = (int64) packed.count()
-                / (int64) Quant.blockBytes(ty);
-            int8[] pay #= heap int8[nBlocks * (int64) Quant.payloadBytes(ty)];
-            int8[] sc #= heap int8[nBlocks * (int64) Quant.scaleBytes(ty)];
-            Quant.splitInto(ty, packed, 0L, nBlocks, pay, 0L, sc, 0L);
+            int64 bpr = cols / (int64) Quant.blockElems(ty);
+            int8[] res #= heap int8[rows * Quant.rowResidentBytes(ty, bpr)];
+            Quant.splitInto(ty, packed, 0L, rows, bpr, res, 0L);
             KernelBuffer<int8> pd #= heap KernelBuffer<int8>(
-                (uint64) pay.count());
-            KernelBuffer<int8> sd #= heap KernelBuffer<int8>(
-                (uint64) sc.count());
-            pd.upload(pay);
-            sd.upload(sc);
-            QuantKernel.matVecLaunch(ty, yb, pd, sd, xb, rows, cols, xOff,
-                yOff);
+                (uint64) res.count());
+            pd.upload(res);
+            QuantKernel.matVecLaunch(ty, yb, pd, xb, rows, cols, xOff, yOff);
             yb.download(y);
             return;
         }
         KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
             (uint64) packed.count());
         pb.upload(packed);
-        QuantKernel.matVecLaunch(ty, yb, pb, null, xb, rows, cols, xOff,
-            yOff);
+        QuantKernel.matVecLaunch(ty, yb, pb, xb, rows, cols, xOff, yOff);
         yb.download(y);
         return;
     }

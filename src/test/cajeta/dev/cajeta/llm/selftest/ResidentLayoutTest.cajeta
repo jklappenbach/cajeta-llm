@@ -13,8 +13,8 @@ import dev.cajeta.llm.model.Linear;
 
 /**
  * One resident layout for every packed format (codebook-quants spec §10):
- * the lone scale field leaves the block for its own array, and the
- * payload is dword-clean at exactly its file bytes.
+ * per row, the block scales padded to a dword and then the row's
+ * dword-clean payloads, at the file's row stride.
  */
 public class ResidentLayoutTest {
 
@@ -56,6 +56,38 @@ public class ResidentLayoutTest {
         return #raw;
     }
 
+    /** Every byte of a Q8_0 row-split image against the file blocks. */
+    static void checkRowSplit(int8[] raw, int8[] out, int64 rows,
+            int64 bpr, String what) {
+        int64 prefix = Quant.rowPrefixBytes(Quant.GG_Q8_0, bpr);
+        int64 rowBytes = Quant.rowResidentBytes(Quant.GG_Q8_0, bpr);
+        int64 i = 0;
+        while (i < rows) {
+            int64 rb = i * rowBytes;
+            int64 b = 0;
+            while (b < bpr) {
+                int64 blk = (i * bpr + b) * 34L;
+                if (out[rb + b * 2L] != raw[blk]
+                        || out[rb + b * 2L + 1L] != raw[blk + 1L]) {
+                    Assert.fail(what + ": row " + i + " block " + b
+                        + " scale bytes differ");
+                }
+                int64 j = 0;
+                while (j < 32L) {
+                    if (out[rb + prefix + b * 32L + j] != raw[blk + 2L + j]) {
+                        Assert.fail(what + ": row " + i + " block " + b
+                            + " byte " + j + ": " + out[rb + prefix + b * 32L + j]
+                            + " vs file " + raw[blk + 2L + j]);
+                    }
+                    j = j + 1;
+                }
+                b = b + 1;
+            }
+            i = i + 1;
+        }
+        return;
+    }
+
     @Test
     public void theLayoutTableIsAPermutationOfTheBlock() {
         int32[] tys #= ResidentLayoutTest.supportedTypes();
@@ -74,99 +106,77 @@ public class ResidentLayoutTest {
                 Assert.equals(2, sb);
             }
             Assert.equals(0, Quant.scaleOffset(ty));
+            Assert.equals(0L, Quant.rowPrefixBytes(ty, 128L) % 4L);
+            Assert.equals(0L, Quant.rowResidentBytes(ty, 128L) % 4L);
             i = i + 1;
         }
         Assert.equals(-1, Quant.payloadBytes(1));
         Assert.equals(-1, Quant.scaleBytes(1));
+        // Q8_0: an even block count keeps the file's row stride; an odd
+        // one pads the scale prefix by two bytes.
+        Assert.equals(256L, Quant.rowPrefixBytes(Quant.GG_Q8_0, 128L));
+        Assert.equals(128L * 34L, Quant.rowResidentBytes(Quant.GG_Q8_0, 128L));
+        Assert.equals(8L, Quant.rowPrefixBytes(Quant.GG_Q8_0, 3L));
+        Assert.equals(104L, Quant.rowResidentBytes(Quant.GG_Q8_0, 3L));
+        // An unsplit format's resident row is its file row.
+        Assert.equals(128L * 144L, Quant.rowResidentBytes(Quant.GG_Q4_K, 128L));
     }
 
     @Test
     public void theSplitIsAPermutationOfTheFileBytes() {
-        int64 nBlocks = 4099L;
+        int64 rows = 13L;
+        int64 bpr = 317L;
         int8[] raw #= ResidentLayoutTest.tiled("q8_0.bin", Quant.GG_Q8_0,
-            nBlocks);
-        int8[] payload #= heap int8[nBlocks * 32L];
-        int8[] scales #= heap int8[nBlocks * 2L];
-        Quant.splitInto(Quant.GG_Q8_0, raw, 0L, nBlocks, payload, 0L,
-            scales, 0L);
-        int64 b = 0;
-        while (b < nBlocks) {
-            Assert.equals(raw[b * 34L], scales[b * 2L]);
-            Assert.equals(raw[b * 34L + 1L], scales[b * 2L + 1L]);
-            int64 j = 0;
-            while (j < 32L) {
-                if (payload[b * 32L + j] != raw[b * 34L + 2L + j]) {
-                    Assert.fail("block " + b + " byte " + j
-                        + ": payload " + payload[b * 32L + j]
-                        + " vs file " + raw[b * 34L + 2L + j]);
-                }
-                j = j + 1;
-            }
-            b = b + 1;
-        }
+            rows * bpr);
+        int8[] out #= heap int8[rows * Quant.rowResidentBytes(Quant.GG_Q8_0,
+            bpr)];
+        Quant.splitInto(Quant.GG_Q8_0, raw, 0L, rows, bpr, out, 0L);
+        ResidentLayoutTest.checkRowSplit(raw, out, rows, bpr, "host split");
     }
 
+    /** The device split, in two chunks that do not end on a row. */
     @Test
     public void theSplitKernelMatchesTheHostSplit() {
         String be #= Device.activeBackend();
         if (be.equals("cpu") || be.equals("none")) { return; }
-        int64 nBlocks = 4099L;
+        int64 rows = 13L;
+        int64 bpr = 317L;
+        int64 nBlocks = rows * bpr;
         int8[] raw #= ResidentLayoutTest.tiled("q8_0.bin", Quant.GG_Q8_0,
             nBlocks);
-        int8[] wantP #= heap int8[nBlocks * 32L];
-        int8[] wantS #= heap int8[nBlocks * 2L];
-        Quant.splitInto(Quant.GG_Q8_0, raw, 0L, nBlocks, wantP, 0L,
-            wantS, 0L);
-
+        int64 resBytes = rows * Quant.rowResidentBytes(Quant.GG_Q8_0, bpr);
         KernelBuffer<int8> src #= heap KernelBuffer<int8>(
             (uint64) raw.count());
         src.upload(raw);
-        KernelBuffer<int8> pd #= heap KernelBuffer<int8>(
-            (uint64) (nBlocks * 32L));
-        KernelBuffer<int8> sd #= heap KernelBuffer<int8>(
-            (uint64) (nBlocks * 2L));
-        QuantKernel.splitLaunch(pd, sd, src, nBlocks, Quant.GG_Q8_0);
-        int8[] gotP #= heap int8[nBlocks * 32L];
-        int8[] gotS #= heap int8[nBlocks * 2L];
-        pd.download(gotP);
-        sd.download(gotS);
-        int64 i = 0;
-        while (i < nBlocks * 32L) {
-            if (gotP[i] != wantP[i]) {
-                Assert.fail("payload byte " + i + ": device " + gotP[i]
-                    + " vs host " + wantP[i]);
-            }
-            i = i + 1;
-        }
-        i = 0;
-        while (i < nBlocks * 2L) {
-            if (gotS[i] != wantS[i]) {
-                Assert.fail("scale byte " + i + ": device " + gotS[i]
-                    + " vs host " + wantS[i]);
-            }
-            i = i + 1;
-        }
+        KernelBuffer<int8> out #= heap KernelBuffer<int8>((uint64) resBytes);
+        int64 first = 2000L;
+        KernelBuffer<int8> s0 #= src.slice((uint64) 0, (uint64) (first * 34L));
+        KernelBuffer<int8> s1 #= src.slice((uint64) (first * 34L),
+            (uint64) ((nBlocks - first) * 34L));
+        QuantKernel.splitLaunch(out, s0, first, 0L, Quant.GG_Q8_0, bpr);
+        QuantKernel.splitLaunch(out, s1, nBlocks - first, first,
+            Quant.GG_Q8_0, bpr);
+        int8[] got #= heap int8[resBytes];
+        out.download(got);
+        ResidentLayoutTest.checkRowSplit(raw, got, rows, bpr, "device split");
     }
 
     /**
      * A bound Q8_0 weight streams to the device through a bounded
-     * staging chunk and lands split: resident bytes are the file's,
-     * the coop view is the payload itself, and the bytes on the device
-     * are the host split byte for byte.
+     * staging chunk and lands in the row-split layout: resident bytes are
+     * the file's, the coop view is the same buffer, and the bytes on the
+     * device are the host split byte for byte.
      */
     @Test
-    public void aBoundQ80WeightIsResidentAsPayloadAndScales() {
+    public void aBoundQ80WeightIsResidentInTheRowSplitLayout() {
         String be #= Device.activeBackend();
         if (be.equals("cpu") || be.equals("none")) { return; }
         int32 outDim = 64;
         int32 inDim = 4096;
-        int64 nBlocks = (int64) outDim * ((int64) inDim / 32L);
+        int64 bpr = (int64) inDim / 32L;
+        int64 nBlocks = (int64) outDim * bpr;
         int8[] raw #= ResidentLayoutTest.tiled("q8_0.bin", Quant.GG_Q8_0,
             nBlocks);
-        int8[] wantP #= heap int8[nBlocks * 32L];
-        int8[] wantS #= heap int8[nBlocks * 2L];
-        Quant.splitInto(Quant.GG_Q8_0, raw, 0L, nBlocks, wantP, 0L,
-            wantS, 0L);
 
         int64 keep = Linear.splitChunkBytes();
         // 700 blocks per chunk: the 8192-block tensor streams in twelve
@@ -187,25 +197,9 @@ public class ResidentLayoutTest {
         lin.ensureCoopW();
         Assert.equals(nBlocks * 34L, lin.devWeightBytes());
 
-        int8[] gotP #= heap int8[nBlocks * 32L];
-        int8[] gotS #= heap int8[nBlocks * 2L];
-        lin.payloadForTest().download(gotP);
-        lin.scalesForTest().download(gotS);
-        i = 0;
-        while (i < nBlocks * 32L) {
-            if (gotP[i] != wantP[i]) {
-                Assert.fail("resident payload byte " + i + ": "
-                    + gotP[i] + " vs " + wantP[i]);
-            }
-            i = i + 1;
-        }
-        i = 0;
-        while (i < nBlocks * 2L) {
-            if (gotS[i] != wantS[i]) {
-                Assert.fail("resident scale byte " + i + ": "
-                    + gotS[i] + " vs " + wantS[i]);
-            }
-            i = i + 1;
-        }
+        int8[] got #= heap int8[nBlocks * 34L];
+        lin.payloadForTest().download(got);
+        ResidentLayoutTest.checkRowSplit(raw, got, (int64) outDim, bpr,
+            "resident");
     }
 }
