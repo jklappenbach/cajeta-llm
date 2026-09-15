@@ -2098,26 +2098,50 @@ prefill runs as four 512-row chunks, and per chunk:
                            evenly through the chunks, not at their edges
 
 llama.cpp Vulkan holds 2297 at pp2048 against 2329 at pp512: its
-attention at depth costs it ~1.5%. Mixtral shows the same growth on
+attention at depth costs it ~1.5%.
+
+MEASURED 2026-09-15 after Unit 10, pp2048 in-process, chunk 512 vs
+one 2048-row step (`chunk=2048`):
+  Mixtral      4291 ms (477 tok/s)  ->  3345 ms (612)   vs HIP fa1 536.7
+  Qwen1.5-MoE  1456 ms (1406)       ->   967 ms (2118)  vs vk fa1 2297.6
+So the depth gap is mostly PER-CHUNK cost, not attention: four
+512-row steps cost 4291 where one lone pp512 step costs 899 (+174 ms
+per step on Mixtral). The host tier of the Qwen1.5 pp2048 profile
+names it. First chunk: `MappedFile.read` 228 ms (17 reads, via
+`Linear.streamPackedFromMap`), `KernelBuffer` allocs + uploads 126 ms
+-- lazy weight streaming and buffer growth INSIDE the timed prefill,
+because the load's warm-up runs one 512-row step at position 0 and
+never touches the state a 2048 context needs. Chunks 2-4:
+`PagedKvCache.appendRowRaw` 138 ms (53 calls, the device K/V written
+back to the host cache per chunk), `AttnKernel.widenHalf` 53 ms (24
+lazy per-layer widens), more reads, 399 ms of `KernelStream.sync`
+(the device-bound share). llama.cpp's n_ubatch is 512 too, so its
+pp2048 runs as four 512-row steps and still holds 0.99x of pp512;
+the fair fix is the per-chunk cost, not a 2048 default. Mixtral shows the same growth on
 the GQA4 kernel (0.9 ms at ctx 512, a 49 ms launch at 2048), so 11.2
 pays on both checkpoints; the attention kernels run at 1-2 TFLOPS
 where the GEMMs run at 10-25.
 
-- [ ] **11.1 TDD** — a timing probe of the flash prefill kernels per
-      (rows, ctx) at 512/1024/1536/2048, GQA1 and GQA4, reported as
-      ms and as a fraction of the row x ctx work: the curve must come
-      out linear after 11.2. The host-side probe: the profiler's host
-      tier over one pp2048 chunk, top frames between launches, to name
-      what the 23% idle is (candidates: `noteRoutesDev` pulling the
-      selections down per layer, `ensureDevBatch` regrowth, the chunk
-      handoff in `Scheduler`); the finding written here before 11.3.
+- [ ] **11.1 TDD** — the host side first, since it is the larger
+      term: a `prefill-chunk` diag record per step naming the host
+      time in (a) lazy weight streaming, (b) buffer growth, (c) the K/V
+      writeback, (d) sync waits, so the bench can print the per-chunk
+      overhead and the test can assert the warm-up leaves (a) and (b)
+      at zero for a prompt up to `ctx`. Then the attention probe: the
+      flash prefill kernels per (rows, ctx) at 512/1024/1536/2048, GQA1
+      and GQA4, ms and fraction of the row x ctx work; the curve must
+      come out linear after 11.2.
 - [ ] **11.2 Coding** — the flash prefill kernels at depth: skip KV
       tiles wholly above the causal diagonal, tile the KV walk so a
       query tile streams its keys once at bandwidth, the GQA1 shape
       given what 9.6.6 gave decode. llama.cpp's `fattn-mma`/Vulkan
       coopmat FA is the reference for the tile.
-- [ ] **11.3 Coding** — the idle 11.1 named, removed on the zero-sync
-      route.
+- [ ] **11.3 Coding** — the per-chunk cost: the warm-up at load sized
+      to `ctx` (or the lazy weight streams and buffer growth moved into
+      load outright), the K/V writeback to the host cache off the
+      prefill path (deferred, or dropped where the device planes are
+      the truth), the per-layer `widenHalf` done once at bind. Target:
+      four 512-row steps within 5% of four lone pp512 steps.
 - [ ] **11.4 Acceptance** — filtered suite green; perplexity on
       Qwen1.5-MoE unchanged (5.576 flash); TIMING, announced, quiet
       box: Qwen1.5-MoE pp2048 >= 2070 tok/s (0.9x of 2297.6), pp512
