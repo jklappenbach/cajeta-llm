@@ -7125,7 +7125,9 @@ public final class QuantKernel {
             KernelBuffer<float32> yk, KernelBuffer<float32> yv,
             KernelBuffer<int8> wq, KernelBuffer<int8> wk,
             KernelBuffer<int8> wv, KernelBuffer<int8> xp,
-            uint32 rowsQ, uint32 rowsKv, int64 blocksPerRow, uint32 vQ6) {
+            uint32 rowsQ, uint32 rowsKv, int64 blocksPerRow, uint32 vQ6,
+            KernelBuffer<float32> bq, KernelBuffer<float32> bk,
+            KernelBuffer<float32> bv, uint32 biased) {
         uint32 lane = KernelThread.x();
         uint32 rl = lane;
         uint32 wave = KernelThread.globalIdX() / 32;
@@ -7441,7 +7443,12 @@ public final class QuantKernel {
                 float32 d = QuantKernel.f16AtDev(wv, (int64) ro + 208L);
                 uint32 xb = b * 320;
                 uint32 xa0 = xb + (uint32) (16 * (8 * g + a));
-                Vector<int8,4> dvs = xp.vload<4>((int64) xr + 288L);
+                // 9.6.5: THIS block's scale. This read `xr`, a name
+                // declared in the Q4_K v body's loop -- a sibling block
+                // that never runs for a Q6_K v -- and the compiler let it
+                // through; every block took a stale scale, wrong on every
+                // Q6_K-v layer since unit 49 (the 30B has 24 of them).
+                Vector<int8,4> dvs = xp.vload<4>((int64) xb + 288L);
                 float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
                     | (((int32) dvs[1] & 255) << 8)
                     | (((int32) dvs[2] & 255) << 16)
@@ -7497,6 +7504,13 @@ public final class QuantKernel {
         }
         float32 tot = Wave.reduceSumF32(acc);
         if (lane == 0 && row < limit) {
+            // Unit 9.6.5: the projection bias in the epilogue -- the
+            // same f32 add the separate addBiasRows launch performs.
+            if (biased != 0) {
+                if (which == 0) { tot = tot + bq[(int64) row]; }
+                else if (which == 1) { tot = tot + bk[(int64) row]; }
+                else { tot = tot + bv[(int64) row]; }
+            }
             if (which == 0) { yq[(int64) row] = tot; }
             else if (which == 1) { yk[(int64) row] = tot; }
             else { yv[(int64) row] = tot; }
@@ -7508,16 +7522,41 @@ public final class QuantKernel {
             KernelBuffer<int8> wq, KernelBuffer<int8> wk,
             KernelBuffer<int8> wv, KernelBuffer<int8> xp, int64 rowsQ,
             int64 rowsKv, int64 cols, boolean vQ6) {
+        QuantKernel.qkvWaveMatVecLaunchNoSync(yq, yk, yv, wq, wk, wv, xp,
+            rowsQ, rowsKv, cols, vQ6, null, null, null);
+        return;
+    }
+
+    /** As above with the three projection biases added in the epilogue
+     *  (unit 9.6.5); all three null = unbiased. */
+    public static void qkvWaveMatVecLaunchNoSync(KernelBuffer<float32> yq,
+            KernelBuffer<float32> yk, KernelBuffer<float32> yv,
+            KernelBuffer<int8> wq, KernelBuffer<int8> wk,
+            KernelBuffer<int8> wv, KernelBuffer<int8> xp, int64 rowsQ,
+            int64 rowsKv, int64 cols, boolean vQ6,
+            KernelBuffer<float32> bq, KernelBuffer<float32> bk,
+            KernelBuffer<float32> bv) {
         QuantKernel.requireOffsets32(wq, "qkvWaveMatVec");
         QuantKernel.requireOffsets32(wk, "qkvWaveMatVec");
         QuantKernel.requireOffsets32(wv, "qkvWaveMatVec");
         uint32 waves = (uint32) (rowsQ + 2L * rowsKv);
         uint32 v6 = 0;
         if (vQ6) { v6 = 1; }
+        uint32 biased = 0;
+        KernelBuffer<float32> pq = bq;
+        KernelBuffer<float32> pk = bk;
+        KernelBuffer<float32> pv = bv;
+        if (bq != null) {
+            biased = 1;
+        } else {
+            // The kernel takes every buffer; hand it live ones it will
+            // not read (biased = 0).
+            pq = yq; pk = yk; pv = yv;
+        }
         KernelStream s = QuantKernel.stream();
         qkvWaveMatVecKernel.launch(s, grid: [waves], block: [32])
             (yq, yk, yv, wq, wk, wv, xp, (uint32) rowsQ, (uint32) rowsKv,
-             cols / 256L, v6);
+             cols / 256L, v6, pq, pk, pv, biased);
         return;
     }
 

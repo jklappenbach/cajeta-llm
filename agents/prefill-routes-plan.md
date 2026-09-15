@@ -1800,12 +1800,44 @@ three projections. llama.cpp: one `mul_mat_id` per bank.
         shexp middle, the same family and the 30B's standard route.
         Recorded, not hidden.
       TIMING HALF: owed (accept96-timing.sh, quiet box).
-- [ ] **9.6.5 Coding** — the q/k/v biases: Qwen1.5-MoE's attention
+- [x] **9.6.5 Coding** — the q/k/v biases: Qwen1.5-MoE's attention
       projections carry biases, `matvecQkvStagedKeep` refuses biases,
       so each layer pays 3 mat-vecs + 3 `addBiasRows` where the 30B
       pays one fused launch. A bias epilogue on `qkvWaveMatVecKernel`
       (lane 0 adds b[row] before the store) removes 5 launches a layer,
       120 a token. Surfaced by the 9.6.4 launch profile.
+      DONE 2026-09-14 night. `qkvWaveMatVecKernel` takes bq/bk/bv +
+      `biased` (live dummies when unbiased, as the tail does); the
+      launcher gains a biased overload; `matvecQkvStagedKeep` fuses
+      when all three or none carry a bias; arm `Linear.setFusedQkv` /
+      bench+ppl `noqkv`. Launches per decode token: 24 qkv fused, 0
+      bias adds (were 72 + 72); profiled token 12.82 -> 12.24 ms.
+      TEST: `theFusedQkvLaunchAddsItsBiases` -- bit-identical to the
+      three wave launches plus three bias adds (the same f32 add).
+      FINDING, the one that mattered: the first real-model run gave
+      ppl 10.29 against 5.61 on the separate path, streams diverging at
+      the second token. The fingerprint sniffer (`sniff` arm, `[FP q|k|v
+      layer sum]`) put the first divergence at v of layer 0, whose v is
+      Q6_K. The fused kernel's Q6_K v body read its activation scale at
+      `xr + 288`, and `xr` is declared only inside the Q4_K v body's
+      loop -- a SIBLING block that never runs for a Q6_K v. The compiler
+      accepted the out-of-scope name and every block took a stale
+      scale. Wrong on every Q6_K-v layer since unit 49 landed the fused
+      kernel: the 30B carries Q6_K v in 24 of 48 layers and its decode
+      perplexity was 4.409 -> 4.271 corrected; Qwen1.5-MoE has it in 12
+      of 24. Every 30B decode number on the bench page was measured on
+      that kernel (the loads are the same, so the speed stands; the
+      answer did not). The unit-49 test passed because
+      `QuantKernelTest.activations` repeats with period 11, so every
+      256-block packs to the SAME Q8 scale and the wrong block's scale
+      was the right value: `activationsVaried` (amplitude by block
+      index) now feeds both qkv tests, the unit-49 test FAILED on the
+      Q6_K arm at row 0 before the one-line fix (`xr` -> `xb`) and
+      passes after. After the fix: ppl fused == separate to every digit
+      on both models (5.61091, 4.2707); greedy streams identical.
+      COMPILER FINDING (cajeta repo, owed): kernel lowering resolves a
+      name declared in a sibling block instead of rejecting it; the
+      block-scope shadow defect's third shape.
 - [ ] **9.6.6 Coding** — decode attention without GQA: Qwen1.5-MoE has
       16 KV heads for 16 query heads, and `attnScore`+`attnCombine`
       read its 100 MB of KV at d512 in 2.6 ms/token (~40 GB/s-

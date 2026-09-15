@@ -4,6 +4,7 @@ import dev.cajeta.unit.Assert;
 import cajeta.xpu.Device;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.Prim;
 import dev.cajeta.llm.io.WmmaKernel;
 import cajeta.io.file.File;
 import cajeta.lang.String;
@@ -62,6 +63,21 @@ public class QuantKernelTest {
         int64 c = 0;
         while (c < n) {
             x[c] = (float32) ((c % 11L) - 5L) * 0.375f;
+            c = c + 1;
+        }
+        return #x;
+    }
+
+    /** Activations whose Q8_K scale DIFFERS per 256-block: `activations`
+     *  repeats with period 11, so every block packs to the same scale
+     *  and a kernel reading the wrong block's scale reads the right
+     *  value. This one cannot be fooled that way. */
+    static #float32[] activationsVaried(int64 n) {
+        float32[] x #= heap float32[n];
+        int64 c = 0;
+        while (c < n) {
+            float32 amp = 0.125f * (float32) (1L + (c / 256L) % 7L);
+            x[c] = (float32) ((c % 11L) - 5L) * amp;
             c = c + 1;
         }
         return #x;
@@ -826,7 +842,7 @@ public class QuantKernelTest {
         int8[] wv6 #= QuantKernelTest.tiled(one6, (16L + n6 - 1L) / n6);
         int64 rowsQ = ((int64) wq.count() / 144L) / 8L;
         int64 rowsKv = 2L;
-        float32[] x #= QuantKernelTest.activations(cols);
+        float32[] x #= QuantKernelTest.activationsVaried(cols);
         int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
         Quant.q8kPack(x, 0L, cols, xp);
         KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
@@ -1777,5 +1793,91 @@ public class QuantKernelTest {
         System.stdout.println("   spill sweep: "
             + QuantKernelTest.spillChecked + " kernels with a footprint, "
             + "all at 0 bytes of scratch");
+    }
+
+    /** 9.6.5 — the fused q|k|v launch with biases in its epilogue is
+     *  the three wave launches plus three bias adds, bit for bit:
+     *  the same f32 add on the same stored sum. */
+    @Test
+    public void theFusedQkvLaunchAddsItsBiases() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int8[] one4 #= File.readAllBytes(QuantKernelTest.DIR + "q4_k.bin");
+        int64 cols = 2048L;
+        int64 n4 = (int64) one4.count() / 144L;
+        int8[] wq #= QuantKernelTest.tiled(one4, (32L + n4 - 1L) / n4);
+        int8[] wk #= QuantKernelTest.tiled(one4, (16L + n4 - 1L) / n4);
+        int64 rowsQ = ((int64) wq.count() / 144L) / 8L;
+        int64 rowsKv = 2L;
+        float32[] x #= QuantKernelTest.activationsVaried(cols);
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, 0L, cols, xp);
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        xpb.upload(xp);
+        KernelBuffer<int8> bwq #= heap KernelBuffer<int8>((uint64) wq.count());
+        KernelBuffer<int8> bwk #= heap KernelBuffer<int8>((uint64) wk.count());
+        bwq.upload(wq);
+        bwk.upload(wk);
+        float32[] hbq = heap float32[rowsQ];
+        float32[] hbk = heap float32[rowsKv];
+        float32[] hbv = heap float32[rowsKv];
+        int64 i = 0;
+        while (i < rowsQ) { hbq[i] = 0.37f * (float32) (i + 1L); i = i + 1; }
+        i = 0;
+        while (i < rowsKv) {
+            hbk[i] = 0.0f - 1.25f * (float32) (i + 1L);
+            hbv[i] = 0.011f * (float32) (i + 3L);
+            i = i + 1;
+        }
+        KernelBuffer<float32> bq #= heap KernelBuffer<float32>((uint64) rowsQ);
+        KernelBuffer<float32> bk #= heap KernelBuffer<float32>((uint64) rowsKv);
+        KernelBuffer<float32> bv #= heap KernelBuffer<float32>((uint64) rowsKv);
+        bq.upload(hbq, rowsQ);
+        bk.upload(hbk, rowsKv);
+        bv.upload(hbv, rowsKv);
+        KernelBuffer<float32> q1 #= heap KernelBuffer<float32>((uint64) rowsQ);
+        KernelBuffer<float32> k1 #= heap KernelBuffer<float32>((uint64) rowsKv);
+        KernelBuffer<float32> v1 #= heap KernelBuffer<float32>((uint64) rowsKv);
+        KernelBuffer<float32> q2 #= heap KernelBuffer<float32>((uint64) rowsQ);
+        KernelBuffer<float32> k2 #= heap KernelBuffer<float32>((uint64) rowsKv);
+        KernelBuffer<float32> v2 #= heap KernelBuffer<float32>((uint64) rowsKv);
+        QuantKernel.q4kQ8WaveMatVecLaunchNoSync(q1, bwq, xpb, rowsQ, cols, 0L);
+        Prim.addBiasRowsDevice(q1, bq, 1L, rowsQ);
+        QuantKernel.q4kQ8WaveMatVecLaunchNoSync(k1, bwk, xpb, rowsKv, cols, 0L);
+        Prim.addBiasRowsDevice(k1, bk, 1L, rowsKv);
+        QuantKernel.q4kQ8WaveMatVecLaunchNoSync(v1, bwk, xpb, rowsKv, cols, 0L);
+        Prim.addBiasRowsDevice(v1, bv, 1L, rowsKv);
+        QuantKernel.qkvWaveMatVecLaunchNoSync(q2, k2, v2, bwq, bwk, bwk,
+            xpb, rowsQ, rowsKv, cols, false, bq, bk, bv);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a #= heap float32[rowsQ];
+        float32[] b #= heap float32[rowsQ];
+        q1.download(a, rowsQ);
+        q2.download(b, rowsQ);
+        QuantKernelTest.assertLive(a, "q wave + bias");
+        int64 r = 0;
+        while (r < rowsQ) {
+            if (a[r] != b[r]) { Assert.fail("q row " + r + " differs: wave+bias " + a[r] + " fused " + b[r]); }
+            r = r + 1;
+        }
+        float32[] c #= heap float32[rowsKv];
+        float32[] d #= heap float32[rowsKv];
+        k1.download(c, rowsKv);
+        k2.download(d, rowsKv);
+        r = 0;
+        while (r < rowsKv) {
+            if (c[r] != d[r]) { Assert.fail("k row " + r + " differs: wave+bias " + c[r] + " fused " + d[r]); }
+            r = r + 1;
+        }
+        v1.download(c, rowsKv);
+        v2.download(d, rowsKv);
+        r = 0;
+        while (r < rowsKv) {
+            if (c[r] != d[r]) { Assert.fail("v row " + r + " differs: wave+bias " + c[r] + " fused " + d[r]); }
+            r = r + 1;
+        }
+        // The bias is not a no-op: v's is tiny but k's is not.
+        Assert.isTrue(c[0] != 0.0f);
     }
 }
