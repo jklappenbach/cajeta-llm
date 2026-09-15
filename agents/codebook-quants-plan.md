@@ -31,7 +31,7 @@ cajeta repo's `tmp/llmbench/leg.sh` for every timing leg.
 prefilling `batched` and decoding wave-per-row; resident device bytes
 equal to file bytes for every packed format, with `coopDev`, the Q6_K
 pad copy and both repack kernels gone; the `bitnet` graph; the
-converter and a converted `bitnet_b1_58-3B` at f16/tq1_0/tq2_0;
+converter and a converted `bitnet_b1_58-large` at f16/tq1_0/tq2_0;
 eleven IQ arbiter files with llama.cpp reference numbers; a parity
 table per unit in this plan.
 
