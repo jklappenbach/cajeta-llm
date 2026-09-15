@@ -1,0 +1,232 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.MoeFfn;
+
+/**
+ * Plan 9.6.1 — a decode row on the shexp fixture takes the zero-sync
+ * row route, agrees with the host row, and says which route it took.
+ *
+ * The row twin of MoeSharedBatchTest. `forwardRowZeroSync` refused any
+ * checkpoint with a shared expert and any bank without a k-quant id
+ * mat-vec, which on Qwen1.5-MoE put every selected expert and the
+ * shared expert's three projections on the per-slot path: 687 launches
+ * per token where llama.cpp issues one `mul_mat_id` per bank, and
+ * decode at 0.23x while the two MoE models without those two shapes
+ * decode at 0.97x.
+ */
+public class MoeRowRouteTest {
+
+    static final int32 H = MoeForwardTest.H;
+    static final int32 ROWS = MoeSharedBatchTest.ROWS;
+
+    public MoeRowRouteTest() { return; }
+
+    /** The zero-sync row output of `path` for the probe rows, one decode
+     *  row at a time onto a zeroed accumulator, or null when the route
+     *  refused a row. */
+    static #float32[] zeroSyncRowsOut(String path, PrefillTap tap) {
+        int64 rb0 = ExpertBank.residencyBudget();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        ExpertBank.resetResidency();
+        CausalLM m #= MoeForwardTest.bindPath(path);
+        MoeFfn moe = m.moeAt(0);
+        Tensor<float32> x #= MoeSharedBatchTest.probeRows();
+        int64 h = (int64) MoeRowRouteTest.H;
+        int64 n = (int64) (MoeRowRouteTest.ROWS * MoeRowRouteTest.H);
+        KernelBuffer<float32> xDev #= heap KernelBuffer<float32>((uint64) h);
+        KernelBuffer<float32> acc #= heap KernelBuffer<float32>((uint64) h);
+        float32[] row = heap float32[h];
+        float32[] zero = heap float32[h];
+        float32[] out = heap float32[n];
+        float32[] xb = x.hostBuffer();
+        int64 xo = x.hostBase();
+        int64 i = 0;
+        while (i < h) {
+            zero[i] = 0.0f;
+            i = i + 1;
+        }
+        boolean ok = true;
+        int32 r = 0;
+        while (r < MoeRowRouteTest.ROWS && ok) {
+            int64 base = (int64) r * h;
+            i = 0;
+            while (i < h) {
+                row[i] = xb[xo + base + i];
+                i = i + 1;
+            }
+            xDev.upload(row, h);
+            acc.upload(zero, h);
+            Diag.register(tap);
+            ok = moe.forwardRowZeroSync(xDev, acc, 0);
+            Diag.register(null);
+            if (ok) {
+                KernelStream s = QuantKernel.stream();
+                s.sync();
+                acc.download(row, h);
+                i = 0;
+                while (i < h) {
+                    out[base + i] = row[i];
+                    i = i + 1;
+                }
+            }
+            r = r + 1;
+        }
+        ExpertBank.setResidencyBudget(rb0);
+        if (!ok) { return null; }
+        return #out;
+    }
+
+    static float64 peak(float32[] a, int64 n) {
+        float64 mag = 0.0;
+        int64 i = 0;
+        while (i < n) {
+            float64 v = a[i];
+            if (v < 0.0) { v = 0.0 - v; }
+            if (v > mag) { mag = v; }
+            i = i + 1;
+        }
+        return mag;
+    }
+
+    /**
+     * 9.6.1 — the zero-sync decode row on the shexp fixture agrees with
+     * the host row: the whole row, and the shared expert's contribution
+     * alone, read as (shexp model − shexp-less model) on each arm so the
+     * expert banks cancel and only the shared sublayer is compared.
+     */
+    @Test
+    public void zeroSyncRowOnTheShexpFixtureAgreesWithTheHostRow() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no resident MoE route on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        PrefillTap ta = heap PrefillTap();
+        float32[] za #= MoeRowRouteTest.zeroSyncRowsOut(
+            MoeForwardTest.FIX, ta);
+        if (za == null) {
+            Assert.fail("the zero-sync row route refused the shexp fixture: "
+                + ta.namesOf("moe-row-route"));
+        }
+        PrefillTap tb = heap PrefillTap();
+        float32[] zb #= MoeRowRouteTest.zeroSyncRowsOut(
+            MoeForwardTest.NOSH, tb);
+        if (zb == null) {
+            Assert.fail("the zero-sync row route refused the control: "
+                + tb.namesOf("moe-row-route"));
+        }
+        float32[] ha #= MoeSharedBatchTest.hostRowOut(MoeForwardTest.FIX);
+        float32[] hb #= MoeSharedBatchTest.hostRowOut(MoeForwardTest.NOSH);
+        int64 n = (int64) (MoeRowRouteTest.ROWS * MoeRowRouteTest.H);
+        float64 cosRow = Metrics.cosine(za, ha, (int32) n);
+        float32[] dz = heap float32[n];
+        float32[] dh = heap float32[n];
+        MoeSharedBatchTest.diff(za, zb, dz, n);
+        MoeSharedBatchTest.diff(ha, hb, dh, n);
+        float64 mag = MoeRowRouteTest.peak(dh, n);
+        Assert.isTrue(mag > 0.000001);
+        float64 cosSh = Metrics.cosine(dz, dh, (int32) n);
+        System.stdout.println("   row cosine " + cosRow
+            + "  shexp contribution cosine " + cosSh + "  peak " + mag);
+        Assert.isTrue(cosRow > 0.999);
+        Assert.isTrue(cosSh > 0.999);
+    }
+
+    /**
+     * 9.6.1 — the row route says which one it took, both ways: the
+     * shexp fixture is SEEN on the resident route, and with the resident
+     * shared expert off the same checkpoint refuses and names the gate.
+     */
+    @Test
+    public void theRowRouteRecordNamesWhatItTook() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no resident MoE route on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        PrefillTap on = heap PrefillTap();
+        float32[] r #= MoeRowRouteTest.zeroSyncRowsOut(
+            MoeForwardTest.FIX, on);
+        Assert.isTrue(r != null);
+        if (!on.sawContaining("moe-row-route", "resident")) {
+            Assert.fail("took the zero-sync row route but did not say so: "
+                + on.namesOf("moe-row-route"));
+        }
+        MoeFfn.setSharedRow(false);
+        PrefillTap off = heap PrefillTap();
+        float32[] r2 #= MoeRowRouteTest.zeroSyncRowsOut(
+            MoeForwardTest.FIX, off);
+        MoeFfn.setSharedRow(true);
+        Assert.isTrue(r2 == null);
+        if (!off.sawContaining("moe-row-route", "shared expert")) {
+            Assert.fail("refused without naming the gate: "
+                + off.namesOf("moe-row-route"));
+        }
+        System.stdout.println("   moe-row-route on="
+            + on.namesOf("moe-row-route") + " off="
+            + off.namesOf("moe-row-route"));
+        return;
+    }
+
+    /**
+     * 9.6.1 / 9.6.3 — a symmetric down bank (Q8_0, the witness's shape)
+     * is SEEN on the zero-sync row route over its widened slab, agrees
+     * with the host row, and with the widen off refuses naming the bank.
+     * Direction only here: the int8 route quantizes its activations and
+     * the toy's values sit near 1e-5. The kernel itself is gated to its
+     * dense form in the widen test.
+     */
+    @Test
+    public void symmetricDownBankTakesTheZeroSyncRow() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no resident MoE route on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        PrefillTap on = heap PrefillTap();
+        float32[] z #= MoeRowRouteTest.zeroSyncRowsOut(
+            MoeForwardTest.Q8EXP, on);
+        if (z == null) {
+            Assert.fail("the zero-sync row route refused a q8_0 down bank: "
+                + on.namesOf("moe-row-route"));
+        }
+        if (!on.sawContaining("moe-row-route", "resident")) {
+            Assert.fail("q8_0 down bank did not say it took the row route: "
+                + on.namesOf("moe-row-route"));
+        }
+        ExpertBank.setWidenSlab(false);
+        PrefillTap off = heap PrefillTap();
+        float32[] z2 #= MoeRowRouteTest.zeroSyncRowsOut(
+            MoeForwardTest.Q8EXP, off);
+        ExpertBank.setWidenSlab(true);
+        Assert.isTrue(z2 == null);
+        if (!off.sawContaining("moe-row-route", "q8_0")) {
+            Assert.fail("refused without naming the bank: "
+                + off.namesOf("moe-row-route"));
+        }
+        float32[] hz #= MoeSharedBatchTest.hostRowOut(MoeForwardTest.Q8EXP);
+        int64 n = (int64) (MoeRowRouteTest.ROWS * MoeRowRouteTest.H);
+        float64 mag = MoeRowRouteTest.peak(hz, n);
+        Assert.isTrue(mag > 0.000001);
+        float64 cos = Metrics.cosine(z, hz, (int32) n);
+        System.stdout.println("   q8_0 row cosine " + cos + "  peak " + mag
+            + "  on=" + on.namesOf("moe-row-route")
+            + " off=" + off.namesOf("moe-row-route"));
+        Assert.isTrue(cos > 0.99);
+        return;
+    }
+}

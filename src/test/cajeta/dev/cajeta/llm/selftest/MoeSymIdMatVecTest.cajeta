@@ -1,0 +1,194 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+import dev.cajeta.llm.model.Linear;
+
+/**
+ * Plan 9.6.3 — the symmetric id mat-vec is the Q8_0 wave mat-vec
+ * indirected, and its fused down-combine is the weighted sum of those.
+ *
+ * The kernel gate the plan's RISK note asks for: the row path's fused
+ * down + combine + norm tail is the decode hot path and a wrong kernel
+ * there is a wrong answer, not a crash. The shape is the witness's —
+ * 1408 columns, so the pad blocks 44..47 are on trial — at a row count
+ * that fills the wave, where the lane→block walk is the wave kernel's
+ * and the two must agree to the bit.
+ */
+public class MoeSymIdMatVecTest {
+
+    public MoeSymIdMatVecTest() { return; }
+
+    /** A synthetic Q8_0 slab: real blocks tiled cyclically, `E` experts
+     *  of `rows` x `cols`. */
+    static #KernelBuffer<int8> slabOf(int64 E, int64 rows, int64 cols) {
+        int8[] src #= File.readAllBytes(
+            "src/test/fixtures/gguf/kquant/q8_0.bin");
+        int64 srcN = (int64) src.count();
+        int64 slabBytes = E * rows * (cols / 32L) * 34L;
+        int8[] slabH = heap int8[slabBytes];
+        int64 i = 0;
+        while (i < slabBytes) {
+            slabH[i] = src[i % srcN];
+            i = i + 1;
+        }
+        KernelBuffer<int8> slab #= heap KernelBuffer<int8>(
+            (uint64) (slabBytes + 4L));
+        slab.upload(slabH, slabBytes);
+        return #slab;
+    }
+
+    /** `rows` distinct activation rows of `cols`. */
+    static #KernelBuffer<float32> rowsOf(int64 rows, int64 cols) {
+        int64 n = rows * cols;
+        float32[] h = heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            int64 r = i / cols;
+            int64 c = i % cols;
+            h[i] = (float32) (((7L * c + 3L * r) % 41L) - 20L) / 16.0f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) n);
+        x.upload(h, n);
+        return #x;
+    }
+
+    @Test
+    public void symIdMatVecIsTheQ80WaveMatVecIndirected() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no wave mat-vec on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        int64 E = 3;
+        int64 rows = 128;
+        int64 cols = 1408;
+        int64 colsPad = Quant.q8kPadCols(cols);
+        int64 used = 3;
+        KernelBuffer<int8> slab #= MoeSymIdMatVecTest.slabOf(E, rows, cols);
+        int64 allRows = E * rows;
+        int64 deqBytes = allRows * colsPad;
+        int64 imgBytes = WmmaKernel.symScaleImageBytes(allRows, colsPad);
+        KernelBuffer<int8> deq #= heap KernelBuffer<int8>((uint64) deqBytes);
+        KernelBuffer<int8> img #= heap KernelBuffer<int8>((uint64) imgBytes);
+        WmmaKernel.q80WidenLaunch(deq, slab, allRows, cols, colsPad);
+        WmmaKernel.deqPadZeroLaunch(deq, allRows, cols, colsPad);
+        WmmaKernel.symScaleImageLaunch(img, slab, allRows, cols, colsPad, 34L);
+
+        // One activation row per used expert, packed on row boundaries
+        // at the padded width — the row path's down-bank staging.
+        KernelBuffer<float32> x #= MoeSymIdMatVecTest.rowsOf(used, cols);
+        int64 xRowBlocks = colsPad / 256L;
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) (used * xRowBlocks * 320L));
+        QuantKernel.q8kPackRowsLaunchNoSync(xp, x, used, cols, colsPad);
+
+        int32[] selH = heap int32[3];
+        selH[0] = 2; selH[1] = 0; selH[2] = 1;
+        KernelBuffer<int32> sel #= heap KernelBuffer<int32>((uint64) 3);
+        sel.upload(selH, 3L);
+
+        // Dense: the wave kernel on expert sel[k]'s packed rows, x row k.
+        int64 yN = used * rows;
+        int64 rowBytes = (cols / 32L) * 34L;
+        KernelBuffer<float32> y1 #= heap KernelBuffer<float32>((uint64) yN);
+        int64 k = 0;
+        while (k < used) {
+            int64 e = (int64) selH[k];
+            KernelBuffer<int8> we #= slab.slice((uint64) (e * rows * rowBytes),
+                (uint64) (rows * rowBytes));
+            KernelBuffer<int8> xe #= xp.slice((uint64) (k * xRowBlocks * 320L),
+                (uint64) (xRowBlocks * 320L));
+            QuantKernel.q80Q8WaveMatVecLaunchNoSync(y1, we, xe, rows, cols,
+                k * rows);
+            k = k + 1;
+        }
+        // Indirected, one launch; and once more for the determinism control.
+        KernelBuffer<float32> y2 #= heap KernelBuffer<float32>((uint64) yN);
+        KernelBuffer<float32> y3 #= heap KernelBuffer<float32>((uint64) yN);
+        QuantKernel.symQ8IdMatVecLaunchNoSync(y2, deq, img, xp, sel,
+            (int32) used, rows, colsPad, xRowBlocks);
+        QuantKernel.symQ8IdMatVecLaunchNoSync(y3, deq, img, xp, sel,
+            (int32) used, rows, colsPad, xRowBlocks);
+        QuantKernel.stream().sync();
+
+        float32[] a = heap float32[yN];
+        float32[] b = heap float32[yN];
+        float32[] b2 = heap float32[yN];
+        y1.download(a, yN);
+        y2.download(b, yN);
+        y3.download(b2, yN);
+        int64 diff = 0;
+        int64 selfBad = 0;
+        float64 maxD = 0.0;
+        float64 peak = 0.0;
+        int64 i = 0;
+        while (i < yN) {
+            if (b[i] != b2[i]) { selfBad = selfBad + 1; }
+            float64 d = (float64) a[i] - (float64) b[i];
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > 0.0) { diff = diff + 1; }
+            if (d > maxD) { maxD = d; }
+            float64 m = a[i];
+            if (m < 0.0) { m = 0.0 - m; }
+            if (m > peak) { peak = m; }
+            i = i + 1;
+        }
+        System.stdout.println("   sym id mat-vec vs wave: " + diff + " of "
+            + yN + " differ, max |d| " + maxD + " peak " + peak
+            + ", self " + selfBad);
+        Assert.isTrue(peak > 0.000001);
+        Assert.isTrue(selfBad == 0);
+        Assert.isTrue(maxD <= peak * 0.00001);
+
+        // The fused down-combine: hs += sum_k w_k * y_k, against the
+        // dense products combined in f64. A different association, so
+        // the bar is the id-GEMM's, not bit identity.
+        float32[] wH = heap float32[3];
+        wH[0] = 0.5f; wH[1] = 0.3f; wH[2] = 0.2f;
+        KernelBuffer<float32> wSel #= heap KernelBuffer<float32>((uint64) 3);
+        wSel.upload(wH, 3L);
+        float32[] hs0 = heap float32[rows];
+        i = 0;
+        while (i < rows) { hs0[i] = 0.0f; i = i + 1; }
+        KernelBuffer<float32> hs #= heap KernelBuffer<float32>((uint64) rows);
+        hs.upload(hs0, rows);
+        QuantKernel.symQ8IdDownCombineLaunchNoSync(hs, deq, img, xp, sel,
+            wSel, (int32) used, rows, colsPad, xRowBlocks);
+        QuantKernel.stream().sync();
+        float32[] got = heap float32[rows];
+        hs.download(got, rows);
+        float64 maxC = 0.0;
+        float64 peakC = 0.0;
+        int64 r = 0;
+        while (r < rows) {
+            float64 want = 0.0;
+            k = 0;
+            while (k < used) {
+                want = want + (float64) wH[k] * (float64) a[k * rows + r];
+                k = k + 1;
+            }
+            float64 d = (float64) got[r] - want;
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > maxC) { maxC = d; }
+            float64 m = want;
+            if (m < 0.0) { m = 0.0 - m; }
+            if (m > peakC) { peakC = m; }
+            r = r + 1;
+        }
+        System.stdout.println("   sym id down-combine vs f64 sum: max |d| "
+            + maxC + " peak " + peakC);
+        Assert.isTrue(peakC > 0.000001);
+        Assert.isTrue(maxC <= peakC * 0.00001);
+        return;
+    }
+}

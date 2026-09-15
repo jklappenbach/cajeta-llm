@@ -1637,13 +1637,14 @@ on a 9 GB model -- along with the 180-launch layer.
       (9.4.1's gate, pad columns on trial) and on the real 1408 by
       perplexity; the whole-width does-not-fire half is the pack
       byte-identity test. No 1408-wide fixture was generated.
-- [~] **9.5.2 Coding** — PREFILL HALF DONE: `forwardBatchRes` packs
-      the down input one row per slot at `q8kPadCols(wid)` on both
-      branches and `xpBgDev` is sized at the padded width; the sym id
-      launcher takes `colsPad`. NOT DONE, and now the decode unit's:
-      `zeroSyncReady`'s `% 256` gate and the three `wid / 256L` in the
-      row path (`idDownCombineTail`, `idDownCombine`, `idLaunch`) --
-      the row path does not serve Q8_0/Q5_0 at all yet (Unit 9.6).
+- [x] **9.5.2 Coding** — prefill half: `forwardBatchRes` packs the
+      down input one row per slot at `q8kPadCols(wid)` on both branches
+      and `xpBgDev` is sized at the padded width; the sym id launcher
+      takes `colsPad`. Decode half, landed with 9.6.3: `zeroSyncReady`
+      gates the width at `% 32`, the GLU'd middle is packed one row per
+      expert at the padded width when the width has a remainder (the
+      flat pack otherwise, so the 30B's launch is untouched), and the
+      three row-path sites pass `widPad / 256`.
 - [x] **9.5.3 Acceptance** — MEASURED 2026-09-14, 512x128 x2, quiet
       box, `void=0 nolaunch=0`, every layer `resident: zero-sync id
       GEMMs`, no widen refused:
@@ -1681,18 +1682,75 @@ and `idLaunch`/`idDownCombineTail` serve Q4_K/Q6_K only, so every
 selected expert is its own mat-vec per bank plus the shared expert's
 three projections. llama.cpp: one `mul_mat_id` per bank.
 
-- [ ] **9.6.1 TDD** — a decode row on the shexp fixture agrees with
-      the host path and is SEEN on the zero-sync row route (a
-      `moe-row-route` record, the row twin of `moe-batch-route`).
-- [ ] **9.6.2 Coding** — the shared expert as a resident sublayer of
-      the row path (the batched form at rows=1, or the mat-vec chain
-      `matvecKeepOnDevice` already used by the dense MLP).
-- [ ] **9.6.3 Coding** — a symmetric id mat-vec over the widened slab
-      (`q4kQ8IdMatVecKernel`'s twin reading `deq` + scale image), and
-      `idDownCombineTail`'s symmetric form; `zeroSyncReady` from
-      `% 256` to `% 32` with `widPad/256` at the three row-path sites.
-- [ ] **9.6.4 Acceptance** — Qwen1.5-MoE decode ratio measured; the
+- [x] **9.6.1 TDD** — `MoeRowRouteTest`: the shexp fixture's decode
+      row on the zero-sync route agrees with the host row (row cosine
+      0.999931; the shexp contribution alone, read as FIX - NOSH on
+      both arms, 0.999958), the `moe-row-route` record names the route
+      taken and, with the resident shexp off, the gate that refused; the
+      Q8_0 down bank (toy-moe-q8exp) is SEEN on the route (row cosine
+      0.999956) and refuses by name with the widen off.
+      `MoeSymIdMatVecTest`: the kernel gate the RISK note asks for --
+      the sym id mat-vec against the Q8_0 wave mat-vec at the witness's
+      1408 width (pad blocks 44..47 on trial): 0 of 384 differ, bit
+      identical; the fused down-combine against the f64 weighted sum:
+      max |d| 2.9e-8 at peak 0.052.
+      HARNESS FINDING: `PrefillTap.namesOf` returned `#` of the literal
+      `""` when no record matched; the runner's catch read the message
+      and SIGSEGV'd at 0x2b with the runner as the crash frame. Every
+      earlier caller had records. Now a fresh copy.
+- [x] **9.6.2 Coding** — `Linear.matvecPackedKeep(xp)`: a kept wave
+      mat-vec against a packed activation the CALLER owns, so the
+      shexp chain reads the route's own `xpXnDev` and packs its middle
+      into its own `shXpDev` -- never the shared stage, whose regrowth
+      to the shexp width would have freed the buffer the down-combine
+      tail captured. `addSharedRowDev`: gate, up, GLU, pack, down, the
+      gate scalar as a one-expert router mat-vec, `addSigmoidRows` at
+      rows=1 onto the residual, all on the stream before the
+      down-combine so the fused norm tail sees the sum. `sharedRowOn`
+      arm (`setSharedRow`; bench/ppl `hostmoe` flips both). The gate
+      `zeroSyncReady(say)` names every refusal.
+- [x] **9.6.3 Coding** — `symQ8IdMatVecKernel` and
+      `symQ8IdDownCombineKernel` (QuantKernel) over the widened slab:
+      the Q8_0 wave dot per 32-block with the f16 scale from the
+      compact image, indirected through `sel`; the down-combine's tail
+      is the Q4_K kernel's verbatim. `ExpertBank.idReady` admits the
+      symmetric formats, `idRowReady` widens on first use, `idLaunch`
+      and `idDownCombineTail` dispatch the sym form when the bank is
+      widened.
+      FINDING: the first version read the widened slab row-major. It is
+      TILE-major -- 16x16 int8 tiles, the GEMM's B operand layout
+      (`q80WidenKernel`: `((ii/16)*tilesK + k/16)*256 + (ii%16)*16 +
+      k%16`) -- so a lane's 32-block is two 16-byte pieces 256 bytes
+      apart, two 16-lane `dotAccum`s whose integer partials sum exactly.
+      The bit gate read 384/384 wrong (max |d| 0.40 at peak 0.21) and
+      the toy Q8_0 row cosine 0.958 before the route ran a single real
+      token; after, 0/384 and 0.999956.
+- [~] **9.6.4 Acceptance** — Qwen1.5-MoE decode ratio measured; the
       other two MoE decodes (0.97x) must not move.
+      NON-TIMING HALF, 2026-09-14 (test suite running alongside, so the
+      tok/s here are not the claim):
+        moe-row-route, prompt=128 gen=8: every layer, every token
+          `resident: zero-sync id mat-vecs + shared expert`; no widen
+          refused, no VOID.
+        launches per decode token (profiler, gen=64): 687 -> 560.
+          Per layer per token: q4kQ8WaveMatVec 6 (4 attn + shexp
+          gate/up), symQ8IdDownCombine 1, q6kQ8WaveMatVec 1 (shexp
+          down), gluF32 1, addSigmoidRows 1, routerF32MatVec 1 (the
+          shexp gate scalar), q8kPack ~3, addBiasRows 3 -- q/k/v carry
+          biases on this model and the fused qkv mat-vec refuses them,
+          so that is 6 launches where the 30B pays 1 (a follow-up, not
+          this unit).
+        decode at d128, busy box: 24.7 -> 108.7 tok/s.
+        PERPLEXITY (pplprobe, prefill 512 + 256 decode positions):
+          all-host (hostmoe)            meanNll 1.71681  ppl 5.56675
+          per-group prefill + host row  meanNll 1.71712  ppl 5.56847
+          id-GEMM prefill + zero-sync   meanNll 1.72471  ppl 5.61091
+        The prefill id-GEMM's +0.41% was recorded at 9.5.3 (5.59142
+        with the host row); the zero-sync row adds +0.35% on top --
+        Q8_K activations at the gate/up input, the GLU'd middle and the
+        shexp middle, the same family and the 30B's standard route.
+        Recorded, not hidden.
+      TIMING HALF: owed (accept96-timing.sh, quiet box).
 
 RISK, unchanged: this is the MoE hot path including the fused
 down+combine tail, and the failure mode of getting it wrong is a wrong

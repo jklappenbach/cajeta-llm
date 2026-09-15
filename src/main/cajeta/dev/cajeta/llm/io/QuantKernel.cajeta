@@ -8973,6 +8973,321 @@ public final class QuantKernel {
             null, null, null, 0L, 0.0f, 0, null);
     }
 
+    /**
+     * Unit 9.6: the symmetric id mat-vec — {@link #q80Q8WaveMatVecKernel}'s
+     * dot over the bank's WIDENED slab (int8 in the GEMM's 16x16 tiles
+     * at the padded width, f16 scales in the compact image) indirected
+     * through `sel`, so a
+     * Q8_0/Q5_0/Q4_0 expert bank takes one launch per bank like the
+     * k-quants do. One lane per 32-wide block, walked as the wave kernel
+     * walks it when a row fills the wave, so the two are bit-identical
+     * there (MoeSymIdMatVecTest); short rows pack rowsPerWave rows per
+     * wave as the Q4_K id kernel does. Pad columns carry zero weights
+     * and a zero scale.
+     */
+    @Kernel
+    public static void symQ8IdMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> deq, KernelBuffer<int8> img,
+            KernelBuffer<int8> xp, KernelBuffer<int32> sel,
+            uint32 rowsPerExpert, int64 blocksPerRow, int64 xRowBlocks,
+            int64 yOff) {
+        uint32 lane = KernelThread.x();
+        uint32 wave = KernelThread.globalIdX() / 32;
+        uint32 lpr = (uint32) blocksPerRow;
+        uint32 rpw = 1;
+        uint32 rl = lane;
+        uint32 sub = 0;
+        uint32 step = 32;
+        if (lpr < 32) { rpw = 32 / lpr; sub = lane / lpr; rl = lane - sub * lpr; step = lpr; }
+        uint32 wpe = (rowsPerExpert + rpw - 1) / rpw;
+        uint32 kk = wave / wpe;
+        uint32 rowBase = (wave - kk * wpe) * rpw;
+        uint32 row = rowBase + sub;
+        float32 acc = 0.0f;
+        if (sub < rpw && row < rowsPerExpert) {
+            int64 gi = (int64) sel[(int64) kk] * (int64) rowsPerExpert
+                + (int64) row;
+            int64 dRow = (gi / 16L) * blocksPerRow * 512L + (gi % 16L) * 16L;
+            int64 sRow = gi * blocksPerRow * 2L;
+            int64 xbase = (int64) kk * xRowBlocks;
+            Vector<int32,4> zv = heap Vector<int32,4>(0, 0, 0, 0);
+            int64 j = (int64) rl;
+            while (j < blocksPerRow) {
+                int64 sOff = sRow + j * 2L;
+                float32 d = GgufFile.halfBitsToF32(((int32) img[sOff] & 255)
+                    | (((int32) img[sOff + 1L] & 255) << 8));
+                // A 32-block spans two 16-wide k-tiles, 256 bytes apart.
+                int64 wOff = dRow + j * 512L;
+                Vector<int8,16> wq0 = deq.vload<16>(wOff);
+                Vector<int8,16> wq1 = deq.vload<16>(wOff + 256L);
+                int64 ab = xbase + j / 8L;
+                int64 aOff = ab * 320L + (j % 8L) * 32L;
+                Vector<int8,16> aq0 = xp.vload<16>(aOff);
+                Vector<int8,16> aq1 = xp.vload<16>(aOff + 16L);
+                Vector<int32,4> tq0 = wq0.dotAccum(aq0, zv);
+                Vector<int32,4> tq1 = wq1.dotAccum(aq1, zv);
+                int32 sumi = tq0[0] + tq0[1] + tq0[2] + tq0[3]
+                           + tq1[0] + tq1[1] + tq1[2] + tq1[3];
+                Vector<int8,4> dv = xp.vload<4>(ab * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+                acc = acc + d * xs * (float32) sumi;
+                j = j + (int64) step;
+            }
+        }
+        uint32 r = 0;
+        while (r < rpw) {
+            float32 part = 0.0f;
+            if (sub == r) { part = acc; }
+            float32 tot = Wave.reduceSumF32(part);
+            if (lane == 0 && rowBase + r < rowsPerExpert) {
+                y[yOff + (int64) kk * (int64) rowsPerExpert
+                  + (int64) (rowBase + r)] = tot;
+            }
+            r = r + 1;
+        }
+    }
+
+    public static void symQ8IdMatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> deq, KernelBuffer<int8> img,
+            KernelBuffer<int8> xp, KernelBuffer<int32> sel, int32 used,
+            int64 rowsPerExpert, int64 colsPad, int64 xRowBlocks) {
+        int64 nb32 = colsPad / 32L;
+        int64 rpw = 1L;
+        if (nb32 < 32L) { rpw = 32L / nb32; }
+        int64 wpe = (rowsPerExpert + rpw - 1L) / rpw;
+        uint32 wgs = (uint32) (wpe * (int64) used);
+        KernelStream s = QuantKernel.stream();
+        symQ8IdMatVecKernel.launch(s, grid: [wgs], block: [32])
+            (y, deq, img, xp, sel, (uint32) rowsPerExpert, nb32, xRowBlocks,
+             0L);
+        return;
+    }
+
+    /**
+     * Unit 9.6: {@link #q4kQ8IdDownCombineKernel}'s shape over the widened
+     * symmetric slab — every used expert of one output row in one wave,
+     * a lane walking the (expert, 32-block) pairs, the weighted combine
+     * onto the residual in the epilogue and the next layer's norm + pack
+     * in the tail (that tail is the Q4_K kernel's, verbatim).
+     */
+    @Kernel
+    public static void symQ8IdDownCombineKernel(KernelBuffer<float32> hs,
+            KernelBuffer<int8> deq, KernelBuffer<int8> img,
+            KernelBuffer<int8> xp, KernelBuffer<int32> sel,
+            KernelBuffer<float32> wSel, uint32 rowsPerExpert,
+            int64 blocksPerRow, int64 xRowBlocks, uint32 used,
+            KernelBuffer<float32> nOut, KernelBuffer<int8> pk,
+            KernelBuffer<float32> nw, uint32 dim, float32 eps, int32 form,
+            KernelBuffer<int32> counter, uint32 normTail) {
+        Shared<float32> part = shared float32[8];
+        Shared<int32> psum = shared int32[256];
+        Shared<int32> tk = shared int32[1];
+        uint32 lane = KernelThread.x() % 32;
+        uint32 row = KernelThread.globalIdX() / 32;
+        float32 acc = 0.0f;
+        if (row < rowsPerExpert) {
+            Vector<int32,4> zv = heap Vector<int32,4>(0, 0, 0, 0);
+            int64 total = (int64) used * blocksPerRow;
+            int64 kb = (int64) lane;
+            while (kb < total) {
+                int64 k = kb / blocksPerRow;
+                int64 j = kb - k * blocksPerRow;
+                int64 gi = (int64) sel[k] * (int64) rowsPerExpert + (int64) row;
+                int64 sOff = gi * blocksPerRow * 2L + j * 2L;
+                float32 wk = wSel[k];
+                float32 d = GgufFile.halfBitsToF32(((int32) img[sOff] & 255)
+                    | (((int32) img[sOff + 1L] & 255) << 8));
+                int64 wOff = (gi / 16L) * blocksPerRow * 512L
+                    + (gi % 16L) * 16L + j * 512L;
+                Vector<int8,16> wq0 = deq.vload<16>(wOff);
+                Vector<int8,16> wq1 = deq.vload<16>(wOff + 256L);
+                int64 ab = k * xRowBlocks + j / 8L;
+                int64 aOff = ab * 320L + (j % 8L) * 32L;
+                Vector<int8,16> aq0 = xp.vload<16>(aOff);
+                Vector<int8,16> aq1 = xp.vload<16>(aOff + 16L);
+                Vector<int32,4> tq0 = wq0.dotAccum(aq0, zv);
+                Vector<int32,4> tq1 = wq1.dotAccum(aq1, zv);
+                int32 sumi = tq0[0] + tq0[1] + tq0[2] + tq0[3]
+                           + tq1[0] + tq1[1] + tq1[2] + tq1[3];
+                Vector<int8,4> dv = xp.vload<4>(ab * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+                acc = acc + wk * (d * xs * (float32) sumi);
+                kb = kb + 32L;
+            }
+        }
+        float32 tot = Wave.reduceSumF32(acc);
+        if (lane == 0 && row < rowsPerExpert) {
+            hs[(int64) row] = hs[(int64) row] + tot;
+        }
+        // ── Unit 59b: the NEXT layer's input norm + pack in this
+        // launch's tail. Every wave has added its row; the last block
+        // to arrive (ticket) norms the whole residual row and packs it
+        // for the next layer's q|k|v, so the norm launch and its CP
+        // gap are gone. The block is 256 threads (eight row waves) so
+        // the tail is rmsnormPackRowF32's body verbatim.
+        if (normTail == 0) { return; }
+        uint32 tid = KernelThread.x();
+        if (lane == 0) { Barrier.deviceMemory(MemoryOrder.Release); }
+        Barrier.workgroup();
+        if (tid == 0) {
+            int32 old = counter.atomicAdd(0L, 1, MemoryOrder.AcqRel);
+            tk[0] = old;
+        }
+        Barrier.workgroup();
+        uint32 nblk = (rowsPerExpert + 7) / 8;
+        if ((uint32) tk[0] != nblk - 1) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        if (tid == 0) { counter[0L] = 0; }
+        uint32 wid = tid / 32;
+        uint32 wl = tid % 32;
+        float32 ss = 0.0f;
+        uint32 i = tid;
+        while (i < dim) {
+            float32 v = hs[(int64) i];
+            ss = ss + v * v;
+            i = i + 256;
+        }
+        float32 wsum = Wave.reduceSumF32(ss);
+        if (wl == 0) { part[wid] = wsum; }
+        Barrier.workgroup();
+        float32 tsq = part[0] + part[1] + part[2] + part[3]
+            + part[4] + part[5] + part[6] + part[7];
+        float32 scale = 1.0f / Math.sqrt(tsq / (float32) dim + eps);
+        uint32 blocks = dim / 256;
+        float32 v0 = 0.0f; float32 v1 = 0.0f; float32 v2 = 0.0f; float32 v3 = 0.0f;
+        float32 v4 = 0.0f; float32 v5 = 0.0f; float32 v6 = 0.0f; float32 v7 = 0.0f;
+        uint32 e0 = wid * 256 + wl * 8;
+        if (wid < blocks) {
+            float32 w0 = nw[e0]; float32 w1 = nw[e0 + 1]; float32 w2 = nw[e0 + 2];
+            float32 w3 = nw[e0 + 3]; float32 w4 = nw[e0 + 4]; float32 w5 = nw[e0 + 5];
+            float32 w6 = nw[e0 + 6]; float32 w7 = nw[e0 + 7];
+            if (form == 1) {
+                w0 = 1.0f + w0; w1 = 1.0f + w1; w2 = 1.0f + w2; w3 = 1.0f + w3;
+                w4 = 1.0f + w4; w5 = 1.0f + w5; w6 = 1.0f + w6; w7 = 1.0f + w7;
+            }
+            v0 = hs[(int64) e0] * scale * w0;
+            v1 = hs[(int64) (e0 + 1)] * scale * w1;
+            v2 = hs[(int64) (e0 + 2)] * scale * w2;
+            v3 = hs[(int64) (e0 + 3)] * scale * w3;
+            v4 = hs[(int64) (e0 + 4)] * scale * w4;
+            v5 = hs[(int64) (e0 + 5)] * scale * w5;
+            v6 = hs[(int64) (e0 + 6)] * scale * w6;
+            v7 = hs[(int64) (e0 + 7)] * scale * w7;
+            nOut[e0] = v0; nOut[e0 + 1] = v1; nOut[e0 + 2] = v2; nOut[e0 + 3] = v3;
+            nOut[e0 + 4] = v4; nOut[e0 + 5] = v5; nOut[e0 + 6] = v6; nOut[e0 + 7] = v7;
+        }
+        float32 amax = 0.0f;
+        float32 av = v0; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v1; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v2; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v3; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v4; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v5; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v6; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        av = v7; if (av < 0.0f) { av = 0.0f - av; } if (av > amax) { amax = av; }
+        float32 bmax = Wave.reduceMaxF32(amax);
+        float32 inv = 0.0f;
+        if (bmax > 0.0f) { inv = 127.0f / bmax; }
+        int64 ob = (int64) wid * 320L;
+        int32 sm = 0;
+        if (wid < blocks) {
+            int32 q0 = (int32) Math.round(v0 * inv);
+            int32 q1 = (int32) Math.round(v1 * inv);
+            int32 q2 = (int32) Math.round(v2 * inv);
+            int32 q3 = (int32) Math.round(v3 * inv);
+            int32 q4 = (int32) Math.round(v4 * inv);
+            int32 q5 = (int32) Math.round(v5 * inv);
+            int32 q6 = (int32) Math.round(v6 * inv);
+            int32 q7 = (int32) Math.round(v7 * inv);
+            int64 qo = ob + (int64) (wl * 8);
+            pk[qo] = (int8) q0; pk[qo + 1L] = (int8) q1;
+            pk[qo + 2L] = (int8) q2; pk[qo + 3L] = (int8) q3;
+            pk[qo + 4L] = (int8) q4; pk[qo + 5L] = (int8) q5;
+            pk[qo + 6L] = (int8) q6; pk[qo + 7L] = (int8) q7;
+            sm = q0 + q1 + q2 + q3 + q4 + q5 + q6 + q7;
+        }
+        psum[tid] = sm;
+        Barrier.workgroup();
+        if (wid < blocks && wl < 8) {
+            uint32 base = wid * 32 + wl * 4;
+            int32 tsum = psum[base] + psum[base + 1]
+                       + psum[base + 2] + psum[base + 3];
+            int64 so = ob + 256L + (int64) (wl * 4);
+            int32 b0 = tsum & 255;
+            int32 b1 = (tsum >> 8) & 255;
+            int32 b2 = (tsum >> 16) & 255;
+            int32 b3 = (tsum >> 24) & 255;
+            if (b0 > 127) { b0 = b0 - 256; }
+            if (b1 > 127) { b1 = b1 - 256; }
+            if (b2 > 127) { b2 = b2 - 256; }
+            if (b3 > 127) { b3 = b3 - 256; }
+            pk[so] = (int8) b0;
+            pk[so + 1L] = (int8) b1;
+            pk[so + 2L] = (int8) b2;
+            pk[so + 3L] = (int8) b3;
+        }
+        if (wid < blocks && wl == 0) {
+            float32 dsc = bmax / 127.0f;
+            int32 db = Cajeta.f32ToBits(dsc);
+            int32 e1 = db & 255;
+            int32 e2 = (db >> 8) & 255;
+            int32 e3 = (db >> 16) & 255;
+            int32 e4 = (db >> 24) & 255;
+            if (e1 > 127) { e1 = e1 - 256; }
+            if (e2 > 127) { e2 = e2 - 256; }
+            if (e3 > 127) { e3 = e3 - 256; }
+            if (e4 > 127) { e4 = e4 - 256; }
+            pk[ob + 288L] = (int8) e1;
+            pk[ob + 289L] = (int8) e2;
+            pk[ob + 290L] = (int8) e3;
+            pk[ob + 291L] = (int8) e4;
+        }
+    }
+
+    public static void symQ8IdDownCombineTailLaunchNoSync(
+            KernelBuffer<float32> hs, KernelBuffer<int8> deq,
+            KernelBuffer<int8> img, KernelBuffer<int8> xp,
+            KernelBuffer<int32> sel, KernelBuffer<float32> wSel, int32 used,
+            int64 rowsPerExpert, int64 colsPad, int64 xRowBlocks,
+            KernelBuffer<float32> nOut, KernelBuffer<int8> pk,
+            KernelBuffer<float32> nw, int64 dim, float32 eps, int32 form,
+            KernelBuffer<int32> counter) {
+        uint32 wgs = (uint32) ((rowsPerExpert + 7L) / 8L);
+        uint32 tailOn = 0;
+        KernelBuffer<float32> o = nOut;
+        KernelBuffer<int8> p = pk;
+        KernelBuffer<float32> w = nw;
+        KernelBuffer<int32> c = counter;
+        if (nOut != null) {
+            tailOn = 1;
+        } else {
+            o = hs; p = xp; w = wSel; c = sel;
+        }
+        KernelStream s = QuantKernel.stream();
+        symQ8IdDownCombineKernel.launch(s, grid: [wgs], block: [256])
+            (hs, deq, img, xp, sel, wSel, (uint32) rowsPerExpert,
+             colsPad / 32L, xRowBlocks, (uint32) used,
+             o, p, w, (uint32) dim, eps, form, c, tailOn);
+        return;
+    }
+
+    public static void symQ8IdDownCombineLaunchNoSync(
+            KernelBuffer<float32> hs, KernelBuffer<int8> deq,
+            KernelBuffer<int8> img, KernelBuffer<int8> xp,
+            KernelBuffer<int32> sel, KernelBuffer<float32> wSel, int32 used,
+            int64 rowsPerExpert, int64 colsPad, int64 xRowBlocks) {
+        QuantKernel.symQ8IdDownCombineTailLaunchNoSync(hs, deq, img, xp, sel,
+            wSel, used, rowsPerExpert, colsPad, xRowBlocks, null, null, null,
+            0L, 0.0f, 0, null);
+        return;
+    }
+
     /** Unit 59b: as {@link #idDownCombineLaunchNoSync}, with the next
      *  layer's input norm + Q8_K pack of the residual `hs` in the
      *  launch's tail when `nOut` is given (dim <= 2048, a multiple of

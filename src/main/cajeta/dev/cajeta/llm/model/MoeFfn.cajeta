@@ -12,6 +12,7 @@ import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.GgufFile;
 
 /**
  * The MoE replacement for a layer's dense FFN (spec 15.1): a router
@@ -104,6 +105,8 @@ public final class MoeFfn extends InfModule {
     static boolean fusedDownOn = true;     // unit 51 A/B arm
     static boolean fusedNormRouterOn = true;   // unit 59 A/B arm
     static boolean sharedBatchOn = true;       // unit 9 A/B arm
+    static boolean sharedRowOn = true;         // unit 9.6 A/B arm
+    public static void setSharedRow(boolean on) { MoeFfn.sharedRowOn = on; }
     public static void setSharedBatch(boolean on) {
         MoeFfn.sharedBatchOn = on;
     }
@@ -189,7 +192,8 @@ public final class MoeFfn extends InfModule {
     ExpertBank upB;
     ExpertBank downB;
     KernelBuffer<float32> shGateWDev;   // the shexp gate vector, [hidden]
-    KernelBuffer<float32> shZDev;       // its per-row logit, [rows]
+    KernelBuffer<float32> shZDev;     // its per-row logit, [rows]
+    KernelBuffer<int8> shXpDev;       // the row route's packed shexp middle
     int64 shZCap;
     Linear sharedGateProj;     // null when the model has no shexp
     Linear sharedUpProj;
@@ -715,26 +719,114 @@ public final class MoeFfn extends InfModule {
         this.xpXnDev #= heap KernelBuffer<int8>(
             (uint64) ((hid / 256L) * 320L));
         this.xpGyDev #= heap KernelBuffer<int8>(
-            (uint64) ((u * wid / 256L) * 320L));
+            (uint64) ((u * (Quant.q8kPadCols(wid) / 256L)) * 320L));
+        if (this.sharedW != 0) {
+            this.shXpDev #= heap KernelBuffer<int8>(
+                (uint64) (((int64) this.sharedW / 256L) * 320L));
+        }
         return;
     }
 
+    boolean zeroSyncReady() { return this.zeroSyncReady(false); }
+
     /** The zero-sync route's shape gate (cheap; the slab binds are the
-     *  expensive half and latch their own refusal). */
-    boolean zeroSyncReady() {
-        if (this.sharedW != 0) { return false; }
-        if (this.gating != 1) { return false; }
-        if (this.hidden % 256 != 0) { return false; }
-        if (this.widthN % 256 != 0) { return false; }
-        if (!this.gateB.idReady() || !this.upB.idReady()
-                || !this.downB.idReady()) {
+     *  expensive half and latch their own refusal). With `say`, a
+     *  refusal names its gate in the `moe-row-route` record. */
+    boolean zeroSyncReady(boolean say) {
+        if (this.sharedW != 0 && !this.sharedRowReady()) {
+            if (say) { this.sayRowRoute("host: shared expert not row-routed"); }
+            return false;
+        }
+        if (this.gating != 1) {
+            if (say) { this.sayRowRoute("host: sigmoid gating not served"); }
+            return false;
+        }
+        if (this.hidden % 256 != 0) {
+            if (say) { this.sayRowRoute("host: hidden not a multiple of 256"); }
+            return false;
+        }
+        if (this.widthN % 32 != 0) {
+            if (say) { this.sayRowRoute("host: expert width not a multiple of 32"); }
+            return false;
+        }
+        if (!this.gateB.idReady()) {
+            if (say) { this.sayBankRefusal("gate", this.gateB); }
+            return false;
+        }
+        if (!this.upB.idReady()) {
+            if (say) { this.sayBankRefusal("up", this.upB); }
+            return false;
+        }
+        if (!this.downB.idReady()) {
+            if (say) { this.sayBankRefusal("down", this.downB); }
             return false;
         }
         if (!this.gateB.ensureSlab() || !this.upB.ensureSlab()
                 || !this.downB.ensureSlab()) {
+            if (say) { this.sayRowRoute("host: an expert slab is not bound"); }
+            return false;
+        }
+        if (!this.gateB.idRowReady() || !this.upB.idRowReady()
+                || !this.downB.idRowReady()) {
+            if (say) { this.sayRowRoute("host: an expert slab is not widened"); }
             return false;
         }
         return true;
+    }
+
+    void sayBankRefusal(String bank, ExpertBank b) {
+        this.sayRowRoute("host: " + bank + " bank "
+            + GgufFile.typeName(b.packedType()) + " has no id mat-vec");
+        return;
+    }
+
+    /** One record per zero-sync row decision, naming the route taken
+     *  or the gate that refused — the row twin of `moe-batch-route`. */
+    void sayRowRoute(String name) {
+        Diag.emit("moe-row-route", 0 - 1, name, (int64) this.layerIdx,
+            (int64) this.expertsN, (int64) this.widthN,
+            (int64) this.hidden, (int64) this.sharedW, 0L);
+        return;
+    }
+
+    /** Whether the shared expert can ride the zero-sync row: three
+     *  wave mat-vecs against the route's own packed activations. */
+    boolean sharedRowReady() {
+        if (this.sharedGateProj == null) { return true; }
+        if (!MoeFfn.sharedRowOn) { return false; }
+        if (this.sharedW % 256 != 0) { return false; }
+        return this.sharedGateProj.packedWaveReady()
+            && this.sharedUpProj.packedWaveReady()
+            && this.sharedDownProj.packedWaveReady();
+    }
+
+    /**
+     * Unit 9.6: the shared expert for one row, ADDED onto `acc` on the
+     * stream — the row twin of {@link #addSharedBatchDev}. The host
+     * form is three mat-vecs, a host GLU and a host sigmoid per row,
+     * and it took the whole layer to the host with it: 687 launches
+     * per token on Qwen1.5-MoE where llama.cpp issues one per bank.
+     */
+    void addSharedRowDev(KernelBuffer<float32> xDev,
+            KernelBuffer<float32> acc, int32 act) {
+        int64 h = (int64) this.hidden;
+        int64 sw = (int64) this.sharedW;
+        this.sharedGateProj.matvecPackedKeep(this.xpXnDev);
+        this.sharedUpProj.matvecPackedKeep(this.xpXnDev);
+        Prim.gluDevice(this.sharedGateProj.out(), this.sharedUpProj.out(),
+            sw, act);
+        QuantKernel.q8kPackLaunchNoSync(this.shXpDev,
+            this.sharedGateProj.out(), sw);
+        this.sharedDownProj.matvecPackedKeep(this.shXpDev);
+        boolean gated = this.sharedGate != null;
+        this.ensureSharedGateDev(1);
+        if (gated) {
+            QuantKernel.routerF32MatVecLaunchNoSync(this.shZDev,
+                this.shGateWDev, xDev, 1L, h);
+        }
+        Prim.addSigmoidRowsDevice(acc, this.sharedDownProj.out(),
+            this.shZDev, 1L, h, gated);
+        return;
     }
 
     /**
@@ -747,7 +839,7 @@ public final class MoeFfn extends InfModule {
      * unit-39 chain (host routing through the crossing) or the
      * unit-38 whole-host crossing.
      */
-    boolean forwardRowZeroSync(KernelBuffer<float32> xDev,
+    public boolean forwardRowZeroSync(KernelBuffer<float32> xDev,
             KernelBuffer<float32> acc, int32 act) {
         return this.forwardRowZeroSync(xDev, acc, act, false);
     }
@@ -839,7 +931,12 @@ public final class MoeFfn extends InfModule {
             KernelBuffer<float32> acc, int32 act, boolean prePacked,
             boolean preRouted) {
         int64 tpre0 = Clock.nanoTime();
-        if (!this.zeroSyncReady()) { return false; }
+        if (!this.zeroSyncReady(true)) { return false; }
+        if (this.sharedW != 0) {
+            this.sayRowRoute("resident: zero-sync id mat-vecs + shared expert");
+        } else {
+            this.sayRowRoute("resident: zero-sync id mat-vecs");
+        }
         int64 tpa = Clock.nanoTime();
         MoeFfn.mtPreANs = MoeFfn.mtPreANs + (tpa - tpre0);
         int64 h0 = ExpertBank.residencyHits();
@@ -884,6 +981,11 @@ public final class MoeFfn extends InfModule {
         if (!prePacked) {
             QuantKernel.q8kPackLaunchNoSync(this.xpXnDev, xDev, hid);
         }
+        if (this.sharedW != 0) {
+            int64 tsh0 = Clock.nanoTime();
+            this.addSharedRowDev(xDev, acc, act);
+            MoeFfn.mtSharedNs = MoeFfn.mtSharedNs + (Clock.nanoTime() - tsh0);
+        }
         // Unit 48: gate + up + GLU in one launch when both banks are
         // Q4_K slabs; the three-launch chain stays as the fallback.
         // (Unit 52 measured folding the middle's Q8_K pack in as well:
@@ -908,25 +1010,31 @@ public final class MoeFfn extends InfModule {
         MoeFfn.phaseSync();
         MoeFfn.mtGluNs = MoeFfn.mtGluNs + (Clock.nanoTime() - tgl0);
         int64 td0 = Clock.nanoTime();
-        QuantKernel.q8kPackLaunchNoSync(this.xpGyDev, this.gyDev,
-            (int64) this.usedN * wid);
+        int64 widPad = Quant.q8kPadCols(wid);
+        if (widPad == wid) {
+            QuantKernel.q8kPackLaunchNoSync(this.xpGyDev, this.gyDev,
+                (int64) this.usedN * wid);
+        } else {
+            QuantKernel.q8kPackRowsLaunchNoSync(this.xpGyDev, this.gyDev,
+                (int64) this.usedN, wid, widPad);
+        }
         // Unit 51: down + combine in one launch (all used experts of an
         // output row in one wave, accumulating onto the residual).
         boolean fusedDown = false;
         if (MoeFfn.fusedDownOn && this.tailArmed) {
             fusedDown = this.downB.idDownCombineTail(acc, this.xpGyDev,
-                this.selDev, this.wSelDev, this.usedN, wid / 256L,
+                this.selDev, this.wSelDev, this.usedN, widPad / 256L,
                 this.tailOut, this.tailPk, this.tailNw, hid, this.tailEps,
                 this.tailForm, this.tailCounter);
             this.tailRan = fusedDown;
         } else if (MoeFfn.fusedDownOn) {
             fusedDown = this.downB.idDownCombine(acc, this.xpGyDev,
-                this.selDev, this.wSelDev, this.usedN, wid / 256L);
+                this.selDev, this.wSelDev, this.usedN, widPad / 256L);
         }
         this.tailArmed = false;
         if (!fusedDown) {
             this.downB.idLaunch(this.dyDev, this.xpGyDev, this.selDev,
-                this.usedN, wid / 256L);
+                this.usedN, widPad / 256L);
         }
         MoeFfn.phaseSync();
         MoeFfn.mtDownNs = MoeFfn.mtDownNs + (Clock.nanoTime() - td0);
