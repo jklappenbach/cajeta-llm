@@ -2049,7 +2049,7 @@ the rebuilt toolchain; the first profile of the morning was not usable.
       averages 5.6 ms (max 9.4) where the 64-row kernel took 11-27;
       `q6kWmmaIdMwKernel` is now 48% of the prefill at 37.8 ms per
       launch, which is 10.3's whole case. Filtered suite 96/96.
-- [ ] **10.3 Coding** — the Q6_K down banks widened FOR PREFILL:
+- [x] **10.3 Coding** — the Q6_K down banks widened FOR PREFILL:
       `q6kWidenLaunch` to the tile-major int8 slab plus a per-16 f32
       scale image (d*sc folded, `q6kScaleImageKernel`), budget-gated
       and refused by name; `symWmmaDeqIdMw8Kernel`, the widened feed
@@ -2061,6 +2061,17 @@ the rebuilt toolchain; the first profile of the morning was not usable.
       costs +8.4 GB on Mixtral instead (27.7 -> ~36 GB GTT); the
       trade is recorded here and the twin can be dropped after idle
       steps later if memory is asked for.
+      MEASURED 2026-09-15, Mixtral pp512, same binary: `nowide` 2064 ms
+      -> default 899 / 903 / 869 ms (248 -> 570 / 567 / 589 tok/s),
+      all 32 layers `wide gud`; `symWmmaDeqIdMw8Kernel` 8.6 ms per
+      launch where the packed Q6_K kernel took 37.8; the widen is a
+      one-time 110 ms at load. GTT high-water 38.2 GB (was ~28).
+      Perplexity, 256 decode positions after a 512 prefill: 3.6615
+      nowide -> 3.6686 default (+0.2%, the accumulation order of two
+      kernels changed; the gates hold both to the reassociation bar
+      element by element). Filtered suite 98/98. Gate tests: the
+      Q6_K widen + image + wide kernel vs the packed 64-row kernel,
+      and the f16-image form vs the 64-row widened kernel.
 - [ ] **10.4 Acceptance** — route records name the wide kernel on every
       Mixtral layer at 512 rows; the filtered suite green; perplexity
       on Mixtral (256 decode positions after a 512 prefill) unchanged
