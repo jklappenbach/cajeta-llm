@@ -1391,6 +1391,15 @@ weight), and its tail entries are simply zero.
       kilobytes of static tables plus sign/scale unpacking, which is a
       different problem from anything in this plan.
 
+      CLOSED 2026-09-15 by reference: that spec exists —
+      `specs/codebook-quants-spec.md`, plan `agents/codebook-quants-plan.md`
+      (Unit 34) — carrying the seven codebook types, TQ1_0/TQ2_0 with
+      the `bitnet` architecture and a cajeta converter (the TQ decoders
+      the paragraph above calls "~20 lines each" were an estimate; none
+      existed), and one resident layout for every packed format that
+      also retires this plan's repack copies. Nothing further is owed
+      here.
+
 SCOPE NOTE on 7.5.1 (2026-09-13). "Supported" for a new quant is FOUR things,
 not one: the block decoder in `Quant`, a host mat-vec, the bind gate in
 `Linear.canBindPacked`, and a device route. Adding only the decoder makes the
