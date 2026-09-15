@@ -1980,36 +1980,72 @@ and a whole layer per millisecond, and the summary printed "2535 kept,
 `gpu_pending_overflow` when it is non-zero. The numbers above are from
 the rebuilt toolchain; the first profile of the morning was not usable.
 
-- [ ] **10.1 TDD** — THE DISCRIMINATING PROBE, a `.cajeta` program under
-      `tmp/u10`: at Mixtral's two bank shapes (eight experts x 128 rows,
-      N=14336/K=4096 and N=4096/K=14336, ragged groups of 100-156 rows)
-      time four cells and report TFLOPS per cell: (a) `q4kWmmaIdMwKernel`
-      as shipped; (b) `symWmmaDeqMw8IdKernel` over the widened slab --
-      same 64-row tile, the B feed alone changed; (c) the dense
-      `q4kWmmaDeqMw8Kernel` per expert -- 128-token tile and widened
-      feed; (d) the dense packed-direct `q4kWmmaMwKernel` per expert --
-      128-token tile, packed feed. The 2x2 says whether the tile or the
-      feed carries the 2.5x, and whether a packed feed at the wide tile
-      is enough (it keeps GTT at 1.06x the file; a widened Mixtral is
-      ~45 GB). Same probe on Q6_K with its dense twins. Record the four
-      numbers here before 10.2 chooses.
-      The kernel gate for 10.2: bit identity against the shipped id
-      kernel at Mixtral's geometry (eight experts, ragged rows, both
-      shapes) and against the f64 sum; fixture rows vary per expert AND
-      per 16-row tile so a wrong map or a wrong tile shows.
-- [ ] **10.2 Coding** — the id GEMM at the wide tile: 128 tokens x 128
-      rows per workgroup, eight token tiles per wave, the chunk map at
-      128 rows (`moeGroupKernel` writes it beside the 64-row map; the
-      route picks by rows per expert), the B feed 10.1 chose. If the
-      probe says the packed feed cannot reach the widened one at the
-      wide tile, stage B through LDS once per superblock as llama.cpp
-      does and reuse it across the eight tiles -- the decode paid once
-      per 128 tokens, not once per wave.
-- [ ] **10.3 Coding** — the Q6_K twin at the same tile, its fragment
-      decode amortized the same way; and the ragged tail: experts with
-      fewer than 128 rows in the step keep the 64-row kernel (decode-
-      sized batches must not regress), the route record names which
-      kernel served each bank.
+- [x] **10.1 TDD** — THE DISCRIMINATING PROBE (`tmp/u10/src/.../IdGemmProbe`,
+      built by `tmp/u10/build-probe.sh` against the day's llama.cja):
+      eight experts x 128 rows, synthetic slabs, min of five, ms and
+      TFLOPS on 120 GFLOP per cell. MEASURED 2026-09-15, idle box:
+
+        gate/up  N=14336 K=4096  Q4_K   ms     TFLOPS
+          (a) id, packed feed, 64-row tile     9.62    12.5
+          (b) id, widened feed, 64-row tile    9.08    13.2
+          (c) dense widened, 128-row tile x8   4.95    24.3
+          (d) dense packed,  128-row tile x8   4.95    24.3
+        down     N=4096 K=14336  Q4_K
+          (a) id, packed, 64-row              16.22     7.4
+          (b) id, widened, 64-row              9.22    13.0
+          (c) dense widened, 128-row x8        6.21    19.4
+          (d) dense packed,  128-row x8        6.49    18.5
+        down     N=4096 K=14336  Q6_K
+          (a) id, packed, 64-row              32.90     3.7
+          (b) id, widened, 64-row              9.38    12.8
+          (c) dense widened, 128-row x8        7.46    16.1
+          (d) no dense packed-direct Q6_K kernel exists
+
+      READING: on gate/up the TILE is the whole 2x -- the packed feed
+      at the wide tile (d) equals the widened one (c) to 0.1%. On the
+      long-K down bank both matter: packed-vs-widened is 1.76x at the
+      64-row tile (a vs b) and the tile another 1.5x (b vs c), and
+      packed at the wide tile (d) is within 5% of widened. Q6_K's
+      packed feed is a 3.5x loss by itself (a vs b); its widened feed
+      at the 64-row tile already reaches 12.8. The in-bench launches
+      run 1.3-1.5x slower than (a) here (11-16 vs 9.6 gate; 21-27 vs
+      16.2 down; 39-50 vs 32.9 Q6_K): ragged groups of 100-156 rows
+      fill the 64-row chunks' tail tiles at 1-3 of 4.
+      DECISION: 10.2 builds the Q4_K id GEMM at the 128-row tile with
+      the PACKED feed (GTT stays at 1.06x the file). 10.3 serves the
+      Q6_K down banks from a WIDENED int8 slab with a per-16 f16 scale
+      image (9 bpw, the packed slab released as 9.4.4 does): Mixtral's
+      16 Q6_K down banks grow 6.2 -> 8.5 GB, the model 27.7 -> ~30 GB
+      GTT, against llama.cpp's 28.4 GB file-resident. Expected per
+      layer: 25 -> ~10 ms gate+up, 24 -> ~7 down Q4_K, 42 -> ~8 down
+      Q6_K; ~50 ms -> ~20 per layer, the prefill 2.07 s -> ~1.0 s if
+      the ragged tails behave, = ~500 tok/s against 542.7.
+      The kernel gate for 10.2/10.3 is 10.2.0 below.
+- [ ] **10.2.0 TDD** — `MoeIdMw8Test`: the wide-tile id kernels against
+      the shipped 64-row id kernels at Mixtral-shaped geometry scaled
+      down in K (eight experts, ragged rows 5/32/48/17/128/100/156/64
+      so every workgroup sees 1..8 active tiles and a ragged tail),
+      both bank shapes, Q4_K packed and Q6_K widened: agreement at the
+      reassociation bar with every output row live, and the row after
+      each group untouched. The fixture varies activations per 16-row
+      tile and per expert. RED until 10.2/10.3 land.
+- [ ] **10.2 Coding** — `q4kWmmaIdMw8Kernel`: the dense packed-direct
+      `q4kWmmaMwKernel` (128 tokens x 128 rows per workgroup, eight
+      token tiles per wave) indirected through a 128-row chunk map --
+      expert offset, row base, ragged end, `nAct` 1..8, the tail tile
+      stored guarded as the 64-row kernel does. `moeGroupKernel`
+      writes the 128-row map beside the 64-row one (`map128*`,
+      `meta[1]`); `ExpertBank.gemmIdBatchMw` takes the wide kernel
+      when the step's rows per expert make it worth it (the 64-row
+      kernel stays for decode-sized batches), and the route record
+      names which served each bank.
+- [ ] **10.3 Coding** — the Q6_K down banks widened: `q6kWidenLaunch`
+      to the tile-major int8 slab plus a per-16 f16 scale image
+      (d*sc folded), the packed slab released; `symWmmaDeqMw8IdKernel`
+      lifted to the 128-row tile with a scale granularity parameter
+      (32 for the symmetric formats, 16 for Q6_K), so one widened
+      wide-tile id kernel serves Q8_0/Q5_0/Q4_0 AND Q6_K. The widen
+      budget gate admits it or refuses by name.
 - [ ] **10.4 Acceptance** — route records name the wide kernel on every
       Mixtral layer at 512 rows; the filtered suite green; perplexity
       on Mixtral (256 decode positions after a 512 prefill) unchanged
