@@ -12,6 +12,10 @@ import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.io.WmmaKernel;
 import dev.cajeta.llm.model.ExpertBank;
+import cajeta.math.Tensor;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.MoeFfn;
 import dev.cajeta.llm.model.Linear;
 
 /**
@@ -363,5 +367,94 @@ public class MoeIdWidenTest {
             Assert.isTrue(nz > 64);
             r = r + 1;
         }
+    }
+
+    /**
+     * 9.4.4 — a widened bank releases its packed slab: nothing on the
+     * id routes reads it, so the bank's charge is the widened form
+     * alone, the batch and row routes still serve and say so, and the
+     * output is bit-identical to the arm that keeps the packed bytes.
+     * The k-quant banks beside it keep theirs.
+     */
+    @Test
+    public void widenedBankReleasesItsPackedSlab() {
+        if (!Linear.waveMv()) {
+            System.stdout.println("  (skipped: no resident MoE route on "
+                + Device.activeBackend() + ")");
+            return;
+        }
+        int64 rb0 = ExpertBank.residencyBudget();
+        int64 n = (int64) (MoeSharedBatchTest.ROWS * MoeSharedBatchTest.H);
+        int64 h = (int64) MoeSharedBatchTest.H;
+        float32[] a = heap float32[n];
+        float32[] b = heap float32[n];
+        int64 packedKept = 0;
+        int32 arm = 0;
+        while (arm < 2) {
+            ExpertBank.setFreePacked(arm == 0);
+            ExpertBank.setResidencyBudget(1152921504606846976L);
+            ExpertBank.resetResidency();
+            CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.Q8EXP);
+            MoeFfn moe = m.moeAt(0);
+            Tensor<float32> x #= MoeSharedBatchTest.probeRows();
+            KernelBuffer<float32> xDev #= heap KernelBuffer<float32>((uint64) n);
+            float32[] flat = heap float32[n];
+            float32[] xb = x.hostBuffer();
+            int64 i = 0;
+            while (i < n) {
+                flat[i] = xb[x.hostBase() + i];
+                i = i + 1;
+            }
+            xDev.upload(flat, n);
+            PrefillTap tap = heap PrefillTap();
+            Diag.register(tap);
+            boolean ok = moe.forwardBatchRes(xDev, MoeSharedBatchTest.ROWS, 0);
+            Diag.register(null);
+            if (!ok || !tap.sawContaining("moe-batch-route", "id GEMMs")) {
+                Assert.fail("arm " + arm + " did not take the id GEMM route: "
+                    + tap.namesOf("moe-batch-route"));
+            }
+            ExpertBank dn = moe.downBank();
+            ExpertBank gt = moe.gateBank();
+            Assert.isTrue(dn.widenSlabBytes() > 0L);
+            Assert.isTrue(gt.slabBytes() > 0L);
+            if (arm == 0) {
+                Assert.equals(dn.widenSlabBytes(), dn.slabBytes());
+                Assert.equals(dn.widenSlabBytes(), dn.residentBytes());
+                moe.batchObDev().download(a, n);
+                // The row route on the released bank, and it says so.
+                KernelBuffer<float32> acc #= heap KernelBuffer<float32>((uint64) h);
+                float32[] zero = heap float32[h];
+                i = 0;
+                while (i < h) { zero[i] = 0.0f; i = i + 1; }
+                acc.upload(zero, h);
+                PrefillTap rt = heap PrefillTap();
+                Diag.register(rt);
+                boolean rok = moe.forwardRowZeroSync(xDev, acc, 0);
+                Diag.register(null);
+                if (!rok || !rt.sawContaining("moe-row-route", "resident")) {
+                    Assert.fail("the row route refused the released bank: "
+                        + rt.namesOf("moe-row-route"));
+                }
+            } else {
+                packedKept = dn.slabBytes() - dn.widenSlabBytes();
+                Assert.isTrue(packedKept > 0L);
+                Assert.equals(dn.slabBytes(), dn.residentBytes());
+                moe.batchObDev().download(b, n);
+            }
+            arm = arm + 1;
+        }
+        ExpertBank.setFreePacked(true);
+        ExpertBank.setResidencyBudget(rb0);
+        int64 bad = 0;
+        int64 i2 = 0;
+        while (i2 < n) {
+            if (a[i2] != b[i2]) { bad = bad + 1; }
+            i2 = i2 + 1;
+        }
+        System.stdout.println("   packed slab released: " + packedKept
+            + " bytes; free-vs-keep mismatches " + bad);
+        Assert.isTrue(bad == 0L);
+        return;
     }
 }

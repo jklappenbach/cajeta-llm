@@ -1617,19 +1617,39 @@ on a 9 GB model -- along with the 180-launch layer.
       bank; the k-quant id kernels now also require `colsN % 256`,
       since they derive blocks-per-row from `cols/256` and a remainder
       would silently drop columns.
-- [ ] **9.4.4 Coding** — free the packed slab once its widened twin is
+- [x] **9.4.4 Coding** — free the packed slab once its widened twin is
       bound and no consumer remains. On this checkpoint the Q8_0/Q5_0
       down slabs are ~3.6 GB of GTT read by nothing on the default
       route; the widened form is what the id-GEMM reads, and the slot
       fallback that would want the packed bytes only runs when the
       widen was refused, which is exactly when the twin is absent.
+      DONE 2026-09-14 night: `ExpertBank.releasePacked` at the end of
+      `ensureWidenSlab` -- stream drained (the widen read the slab),
+      the word view and the slab dropped, the bank's charge refunded;
+      refused when a slot was already cut from the slab. The id
+      routes' gates (`ensureSlab`, `idMwReady`, `idGemmReady`,
+      `idLaunch`, `idDownCombineTail`) take the widened form as
+      "bound"; `isAdmitted` falls to the slots, so the slot fallback
+      refuses and the host path serves. `slabBytes` now reports the
+      bank-level charge, packed and widened, so MoeSlotTest's
+      `slots + slab == resident` invariant holds in every regime.
+      Arm: `setFreePacked` / bench `keeppacked`.
+      TEST (`MoeIdWidenTest.widenedBankReleasesItsPackedSlab`): the
+      Q8_0 down bank's charge equals its widened bytes, the k-quant
+      gate bank keeps its slab, the batch AND row routes still say
+      `resident`, and free-vs-keep outputs have 0 mismatches.
+      ACCEPTANCE, Qwen1.5-MoE, aligned mid-decode snapshot (prompt=512,
+      gen=600, sampled at 6.5 s):
+        kernel GTT   keep 17.66 GB -> free 14.01 GB   -3.65 GB (repeat 14.01)
+        engine-live  keep 16.91 GB -> free 13.28 GB   -3.63 GB
+        gap                 0.75 GB ->       0.73 GB   (the runtime baseline)
+      Route records unchanged (every decode row `resident: zero-sync id
+      mat-vecs + shared expert`, prefill `zero-sync id GEMMs`). No
+      kernel changed, so no timing leg. Filtered suite green; the
+      amdgpu full suite had also run green (862) before Julian's rule
+      landed -- no full suite from here until prefill AND decode reach
+      parity on the recent MoE checkpoints.
 
-- [ ] **9.4.1 TDD** — an expert bank at Q8_0 and one at Q5_0 agree with
-      the per-expert path, and are seen on `idPath`.
-- [ ] **9.4.2 Coding** — widen an expert slab to int8 + its f16 scale
-      image once, under `WidenBudget`, and an id-indirected form of the
-      widened-int8 GEMM.
-- [ ] **9.4.3 Coding** — `idMwReady`/`idGemmReady` admit a widened bank.
 
 ### 9.5 — the width remainder (the original Unit 9)
 

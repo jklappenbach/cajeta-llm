@@ -7,6 +7,7 @@ import dev.cajeta.llm.io.Checkpoint;
 import cajeta.io.file.MappedFile;
 import cajeta.math.Tensor;
 import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
 import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
@@ -50,6 +51,10 @@ public final class ExpertBank {
     static boolean widenSlabOn = true;   // unit 9.4 A/B arm
     public static void setWidenSlab(boolean on) {
         ExpertBank.widenSlabOn = on;
+    }
+    static boolean freePackedOn = true;  // unit 9.4.4 A/B arm
+    public static void setFreePacked(boolean on) {
+        ExpertBank.freePackedOn = on;
     }
     boolean slabRefused;
     int64 stride;      // bytes per expert
@@ -426,7 +431,7 @@ public final class ExpertBank {
      * indirected decode dispatch reads.
      */
     public boolean ensureSlab() {
-        if (this.slabDev != null) { return true; }
+        if (this.slabDev != null || this.deqSlabDev != null) { return true; }
         if (this.slabRefused) { return false; }
         if (this.map == null) { return false; }
         int64 charge = (int64) this.expertsN * this.stride;
@@ -478,8 +483,11 @@ public final class ExpertBank {
      *  accounting's counterpart to slotBytesOf (spec 15.21.3: the
      *  budget accounts at the granularity it binds). */
     public int64 slabBytes() {
-        if (this.slabDev == null) { return 0L; }
-        return (int64) this.expertsN * this.stride;
+        int64 b = this.widenSlabBytes();
+        if (this.slabDev != null) {
+            b = b + (int64) this.expertsN * this.stride;
+        }
+        return b;
     }
 
     /** The bound slab (valid only when {@link #slabReady}). */
@@ -602,7 +610,6 @@ public final class ExpertBank {
             KernelBuffer<float32> nOut, KernelBuffer<int8> pk,
             KernelBuffer<float32> nw, int64 dim, float32 eps, int32 form,
             KernelBuffer<int32> counter) {
-        if (this.slabDev == null) { return false; }
         if (this.symId()) {
             QuantKernel.symQ8IdDownCombineTailLaunchNoSync(hs,
                 this.deqSlabDev, this.scaleSlabDev, xp, sel, wSel, used,
@@ -611,6 +618,7 @@ public final class ExpertBank {
             ExpertBank.resHits = ExpertBank.resHits + (int64) used;
             return true;
         }
+        if (this.slabDev == null) { return false; }
         boolean ok = QuantKernel.idDownCombineTailLaunchNoSync(this.packedTy,
             hs, this.slabDev, xp, sel, wSel, used, (int64) this.rowsN,
             (int64) this.colsN, xRowBlocks, nOut, pk, nw, dim, eps, form,
@@ -623,9 +631,9 @@ public final class ExpertBank {
 
     /** Whether {@link #gemmIdBatchMw} can serve this bank. */
     public boolean idMwReady() {
-        if (this.slabDev == null || this.slabW == null) { return false; }
         if (this.rowsN % 128 != 0) { return false; }
         if (this.deqSlabDev != null) { return true; }
+        if (this.slabDev == null || this.slabW == null) { return false; }
         // The k-quant id kernels derive blocks-per-row from cols/256:
         // a remainder width would silently drop its last columns.
         return (this.packedTy == 12 || this.packedTy == 14)
@@ -683,7 +691,30 @@ public final class ExpertBank {
             rows, cols, colsPad, blkBytes);
         this.residentB = this.residentB + total;
         ExpertBank.resUsed = ExpertBank.resUsed + total;
+        this.releasePacked();
         return true;
+    }
+
+    /**
+     * Unit 9.4.4: the packed slab has no reader once its widened twin
+     * is bound -- the id routes read the twin, and the slot fallback
+     * that wants packed bytes only runs when the widen was refused,
+     * which is when the twin is absent. Freed here, after the stream
+     * has drained the widen that read it, unless a slot was already
+     * cut from it. On Qwen1.5-MoE this is the 24 Q8_0/Q5_0 down slabs,
+     * ~3.6 GB of GTT held for nothing.
+     */
+    void releasePacked() {
+        if (this.slabDev == null || this.deqSlabDev == null) { return; }
+        if (!ExpertBank.freePackedOn || this.slots != null) { return; }
+        int64 charge = (int64) this.expertsN * this.stride;
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        this.slabW = null;
+        this.slabDev = null;
+        this.residentB = this.residentB - charge;
+        ExpertBank.resUsed = ExpertBank.resUsed - charge;
+        return;
     }
 
     /** The widened slab and its scale image — BORROWS of interior
@@ -731,8 +762,8 @@ public final class ExpertBank {
 
     /** Whether {@link #gemmIdBatch} can serve this bank. */
     public boolean idGemmReady() {
-        if (this.slabDev == null) { return false; }
         if (this.deqSlabDev != null) { return true; }
+        if (this.slabDev == null) { return false; }
         return (this.packedTy == 12 || this.packedTy == 14)
             && this.colsN % 256 == 0;
     }
@@ -771,7 +802,6 @@ public final class ExpertBank {
     public boolean idLaunch(KernelBuffer<float32> y,
             KernelBuffer<int8> xp, KernelBuffer<int32> sel, int32 used,
             int64 xRowBlocks) {
-        if (this.slabDev == null) { return false; }
         if (this.symId()) {
             QuantKernel.symQ8IdMatVecLaunchNoSync(y, this.deqSlabDev,
                 this.scaleSlabDev, xp, sel, used, (int64) this.rowsN,
@@ -779,6 +809,7 @@ public final class ExpertBank {
             ExpertBank.resHits = ExpertBank.resHits + (int64) used;
             return true;
         }
+        if (this.slabDev == null) { return false; }
         boolean ok = QuantKernel.idMatVecLaunchNoSync(this.packedTy, y,
             this.slabDev, xp, sel, used, (int64) this.rowsN,
             (int64) this.colsN, xRowBlocks);
