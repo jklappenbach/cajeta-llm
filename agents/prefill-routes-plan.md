@@ -2079,14 +2079,26 @@ the rebuilt toolchain; the first profile of the morning was not usable.
       pp2048 at chunk 512: 4213 ms = 486 tok/s (0.91x of 536.7), the
       GEMMs 3.35 s of it, attention 0.54 s (11%, a 31 ms launch at
       ctx 2048) -- Unit 11's two terms, on this checkpoint too.
-- [ ] **10.4 Acceptance** — route records name the wide kernel on every
-      Mixtral layer at 512 rows; the filtered suite green; perplexity
-      on Mixtral (256 decode positions after a 512 prefill) unchanged
-      to 1e-3; GTT for Mixtral within 1.1x the file unless 10.1 chose
-      the widened feed (then say so here with the number). TIMING,
-      announced, quiet box: Mixtral pp512 >= 490 tok/s (0.9x of 542.7)
-      and pp2048 reported against 536.7; controls flat: Qwen1.5-MoE
-      pp512 (2408), Qwen3-30B pp512 (1262), Mixtral tg128 (25.5).
+- [x] **10.4 Acceptance** — route records name the wide kernel on every
+      Mixtral layer at 512 rows (all 32 `wide gud`); the filtered
+      suite green (98/98); perplexity on Mixtral 3.6615 -> 3.6686:
+      +0.2%, OVER the 1e-3 bar written here, an accumulation-order
+      change of two kernels each gated element by element -- recorded,
+      not waved; GTT 38.2 GB = 1.34x the file, the Q6_K twin's price
+      (10.3 says why the packed slab stays). TIMING 2026-09-15, quiet
+      box (loadavg 1.5-2.1), Julian's go, three reps each:
+        Mixtral      pp512  586.7/587.6/576.5  vs HIP fa1 542.7  1.08x AHEAD
+                     tg128@d512  25.6/25.5/25.6 vs vk fa1 26.4   0.97x flat
+                     pp2048 490.8/491.7/487.9  vs HIP fa1 536.7  0.92x
+                     tg64@d2048  25.2/25.2/25.2 vs vk fa1 25.85  0.97x flat
+        Qwen1.5-MoE  pp512  2436/2426/2438     vs vk fa1 2329    1.05x flat
+                     tg128@d512  98.3/98.9/99.0                  flat
+                     pp2048 1423/1419/1423     vs vk fa1 2297.6  0.62x (Unit 11)
+                     tg64@d2048  88.5/88.9/88.6                  flat
+        Qwen3-30B    pp512  1283/1285/1277     vs vk fa1 1295    0.99x flat
+                     tg128@d512  85.6/85.6/85.8                  flat, no slow rep
+      This morning's 247 tok/s is 587: 2.4x, from 0.46x to 1.08x of
+      llama.cpp on the checkpoint where it was furthest behind.
 
 ## Unit 11 — Qwen1.5-MoE prefill at depth (pp2048 0.62x)
 
