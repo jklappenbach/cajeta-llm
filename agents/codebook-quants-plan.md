@@ -108,9 +108,33 @@ every timing leg and wait for the go; filtered suite only
 - [x] 1.3.1 Filtered suite green.
 - [ ] 1.3.2 8B Q8_0 legs (announced, quiet box): pp512 / tg128 within
       noise of the 2026-09-14 rows; bit gate first.
-- [ ] 1.3.3 Qwen3-Coder-30B Q8_0: resident weight bytes equal the file's
+- [x] 1.3.3 Qwen3-Coder-30B Q8_0: resident weight bytes equal the file's
       (ledger), against the two-copy number measured before the change;
       load time not worse. Both numbers recorded here.
+      MEASURED 2026-09-15 with `CAJETA_XPU_ALLOC_TRACE`, prompt 512 /
+      gen 8, the 95608c6 bench binary against this tree
+      (`tmp/cbq/resident30b.sh`, ledgers under `tmp/cbq/`):
+
+        before  peak 34.62 GB  steady 34.41 GB  load 19.0 s
+                prefill 1236 tok/s  decode 55.5 tok/s (8 tokens)
+        after   peak 34.66 GB  steady 34.45 GB  load 11.4 s
+                prefill 1259 tok/s  decode 48.6 tok/s (8 tokens)
+
+      The resident number did not move because the two-copy case never
+      arose on this workload: neither ledger holds an `ensureCoopW`
+      allocation. The Q8_0 projections prefill through the int8 widen
+      (`deqFor`), and the expert slab is single-copy once its widened
+      twin exists (the packed slab is released). The file is 32.48 GB;
+      the excess is the int8 widen twin (0.96 GB for the projections;
+      the 30.8 GB expert twin replaces the packed slab) plus 0.8 GB of
+      batch scratch. That twin is the one-copy rule's remaining case and
+      is item 8.2.2. Load fell by 40 % because the split streams the slab
+      from the mapping in chunks and no 30 GB host array exists any
+      more (a first cut copied it byte by byte and doubled the load
+      time; fixed before this record). Host RSS reads 32.3 GB against
+      23.8 because the mapping's pages stay resident in place of the
+      freed host array. The 8-token decode delta is below what this
+      instrument resolves; 1.3.2 settles it.
 
 ## Unit 2 — Reference material: fixtures, tables, names, arbiter files (spec §2, §3.5, §4.1, §9)
 
@@ -315,6 +339,14 @@ every timing leg and wait for the go; filtered suite only
       `blockRepack2Kernel`, `blockPadKernel`, `ensureQ6Pad`, `coopDev`
       and `splitOn` removed; the split unconditional; `coopBlockWords`
       the payload stride everywhere.
+- [ ] 8.2.2 The int8 widen twin of a Q8_0 weight — `deqFor(Q8_0)` builds
+      a tile-major `deqDev` (and `ensureWidenSlab` a `deqSlabDev`) that
+      the Mw8 GEMM and the sym id-kernels read — is a second copy of
+      int8 data. Those kernels read the split payload in place and
+      `deqFor(Q8_0)` turns false. Found by 1.3.3 on the 30B Q8_0: the
+      twin is the whole excess over file bytes there, and the coop copy
+      the split retires was never built because the widen route served
+      prefill.
 
 ### 8.3 Acceptance
 - [ ] 8.3.1 Filtered suite green.

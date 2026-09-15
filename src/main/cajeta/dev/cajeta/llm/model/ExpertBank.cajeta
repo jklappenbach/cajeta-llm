@@ -41,6 +41,9 @@ public final class ExpertBank {
     // dispatch reads — and per-expert slots become zero-copy SLICES of
     // it. One admission, one charge, one upload per bank. ──
     KernelBuffer<int8> slabDev;
+    // The slab's split scale array for a `Quant.splitOn` format (spec
+    // §10); null otherwise. `slabDev` is then the payload slab.
+    KernelBuffer<int8> slabScalesDev;
     KernelBuffer<int32> slabW;         // unit 44: word view of the slab
     // Unit 9.4: the slab widened ONCE to int8 with its f16 scale image,
     // bound beside the packed slab under WidenBudget. What the
@@ -462,13 +465,23 @@ public final class ExpertBank {
             }
             this.slotOwn = heap ArrayList<Linear>();
         }
-        int8[] hostSlab #= heap int8[charge];
-        this.map.read(this.mapOff, hostSlab, 0L, charge);
         // Four spare bytes past the last block: the Q6_K multi-wave
         // id-GEMM assembles its unaligned words through a funnel that
         // reads the aligned word after the bytes it wants.
-        this.slabDev #= heap KernelBuffer<int8>((uint64) (charge + 4L));
-        this.slabDev.upload(hostSlab, charge);
+        if (Quant.splitOn(this.packedTy)) {
+            int64 nb = charge / (int64) Quant.blockBytes(this.packedTy);
+            this.slabDev #= heap KernelBuffer<int8>((uint64)
+                (nb * (int64) Quant.payloadBytes(this.packedTy) + 4L));
+            this.slabScalesDev #= heap KernelBuffer<int8>((uint64)
+                (nb * (int64) Quant.scaleBytes(this.packedTy)));
+            Linear.splitStreamFromMap(this.map, this.mapOff, charge,
+                this.packedTy, this.slabDev, this.slabScalesDev);
+        } else {
+            int8[] hostSlab #= heap int8[charge];
+            this.map.read(this.mapOff, hostSlab, 0L, charge);
+            this.slabDev #= heap KernelBuffer<int8>((uint64) (charge + 4L));
+            this.slabDev.upload(hostSlab, charge);
+        }
         this.slabW #= this.slabDev.wordView();
         this.residentB = this.residentB + charge;
         ExpertBank.resUsed = ExpertBank.resUsed + charge;
@@ -722,8 +735,13 @@ public final class ExpertBank {
                 cols, colsPad);
         }
         WmmaKernel.deqPadZeroLaunch(this.deqSlabDev, rows, cols, colsPad);
-        WmmaKernel.symScaleImageLaunch(this.scaleSlabDev, this.slabDev,
-            rows, cols, colsPad, blkBytes);
+        if (Quant.splitOn(ty)) {
+            WmmaKernel.symScaleImageLaunch(this.scaleSlabDev,
+                this.slabScalesDev, rows, cols, colsPad, 2L);
+        } else {
+            WmmaKernel.symScaleImageLaunch(this.scaleSlabDev, this.slabDev,
+                rows, cols, colsPad, blkBytes);
+        }
         this.residentB = this.residentB + total;
         ExpertBank.resUsed = ExpertBank.resUsed + total;
         this.releasePacked();
@@ -747,6 +765,7 @@ public final class ExpertBank {
         s.sync();
         this.slabW = null;
         this.slabDev = null;
+        this.slabScalesDev = null;
         this.residentB = this.residentB - charge;
         ExpertBank.resUsed = ExpertBank.resUsed - charge;
         return;
@@ -919,10 +938,22 @@ public final class ExpertBank {
             this.slotCharge #= heap int64[this.expertsN];
         }
         Linear sl = heap Linear(this.colsN, this.rowsN);
-        KernelBuffer<int8> sliceV #= this.slabDev.slice(
-            (uint64) ((int64) e * this.stride),
-            (uint64) this.stride);
-        sl.bindExpertSlice(this.packedTy, this.stride, #sliceV);
+        if (Quant.splitOn(this.packedTy)) {
+            int64 nbE = this.stride / (int64) Quant.blockBytes(this.packedTy);
+            int64 sp = nbE * (int64) Quant.payloadBytes(this.packedTy);
+            int64 ss = nbE * (int64) Quant.scaleBytes(this.packedTy);
+            KernelBuffer<int8> sliceP #= this.slabDev.slice(
+                (uint64) ((int64) e * sp), (uint64) sp);
+            KernelBuffer<int8> sliceS #= this.slabScalesDev.slice(
+                (uint64) ((int64) e * ss), (uint64) ss);
+            sl.bindExpertSlicePair(this.packedTy, this.stride, #sliceP,
+                #sliceS);
+        } else {
+            KernelBuffer<int8> sliceV #= this.slabDev.slice(
+                (uint64) ((int64) e * this.stride),
+                (uint64) this.stride);
+            sl.bindExpertSlice(this.packedTy, this.stride, #sliceV);
+        }
         this.slots[e] = sl;
         this.slotOwn.add(#sl);
         this.slotCharge[e] = sl.devWeightBytes();

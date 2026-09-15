@@ -49,7 +49,7 @@ public final class Linear extends InfModule {
 
     // ── the routed (kernel) path's resident state ───────────────────────
     //
-    // `packedDev` is the one that matters: the weight is the only operand
+    // `payloadDev` is the one that matters: the weight is the only operand
     // that does not change between tokens, so it is uploaded ONCE and kept.
     // Uploading it per call would cost more than the mat-vec it feeds.
     //
@@ -61,13 +61,17 @@ public final class Linear extends InfModule {
     // call). The copies are 2·(inDim + outDim) floats against a weight read
     // of inDim·outDim/2 bytes; they go away when the activations themselves
     // become device-resident.
-    KernelBuffer<int8> packedDev;
-    // Dword view of packedDev for the mmq route (created lazily, released
-    // with the layer). Non-owning: packedDev holds the storage.
+    KernelBuffer<int8> payloadDev;
+    // The split scale array of a `Quant.splitOn` format (spec §10): one
+    // resident layout, the payload above dword-clean at its file bytes,
+    // the lone scale field here. Null for a format not yet split.
+    KernelBuffer<int8> scalesDev;
+    // Dword view of payloadDev for the mmq route (created lazily, released
+    // with the layer). Non-owning: payloadDev holds the storage.
     KernelBuffer<int32> packedW;
     // Q6_K mmq route: 212-byte-padded copy of the packed tensor (Q6's
     // 210-byte blocks are not dword-aligned) plus its word view. Costs a
-    // duplicate of the Q6 tensor; packedDev keeps the 210-stride the
+    // duplicate of the Q6 tensor; payloadDev keeps the 210-stride the
     // decode mat-vecs read.
     KernelBuffer<int8> q6PadDev;
     KernelBuffer<int32> q6PadW;
@@ -697,7 +701,8 @@ public final class Linear extends InfModule {
         this.packedTy = -1;
         this.inDim = inDim;
         this.outDim = outDim;
-        this.packedDev = null;
+        this.payloadDev = null;
+        this.scalesDev = null;
         this.packedW = null;
         this.q6PadW = null;
         this.q6PadDev = null;
@@ -1364,7 +1369,7 @@ public final class Linear extends InfModule {
     // 15.19's load-bearing constraint. All the batched machinery
     // (matmulBatchKeep's route tree, the shared activation staging,
     // yBatch) works unchanged because ensureDevice early-returns on
-    // the preallocated packedDev.
+    // the preallocated payloadDev.
     int8[] winStage;            // host staging, [winLen]
     int64 winLen;
 
@@ -1374,7 +1379,7 @@ public final class Linear extends InfModule {
         this.packedTy = ty;
         this.winLen = len;
         this.winStage = heap int8[len];
-        this.packedDev #= heap KernelBuffer<int8>((uint64) len);
+        this.allocResident(len);
         return;
     }
 
@@ -1395,11 +1400,11 @@ public final class Linear extends InfModule {
         this.packedTy = ty;
         this.winLen = len;
         this.slotMode = true;
-        this.packedDev #= heap KernelBuffer<int8>((uint64) len);
+        this.allocResident(len);
         this.devWBytes = this.devWBytes + len;
         // Decode readiness: yScratch/yDev and the wave-route flags,
         // which ensureDevice would have latched had it allocated
-        // packedDev itself (its early return skips them for slots).
+        // payloadDev itself (its early return skips them for slots).
         this.finishDeviceSetup();
         return;
     }
@@ -1413,14 +1418,26 @@ public final class Linear extends InfModule {
         this.packedTy = ty;
         this.winLen = len;
         this.slotMode = true;
-        this.packedDev #= #sliceV;
+        this.payloadDev #= #sliceV;
+        this.finishDeviceSetup();
+        return;
+    }
+
+    /** A slot over a split slab: views of both resident arrays. */
+    void bindExpertSlicePair(int32 ty, int64 len,
+            #KernelBuffer<int8> sliceP, #KernelBuffer<int8> sliceS) {
+        this.packedTy = ty;
+        this.winLen = len;
+        this.slotMode = true;
+        this.payloadDev #= #sliceP;
+        this.scalesDev #= #sliceS;
         this.finishDeviceSetup();
         return;
     }
 
     /** The slot's one admission upload, from the bank's staging. */
     void stageExpertSlot(int8[] bytes) {
-        this.packedDev.upload(bytes);
+        this.uploadSplit(bytes, (int64) bytes.count());
         return;
     }
 
@@ -1451,10 +1468,10 @@ public final class Linear extends InfModule {
     /** As {@link #stageExpertWindow} but the caller already filled
      *  `winStage` (ExpertBank reads its mapping straight into it). */
     void stageExpertWindowStaged() {
-        this.packedDev.upload(this.winStage);
+        this.uploadSplit(this.winStage, this.winLen);
         if (this.q6PadDev != null) {
             int64 nb6 = (int64) this.outDim * ((int64) this.inDim / 256L);
-            QuantKernel.q6kPadLaunch(this.q6PadDev, this.packedDev, nb6);
+            QuantKernel.q6kPadLaunch(this.q6PadDev, this.payloadDev, nb6);
         }
         if (this.coopDev != null) {
             int64 nBlocks = (int64) this.outDim * ((int64) this.inDim
@@ -1462,11 +1479,11 @@ public final class Linear extends InfModule {
             int32 sb = Quant.blockBytes(this.packedTy);
             int32 db = QuantKernel.coopBlockWords(this.packedTy) * 4;
             if (this.packedTy == Quant.GG_Q3_K) {
-                QuantKernel.blockPadLaunch(this.coopDev, this.packedDev,
+                QuantKernel.blockPadLaunch(this.coopDev, this.payloadDev,
                     nBlocks, sb, db);
             } else {
                 QuantKernel.blockRepack2Launch(this.coopDev,
-                    this.packedDev, nBlocks, sb, db);
+                    this.payloadDev, nBlocks, sb, db);
             }
         }
         if (this.deqDev != null) {
@@ -1477,7 +1494,7 @@ public final class Linear extends InfModule {
 
     void ensurePackedW() {
         if (this.packedW == null) {
-            this.packedW #= this.packedDev.wordView();
+            this.packedW #= this.payloadDev.wordView();
         }
     }
 
@@ -1488,7 +1505,7 @@ public final class Linear extends InfModule {
             this.devWBytes = this.devWBytes + nBlocks * 212L;
             this.q6PadDev #= heap KernelBuffer<int8>(
                 (uint64) (nBlocks * 212L));
-            QuantKernel.q6kPadLaunch(this.q6PadDev, this.packedDev,
+            QuantKernel.q6kPadLaunch(this.q6PadDev, this.payloadDev,
                 nBlocks);
             this.q6PadW #= this.q6PadDev.wordView();
         }
@@ -1502,7 +1519,7 @@ public final class Linear extends InfModule {
         if (this.coopW != null) { return; }
         int32 ty = this.packedTy;
         if (!QuantKernel.coopNeedsRepack(ty)) {
-            this.coopW #= this.packedDev.wordView();
+            this.coopW #= this.payloadDev.wordView();
             return;
         }
         if (ty == Quant.GG_Q6_K) {
@@ -1520,12 +1537,12 @@ public final class Linear extends InfModule {
         if (ty == Quant.GG_Q3_K) {
             // Stride-only pad: Q3_K's hmask/qs/scales/d already sit on
             // dword boundaries, the 110-byte block stride does not.
-            QuantKernel.blockPadLaunch(this.coopDev, this.packedDev,
+            QuantKernel.blockPadLaunch(this.coopDev, this.payloadDev,
                 nBlocks, sb, db);
         } else {
             // Q4_0/Q5_0/Q8_0: f16 scale, then the payload moved from
             // byte 2 to byte 4 so it is dword-addressable.
-            QuantKernel.blockRepack2Launch(this.coopDev, this.packedDev,
+            QuantKernel.blockRepack2Launch(this.coopDev, this.payloadDev,
                 nBlocks, sb, db);
         }
         this.coopW #= this.coopDev.wordView();
@@ -2138,13 +2155,13 @@ public final class Linear extends InfModule {
                 if (Linear.part32On) {
                     this.sayRoute(1, "q4 deqMw8Part");
                     WmmaKernel.q4kWmmaDeqMw8PartLaunch(this.yBatch,
-                        this.packedDev, this.deqDev, Linear.btXp,
+                        this.payloadDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else {
                     this.sayRoute(2, "q4 deqMw8");
                     WmmaKernel.q4kWmmaDeqMw8Launch(this.yBatch,
-                        this.packedDev, this.deqDev, Linear.btXp,
+                        this.payloadDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 }
@@ -2153,7 +2170,7 @@ public final class Linear extends InfModule {
                         (int64) this.outDim)) {
                 this.sayRoute(4, "q4 deqMw4");
                 WmmaKernel.q4kWmmaDeqMw4Launch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else if (Linear.q4MwOn
@@ -2161,7 +2178,7 @@ public final class Linear extends InfModule {
                         (int64) this.outDim)) {
                 this.sayRoute(8, "q4 deqMw");
                 WmmaKernel.q4kWmmaDeqMwLaunch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else if (Linear.q4N4On
@@ -2169,7 +2186,7 @@ public final class Linear extends InfModule {
                         (int64) this.outDim)) {
                 this.sayRoute(16, "q4 deqN4");
                 WmmaKernel.q4kWmmaDeqN4Launch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else if (Linear.q4T2On
@@ -2177,18 +2194,18 @@ public final class Linear extends InfModule {
                         (int64) this.outDim)) {
                 this.sayRoute(32, "q4 deqT2");
                 WmmaKernel.q4kWmmaDeqT2Launch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else if (Linear.q4EpiOn) {
                 this.sayRoute(64, "q4 deqEpi");
                 WmmaKernel.q4kWmmaDeqEpiLaunch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
                 this.sayRoute(128, "q4 deq");
-                WmmaKernel.q4kWmmaDeqLaunch(this.yBatch, this.packedDev,
+                WmmaKernel.q4kWmmaDeqLaunch(this.yBatch, this.payloadDev,
                     this.deqDev, Linear.btXp, (int64) rows,
                     (int64) this.outDim, (int64) this.inDim);
             }
@@ -2200,17 +2217,17 @@ public final class Linear extends InfModule {
                 // fromWords reads the nibbles as int32 words off the
                 // packed weight — the same word view the mmq route takes.
                 this.ensurePackedW();
-                WmmaKernel.q4kWmmaMwLaunch(this.yBatch, this.packedDev,
+                WmmaKernel.q4kWmmaMwLaunch(this.yBatch, this.payloadDev,
                     this.packedW, Linear.btXp, (int64) rows,
                     (int64) this.outDim, (int64) this.inDim);
             } else if (Linear.q4EpiOn) {
                 this.sayRoute(256, "q4 epi");
-                WmmaKernel.q4kWmmaEpiLaunch(this.yBatch, this.packedDev,
+                WmmaKernel.q4kWmmaEpiLaunch(this.yBatch, this.payloadDev,
                     Linear.btXp, (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
                 this.sayRoute(512, "q4 plain");
-                WmmaKernel.q4kWmmaLaunch(this.yBatch, this.packedDev,
+                WmmaKernel.q4kWmmaLaunch(this.yBatch, this.payloadDev,
                     Linear.btXp, (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
@@ -2229,36 +2246,36 @@ public final class Linear extends InfModule {
                 if (mw8 && Linear.part32On) {
                     this.sayRoute(33554432, "q6 deqMw8Part");
                     WmmaKernel.q6kWmmaDeqMw8PartLaunch(this.yBatch,
-                        this.packedDev, this.deqDev, Linear.btXp,
+                        this.payloadDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else if (mw8) {
                     this.sayRoute(33554432, "q6 deqMw8");
                     WmmaKernel.q6kWmmaDeqMw8Launch(this.yBatch,
-                        this.packedDev, this.deqDev, Linear.btXp,
+                        this.payloadDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else if (Linear.part32On) {
                     this.sayRoute(67108864, "q6 deqMw4Part");
                     WmmaKernel.q6kWmmaDeqMw4PartLaunch(this.yBatch,
-                        this.packedDev, this.deqDev, Linear.btXp,
+                        this.payloadDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else {
                     this.sayRoute(67108864, "q6 deqMw4");
                     WmmaKernel.q6kWmmaDeqMw4Launch(this.yBatch,
-                        this.packedDev, this.deqDev, Linear.btXp,
+                        this.payloadDev, this.deqDev, Linear.btXp,
                         (int64) rows, (int64) this.outDim,
                         (int64) this.inDim);
                 }
             } else if (Linear.epiOn) {
                 this.sayRoute(134217728, "q6 epi");
-                WmmaKernel.q6kWmmaEpiLaunch(this.yBatch, this.packedDev,
+                WmmaKernel.q6kWmmaEpiLaunch(this.yBatch, this.payloadDev,
                     Linear.btXp, (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
                 this.sayRoute(268435456, "q6 plain");
-                WmmaKernel.q6kWmmaLaunch(this.yBatch, this.packedDev,
+                WmmaKernel.q6kWmmaLaunch(this.yBatch, this.payloadDev,
                     Linear.btXp, (int64) rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
@@ -2268,13 +2285,13 @@ public final class Linear extends InfModule {
             if (Linear.part32On) {
                 this.sayRoute(2097152, "q5_k deqMw8Part");
                 WmmaKernel.q5kWmmaDeqMw8PartLaunch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
                 this.sayRoute(2097152, "q5_k deqMw8");
                 WmmaKernel.q5kWmmaDeqMw8Launch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
@@ -2311,13 +2328,13 @@ public final class Linear extends InfModule {
             if (Linear.part32On) {
                 this.sayRoute(8388608, "q2_k deqMw8Part");
                 WmmaKernel.q2kWmmaDeqMw8PartLaunch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
                 this.sayRoute(8388608, "q2_k deqMw8");
                 WmmaKernel.q2kWmmaDeqMw8Launch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
@@ -2327,13 +2344,13 @@ public final class Linear extends InfModule {
             if (Linear.part32On) {
                 this.sayRoute(16777216, "q3_k deqMw8Part");
                 WmmaKernel.q3kWmmaDeqMw8PartLaunch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
                 this.sayRoute(16777216, "q3_k deqMw8");
                 WmmaKernel.q3kWmmaDeqMw8Launch(this.yBatch,
-                    this.packedDev, this.deqDev, Linear.btXp,
+                    this.payloadDev, this.deqDev, Linear.btXp,
                     mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
@@ -2378,8 +2395,8 @@ public final class Linear extends InfModule {
             // (ensureBtXh / ensureBatchStage) before freeing a buffer an
             // in-flight GEMM may still read.
             QuantKernel.coopBatchLaunchNoSync(this.packedTy, this.yBatch,
-                this.coopW, Linear.btXh, padRows, (int64) this.outDim,
-                (int64) this.inDim);
+                this.coopW, this.scalesDev, Linear.btXh, padRows,
+                (int64) this.outDim, (int64) this.inDim);
         } else if (Linear.mmqOn && this.packedTy == Quant.GG_Q4_K
                 && Linear.backendIsVulkan()) {
             // The LDS-tiled dp4a GEMM (q4kQ8MmqKernel): reads dwords only,
@@ -2401,7 +2418,7 @@ public final class Linear extends InfModule {
         } else {
             this.sayRoute(1024, "dotAccum ty=" + this.packedTy);
             QuantKernel.batchMatMulLaunch(this.packedTy, this.yBatch,
-                this.packedDev, Linear.btXp, (int64) rows,
+                this.payloadDev, Linear.btXp, (int64) rows,
                 (int64) this.outDim, (int64) this.inDim);
         }
         int64 t1 = Clock.nanoTime();
@@ -2549,9 +2566,9 @@ public final class Linear extends InfModule {
         this.fusedOut = (int64) this.outDim + (int64) b.outDim;
         this.fusedPackedDev #= heap KernelBuffer<int8>(
             (uint64) (an + bn));
-        WmmaKernel.concatI8Launch(this.fusedPackedDev, this.packedDev,
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, this.payloadDev,
             an, 0L);
-        WmmaKernel.concatI8Launch(this.fusedPackedDev, b.packedDev,
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, b.payloadDev,
             bn, an);
         int64 n = this.fusedOut * (int64) this.inDim;
         // 8.3.1: the fused widen is a widen too — same bytes per weight,
@@ -2576,11 +2593,11 @@ public final class Linear extends InfModule {
             + (int64) c.outDim;
         this.fusedPackedDev #= heap KernelBuffer<int8>(
             (uint64) (an + bn + cn));
-        WmmaKernel.concatI8Launch(this.fusedPackedDev, this.packedDev,
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, this.payloadDev,
             an, 0L);
-        WmmaKernel.concatI8Launch(this.fusedPackedDev, b.packedDev,
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, b.payloadDev,
             bn, an);
-        WmmaKernel.concatI8Launch(this.fusedPackedDev, c.packedDev,
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, c.payloadDev,
             cn, an + bn);
         int64 n = this.fusedOut * (int64) this.inDim;
         WidenBudget.charge(n + an + bn + cn);
@@ -2697,7 +2714,7 @@ public final class Linear extends InfModule {
     }
 
     /** Build the widened int8 copy once (10.12.16; Q6 10.12.27).
-     *  Caller holds `ensureDevice()` already done — `packedDev` is the
+     *  Caller holds `ensureDevice()` already done — `payloadDev` is the
      *  source. Both widens write the same tile-major layout. */
     void ensureDeq() {
         if (this.deqDev != null) { return; }
@@ -2802,30 +2819,30 @@ public final class Linear extends InfModule {
      *  re-run it over freshly staged bytes without reallocating. */
     void runDeqWiden() {
         if (this.packedTy == Quant.GG_Q6_K) {
-            WmmaKernel.q6kWidenLaunch(this.deqDev, this.packedDev,
+            WmmaKernel.q6kWidenLaunch(this.deqDev, this.payloadDev,
                 (int64) this.outDim, (int64) this.inDim);
         } else if (this.packedTy == Quant.GG_Q5_K) {
-            WmmaKernel.q5kWidenLaunch(this.deqDev, this.packedDev,
+            WmmaKernel.q5kWidenLaunch(this.deqDev, this.payloadDev,
                 (int64) this.outDim, (int64) this.inDim);
         } else if (this.packedTy == Quant.GG_Q8_0) {
-            WmmaKernel.q80WidenLaunch(this.deqDev, this.packedDev,
+            WmmaKernel.q80WidenLaunch(this.deqDev, this.payloadDev,
                 (int64) this.outDim, (int64) this.inDim, this.deqCols());
             this.runScaleImage(34L);
         } else if (this.packedTy == Quant.GG_Q2_K) {
-            WmmaKernel.q2kWidenLaunch(this.deqDev, this.packedDev,
+            WmmaKernel.q2kWidenLaunch(this.deqDev, this.payloadDev,
                 (int64) this.outDim, (int64) this.inDim);
         } else if (this.packedTy == Quant.GG_Q3_K) {
-            WmmaKernel.q3kWidenLaunch(this.deqDev, this.packedDev,
+            WmmaKernel.q3kWidenLaunch(this.deqDev, this.payloadDev,
                 (int64) this.outDim, (int64) this.inDim);
         } else if (this.packedTy == Quant.GG_Q4_K) {
-            WmmaKernel.q4kWidenLaunch(this.deqDev, this.packedDev,
+            WmmaKernel.q4kWidenLaunch(this.deqDev, this.payloadDev,
                 (int64) this.outDim, (int64) this.inDim);
         } else if (this.packedTy == Quant.GG_Q5_0) {
-            WmmaKernel.q50WidenLaunch(this.deqDev, this.packedDev,
+            WmmaKernel.q50WidenLaunch(this.deqDev, this.payloadDev,
                 (int64) this.outDim, (int64) this.inDim, this.deqCols());
             this.runScaleImage(22L);
         } else if (this.packedTy == Quant.GG_Q4_0) {
-            WmmaKernel.q40WidenLaunch(this.deqDev, this.packedDev,
+            WmmaKernel.q40WidenLaunch(this.deqDev, this.payloadDev,
                 (int64) this.outDim, (int64) this.inDim, this.deqCols());
             this.runScaleImage(18L);
         } else {
@@ -2840,7 +2857,13 @@ public final class Linear extends InfModule {
     /** The widen's second output (7.4.2), re-run with it so a restaged
      *  expert window rebuilds both. */
     void runScaleImage(int64 blkBytes) {
-        WmmaKernel.symScaleImageLaunch(this.scaleDev, this.packedDev,
+        if (Quant.splitOn(this.packedTy)) {
+            WmmaKernel.symScaleImageLaunch(this.scaleDev, this.scalesDev,
+                (int64) this.outDim, (int64) this.inDim, this.deqCols(),
+                2L);
+            return;
+        }
+        WmmaKernel.symScaleImageLaunch(this.scaleDev, this.payloadDev,
             (int64) this.outDim, (int64) this.inDim, this.deqCols(),
             blkBytes);
         return;
@@ -3040,10 +3063,10 @@ public final class Linear extends InfModule {
     boolean matvecPackedKeep(KernelBuffer<int8> xp) {
         if (!this.packedWaveReady()) { return false; }
         if (this.q8 && this.wave) {
-            QuantKernel.q4kQ8WaveMatVecLaunchNoSync(this.yDev, this.packedDev,
+            QuantKernel.q4kQ8WaveMatVecLaunchNoSync(this.yDev, this.payloadDev,
                 xp, (int64) this.outDim, (int64) this.inDim, 0L);
         } else {
-            QuantKernel.q6kQ8WaveMatVecLaunchNoSync(this.yDev, this.packedDev,
+            QuantKernel.q6kQ8WaveMatVecLaunchNoSync(this.yDev, this.payloadDev,
                 xp, (int64) this.outDim, (int64) this.inDim, 0L);
         }
         Linear.nLaunches = Linear.nLaunches + 1L;
@@ -3054,13 +3077,13 @@ public final class Linear extends InfModule {
         this.ensureDevice();
         if (this.bias != null || !this.packedAct) { return false; }
         if (this.q8 && this.wave) {
-            QuantKernel.q4kQ8WaveMatVecAccumLaunchNoSync(dst, this.packedDev,
+            QuantKernel.q4kQ8WaveMatVecAccumLaunchNoSync(dst, this.payloadDev,
                 Linear.stXp, (int64) this.outDim, (int64) this.inDim, 0L);
             Linear.nLaunches = Linear.nLaunches + 1L;
             return true;
         }
         if (this.wave6) {
-            QuantKernel.q6kQ8WaveMatVecAccumLaunchNoSync(dst, this.packedDev,
+            QuantKernel.q6kQ8WaveMatVecAccumLaunchNoSync(dst, this.payloadDev,
                 Linear.stXp, (int64) this.outDim, (int64) this.inDim, 0L);
             Linear.nLaunches = Linear.nLaunches + 1L;
             return true;
@@ -3100,7 +3123,7 @@ public final class Linear extends InfModule {
         }
         if (this.inDim / 256 < 8) { return false; }
         QuantKernel.qkvWaveMatVecLaunchNoSync(this.yDev, kL.yDev, vL.yDev,
-            this.packedDev, kL.packedDev, vL.packedDev, Linear.stXp,
+            this.payloadDev, kL.payloadDev, vL.payloadDev, Linear.stXp,
             (int64) this.outDim, (int64) kL.outDim, (int64) this.inDim,
             vQ6, this.biasDev, kL.biasDev, vL.biasDev);
         Linear.nLaunches = Linear.nLaunches + 1L;
@@ -3170,7 +3193,7 @@ public final class Linear extends InfModule {
         return;
     }
 
-    /** Fill `packedDev` straight from the checkpoint mapping in chunks,
+    /** Fill `payloadDev` straight from the checkpoint mapping in chunks,
      *  so the whole tensor never exists as a host array. The staging
      *  buffer is the only host cost and it is bounded, not proportional
      *  to the weight. */
@@ -3180,7 +3203,13 @@ public final class Linear extends InfModule {
                 + "source mapping for a packed weight of "
                 + this.packedBytes + " bytes");
         }
-        int64 chunk = 33554432L;
+        if (Quant.splitOn(this.packedTy)) {
+            Linear.splitStreamFromMap(this.srcMap, this.mapOff,
+                this.packedBytes, this.packedTy, this.payloadDev,
+                this.scalesDev);
+            return;
+        }
+        int64 chunk = Linear.chunkFor(this.packedTy);
         if (chunk > this.packedBytes) { chunk = this.packedBytes; }
         int8[] stage #= heap int8[chunk];
         int64 off = 0L;
@@ -3193,12 +3222,160 @@ public final class Linear extends InfModule {
                     + (this.mapOff + off) + " - wanted " + n + ", got "
                     + got);
             }
-            KernelBuffer<int8> sl #= this.packedDev.slice((uint64) off,
+            KernelBuffer<int8> sl #= this.payloadDev.slice((uint64) off,
                 (uint64) n);
             sl.upload(stage, n);
             off = off + n;
         }
         return;
+    }
+
+    /** Stream `n` file bytes of `ty` at `mapOff` in `map` through the
+     *  shared staging chunk into the split pair: no host array of the
+     *  tensor ever exists. */
+    static void splitStreamFromMap(MappedFile map, int64 mapOff, int64 n,
+            int32 ty, KernelBuffer<int8> payload, KernelBuffer<int8> scales) {
+        int64 chunk = Linear.chunkFor(ty);
+        if (chunk > n) { chunk = n; }
+        int8[] stage #= heap int8[chunk];
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 off = 0L;
+        while (off < n) {
+            int64 m = chunk;
+            if (off + m > n) { m = n - off; }
+            int64 got = map.read(mapOff + off, stage, 0L, m);
+            if (got != m) {
+                throw heap LlmException("split upload: short read at "
+                    + (mapOff + off) + " - wanted " + m + ", got " + got);
+            }
+            Linear.putChunk(stage, m, off / bb, ty, payload, scales);
+            off = off + m;
+        }
+        return;
+    }
+
+    // ── The resident layout (codebook-quants spec §10) ──────────────────
+
+    static KernelBuffer<int8> splitStage;
+    static int64 splitStageCap;
+    static int64 splitChunk = 33554432L;
+    static int64 splitChunks;
+
+    static void setSplitChunkBytes(int64 n) {
+        Linear.splitChunk = n;
+        return;
+    }
+
+    static int64 splitChunkBytes() {
+        return Linear.splitChunk;
+    }
+
+    /** Bytes of the shared device staging chunk, 0 before any split;
+     *  it grows to the largest chunk asked of it and never shrinks. */
+    static int64 splitStageBytes() {
+        return Linear.splitStageCap;
+    }
+
+    /** Chunks split so far, process-wide. */
+    static int64 splitChunkCount() {
+        return Linear.splitChunks;
+    }
+
+    /** File bytes per staging chunk for `ty`: the largest whole number
+     *  of blocks within the configured chunk, at least one block. */
+    static int64 chunkFor(int32 ty) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 n = (Linear.splitChunk / bb) * bb;
+        if (n < bb) { n = bb; }
+        return n;
+    }
+
+    /** Allocate the resident buffers for `fileBytes` of `packedTy`. */
+    void allocResident(int64 fileBytes) {
+        int32 ty = this.packedTy;
+        if (!Quant.splitOn(ty)) {
+            this.payloadDev #= heap KernelBuffer<int8>((uint64) fileBytes);
+            return;
+        }
+        int64 nb = fileBytes / (int64) Quant.blockBytes(ty);
+        this.payloadDev #= heap KernelBuffer<int8>(
+            (uint64) (nb * (int64) Quant.payloadBytes(ty)));
+        this.scalesDev #= heap KernelBuffer<int8>(
+            (uint64) (nb * (int64) Quant.scaleBytes(ty)));
+        return;
+    }
+
+    /** Upload `n` file bytes from `host`, split when the format is. */
+    void uploadSplit(int8[] host, int64 n) {
+        if (!Quant.splitOn(this.packedTy)) {
+            this.payloadDev.upload(host, n);
+            return;
+        }
+        Linear.splitUploadTo(host, n, this.packedTy, this.payloadDev,
+            this.scalesDev);
+        return;
+    }
+
+    /** Stream `n` file bytes of `ty` from `host` through the shared
+     *  staging chunk into the split `(payload, scales)` pair. */
+    static void splitUploadTo(int8[] host, int64 n, int32 ty,
+            KernelBuffer<int8> payload, KernelBuffer<int8> scales) {
+        int64 chunk = Linear.chunkFor(ty);
+        if (n <= chunk) {
+            Linear.putChunk(host, n, 0L, ty, payload, scales);
+            return;
+        }
+        int8[] stage #= heap int8[chunk];
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 off = 0L;
+        while (off < n) {
+            int64 m = chunk;
+            if (off + m > n) { m = n - off; }
+            int64 i = 0L;
+            while (i < m) {
+                stage[i] = host[off + i];
+                i = i + 1L;
+            }
+            Linear.putChunk(stage, m, off / bb, ty, payload, scales);
+            off = off + m;
+        }
+        return;
+    }
+
+    /** Split one staged chunk of `m` file bytes, starting at block
+     *  `blockBase`, into `payload` and `scales` on the device. */
+    static void putChunk(int8[] stage, int64 m, int64 blockBase, int32 ty,
+            KernelBuffer<int8> payload, KernelBuffer<int8> scales) {
+        Linear.ensureSplitStage(m);
+        Linear.splitStage.upload(stage, m);
+        Linear.splitChunks = Linear.splitChunks + 1L;
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 pb = (int64) Quant.payloadBytes(ty);
+        int64 sb = (int64) Quant.scaleBytes(ty);
+        int64 nb = m / bb;
+        KernelBuffer<int8> pd #= payload.slice((uint64) (blockBase * pb),
+            (uint64) (nb * pb));
+        KernelBuffer<int8> sd #= scales.slice((uint64) (blockBase * sb),
+            (uint64) (nb * sb));
+        QuantKernel.splitLaunch(pd, sd, Linear.splitStage, nb, ty);
+        return;
+    }
+
+    static void ensureSplitStage(int64 m) {
+        if (Linear.splitStage != null && Linear.splitStageCap >= m) {
+            return;
+        }
+        Linear.splitStage #= heap KernelBuffer<int8>((uint64) m);
+        Linear.splitStageCap = m;
+        return;
+    }
+
+    KernelBuffer<int8> payloadForTest() {
+        return this.payloadDev;
+    }
+
+    KernelBuffer<int8> scalesForTest() {
+        return this.scalesDev;
     }
 
     /** The host mat-vec needs the bytes themselves. Under a streamed
@@ -3226,13 +3403,12 @@ public final class Linear extends InfModule {
     static int64 lazyDevNs = 0L;   // 11.1: device builds inside a step
     static int64 growNs = 0L;      // 11.1: staging and output growth
     void ensureDevice() {
-        if (this.packedDev != null) { return; }
+        if (this.payloadDev != null) { return; }
         int64 ld0 = Clock.nanoTime();
             this.devWBytes = this.devWBytes + this.packedBytes;
-            this.packedDev #= heap KernelBuffer<int8>(
-                (uint64) this.packedBytes);
+            this.allocResident(this.packedBytes);
             if (this.packed != null) {
-                this.packedDev.upload(this.packed);
+                this.uploadSplit(this.packed, this.packedBytes);
             } else {
                 this.streamPackedFromMap();
             }
@@ -3249,9 +3425,9 @@ public final class Linear extends InfModule {
         return;
     }
 
-    /** The device-side setup AFTER packedDev exists: the output
+    /** The device-side setup AFTER payloadDev exists: the output
      *  buffers, the shared stage, every latched routing flag.
-     *  Factored (moe-cache unit 2) so a slot Linear — whose packedDev
+     *  Factored (moe-cache unit 2) so a slot Linear — whose payloadDev
      *  is pre-allocated by bindExpertSlot with no host `packed`
      *  tensor — latches the same decode routes the normal path does. */
     void finishDeviceSetup() {
@@ -3364,7 +3540,7 @@ public final class Linear extends InfModule {
      * indexes `packed` from its own base and writes `y[yOff + i]`, which is
      * exactly the pair of adjustments a row slice needs.
      */
-    /** Total packed weight bytes behind packedDev — the host tensor's
+    /** Total packed weight bytes behind payloadDev — the host tensor's
      *  when one exists, else the expert window/slot length. */
     int64 packedBytesTotal() {
         if (this.packedBytes > 0L) { return this.packedBytes; }
@@ -3390,25 +3566,42 @@ public final class Linear extends InfModule {
         }
         if (chunk >= rows) {
             Linear.nLaunches = Linear.nLaunches + 1L;
-            this.launchOne(this.packedDev, rows, 0L);
+            this.launchOne(this.payloadDev, this.scalesDev, rows, 0L);
             return;
+        }
+        boolean split = Quant.splitOn(this.packedTy);
+        int64 blocksPerRow = (int64) this.inDim
+            / (int64) Quant.blockElems(this.packedTy);
+        int64 pRow = rowBytes;
+        int64 sRow = 0L;
+        if (split) {
+            pRow = blocksPerRow * (int64) Quant.payloadBytes(this.packedTy);
+            sRow = blocksPerRow * (int64) Quant.scaleBytes(this.packedTy);
         }
         int64 r0 = 0L;
         while (r0 < rows) {
             int64 nr = chunk;
             if (r0 + nr > rows) { nr = rows - r0; }
             Linear.nLaunches = Linear.nLaunches + 1L;
-            KernelBuffer<int8> sub #= this.packedDev.slice(
-                (uint64) (r0 * rowBytes), (uint64) (nr * rowBytes));
-            this.launchOne(sub, nr, r0);
+            KernelBuffer<int8> sub #= this.payloadDev.slice(
+                (uint64) (r0 * pRow), (uint64) (nr * pRow));
+            if (split) {
+                KernelBuffer<int8> subS #= this.scalesDev.slice(
+                    (uint64) (r0 * sRow), (uint64) (nr * sRow));
+                this.launchOne(sub, subS, nr, r0);
+            } else {
+                this.launchOne(sub, null, nr, r0);
+            }
             r0 = r0 + nr;
         }
         return;
     }
 
-    /** One dispatch over `nr` rows of `w` starting at output row `r0`.
-     *  Whether it waits is `oneSync`'s business, not this method's. */
-    void launchOne(KernelBuffer<int8> w, int64 nr, int64 r0) {
+    /** One dispatch over `nr` rows of `w` (and its scales `ws` for a
+     *  split format) starting at output row `r0`. Whether it waits is
+     *  `oneSync`'s business, not this method's. */
+    void launchOne(KernelBuffer<int8> w, KernelBuffer<int8> ws, int64 nr,
+            int64 r0) {
         if (this.q8) {
             if (this.wave) {
                 if (Linear.oneSync) {
@@ -3467,10 +3660,10 @@ public final class Linear extends InfModule {
             }
         } else if (this.wave8) {
             if (Linear.oneSync) {
-                QuantKernel.q80Q8WaveMatVecLaunchNoSync(this.yDev, w,
+                QuantKernel.q80Q8WaveMatVecLaunchNoSync(this.yDev, w, ws,
                     Linear.stXp, nr, (int64) this.inDim, r0);
             } else {
-                QuantKernel.q80Q8WaveMatVecLaunch(this.yDev, w,
+                QuantKernel.q80Q8WaveMatVecLaunch(this.yDev, w, ws,
                     Linear.stXp, nr, (int64) this.inDim, r0);
             }
         } else if (this.wave40) {
@@ -3491,10 +3684,10 @@ public final class Linear extends InfModule {
             }
         } else if (this.wavef && this.packedTy == Quant.GG_Q8_0) {
             if (Linear.oneSync) {
-                QuantKernel.q80F32WaveMatVecLaunchNoSync(this.yDev, w,
+                QuantKernel.q80F32WaveMatVecLaunchNoSync(this.yDev, w, ws,
                     Linear.stX, nr, (int64) this.inDim, 0L, r0);
             } else {
-                QuantKernel.q80F32WaveMatVecLaunch(this.yDev, w,
+                QuantKernel.q80F32WaveMatVecLaunch(this.yDev, w, ws,
                     Linear.stX, nr, (int64) this.inDim, 0L, r0);
             }
         } else if (this.wavef && this.packedTy == Quant.GG_Q5_0) {
@@ -3514,10 +3707,10 @@ public final class Linear extends InfModule {
                     Linear.stX, nr, (int64) this.inDim, 0L, r0);
             }
         } else if (Linear.oneSync) {
-            QuantKernel.matVecLaunchNoSync(this.packedTy, this.yDev, w,
+            QuantKernel.matVecLaunchNoSync(this.packedTy, this.yDev, w, ws,
                 Linear.stX, nr, (int64) this.inDim, 0L, r0);
         } else {
-            QuantKernel.matVecLaunch(this.packedTy, this.yDev, w,
+            QuantKernel.matVecLaunch(this.packedTy, this.yDev, w, ws,
                 Linear.stX, nr, (int64) this.inDim, 0L, r0);
         }
         return;

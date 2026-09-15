@@ -1,0 +1,211 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.Linear;
+
+/**
+ * One resident layout for every packed format (codebook-quants spec §10):
+ * the lone scale field leaves the block for its own array, and the
+ * payload is dword-clean at exactly its file bytes.
+ */
+public class ResidentLayoutTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+
+    public ResidentLayoutTest() { return; }
+
+    static #int32[] supportedTypes() {
+        int32[] t #= heap int32[13];
+        t[0] = Quant.GG_Q4_0;  t[1] = Quant.GG_Q4_1;  t[2] = Quant.GG_Q5_0;
+        t[3] = Quant.GG_Q5_1;  t[4] = Quant.GG_Q8_0;  t[5] = Quant.GG_Q2_K;
+        t[6] = Quant.GG_Q3_K;  t[7] = Quant.GG_Q4_K;  t[8] = Quant.GG_Q5_K;
+        t[9] = Quant.GG_Q6_K;  t[10] = Quant.GG_IQ4_NL;
+        t[11] = Quant.GG_IQ4_XS; t[12] = Quant.GG_MXFP4;
+        return #t;
+    }
+
+    static boolean alignedAsStored(int32 ty) {
+        return ty == Quant.GG_Q4_1 || ty == Quant.GG_Q5_1
+            || ty == Quant.GG_Q2_K || ty == Quant.GG_Q4_K
+            || ty == Quant.GG_Q5_K || ty == Quant.GG_IQ4_XS;
+    }
+
+    /** Tile the fixture's blocks cyclically to `nBlocks`. */
+    static #int8[] tiled(String fixture, int32 ty, int64 nBlocks) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int8[] fix #= File.readAllBytes(ResidentLayoutTest.DIR + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        Assert.isTrue(fixBlocks > 0L);
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        return #raw;
+    }
+
+    @Test
+    public void theLayoutTableIsAPermutationOfTheBlock() {
+        int32[] tys #= ResidentLayoutTest.supportedTypes();
+        int32 i = 0;
+        while (i < 13) {
+            int32 ty = tys[i];
+            int32 pb = Quant.payloadBytes(ty);
+            int32 sb = Quant.scaleBytes(ty);
+            Assert.equals(Quant.blockBytes(ty), pb + sb);
+            Assert.equals(0, pb % 4);
+            if (ResidentLayoutTest.alignedAsStored(ty)) {
+                Assert.equals(0, sb);
+            } else if (ty == Quant.GG_MXFP4) {
+                Assert.equals(1, sb);
+            } else {
+                Assert.equals(2, sb);
+            }
+            Assert.equals(0, Quant.scaleOffset(ty));
+            i = i + 1;
+        }
+        Assert.equals(-1, Quant.payloadBytes(1));
+        Assert.equals(-1, Quant.scaleBytes(1));
+    }
+
+    @Test
+    public void theSplitIsAPermutationOfTheFileBytes() {
+        int64 nBlocks = 4099L;
+        int8[] raw #= ResidentLayoutTest.tiled("q8_0.bin", Quant.GG_Q8_0,
+            nBlocks);
+        int8[] payload #= heap int8[nBlocks * 32L];
+        int8[] scales #= heap int8[nBlocks * 2L];
+        Quant.splitInto(Quant.GG_Q8_0, raw, 0L, nBlocks, payload, 0L,
+            scales, 0L);
+        int64 b = 0;
+        while (b < nBlocks) {
+            Assert.equals(raw[b * 34L], scales[b * 2L]);
+            Assert.equals(raw[b * 34L + 1L], scales[b * 2L + 1L]);
+            int64 j = 0;
+            while (j < 32L) {
+                if (payload[b * 32L + j] != raw[b * 34L + 2L + j]) {
+                    Assert.fail("block " + b + " byte " + j
+                        + ": payload " + payload[b * 32L + j]
+                        + " vs file " + raw[b * 34L + 2L + j]);
+                }
+                j = j + 1;
+            }
+            b = b + 1;
+        }
+    }
+
+    @Test
+    public void theSplitKernelMatchesTheHostSplit() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int64 nBlocks = 4099L;
+        int8[] raw #= ResidentLayoutTest.tiled("q8_0.bin", Quant.GG_Q8_0,
+            nBlocks);
+        int8[] wantP #= heap int8[nBlocks * 32L];
+        int8[] wantS #= heap int8[nBlocks * 2L];
+        Quant.splitInto(Quant.GG_Q8_0, raw, 0L, nBlocks, wantP, 0L,
+            wantS, 0L);
+
+        KernelBuffer<int8> src #= heap KernelBuffer<int8>(
+            (uint64) raw.count());
+        src.upload(raw);
+        KernelBuffer<int8> pd #= heap KernelBuffer<int8>(
+            (uint64) (nBlocks * 32L));
+        KernelBuffer<int8> sd #= heap KernelBuffer<int8>(
+            (uint64) (nBlocks * 2L));
+        QuantKernel.splitLaunch(pd, sd, src, nBlocks, Quant.GG_Q8_0);
+        int8[] gotP #= heap int8[nBlocks * 32L];
+        int8[] gotS #= heap int8[nBlocks * 2L];
+        pd.download(gotP);
+        sd.download(gotS);
+        int64 i = 0;
+        while (i < nBlocks * 32L) {
+            if (gotP[i] != wantP[i]) {
+                Assert.fail("payload byte " + i + ": device " + gotP[i]
+                    + " vs host " + wantP[i]);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < nBlocks * 2L) {
+            if (gotS[i] != wantS[i]) {
+                Assert.fail("scale byte " + i + ": device " + gotS[i]
+                    + " vs host " + wantS[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    /**
+     * A bound Q8_0 weight streams to the device through a bounded
+     * staging chunk and lands split: resident bytes are the file's,
+     * the coop view is the payload itself, and the bytes on the device
+     * are the host split byte for byte.
+     */
+    @Test
+    public void aBoundQ80WeightIsResidentAsPayloadAndScales() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int32 outDim = 64;
+        int32 inDim = 4096;
+        int64 nBlocks = (int64) outDim * ((int64) inDim / 32L);
+        int8[] raw #= ResidentLayoutTest.tiled("q8_0.bin", Quant.GG_Q8_0,
+            nBlocks);
+        int8[] wantP #= heap int8[nBlocks * 32L];
+        int8[] wantS #= heap int8[nBlocks * 2L];
+        Quant.splitInto(Quant.GG_Q8_0, raw, 0L, nBlocks, wantP, 0L,
+            wantS, 0L);
+
+        int64 keep = Linear.splitChunkBytes();
+        // 700 blocks per chunk: the 8192-block tensor streams in twelve
+        // chunks with a ragged last one.
+        Linear.setSplitChunkBytes(700L * 34L + 17L);
+        int64 chunks0 = Linear.splitChunkCount();
+        Linear lin #= heap Linear(inDim, outDim);
+        int8[] copy #= heap int8[raw.count()];
+        int64 i = 0;
+        while (i < (int64) raw.count()) { copy[i] = raw[i]; i = i + 1; }
+        lin.bindPacked(#copy, Quant.GG_Q8_0);
+        lin.ensureDevice();
+        Linear.setSplitChunkBytes(keep);
+
+        Assert.equals(12L, Linear.splitChunkCount() - chunks0);
+        Assert.isTrue(Linear.splitStageBytes() >= 700L * 34L);
+        Assert.equals(nBlocks * 34L, lin.devWeightBytes());
+        lin.ensureCoopW();
+        Assert.equals(nBlocks * 34L, lin.devWeightBytes());
+
+        int8[] gotP #= heap int8[nBlocks * 32L];
+        int8[] gotS #= heap int8[nBlocks * 2L];
+        lin.payloadForTest().download(gotP);
+        lin.scalesForTest().download(gotS);
+        i = 0;
+        while (i < nBlocks * 32L) {
+            if (gotP[i] != wantP[i]) {
+                Assert.fail("resident payload byte " + i + ": "
+                    + gotP[i] + " vs " + wantP[i]);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < nBlocks * 2L) {
+            if (gotS[i] != wantS[i]) {
+                Assert.fail("resident scale byte " + i + ": "
+                    + gotS[i] + " vs " + wantS[i]);
+            }
+            i = i + 1;
+        }
+    }
+}
