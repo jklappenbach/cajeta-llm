@@ -1858,7 +1858,7 @@ three projections. llama.cpp: one `mul_mat_id` per bank.
       pool the weights land in (VRAM carve-out vs GTT on the APU), CPU
       frequency. Instrument: sample `pp_dpm_sclk` and the process's
       fdinfo mid-decode per rep and correlate with the class.
-- [ ] **9.6.6 Coding** — decode attention without GQA: Qwen1.5-MoE has
+- [x] **9.6.6 Coding** — decode attention without GQA: Qwen1.5-MoE has
       16 KV heads for 16 query heads, and `attnScore`+`attnCombine`
       read its 100 MB of KV at d512 in 2.6 ms/token (~40 GB/s-
       equivalent) against a 0.5 ms bus floor; the 30B shares each KV
@@ -1866,6 +1866,36 @@ three projections. llama.cpp: one `mul_mat_id` per bank.
       model holds 0.45x. Not an MoE lever: profile the flash-decode
       split at nKv == nHeads and read llama.cpp's fattn tile choice for
       that shape. Surfaced by the 9.6.4 device profile.
+      DONE 2026-09-14 night, from llama.cpp's shape (Julian: "look over
+      llama.cpp's code to see how they do it"). Both their backends put
+      EIGHT threads on one K/V row (16 dims each) with several rows in
+      flight per thread, a per-thread running max/sum over the rows
+      that thread saw, and a combine across threads at the end: the
+      CUDA fattn-vec (128 threads, 8 per row, split-K `parallel_blocks`
+      + a combine kernel) and the Vulkan scalar shader that produced the
+      107 tok/s here (one 64-thread workgroup per head, D_split=8, no
+      split). Ours (`attnFlashDecodeGqa1Kernel`, AttnKernel): that layout
+      on one wave -- four rows in flight per step, a lane's own online
+      softmax over its segment's rows, the wave's four segments written
+      as four partials so the EXISTING reduce (and the unit-50 fused
+      reduce+pack, which now takes this shape too) combine `splits*4`;
+      wave-uniform loop for the segmented reduce (`Wave.reduceSumF32
+      Segmented`), a lane past its chunk loads row 0 and discards; the
+      first live row seeds, so no sentinel exp under @FastMath. Chunk
+      `fd1Chunk` = 32 positions, 16 splits max (the reduce-pack's 64-
+      partial limit). Routed at `nH == nKv && hd == 128` in both decode
+      attends; arm `nofd` (bench + ppl), bench `fd1chunk=N`.
+      TESTS: host floor at counts 1/3/4/33/100/513 (one position, an
+      idle segment, one exact step, ragged chunks, 512-class) within the
+      reassociation gate, SEEN on the route (call counter), fused vs
+      two-kernel agree.
+      MEASURED, d512, profiler on, per token: attention 2.55 ms
+      (attnScore 45.7 + attnCombine 35.9 ms / 32 tokens) -> 0.51 ms
+      (attnFlashDecodeGqa1 16.2 ms / 32): 5x; the profiled token 12.23
+      -> 10.34 ms. Chunk sweep: 16 and 32 identical (the cap binds at
+      d512), 64 +2%. Perplexity, 256 decode positions: two-launch
+      5.61091 -> flash 5.57635 (-0.6%); the 30B (GQA8, its route
+      untouched) 4.2707 unchanged. Quiet-box legs OWED (accept966).
 
 RISK, unchanged: this is the MoE hot path including the fused
 down+combine tail, and the failure mode of getting it wrong is a wrong
