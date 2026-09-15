@@ -2606,6 +2606,361 @@ public final class WmmaKernel {
     }
 
     /**
+     * 10.3: the per-16 scale image of a Q6_K tensor for the widened
+     * wide-tile id GEMM -- d*sc as f32, sixteen per (row, 256-block).
+     */
+    @Kernel
+    public static void q6kScaleImageKernel(KernelBuffer<float32> img,
+            KernelBuffer<int8> packed, uint32 total, int64 blocksPerRow) {
+        uint32 tid = KernelThread.globalIdX();
+        if (tid < total) {
+            uint32 perRow = (uint32) blocksPerRow * 16;
+            uint32 ii = tid / perRow;
+            uint32 rem = tid % perRow;
+            uint32 b = rem / 16;
+            uint32 e = rem % 16;
+            int64 ro = (int64) ii * (blocksPerRow * 210L) + (int64) b * 210L;
+            float32 dv = GgufFile.halfBitsToF32(
+                ((int32) packed[ro + 208L] & 255)
+                | (((int32) packed[ro + 209L] & 255) << 8));
+            int32 sc = (int32) packed[ro + 192L + (int64) e];
+            img[(int64) tid] = dv * (float32) sc;
+        }
+    }
+
+    public static void q6kScaleImageLaunch(KernelBuffer<float32> img,
+            KernelBuffer<int8> packed, int64 outDim, int64 cols) {
+        int64 bpr = cols / 256L;
+        int64 total = outDim * bpr * 16L;
+        KernelStream s = QuantKernel.stream();
+        q6kScaleImageKernel.launch(s,
+            grid: [(uint32) ((total + 255L) / 256L)], block: [256])
+            (img, packed, (uint32) total, bpr);
+        return;
+    }
+
+    /**
+     * 10.3: the widened-feed id GEMM at the dense kernel's tile -- 128
+     * tokens x 128 rows per workgroup, the 4x2 wave tiling, A staged
+     * through LDS, B straight from the tile-major int8 slab -- over the
+     * 128-row chunk map. `sg16` picks the scale image: 0 = the
+     * symmetric formats' f16 per 32 (`img16`), 1 = Q6_K's f32 per 16
+     * (`img32`); the scale is applied per 32-k pair or per 16-k step.
+     * Tails store as q4kWmmaIdMw8Kernel does.
+     */
+    @Kernel @FastMath
+    @Occupancy(maxThreads = 512)
+    public static void symWmmaDeqIdMw8Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> img16, KernelBuffer<float32> img32,
+            KernelBuffer<int8> deq, KernelBuffer<int8> xp,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, KernelBuffer<int32> meta,
+            uint32 outDim, uint32 tilesN8, int64 blocksPerRow,
+            int64 rowsPerExpert, uint32 sg16) {
+        Shared<float32> xsAll = shared float32[128];
+        Shared<float32> cfAll = shared float32[2048];
+        Shared<int8> aTile = shared int8[18432];
+        Shared<float32> fs = shared float32[2048];
+        int32 wv = Group.width();
+        uint32 wvu = (uint32) wv;
+        uint32 nThreads = (uint32) (8 * wv);
+        uint32 tid = KernelThread.x();
+        uint32 lane = tid % wvu;
+        uint32 wid = tid / wvu;
+        uint32 lane16 = lane % 16;
+        uint32 wg = KernelThread.globalIdX() / (uint32) (8 * wv);
+        uint32 mapIdx = wg / tilesN8;
+        uint32 tileI8 = wg % tilesN8;
+        uint32 i0 = tileI8 * 128 + wid * 16;
+        uint32 nChunks = (uint32) meta[1L];
+        uint32 wr = wid / 4;
+        uint32 wc = wid % 4;
+        uint32 cw = tileI8 * 128 + 32 * wc;
+        uint32 ent = 8 << sg16;
+        uint32 xbase = 64 * wr;
+        if (mapIdx < nChunks && i0 < outDim) {
+            uint32 t0 = (uint32) mapT0[(int64) mapIdx];
+            uint32 mEnd = (uint32) mapM1[(int64) mapIdx];
+            uint32 tw = t0 + 64 * wr;
+            int64 xRowBytes = blocksPerRow * 320L;
+            int64 ex = (int64) mapE[(int64) mapIdx];
+            int64 tilesK = blocksPerRow * 16L;
+            int64 eDeq = ex * rowsPerExpert * blocksPerRow * 256L;
+            int64 gRow0 = ex * rowsPerExpert + (int64) (tileI8 * 128);
+            int64 colA = (int64) (cw / 16) * tilesK;
+            int64 colB = colA + tilesK;
+            uint32 aBase = wr * 9216;
+            uint32 cRowA = (32 * wc + lane16) * ent;
+            uint32 cRowB = cRowA + 16 * ent;
+
+            CooperativeMatrix<int8,16,16,0> ma;
+            // 4x2 tiling: TWO B fragments — the wave's two column tiles,
+            // each its own fromWords unpack — feed eight mmas against
+            // the four token tiles, so one A load serves two mmas.
+            CooperativeMatrix<int8,16,16,1> mbA;
+            CooperativeMatrix<int8,16,16,1> mbB;
+            CooperativeMatrix<int32,16,16,2> mc0;
+            CooperativeMatrix<int32,16,16,2> mc1;
+            CooperativeMatrix<int32,16,16,2> mc2;
+            CooperativeMatrix<int32,16,16,2> mc3;
+            CooperativeMatrix<int32,16,16,2> mc4;
+            CooperativeMatrix<int32,16,16,2> mc5;
+            CooperativeMatrix<int32,16,16,2> mc6;
+            CooperativeMatrix<int32,16,16,2> mc7;
+            CooperativeMatrix<float32,16,16,2> facc0;
+            CooperativeMatrix<float32,16,16,2> facc1;
+            CooperativeMatrix<float32,16,16,2> facc2;
+            CooperativeMatrix<float32,16,16,2> facc3;
+            CooperativeMatrix<float32,16,16,2> facc4;
+            CooperativeMatrix<float32,16,16,2> facc5;
+            CooperativeMatrix<float32,16,16,2> facc6;
+            CooperativeMatrix<float32,16,16,2> facc7;
+            facc0.splat(0.0f);
+            facc1.splat(0.0f);
+            facc2.splat(0.0f);
+            facc3.splat(0.0f);
+            facc4.splat(0.0f);
+            facc5.splat(0.0f);
+            facc6.splat(0.0f);
+            facc7.splat(0.0f);
+
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                if (lane < 16) {
+                    int64 xb = (int64) (t0 + wid * 16 + lane)
+                        * xRowBytes + b * 320L;
+                    xsAll[wid * 16 + lane] = Cajeta.bitsToF32(
+                        ((int32) xp[xb + 288L] & 255)
+                        | (((int32) xp[xb + 289L] & 255) << 8)
+                        | (((int32) xp[xb + 290L] & 255) << 16)
+                        | (((int32) xp[xb + 291L] & 255) << 24));
+                }
+                // The block's scales for the workgroup's 128 rows: each
+                // thread stages half a row's entries.
+                uint32 sRow = tid / 2;
+                uint32 sHalf = tid % 2;
+                uint32 sk = 0;
+                while (sk < ent / 2) {
+                    uint32 sIdx = sHalf * (ent / 2) + sk;
+                    int64 sEnt = (gRow0 + (int64) sRow) * blocksPerRow
+                        * (int64) ent + b * (int64) ent + (int64) sIdx;
+                    float32 cfv = 0.0f;
+                    if (sg16 == 1) {
+                        cfv = img32[sEnt];
+                    } else {
+                        cfv = GgufFile.halfBitsToF32(
+                            ((int32) img16[sEnt * 2L] & 255)
+                            | (((int32) img16[sEnt * 2L + 1L] & 255) << 8));
+                    }
+                    cfAll[sRow * ent + sIdx] = cfv;
+                    sk = sk + 1;
+                }
+
+                uint32 H = 0;
+                while (H < 2) {
+                    uint32 c = tid;
+                    while (c < 1024) {
+                        uint32 row = c / 8;
+                        uint32 chunk = c % 8;
+                        int64 src = (int64) (t0 + row) * xRowBytes
+                            + b * 320L
+                            + (int64) (128 * H + chunk * 16);
+                        aTile.vstore((int64) (row * 144 + chunk * 16),
+                            xp.vload<16>(src));
+                        c = c + nThreads;
+                    }
+                    Barrier.workgroup();
+
+                    if (tw < mEnd) {
+                    uint32 st = 0;
+                    while (st < 8) {
+                        int64 kAbs = b * 256L + (int64) (128 * H + 16 * st);
+                        int64 bOffA = eDeq + (colA + kAbs / 16L) * 256L;
+                        int64 bOffB = eDeq + (colB + kAbs / 16L) * 256L;
+                        uint32 eIdx = (8 * H + st) >> (1 - sg16);
+                        float32 cA = cfAll[cRowA + eIdx];
+                        float32 cB = cfAll[cRowB + eIdx];
+                        if (sg16 == 1 || st % 2 == 0) {
+                            mc0.splat(0);
+                            mc1.splat(0);
+                            mc2.splat(0);
+                            mc3.splat(0);
+                            mc4.splat(0);
+                            mc5.splat(0);
+                            mc6.splat(0);
+                            mc7.splat(0);
+                        }
+                        mbA.load(deq, (uint32) bOffA, 1, 16);
+                        mbB.load(deq, (uint32) bOffB, 1, 16);
+                        ma.load(aTile, aBase + 16 * st, 0, 144);
+                        mc0.mma(ma, mbA);
+                        mc4.mma(ma, mbB);
+                        ma.load(aTile, aBase + 2304 + 16 * st, 0, 144);
+                        mc1.mma(ma, mbA);
+                        mc5.mma(ma, mbB);
+                        ma.load(aTile, aBase + 4608 + 16 * st, 0, 144);
+                        mc2.mma(ma, mbA);
+                        mc6.mma(ma, mbB);
+                        ma.load(aTile, aBase + 6912 + 16 * st, 0, 144);
+                        mc3.mma(ma, mbA);
+                        mc7.mma(ma, mbB);
+                        if (sg16 == 1 || st % 2 == 1) {
+                            mc0.scaledAccumIntoS(facc0, xsAll[xbase], cA);
+                            mc1.scaledAccumIntoS(facc1, xsAll[xbase + 16], cA);
+                            mc2.scaledAccumIntoS(facc2, xsAll[xbase + 32], cA);
+                            mc3.scaledAccumIntoS(facc3, xsAll[xbase + 48], cA);
+                            mc4.scaledAccumIntoS(facc4, xsAll[xbase], cB);
+                            mc5.scaledAccumIntoS(facc5, xsAll[xbase + 16], cB);
+                            mc6.scaledAccumIntoS(facc6, xsAll[xbase + 32], cB);
+                            mc7.scaledAccumIntoS(facc7, xsAll[xbase + 48], cB);
+                        }
+                        st = st + 1;
+                    }
+                    }
+                    Barrier.workgroup();
+                    H = H + 1;
+                }
+                b = b + 1;
+            }
+
+            uint32 tb0 = tw + 0;
+            if (tb0 < mEnd) {
+                if (tb0 + 16 <= mEnd) {
+                    facc0.store(y, (uint32) ((int64) tb0 * (int64) outDim
+                        + (int64) cw), 0, outDim);
+                    facc4.store(y, (uint32) ((int64) tb0 * (int64) outDim
+                        + (int64) (cw + 16)), 0, outDim);
+                } else {
+                    facc0.store(fs, wid * 256, 0, 16);
+                    uint32 sa0 = lane;
+                    while (sa0 < 256) {
+                        if (tb0 + sa0 / 16 < mEnd) {
+                            y[(int64) (tb0 + sa0 / 16) * (int64) outDim
+                                + (int64) (cw + sa0 % 16)] = fs[wid * 256 + sa0];
+                        }
+                        sa0 = sa0 + wvu;
+                    }
+                    facc4.store(fs, wid * 256, 0, 16);
+                    uint32 sb0 = lane;
+                    while (sb0 < 256) {
+                        if (tb0 + sb0 / 16 < mEnd) {
+                            y[(int64) (tb0 + sb0 / 16) * (int64) outDim
+                                + (int64) (cw + 16 + sb0 % 16)] = fs[wid * 256 + sb0];
+                        }
+                        sb0 = sb0 + wvu;
+                    }
+                }
+            }
+            uint32 tb1 = tw + 16;
+            if (tb1 < mEnd) {
+                if (tb1 + 16 <= mEnd) {
+                    facc1.store(y, (uint32) ((int64) tb1 * (int64) outDim
+                        + (int64) cw), 0, outDim);
+                    facc5.store(y, (uint32) ((int64) tb1 * (int64) outDim
+                        + (int64) (cw + 16)), 0, outDim);
+                } else {
+                    facc1.store(fs, wid * 256, 0, 16);
+                    uint32 sa1 = lane;
+                    while (sa1 < 256) {
+                        if (tb1 + sa1 / 16 < mEnd) {
+                            y[(int64) (tb1 + sa1 / 16) * (int64) outDim
+                                + (int64) (cw + sa1 % 16)] = fs[wid * 256 + sa1];
+                        }
+                        sa1 = sa1 + wvu;
+                    }
+                    facc5.store(fs, wid * 256, 0, 16);
+                    uint32 sb1 = lane;
+                    while (sb1 < 256) {
+                        if (tb1 + sb1 / 16 < mEnd) {
+                            y[(int64) (tb1 + sb1 / 16) * (int64) outDim
+                                + (int64) (cw + 16 + sb1 % 16)] = fs[wid * 256 + sb1];
+                        }
+                        sb1 = sb1 + wvu;
+                    }
+                }
+            }
+            uint32 tb2 = tw + 32;
+            if (tb2 < mEnd) {
+                if (tb2 + 16 <= mEnd) {
+                    facc2.store(y, (uint32) ((int64) tb2 * (int64) outDim
+                        + (int64) cw), 0, outDim);
+                    facc6.store(y, (uint32) ((int64) tb2 * (int64) outDim
+                        + (int64) (cw + 16)), 0, outDim);
+                } else {
+                    facc2.store(fs, wid * 256, 0, 16);
+                    uint32 sa2 = lane;
+                    while (sa2 < 256) {
+                        if (tb2 + sa2 / 16 < mEnd) {
+                            y[(int64) (tb2 + sa2 / 16) * (int64) outDim
+                                + (int64) (cw + sa2 % 16)] = fs[wid * 256 + sa2];
+                        }
+                        sa2 = sa2 + wvu;
+                    }
+                    facc6.store(fs, wid * 256, 0, 16);
+                    uint32 sb2 = lane;
+                    while (sb2 < 256) {
+                        if (tb2 + sb2 / 16 < mEnd) {
+                            y[(int64) (tb2 + sb2 / 16) * (int64) outDim
+                                + (int64) (cw + 16 + sb2 % 16)] = fs[wid * 256 + sb2];
+                        }
+                        sb2 = sb2 + wvu;
+                    }
+                }
+            }
+            uint32 tb3 = tw + 48;
+            if (tb3 < mEnd) {
+                if (tb3 + 16 <= mEnd) {
+                    facc3.store(y, (uint32) ((int64) tb3 * (int64) outDim
+                        + (int64) cw), 0, outDim);
+                    facc7.store(y, (uint32) ((int64) tb3 * (int64) outDim
+                        + (int64) (cw + 16)), 0, outDim);
+                } else {
+                    facc3.store(fs, wid * 256, 0, 16);
+                    uint32 sa3 = lane;
+                    while (sa3 < 256) {
+                        if (tb3 + sa3 / 16 < mEnd) {
+                            y[(int64) (tb3 + sa3 / 16) * (int64) outDim
+                                + (int64) (cw + sa3 % 16)] = fs[wid * 256 + sa3];
+                        }
+                        sa3 = sa3 + wvu;
+                    }
+                    facc7.store(fs, wid * 256, 0, 16);
+                    uint32 sb3 = lane;
+                    while (sb3 < 256) {
+                        if (tb3 + sb3 / 16 < mEnd) {
+                            y[(int64) (tb3 + sb3 / 16) * (int64) outDim
+                                + (int64) (cw + 16 + sb3 % 16)] = fs[wid * 256 + sb3];
+                        }
+                        sb3 = sb3 + wvu;
+                    }
+                }
+            }
+        }
+    }
+
+    /** `colsPad` is the widened row width (whole 256-blocks); `meta[1]`
+     *  holds the 128-row chunk count; `sg16` 0 = f16 per-32 image in
+     *  `img16`, 1 = f32 per-16 image in `img32` (the other is unread). */
+    public static void symWmmaDeqIdMw8LaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> img16, KernelBuffer<float32> img32,
+            KernelBuffer<int8> deq, KernelBuffer<int8> xp,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, KernelBuffer<int32> meta,
+            int64 nChunksMax, int64 outDim, int64 colsPad,
+            int64 rowsPerExpert, int64 sg16) {
+        WmmaKernel.resolveMwGeom();
+        int64 tilesN8 = outDim / 128L;
+        KernelStream s = QuantKernel.stream();
+        symWmmaDeqIdMw8Kernel.launch(s,
+            grid: [(uint32) (nChunksMax * tilesN8)],
+            block: [(uint32) WmmaKernel.mwBlock])
+            (y, img16, img32, deq, xp, mapE, mapT0, mapM1, meta,
+             (uint32) outDim, (uint32) tilesN8, colsPad / 256L,
+             rowsPerExpert, (uint32) sg16);
+        return;
+    }
+
+    /**
      * 10.12.16 — the ONE-TIME widen: packed Q4_K nibbles out to a
      * TILE-MAJOR int8 copy holding the RAW nibble 0..15. Scales, mins,
      * d and dmin are NOT folded in — they stay in the packed buffer and

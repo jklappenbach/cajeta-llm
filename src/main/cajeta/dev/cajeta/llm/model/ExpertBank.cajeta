@@ -48,6 +48,10 @@ public final class ExpertBank {
     KernelBuffer<int8> deqSlabDev;
     KernelBuffer<int8> scaleSlabDev;
     boolean widenRefused;
+    KernelBuffer<int8> wideDeqDev;       // 10.3: the Q6_K prefill twin
+    KernelBuffer<float32> wideImgDev;
+    boolean wideRefused;
+    static KernelBuffer<float32> noImg32;
     static boolean widenSlabOn = true;   // unit 9.4 A/B arm
     public static void setWidenSlab(boolean on) {
         ExpertBank.widenSlabOn = on;
@@ -584,10 +588,23 @@ public final class ExpertBank {
             KernelBuffer<int32> mapT0, KernelBuffer<int32> mapM1,
             KernelBuffer<int32> meta, int32 nChunksMax, int32 groups) {
         if (!this.idMwReady()) { return false; }
-        if (this.deqSlabDev != null || this.packedTy != 12) { return false; }
-        WmmaKernel.q4kWmmaIdMw8LaunchNoSync(y, this.slabDev, this.slabW,
-            xp, mapE, mapT0, mapM1, meta, (int64) nChunksMax,
-            (int64) this.rowsN, (int64) this.colsN, (int64) this.rowsN);
+        if (this.deqSlabDev != null) {
+            WmmaKernel.symWmmaDeqIdMw8LaunchNoSync(y, this.scaleSlabDev,
+                ExpertBank.noImg32(), this.deqSlabDev, xp, mapE, mapT0,
+                mapM1, meta, (int64) nChunksMax, (int64) this.rowsN,
+                Quant.q8kPadCols((int64) this.colsN), (int64) this.rowsN, 0L);
+        } else if (this.packedTy == 12) {
+            WmmaKernel.q4kWmmaIdMw8LaunchNoSync(y, this.slabDev, this.slabW,
+                xp, mapE, mapT0, mapM1, meta, (int64) nChunksMax,
+                (int64) this.rowsN, (int64) this.colsN, (int64) this.rowsN);
+        } else if (this.packedTy == Quant.GG_Q6_K && this.ensureWideSlab()) {
+            WmmaKernel.symWmmaDeqIdMw8LaunchNoSync(y, this.slabDev,
+                this.wideImgDev, this.wideDeqDev, xp, mapE, mapT0, mapM1,
+                meta, (int64) nChunksMax, (int64) this.rowsN,
+                (int64) this.colsN, (int64) this.rowsN, 1L);
+        } else {
+            return false;
+        }
         ExpertBank.resHits = ExpertBank.resHits + (int64) groups;
         return true;
     }
@@ -742,10 +759,57 @@ public final class ExpertBank {
 
     /** The widened slab's bytes, 0 when unbound. */
     public int64 widenSlabBytes() {
-        if (this.deqSlabDev == null) { return 0L; }
         int64 rows = (int64) this.expertsN * (int64) this.rowsN;
+        int64 b = 0L;
+        if (this.wideDeqDev != null) {
+            b = rows * (int64) this.colsN
+                + rows * ((int64) this.colsN / 256L) * 64L;
+        }
+        if (this.deqSlabDev == null) { return b; }
         int64 colsPad = Quant.q8kPadCols((int64) this.colsN);
-        return rows * colsPad + WmmaKernel.symScaleImageBytes(rows, colsPad);
+        return b + rows * colsPad
+            + WmmaKernel.symScaleImageBytes(rows, colsPad);
+    }
+
+    /**
+     * 10.3: a Q6_K bank's widened twin for the wide-tile prefill GEMM
+     * -- tile-major int8 values plus the per-16 f32 scale image. The
+     * packed slab stays: decode reads it at 6.6 bpw. Budgeted and
+     * refused one-shot like every widen.
+     */
+    boolean ensureWideSlab() {
+        if (this.wideDeqDev != null) { return true; }
+        if (this.wideRefused || !ExpertBank.widenSlabOn) { return false; }
+        if (this.slabDev == null || this.packedTy != Quant.GG_Q6_K) {
+            return false;
+        }
+        if (this.rowsN % 128 != 0 || this.colsN % 256 != 0) { return false; }
+        int64 rows = (int64) this.expertsN * (int64) this.rowsN;
+        int64 cols = (int64) this.colsN;
+        int64 total = rows * cols + rows * (cols / 256L) * 64L;
+        if (!WidenBudget.fits(total)) {
+            this.wideRefused = true;
+            WidenBudget.refuse("expert slab q6_k wide twin", total, rows,
+                cols);
+            return false;
+        }
+        this.wideDeqDev #= heap KernelBuffer<int8>((uint64) (rows * cols));
+        this.wideImgDev #= heap KernelBuffer<float32>(
+            (uint64) (rows * (cols / 256L) * 16L));
+        WidenBudget.charge(total);
+        WmmaKernel.q6kWidenLaunch(this.wideDeqDev, this.slabDev, rows, cols);
+        WmmaKernel.q6kScaleImageLaunch(this.wideImgDev, this.slabDev, rows,
+            cols);
+        this.residentB = this.residentB + total;
+        ExpertBank.resUsed = ExpertBank.resUsed + total;
+        return true;
+    }
+
+    static KernelBuffer<float32> noImg32() {
+        if (ExpertBank.noImg32 == null) {
+            ExpertBank.noImg32 #= heap KernelBuffer<float32>((uint64) 16);
+        }
+        return ExpertBank.noImg32;
     }
 
     /**
