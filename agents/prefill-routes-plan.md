@@ -1895,7 +1895,22 @@ three projections. llama.cpp: one `mul_mat_id` per bank.
       -> 10.34 ms. Chunk sweep: 16 and 32 identical (the cap binds at
       d512), 64 +2%. Perplexity, 256 decode positions: two-launch
       5.61091 -> flash 5.57635 (-0.6%); the 30B (GQA8, its route
-      untouched) 4.2707 unchanged. Quiet-box legs OWED (accept966).
+      untouched) 4.2707 unchanged.
+      TIMING, 2026-09-15, quiet box (loadavg 0.9-1.4), cached=100%:
+        Qwen1.5-MoE tg128@d512   80.7 -> 98.3 tok/s (98.2/98.3/98.4)
+          vs llama.cpp best (vk fa1 107.4)   0.75x -> 0.92x
+        Qwen1.5-MoE tg64@d2048   39.9 -> 88.1 (88.2/88.4/87.8)
+          vs llama.cpp best (vk fa1 87.6)    0.46x -> 1.005x   AHEAD
+        Qwen1.5-MoE pp512        2387/2415/2388                flat
+        Qwen1.5-MoE pp2048       1403/1399/1397 (1414)         flat
+        Qwen3-30B   tg128@d512   85.1/85.2/85.1 (no slow rep)  flat
+        Qwen3-30B   pp512        1262-1269                     flat
+      The evening's decode on this checkpoint: 24.7 -> 98.3 (4.0x) at
+      d512, 18.5 -> 88.1 (4.8x) at d2048. What remains at d512 is 0.9
+      ms/token against llama.cpp: the profile is ~8.5 ms of mat-vecs
+      at 7.5 ms of bus floor and ~1 ms of packs/router/sigmoid/glu/
+      norms; the pp2048 prefill (0.61x) is the larger gap on this
+      model now.
 
 RISK, unchanged: this is the MoE hot path including the fused
 down+combine tail, and the failure mode of getting it wrong is a wrong
