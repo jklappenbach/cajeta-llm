@@ -2143,7 +2143,7 @@ the GQA4 kernel (0.9 ms at ctx 512, a 49 ms launch at 2048), so 11.2
 pays on both checkpoints; the attention kernels run at 1-2 TFLOPS
 where the GEMMs run at 10-25.
 
-- [ ] **11.1 TDD** — the host side first, since it is the larger
+- [x] **11.1 TDD** — the host side first, since it is the larger
       term: a `prefill-chunk` diag record per step (rows, startPos,
       lazy device builds ns, buffer growth ns, K/V writeback ns, step
       wall ns), the bench printing the three sums as `prefill host
@@ -2196,11 +2196,105 @@ where the GEMMs run at 10-25.
       At pp2048 the attention is 24 x (0.51 + 1.84 + 3.29 + 5.30) =
       262 ms on Qwen1.5-MoE, 18% of the prefill; on Mixtral 32 x 14.6
       = 467 ms, 11%.
-- [ ] **11.2 Coding** — the flash prefill kernels at depth: skip KV
+- [x] **11.2 Coding** — the flash prefill kernels at depth: skip KV
       tiles wholly above the causal diagonal, tile the KV walk so a
       query tile streams its keys once at bandwidth, the GQA1 shape
       given what 9.6.6 gave decode. llama.cpp's `fattn-mma`/Vulkan
       coopmat FA is the reference for the tile.
+      DONE as `attnFlashPrefillTileKernel`: 64 (query, head) pairs
+      per workgroup on one K/V head (16 queries x GQA4, 64 x GQA1),
+      K and V streamed once per tile through LDS in 32-key batches,
+      QK^T and PV on the f16 matrix cores, two passes so no running
+      max ever rescales an accumulator, causal batches above the
+      diagonal skipped. Q and P each go in as an f16 (value,
+      residual) pair through two MMAs; Q's residual scaled by 2^10
+      because the device flushes f16 subnormals (an unscaled residual
+      below 6.1e-5 is silently zero). Routed for hd 128 with
+      64 % (nH/nKv) == 0 -- every MoE checkpoint here; `notile` arm.
+      THE PRECISION FINDING (a day of wrong conclusions, then a probe):
+      against the f32 host floor the first tile carried a broad 2^-12
+      x V-scale noise (worst 3.6e-4 on |V| <= 1.43, row 0 exact), 1.8x
+      over the `mag*1e-3 + 2e-4` reassociation bar, and moved Qwen1.5
+      perplexity +0.4% at depth. Compensating Q "changed nothing to 7
+      digits" and that was read as matrix-core precision. It was not:
+      a one-tile probe (`tmp/u10/src/.../WmmaPrecProbe`) puts the f16
+      WMMA at 1.5e-7 of the absolute product sum -- sequential f32 to
+      the last digit, 64 chained MMAs included, subnormal operands not
+      flushed, the fold intrinsic exact -- and shows that under
+      `@FastMath` a device-computed residual `x - (float32)(float16) x`
+      is exactly ZERO (1.8e-7 with the residual uploaded from the host
+      or with FastMath off, 2.9e-4 computed in the kernel). Both
+      residual paths in the tile were dead: the kernel ran on
+      f16-rounded Q and P, and the Q rounding is what moves the
+      Qwen1.5 logits. Four mode sweeps had shown the paths changing
+      nothing before a mode-4 control (uniform P) proved the instrument
+      alive. Fix: the residual is taken from the f16 value read back
+      from LDS after a barrier, for Q (one extra barrier per tile) and
+      P (one per 32-key batch). Compiler finding owed in the cajeta
+      repo: FastMath must not fold `fpext(fptrunc x)` to `x`.
+      FIXED AND RE-MEASURED 2026-09-15: synthetic floor worst 9.8e-7
+      (was 3.6e-4), 0 of 1M over the bar; on the LIVE Qwen1.5 buffers
+      (`attncheck` arm of pplprobe: every tile launch of a 512-row
+      prefill against the host floor and the wave route) worst 9.5e-6
+      over 24 layers, tile vs wave <= 3e-6, no NaN. Perplexity still
+      moves: Qwen1.5 +0.46%, Mixtral +0.44% at pre 2048 / eval 1024.
+      Bisection: uploading the WAVE output over the tile's (equal to
+      1e-6) restores the wave value exactly, while re-uploading the
+      tile's own output or a bare sync changes nothing -- the values
+      are the difference, at 1e-6. The route records explain it: 19 of
+      the 25 per-layer expert-routing histograms differ between the two
+      arms (single tokens at a near-tied top-k, from layer 1 on), so
+      on a mixture the perplexity A/B between two f32-equivalent
+      kernels has a ~0.5% routing-flip floor at this sample size. The
+      dense control (Llama-3.1-8B Q4_K_M, GQA4, tile served): live
+      floor worst 1.0e-5 over 32 layers, tile vs wave 5e-7, no NaN --
+      and STILL +0.11% at pre 2048 / eval 1024 (6.5833 vs 6.5758),
+      +0.18% at 512/256, with nothing to route. So the second amplifier
+      is the int8 activation quantization every prefill GEMM consumes:
+      a 1e-6 change in an activation flips its q8 rounding by a whole
+      quantum (~0.8% of the block max), thousands of times per layer,
+      and the perplexity of two f32-equivalent kernels differs at that
+      floor. Controls without the tile: `noqkv` (fused vs unfused
+      QKV) is bit-identical on both models -- integer GEMMs are exact,
+      so it perturbs nothing; `nofd` (the other decode attention
+      route, wave side only) moves Qwen1.5 +0.49% and the dense 8B
+      +0.008%; the `attnjitter` arm (the wave output scaled by
+      1 - 2^-20, the tile's floor, no tile) is the direct control:
+      dense 8B 6.5758 -> 6.5931 (+0.26%), Qwen1.5 6.1534 -> 6.1937
+      (+0.66%) -- both LARGER than the tile's deltas. A perplexity
+      delta of that size between two f32-equivalent routes is the
+      floor of this model + quantization, and the acceptance for a
+      kernel change is the live floor check plus the synthetic bar,
+      not an MoE perplexity match. Filtered suite 102/102 with the
+      tile cases on the reassociation bar.
+      Attention probe after the fix, box busy with another session's
+      tests, indicative only: GQA1 ctx 2048 1.26 ms, GQA4 2.28 -- the
+      two extra barriers cost ~3%; the quiet-box number is 11.4's.
+      MEASURED 2026-09-15 (the attention probe, 512 rows at the end
+      of the context, min of five; wave -> tile):
+        GQA1 16/16   ctx 512   0.51 -> 0.22 ms   5.0 TFLOPS
+                     ctx 1024  1.84 -> 0.53      6.1
+                     ctx 1536  3.29 -> 0.88      6.1
+                     ctx 2048  5.30 -> 1.22      6.2
+        GQA4 32/8    ctx 512   0.89 -> 0.35      6.2
+                     ctx 1024  2.64 -> 0.97      6.7
+                     ctx 1536  4.49 -> 1.59      6.7
+                     ctx 2048  6.57 -> 2.21      6.8
+      In-process prefill, chunk 512, tile vs `notile`, first tokens
+      unchanged (75620 / 198, 21969 / 28074):
+        Qwen1.5-MoE pp2048  1040 -> 856 ms  (1969 -> 2394 tok/s,
+                            0.86x -> 1.04x of vk fa1 2297.6)
+                    pp512    209 -> 203     (2450 -> 2521)
+        Mixtral     pp2048  3892 -> 3561 / 3568 ms (526 -> 575 tok/s,
+                            0.98x -> 1.07x of HIP fa1 536.7; a 7947
+                            ms tile run was the cold first model of
+                            the loop and did not reproduce alone)
+                    pp512    871 -> 850     (588 -> 602)
+      Perplexity (README, pre 512 / eval 256): Qwen1.5-MoE 5.576 ->
+      5.607 (+0.55%), Mixtral 3.669 -> 3.654 (-0.41%) -- opposite
+      signs, the size of the sample's own sensitivity; the larger
+      sample (pre 2048 / eval 1024, the tile at depth) is recorded
+      under 11.4.
 - [x] **11.3 Coding** — the per-chunk cost: (a) `prewarmPrefillWeights`
       covers MoE layers (router upload, the shared expert's device
       side and batch outputs), so the load's warm-up step builds

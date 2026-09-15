@@ -2,7 +2,10 @@ package dev.cajeta.llm.model;
 
 import dev.cajeta.llm.io.QuantKernel;
 import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.lang.System;
 import cajeta.xpu.Barrier;
+import cajeta.xpu.CooperativeMatrix;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.Shared;
@@ -2178,6 +2181,349 @@ public final class AttnKernel {
     // matching would otherwise pass every tolerance while running the old
     // kernels).
     static boolean flashDecOn = true;
+    /** 11.2: the query-tiled flash prefill -- 64 (query, head) pairs per
+     *  workgroup on one K/V head, K/V through LDS in 32-key batches, f16
+     *  WMMA on (value, 2^10 residual) pairs read back from LDS; hd 128. */
+    @Kernel @FastMath
+    @Occupancy(maxThreads = 256)
+    public static void attnFlashPrefillTileKernel(KernelBuffer<float32> out,
+            KernelBuffer<float32> q, KernelBuffer<float16> kPool,
+            KernelBuffer<float16> vPool, uint32 rows, uint32 nH,
+            uint32 nKv, uint32 startPos, float32 scale) {
+        Shared<float16> qs = shared float16[8704];
+        Shared<float16> ql = shared float16[8704];
+        Shared<float16> ks = shared float16[4352];
+        Shared<float16> vs = shared float16[4352];
+        Shared<float32> ss = shared float32[2304];
+        Shared<float32> mrow = shared float32[64];
+        Shared<float32> lrow = shared float32[64];
+        Shared<float32> ones = shared float32[16];
+        uint32 tid = KernelThread.x();
+        uint32 lane = tid % 32;
+        uint32 wid = tid / 32;
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 group = nH / nKv;
+        uint32 qt = 64 / group;
+        uint32 qb = wg / nKv;
+        uint32 kvh = wg % nKv;
+        uint32 r0 = qb * qt;
+        uint32 kvDim = nKv * 128;
+        uint32 wr = wid / 2;
+        uint32 wc = wid % 2;
+        if (r0 < rows) {
+            uint32 lastPos = startPos + r0 + qt - 1;
+            if (lastPos > startPos + rows - 1) { lastPos = startPos + rows - 1; }
+            uint32 kEnd = lastPos + 1;
+            uint32 sp = tid / 4;
+            uint32 sd = (tid % 4) * 32;
+            uint32 sq = r0 + sp / group;
+            uint32 sh = kvh * group + sp % group;
+            uint32 di = 0;
+            while (di < 32) {
+                float32 qv = 0.0f;
+                if (sq < rows) {
+                    qv = q[(int64) sq * (int64) (nH * 128) + (int64) (sh * 128)
+                        + (int64) (sd + di)] * scale;
+                }
+                qs[sp * 136 + sd + di] = (float16) qv;
+                di = di + 1;
+            }
+            if (tid < 64) {
+                mrow[tid] = -1.0e30f;
+                lrow[tid] = 0.0f;
+            }
+            if (tid < 16) { ones[tid] = 1.0f; }
+            Barrier.workgroup();
+            uint32 dj = 0;
+            while (dj < 32) {
+                float32 qw = 0.0f;
+                if (sq < rows) {
+                    qw = q[(int64) sq * (int64) (nH * 128) + (int64) (sh * 128)
+                        + (int64) (sd + dj)] * scale;
+                }
+                float32 qr = qw - (float32) qs[sp * 136 + sd + dj];
+                ql[sp * 136 + sd + dj] = (float16) (qr * 1024.0f);
+                dj = dj + 1;
+            }
+            Barrier.workgroup();
+
+            CooperativeMatrix<float16,16,16,0> qa;
+            CooperativeMatrix<float16,16,16,0> qla;
+            CooperativeMatrix<float16,16,16,1> kb;
+            CooperativeMatrix<float32,16,16,2> sacc;
+            CooperativeMatrix<float32,16,16,2> sres;
+            CooperativeMatrix<float16,16,16,0> pa;
+            CooperativeMatrix<float16,16,16,0> pla;
+            CooperativeMatrix<float16,16,16,1> vb;
+            CooperativeMatrix<float32,16,16,2> o0;
+            CooperativeMatrix<float32,16,16,2> o1;
+            CooperativeMatrix<float32,16,16,2> o2;
+            CooperativeMatrix<float32,16,16,2> o3;
+            CooperativeMatrix<float32,16,16,2> o0l;
+            CooperativeMatrix<float32,16,16,2> o1l;
+            CooperativeMatrix<float32,16,16,2> o2l;
+            CooperativeMatrix<float32,16,16,2> o3l;
+            o0.splat(0.0f);
+            o1.splat(0.0f);
+            o2.splat(0.0f);
+            o3.splat(0.0f);
+            o0l.splat(0.0f);
+            o1l.splat(0.0f);
+            o2l.splat(0.0f);
+            o3l.splat(0.0f);
+            uint32 kk = tid / 8;
+            uint32 kd = (tid % 8) * 16;
+            uint32 rr = tid / 4;
+            uint32 rk = (tid % 4) * 8;
+            uint32 rpos = startPos + r0 + rr / group;
+            if (r0 + rr / group >= rows) { rpos = startPos + rows - 1; }
+
+            uint32 pass = 0;
+            while (pass < 2) {
+                uint32 kb0 = 0;
+                while (kb0 < kEnd) {
+                    uint32 kpos = kb0 + kk;
+                    if (kpos >= kEnd) { kpos = kEnd - 1; }
+                    int64 kOff = (int64) kpos * (int64) kvDim
+                        + (int64) (kvh * 128) + (int64) kd;
+                    ks.vstore((int64) (kk * 136 + kd), kPool.vload<8>(kOff));
+                    ks.vstore((int64) (kk * 136 + kd + 8), kPool.vload<8>(kOff + 8L));
+                    if (pass == 1) {
+                        vs.vstore((int64) (kk * 136 + kd), vPool.vload<8>(kOff));
+                        vs.vstore((int64) (kk * 136 + kd + 8), vPool.vload<8>(kOff + 8L));
+                    }
+                    Barrier.workgroup();
+                    sacc.splat(0.0f);
+                    sres.splat(0.0f);
+                    uint32 kst = 0;
+                    while (kst < 8) {
+                        qa.load(qs, wr * 2176 + kst * 16, 0, 136);
+                        qla.load(ql, wr * 2176 + kst * 16, 0, 136);
+                        kb.load(ks, wc * 2176 + kst * 16, 1, 136);
+                        sacc.mma(qa, kb);
+                        sres.mma(qla, kb);
+                        kst = kst + 1;
+                    }
+                    sres.scaledAccumIntoS(sacc, ones[0], 0.0009765625f);
+                    sacc.store(ss, wr * 576 + wc * 16, 0, 36);
+                    Barrier.workgroup();
+                    if (pass == 0) {
+                        float32 mx = -1.0e30f;
+                        uint32 j = 0;
+                        while (j < 8) {
+                            uint32 kabs = kb0 + rk + j;
+                            if (kabs <= rpos && kabs < kEnd) {
+                                float32 sv = ss[rr * 36 + rk + j];
+                                if (sv > mx) { mx = sv; }
+                            }
+                            j = j + 1;
+                        }
+                        float32 mt = Wave.reduceMaxF32Segmented(mx, 4);
+                        if (tid % 4 == 0) {
+                            if (mt > mrow[rr]) { mrow[rr] = mt; }
+                        }
+                    } else {
+                        float32 mv = mrow[rr];
+                        uint32 j2 = 0;
+                        while (j2 < 8) {
+                            uint32 kabs2 = kb0 + rk + j2;
+                            float32 pv = 0.0f;
+                            if (kabs2 <= rpos && kabs2 < kEnd) {
+                                pv = Math.exp(ss[rr * 36 + rk + j2] - mv);
+                            }
+                            ks[rr * 32 + rk + j2] = (float16) pv;
+                            ss[rr * 36 + rk + j2] = pv;
+                            j2 = j2 + 1;
+                        }
+                        Barrier.workgroup();
+                        float32 ls = 0.0f;
+                        uint32 j3 = 0;
+                        while (j3 < 8) {
+                            float32 phf = (float32) ks[rr * 32 + rk + j3];
+                            float32 prf = ss[rr * 36 + rk + j3] - phf;
+                            float16 pl = (float16) (prf * 1024.0f);
+                            ks[2048 + rr * 32 + rk + j3] = pl;
+                            ls = ls + phf + (float32) pl * 0.0009765625f;
+                            j3 = j3 + 1;
+                        }
+                        float32 lt = Wave.reduceSumF32Segmented(ls, 4);
+                        if (tid % 4 == 0) { lrow[rr] = lrow[rr] + lt; }
+                    }
+                    Barrier.workgroup();
+                    if (pass == 1) {
+                        uint32 ks2 = 0;
+                        while (ks2 < 2) {
+                            pa.load(ks, wr * 512 + ks2 * 16, 0, 32);
+                            pla.load(ks, 2048 + wr * 512 + ks2 * 16, 0, 32);
+                            vb.load(vs, ks2 * 2176 + wc * 64, 0, 136);
+                            o0.mma(pa, vb);
+                            o0l.mma(pla, vb);
+                            vb.load(vs, ks2 * 2176 + wc * 64 + 16, 0, 136);
+                            o1.mma(pa, vb);
+                            o1l.mma(pla, vb);
+                            vb.load(vs, ks2 * 2176 + wc * 64 + 32, 0, 136);
+                            o2.mma(pa, vb);
+                            o2l.mma(pla, vb);
+                            vb.load(vs, ks2 * 2176 + wc * 64 + 48, 0, 136);
+                            o3.mma(pa, vb);
+                            o3l.mma(pla, vb);
+                            ks2 = ks2 + 1;
+                        }
+                    }
+                    Barrier.workgroup();
+                    kb0 = kb0 + 32;
+                }
+                pass = pass + 1;
+            }
+
+            o0l.scaledAccumIntoS(o0, ones[0], 0.0009765625f);
+            o1l.scaledAccumIntoS(o1, ones[0], 0.0009765625f);
+            o2l.scaledAccumIntoS(o2, ones[0], 0.0009765625f);
+            o3l.scaledAccumIntoS(o3, ones[0], 0.0009765625f);
+            uint32 slot = wid * 256;
+            uint32 fj = 0;
+            while (fj < 4) {
+                if (fj == 0) { o0.store(ss, slot, 0, 16); }
+                else if (fj == 1) { o1.store(ss, slot, 0, 16); }
+                else if (fj == 2) { o2.store(ss, slot, 0, 16); }
+                else { o3.store(ss, slot, 0, 16); }
+                uint32 e = lane;
+                while (e < 256) {
+                    uint32 pr = wr * 16 + e / 16;
+                    uint32 qi = r0 + pr / group;
+                    if (qi < rows) {
+                        uint32 hh = kvh * group + pr % group;
+                        float32 inv = 1.0f / lrow[pr];
+                        out[(int64) qi * (int64) (nH * 128) + (int64) (hh * 128)
+                            + (int64) (wc * 64 + fj * 16 + e % 16)] = ss[slot + e] * inv;
+                    }
+                    e = e + 32;
+                }
+                fj = fj + 1;
+            }
+        }
+    }
+
+    static boolean attnTileOn = true;
+    public static void setPrefillTile(boolean on) { AttnKernel.attnTileOn = on; }
+    static boolean floorCheckOn = false;
+    static int32 floorChecks = 0;
+    public static void setFloorCheck(boolean on) { AttnKernel.floorCheckOn = on; }
+    static boolean jitterOn = false;
+    public static void setJitter(boolean on) { AttnKernel.jitterOn = on; }
+
+    /** Diagnostic (`attnjitter` arm): the wave route's output scaled by
+     *  1 - 2^-20, a perturbation at the tile's floor with no tile. */
+    static void jitter(KernelBuffer<float32> out, int64 qn) {
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] v = heap float32[qn];
+        out.download(v, qn);
+        int64 i = 0;
+        while (i < qn) {
+            v[i] = v[i] * 0.999999046f;
+            i = i + 1;
+        }
+        out.upload(v, qn);
+    }
+
+    static #String floorStat(float32[] want, float32[] got, int64 n) {
+        float32 worst = 0.0f;
+        int64 worstAt = 0;
+        int64 over = 0;
+        int64 dead = 0;
+        float32 big = 0.0f;
+        int64 i = 0;
+        while (i < n) {
+            float32 a = want[i];
+            float32 g = got[i];
+            if (g != g || g > 1.0e30f || g < -1.0e30f) { dead = dead + 1; }
+            float32 d = a - g;
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 mag = a;
+            if (mag < 0.0f) { mag = 0.0f - mag; }
+            if (mag > big) { big = mag; }
+            if (d > mag * 0.001f + 0.0002f) { over = over + 1; }
+            if (d > worst) { worst = d; worstAt = i; }
+            i = i + 1;
+        }
+        String r = "worst " + worst + " at " + worstAt + " (want " + want[worstAt]
+            + " got " + got[worstAt] + ") over " + over + "/" + n + " nan/inf " + dead
+            + " max|want| " + big;
+        return #r;
+    }
+
+    /** Diagnostic (`attncheck` arm): every routed tile launch against
+     *  the host floor and the wave route on the live buffers. */
+    static void floorCheck(KernelBuffer<float32> out,
+            KernelBuffer<float32> scores, KernelBuffer<float32> q,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool,
+            int32 rows, int32 nH, int32 nKv, int32 hd, int32 startPos,
+            int32 stride, float32 scale) {
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int32 tMax = startPos + rows;
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        int64 kvn = (int64) tMax * (int64) (nKv * hd);
+        float32[] qh = heap float32[qn];
+        q.download(qh, qn);
+        float16[] kh = heap float16[kvn];
+        float16[] vh = heap float16[kvn];
+        kPool.download(kh, kvn);
+        vPool.download(vh, kvn);
+        float32[] kf = heap float32[kvn];
+        float32[] vf = heap float32[kvn];
+        AttnKernel.widenHalf(kh, kf, kvn);
+        AttnKernel.widenHalf(vh, vf, kvn);
+        float32[] want = heap float32[qn];
+        AttnKernel.attendPrefillHost(want, qh, kf, vf, rows, nH, nKv, hd,
+            startPos, scale);
+        float32[] got = heap float32[qn];
+        out.download(got, qn);
+        KernelBuffer<float32> wb = heap KernelBuffer<float32>((uint64) qn);
+        AttnKernel.attnTileOn = false;
+        AttnKernel.attendPrefillLaunchNoSync(wb, scores, q, kPool, vPool,
+            rows, nH, nKv, hd, startPos, stride, scale);
+        AttnKernel.attnTileOn = true;
+        s.sync();
+        float32[] ref = heap float32[qn];
+        wb.download(ref, qn);
+        float32 qmax = 0.0f;
+        int64 i = 0;
+        while (i < qn) {
+            float32 a = qh[i];
+            if (a < 0.0f) { a = 0.0f - a; }
+            if (a > qmax) { qmax = a; }
+            i = i + 1;
+        }
+        System.stdout.println("attn-floor rows " + rows + " sp " + startPos
+            + " nH " + nH + " nKv " + nKv + " |q|max " + qmax);
+        System.stdout.println("  tile vs host: " + AttnKernel.floorStat(want, got, qn));
+        System.stdout.println("  wave vs host: " + AttnKernel.floorStat(want, ref, qn));
+        System.stdout.println("  tile vs wave: " + AttnKernel.floorStat(ref, got, qn));
+    }
+    public static boolean prefillTileOn() { return AttnKernel.attnTileOn; }
+
+    static boolean tileServes(int32 nH, int32 nKv, int32 hd) {
+        if (hd != 128 || nKv <= 0 || nH % nKv != 0) { return false; }
+        int32 group = nH / nKv;
+        return 64 % group == 0;
+    }
+
+    static void flashPrefillTileLaunchNoSync(KernelBuffer<float32> out,
+            KernelBuffer<float32> q, KernelBuffer<float16> kPool,
+            KernelBuffer<float16> vPool, int32 rows, int32 nH, int32 nKv,
+            int32 startPos, float32 scale) {
+        int32 qt = 64 / (nH / nKv);
+        int64 tiles = ((int64) rows + (int64) qt - 1L) / (int64) qt;
+        KernelStream s = QuantKernel.stream();
+        attnFlashPrefillTileKernel.launch(s,
+            grid: [(uint32) (tiles * (int64) nKv)], block: [256])
+            (out, q, kPool, vPool, (uint32) rows, (uint32) nH, (uint32) nKv,
+             (uint32) startPos, scale);
+        return;
+    }
+
     static int32 fdChunk = 8;
     static int32 fd1Chunk = 32;              // unit 9.6.6: positions per GQA1 split
     // Unit 50, measured: a fenced last-split reduce inside the flash
@@ -2226,6 +2572,16 @@ public final class AttnKernel {
             int32 stride, float32 scale) {
         KernelStream s = QuantKernel.stream();
         int32 tMax = startPos + rows;
+        if (AttnKernel.attnTileOn && AttnKernel.tileServes(nH, nKv, hd)) {
+            AttnKernel.flashPrefillTileLaunchNoSync(out, q, kPool, vPool,
+                rows, nH, nKv, startPos, scale);
+            if (AttnKernel.floorCheckOn && AttnKernel.floorChecks < 200) {
+                AttnKernel.floorChecks = AttnKernel.floorChecks + 1;
+                AttnKernel.floorCheck(out, scores, q, kPool, vPool, rows,
+                    nH, nKv, hd, startPos, stride, scale);
+            }
+            return;
+        }
         if (AttnKernel.attnFlashOn && hd == 128) {
             if (nH == 4 * nKv) {
                 int64 wg = (int64) rows * (int64) nKv;
@@ -2233,6 +2589,9 @@ public final class AttnKernel {
                     grid: [(uint32) wg], block: [32])
                     (out, q, kPool, vPool, (uint32) rows, (uint32) nH,
                      (uint32) nKv, (uint32) startPos, scale);
+                if (AttnKernel.jitterOn) {
+                    AttnKernel.jitter(out, (int64) rows * (int64) (nH * hd));
+                }
                 return;
             }
             int64 wv = (int64) rows * (int64) nH;
@@ -2240,6 +2599,9 @@ public final class AttnKernel {
                 grid: [(uint32) wv], block: [32])
                 (out, q, kPool, vPool, (uint32) rows, (uint32) nH,
                  (uint32) nKv, (uint32) startPos, scale);
+            if (AttnKernel.jitterOn) {
+                AttnKernel.jitter(out, (int64) rows * (int64) (nH * hd));
+            }
             return;
         }
         if (AttnKernel.attnV2On && hd == 128) {
