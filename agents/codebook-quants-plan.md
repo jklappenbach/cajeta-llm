@@ -511,11 +511,41 @@ every timing leg and wait for the go; filtered suite only
       mask had run out of bits and IQ3_S would have aliased `q4 deqMw4`.
 
 ### 6.3 Acceptance
-- [ ] 6.3.1 IQ2_S, IQ2_M, IQ3_S, IQ3_XS, IQ3_M 8B files (the mixes
+- [~] 6.3.1 IQ2_S, IQ2_M, IQ3_S, IQ3_XS, IQ3_M 8B files (the mixes
       exercise Units 5 and 6 together): legs, greedy agreement,
       perplexity, resident bytes.
-- [ ] 6.3.2 The IQ3_XXS Qwen1.5-MoE: every expert tensor `batched`,
+      DONE 2026-09-16 except the legs (`tmp/cbq/u6-accept.sh`). Every
+      one of these files carries IQ3_S or IQ2_S, so all six — including
+      the `llama8b-iq3_xxs` that Unit 5 could not open — load only now.
+      Perplexity at llama-perplexity's chunk-1 window, BOS aligned:
+
+      | file | cajeta | llama.cpp | delta | greedy (16 tokens) |
+      |---|---|---|---|---|
+      | iq2_s | 6.2280 | 6.2346 | −0.11% | identical |
+      | iq2_m | 5.7347 | 5.7365 | −0.03% | tips at token 1 |
+      | iq3_s | 5.1634 | 5.1717 | −0.16% | identical |
+      | iq3_xs | 5.1719 | 5.1743 | −0.05% | tips at token 2 |
+      | iq3_m | 5.1521 | 5.1721 | −0.39% | identical |
+      | iq3_xxs | 5.3515 | 5.3598 | −0.15% | identical |
+
+      Routes: `coop` per codebook type, `dotAccum ty=12` for the Q4_K
+      tensors, no `batch-refused`. Resident bytes equal the bound
+      tensors' file bytes EXACTLY on all six (ledger against the GGUF
+      table: 2,523,856,896 / 2,713,649,152 / 3,447,693,312 /
+      3,284,115,456 / 3,550,191,616 / 3,040,280,576, each the linear
+      bytes less the `token_embd` an untied model keeps in the
+      Embedding). Worth a look later: all seven perplexities here sit
+      BELOW llama.cpp's, between 0.03% and 0.39% — a consistent sign,
+      not scatter.
+- [~] 6.3.2 The IQ3_XXS Qwen1.5-MoE: every expert tensor `batched`,
       perplexity within the MoE floor of llama.cpp's, legs.
+      DONE 2026-09-16 except the legs: all 24 layers report
+      `moe-batch-route resident` and the four codebook types take the
+      coop GEMM, with no refusal; perplexity 5.4687 against 5.4781
+      (−0.17%), inside the MoE routing-flip floor. `DenseRouteProbe`
+      set no expert residency budget, so its first answer was 24 ×
+      "an expert is not admitted" — the trap `PplProbe` already
+      documents; the probe now sets the budget the engine's AUTO would.
 
 ## Unit 7 — IQ1_S, IQ1_M (spec §3.2, §6.3)
 
