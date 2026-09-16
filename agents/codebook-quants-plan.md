@@ -483,7 +483,8 @@ every timing leg and wait for the go; filtered suite only
       claim. BLOCKED for IQ3_XXS: `llama8b-iq3_xxs.gguf` stores
       `token_embd` as IQ3_S (type 21), so the file cannot load until
       Unit 6; it is a composition dependency, not a defect here. The
-      HIP/Vulkan legs are ANNOUNCED and wait on the box.
+      HIP/Vulkan legs are MEASURED — see the legs table below
+      Unit 6; the bar is not met and the gap is item 6.4.1.
 
 ## Unit 6 — IQ2_S, IQ3_S: raw signs and qh high bits (spec §3.4, 12.1)
 
@@ -492,13 +493,30 @@ every timing leg and wait for the go; filtered suite only
 - [x] 6.1.2 Host mat-vecs and Q8 twins.
 - [x] 6.1.3 Wave decode kernels and coop X1/X3; `coopBlockWords` 20 / 27.
       (X3 only, as in Unit 5; X1 rides 4.3.5.)
-- [~] 6.1.4 The 12.1 harness: the IQ2_S wave kernel with an LDS-table arm
+- [x] 6.1.4 The 12.1 harness: the IQ2_S wave kernel with an LDS-table arm
       and an L1-table arm, bit-identical outputs, timed alternating on
       idle; the choice recorded here with both numbers.
-      Both arms SHIP and are bit-identical
+      Both arms ship and are bit-identical
       (`IqCodebookTest.theTwoTableResidencyArmsAgreeExactly`;
-      `QuantKernel.setIqLdsTable` picks one, L1 by default). The TIMING
-      half is announced and waits on a quiet box.
+      `QuantKernel.setIqLdsTable` picks one). MEASURED 2026-09-16 on a
+      quiet box, `llama8b-iq2_m` (156 IQ2_S tensors), tg128 at depth
+      512, five repeats with the arm order alternating
+      (`tmp/cbq/u6-lds-ab.sh`):
+
+      | rep | L1 t/s | LDS t/s |
+      |---|---|---|
+      | 1 | 46.63 | 36.93 |
+      | 2 | 46.78 | 36.98 |
+      | 3 | 46.81 | 36.96 |
+      | 4 | 46.70 | 37.10 |
+      | 5 | 46.83 | 37.13 |
+
+      DECIDED: L1, and it is not close — 46.8 against 37.1, a 26% gap
+      with under 0.5% spread inside each arm. The decode wave is one
+      workgroup of 32 lanes per row, so an 8 KB stage is paid per row
+      and read by 32 lanes; Vulkan's LDS choice is for a GEMM workgroup
+      of 256 that reuses the table across a whole tile. `iqLdsTable`
+      stays false and the LDS kernel stays as the control.
 
 ### 6.2 Coding
 - [x] 6.2.1 Decoders; host; kernels; registration; gates last.
@@ -514,7 +532,8 @@ every timing leg and wait for the go; filtered suite only
 - [~] 6.3.1 IQ2_S, IQ2_M, IQ3_S, IQ3_XS, IQ3_M 8B files (the mixes
       exercise Units 5 and 6 together): legs, greedy agreement,
       perplexity, resident bytes.
-      DONE 2026-09-16 except the legs (`tmp/cbq/u6-accept.sh`). Every
+      DONE 2026-09-16, legs included (`tmp/cbq/u6-accept.sh`,
+      `u56-legs.sh`; the legs miss their bar — item 6.4.1). Every
       one of these files carries IQ3_S or IQ2_S, so all six — including
       the `llama8b-iq3_xxs` that Unit 5 could not open — load only now.
       Perplexity at llama-perplexity's chunk-1 window, BOS aligned:
@@ -539,13 +558,55 @@ every timing leg and wait for the go; filtered suite only
       not scatter.
 - [~] 6.3.2 The IQ3_XXS Qwen1.5-MoE: every expert tensor `batched`,
       perplexity within the MoE floor of llama.cpp's, legs.
-      DONE 2026-09-16 except the legs: all 24 layers report
+      DONE 2026-09-16, legs included (they miss badly — item 6.4.3):
+      all 24 layers report
       `moe-batch-route resident` and the four codebook types take the
       coop GEMM, with no refusal; perplexity 5.4687 against 5.4781
       (−0.17%), inside the MoE routing-flip floor. `DenseRouteProbe`
       set no expert residency budget, so its first answer was 24 ×
       "an expert is not admitted" — the trap `PplProbe` already
       documents; the probe now sets the budget the engine's AUTO would.
+
+### 5.4 / 6.4 Legs (measured 2026-09-16, quiet box)
+
+- [x] The announced legs for 5.3.1, 6.3.1 and 6.3.2, one table
+      (`tmp/cbq/u56-legs.sh`; 3 reps, engine order alternating per file,
+      max of reps, llama.cpp best of fa=0/fa=1; pp512 and tg128 at depth
+      512). llama.cpp reproduces 2.2.4's reference legs within noise
+      (MoE HIP 1178/93.1 against 1173.1/92.8, Vulkan 2308/139.4 against
+      2289.3/139.6), so the box is the same one and the gap is ours.
+
+      | file | cajeta pp | hip | vulkan | pp × | cajeta tg | hip | vulkan | tg × |
+      |---|---|---|---|---|---|---|---|---|
+      | iq2_xxs | 1311 | 783 | 1178 | 1.11 | 61.7 | 52.3 | 78.8 | 0.78 |
+      | iq2_xs | 1235 | 1155 | 1182 | 1.04 | 48.7 | 51.3 | 73.4 | 0.66 |
+      | iq3_xxs | 1198 | 758 | 1199 | 1.00 | 50.7 | 48.2 | 59.4 | 0.85 |
+      | iq2_s | 1233 | 1057 | 1164 | 1.06 | 47.8 | 50.0 | 69.9 | 0.68 |
+      | iq2_m | 1288 | 1129 | 1157 | 1.11 | 46.8 | 50.2 | 67.0 | 0.70 |
+      | iq3_s | 1038 | 698 | 1255 | 0.83 | 42.8 | 47.7 | 55.1 | 0.78 |
+      | iq3_xs | 1088 | 706 | 1212 | 0.90 | 46.0 | 47.1 | 56.4 | 0.82 |
+      | iq3_m | 1082 | 740 | 1260 | 0.86 | 43.0 | 47.6 | 54.2 | 0.79 |
+      | qwen15moe-iq3_xxs | 613 | 1178 | 2308 | 0.27 | 36.6 | 93.1 | 139.4 | 0.26 |
+
+      THE BAR IS NOT MET. Prefill clears 1.0× on the five IQ2-family
+      files and misses on the three the IQ3_S coop GEMM dominates
+      (0.83–0.90); decode misses 0.95× on every file (0.66–0.85),
+      though it beats or matches HIP everywhere except the MoE. The MoE
+      is 0.27× / 0.26× — its own item below. These are first
+      measurements, not regressions: none of these files could load
+      before Units 5 and 6.
+- [ ] 6.4.1 The IQ codebook decode gap: 0.66–0.85× of Vulkan's tg on
+      eight files, with the same shape as 4.3.5's ternary gap. One
+      kernel family, one cause to find — read the ISA and the achieved
+      bandwidth of `iq2xxs/iq2xs/iq2s/iq3xxs/iq3s Q8WaveMatVec` before
+      changing anything. Folds 4.3.5 in.
+- [ ] 6.4.2 The IQ3_S coop GEMM prefill gap: 0.83–0.90× of Vulkan where
+      the IQ2 family clears 1.0×. The three files that miss are exactly
+      the IQ3_S-heavy ones (193 / 157 / 81 tensors).
+- [ ] 6.4.3 The Qwen1.5-MoE at 0.27× / 0.26×. Expert residency is the
+      first suspect (the CLI ledger held 678 MB of 6.3 GB of expert
+      bytes), so measure what the bank admits before touching a kernel.
+
 
 ## Unit 7 — IQ1_S, IQ1_M (spec §3.2, §6.3)
 
