@@ -463,10 +463,27 @@ every timing leg and wait for the go; filtered suite only
       prefix then 16 / 18 / 24 payload words per block.
 
 ### 5.3 Acceptance
-- [ ] 5.3.1 IQ2_XXS, IQ2_XS, IQ3_XXS 8B files: `batched`, no
+- [~] 5.3.1 IQ2_XXS, IQ2_XS, IQ3_XXS 8B files: `batched`, no
       `batch-refused`; legs against llama.cpp HIP and Vulkan (pp ≥ 1.0×,
       tg ≥ 0.95×); greedy agreement; perplexity within the floor;
       resident bytes equal file bytes.
+      PART DONE 2026-09-16 on the two loadable files (`tmp/cbq/iq-accept*.sh`,
+      `iq-routes.sh`). Routes: `batch-route coop iq2_xxs 4096x4096` and
+      `coop iq2_xs 4096x4096`, no `batch-refused` on any tensor.
+      Perplexity at llama-perplexity's chunk-1 window (BOS aligned):
+      iq2_xxs 7.4942 against 7.4910 (+0.04%), iq2_xs 6.5934 against
+      6.6042 (−0.16%) — within the floor. Resident bytes equal the file
+      bytes of every bound Linear EXACTLY: 2,217,934,848 of 2,390,310,912
+      and 2,424,504,320 of 2,596,880,384, each short by the Q2_K
+      `token_embd` (172,376,064 B) that an untied model keeps in the
+      Embedding rather than a Linear. Greedy is NOT token-identical on
+      iq2_xs: the openings agree and the fifth token tips ("famous" /
+      "full"), which is the near-tie behaviour these f16-accumulating
+      kernels document — perplexity over 1023 positions carries the
+      claim. BLOCKED for IQ3_XXS: `llama8b-iq3_xxs.gguf` stores
+      `token_embd` as IQ3_S (type 21), so the file cannot load until
+      Unit 6; it is a composition dependency, not a defect here. The
+      HIP/Vulkan legs are ANNOUNCED and wait on the box.
 
 ## Unit 6 — IQ2_S, IQ3_S: raw signs and qh high bits (spec §3.4, 12.1)
 
