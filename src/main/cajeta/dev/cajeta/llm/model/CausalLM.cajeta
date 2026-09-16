@@ -636,6 +636,10 @@ public final class CausalLM extends InfModule {
                     nH, nKv, hd);
                 int64 top0 = Clock.nanoTime();
                 CausalLM.hdAttendNs = CausalLM.hdAttendNs + (top0 - tat0);
+                if (d.subNorm) {
+                    Prim.rmsnormRowHost(ao, rq, d.attnSubNorm.weight,
+                        d.attnSubNorm.eps, ao, rq, qd, d.normForm);
+                }
                 a.oProj.matvecInto(ao, rq, proj, rh);
                 if (d.fourNorm) {
                     // Gemma layout: post-norm on the sublayer OUTPUT.
@@ -667,7 +671,7 @@ public final class CausalLM extends InfModule {
                     continue;
                 } else {
                     Linear.beginSharedActivation();
-                    if (d.mlp.gateProj.isDeviceRouted()
+                    if (!d.subNorm && d.mlp.gateProj.isDeviceRouted()
                             && d.mlp.upProj.isDeviceRouted()
                             && d.mlp.downProj.isDeviceRouted()) {
                         // THE MLP MIDDLE NEVER LEAVES THE DEVICE (plan 10.2).
@@ -689,6 +693,11 @@ public final class CausalLM extends InfModule {
                         Linear.endSharedActivation();
                         Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
                             d.activation);
+                        if (d.subNorm) {
+                            Prim.rmsnormRowHost(gate, ri, d.ffnSubNorm.weight,
+                                d.ffnSubNorm.eps, gate, ri, inter,
+                                d.normForm);
+                        }
                         d.mlp.downProj.matvecInto(gate, ri, mlpOut, rh);
                     }
                 }
@@ -836,6 +845,7 @@ public final class CausalLM extends InfModule {
     KernelBuffer<float32> hsDev;
     KernelBuffer<float32> xnDev;
     KernelBuffer<float32> moeDev;   // unit 38: MoE crossing up-leg
+    KernelBuffer<float32> subDev;   // bitnet sub-norm output (8.1)
     float32[] hsHost;
 
     // Prefill-resident hidden state (10.12.7.b): `[rows x h]` device
@@ -844,6 +854,8 @@ public final class CausalLM extends InfModule {
     // slice's `hostBase` is nonzero and `KernelBuffer.upload` starts at
     // index 0, the exact trap that broke `prefillAttend` (spec 9).
     KernelBuffer<float32> pfHsDev;
+    KernelBuffer<float32> pfSubDev;
+    int64 pfSubCap;
     KernelBuffer<float32> pfXnDev;
     float32[] pfHsHost;
     int64 pfHsCap;
@@ -1039,6 +1051,27 @@ public final class CausalLM extends InfModule {
             i = i + 1;
         }
         return s;
+    }
+
+    /** Fingerprint the V plane row `p` of layer `li` under the sniffer
+     *  (syncs), naming the position attended. */
+    void sniffKvRow(String where, int32 li, DeviceKv dkv, int32 p) {
+        if (!CausalLM.nanSniff) { return; }
+        KernelStream ns = QuantKernel.stream();
+        ns.sync();
+        int64 kvDim = (int64) dkv.kvDim;
+        int64 n = (int64) (p + 1) * kvDim;
+        dkv.readPlanes(li, dkv.stageK, dkv.stageV, n);
+        float32[] row = heap float32[kvDim];
+        int64 i = 0;
+        while (i < kvDim) {
+            row[i] = dkv.stageV[(int64) p * kvDim + i];
+            i = i + 1;
+        }
+        System.stdout.println("[FP " + where + " " + li + " "
+            + CausalLM.fingerprint(row, kvDim) + " p=" + p + " len="
+            + dkv.len + "]");
+        return;
     }
 
     /** Fingerprint a device buffer under the sniffer (syncs). */
@@ -1674,8 +1707,16 @@ public final class CausalLM extends InfModule {
                 int64 taEnd = CausalLM.pfMark();
                 CausalLM.pfAttendNs = CausalLM.pfAttendNs
                     + (taEnd - ta0);
+                KernelBuffer<float32> oIn = aoDev;
+                if (d.subNorm) {
+                    this.ensurePrefillSub((int64) rows * (int64) qd);
+                    Prim.rmsnormBatchDevice(this.pfSubDev, aoDev,
+                        d.attnSubNorm.deviceWeight(), (int64) rows,
+                        (int64) qd, d.attnSubNorm.eps, d.normForm);
+                    oIn = this.pfSubDev;
+                }
                 this.stageTag = Linear.nextStageTag();
-                Linear.stageBatchFromDevice(aoDev, rows, qd,
+                Linear.stageBatchFromDevice(oIn, rows, qd,
                     this.stageTag);
                 CausalLM.pfStageNs = CausalLM.pfStageNs
                     + (CausalLM.pfMark() - taEnd);
@@ -1762,6 +1803,15 @@ public final class CausalLM extends InfModule {
                 }
             }
 
+            if (d.subNorm) {
+                r = 0;
+                while (r < rows) {
+                    int64 rqs = (int64) r * (int64) qd;
+                    Prim.rmsnormRowHost(ao, rqs, d.attnSubNorm.weight,
+                        d.attnSubNorm.eps, ao, rqs, qd, d.normForm);
+                    r = r + 1;
+                }
+            }
             this.stageTag = Linear.nextStageTag();
             Linear.stageBatch(ao, 0L, rows, qd, this.stageTag);
             }
@@ -1900,9 +1950,17 @@ public final class CausalLM extends InfModule {
                     CausalLM.pfPrimNs = CausalLM.pfPrimNs + (tu1 - tu0);
                 }
                 int64 ts3 = CausalLM.pfMark();
+                KernelBuffer<float32> ffnAct = d.mlp.gateProj.yBatch;
+                if (d.subNorm) {
+                    this.ensurePrefillSub((int64) rows * (int64) inter);
+                    Prim.rmsnormBatchDevice(this.pfSubDev, ffnAct,
+                        d.ffnSubNorm.deviceWeight(), (int64) rows,
+                        (int64) inter, d.ffnSubNorm.eps, d.normForm);
+                    ffnAct = this.pfSubDev;
+                }
                 this.stageTag = Linear.nextStageTag();
-                Linear.stageBatchFromDevice(d.mlp.gateProj.yBatch,
-                    rows, inter, this.stageTag);
+                Linear.stageBatchFromDevice(ffnAct, rows, inter,
+                    this.stageTag);
                 int64 ts4 = CausalLM.pfMark();
                 CausalLM.pfStageNs = CausalLM.pfStageNs + (ts4 - ts3);
                 // With hs resident (.b) the down projection joins it on
@@ -1926,6 +1984,10 @@ public final class CausalLM extends InfModule {
                     int64 ri = (int64) r * (int64) inter;
                     Prim.gluRowHost(gate, ri, up, ri, gate, ri, inter,
                         d.activation);
+                    if (d.subNorm) {
+                        Prim.rmsnormRowHost(gate, ri, d.ffnSubNorm.weight,
+                            d.ffnSubNorm.eps, gate, ri, inter, d.normForm);
+                    }
                     r = r + 1;
                 }
                 CausalLM.pfPrimNs = CausalLM.pfPrimNs
@@ -2093,6 +2155,20 @@ public final class CausalLM extends InfModule {
         // buffer, not xnDev — the expert sum must not clobber the
         // normed activation mid-flight on the stream.
         this.moeDev #= heap KernelBuffer<float32>((uint64) h);
+        if (this.cfg.subNorm) {
+            int64 sn = (int64) this.cfg.qDim();
+            if ((int64) this.cfg.intermediateSize > sn) {
+                sn = (int64) this.cfg.intermediateSize;
+            }
+            this.subDev #= heap KernelBuffer<float32>((uint64) sn);
+        }
+        return;
+    }
+
+    void ensurePrefillSub(int64 n) {
+        if (this.pfSubCap >= n) { return; }
+        this.pfSubDev #= heap KernelBuffer<float32>((uint64) n);
+        this.pfSubCap = n;
         return;
     }
 
@@ -2184,8 +2260,11 @@ public final class CausalLM extends InfModule {
             // o-projection's pack reduces them — one launch fewer, no
             // f32 attention output; the full attend + pack is the
             // fallback shape.
-            boolean partials = dkv.attendPartials(li, a.qProj.out(), p,
-                a.scale);
+            boolean partials = false;
+            if (!d.subNorm) {
+                partials = dkv.attendPartials(li, a.qProj.out(), p,
+                    a.scale);
+            }
             if (!partials) {
                 dkv.attend(li, a.qProj.out(), p, a.scale);
             }
@@ -2194,6 +2273,14 @@ public final class CausalLM extends InfModule {
             CausalLM.raAttnNs = CausalLM.raAttnNs + (ta4 - ta3);
             if (partials) {
                 Linear.stageDeviceActivationFromAttnPartials(nH, (int64) qd);
+            } else if (d.subNorm) {
+                this.sniffKvRow("vrow", li, dkv, p);
+                this.sniffBuf("ao", li, dkv.out(), (int64) qd);
+                Prim.rmsnormDevice(this.subDev, dkv.out(),
+                    d.attnSubNorm.deviceWeight(), (int64) qd,
+                    d.attnSubNorm.eps, d.normForm);
+                this.sniffBuf("ao-normed", li, this.subDev, (int64) qd);
+                Linear.stageDeviceActivation(this.subDev, (int64) qd);
             } else {
                 Linear.stageDeviceActivation(dkv.out(), (int64) qd);
             }
@@ -2236,6 +2323,10 @@ public final class CausalLM extends InfModule {
             }
             this.cache.attendRow(seq, li, q, 0L, a.scale, scores,
                 ao, 0L, nH, nKv, hd);
+            if (d.subNorm) {
+                Prim.rmsnormRowHost(ao, 0L, d.attnSubNorm.weight,
+                    d.attnSubNorm.eps, ao, 0L, qd, d.normForm);
+            }
             a.oProj.matvecKeepOnDevice(ao, 0L);
         }
         if (!oAdded) {
@@ -2343,9 +2434,20 @@ public final class CausalLM extends InfModule {
         d.mlp.upProj.matvecStagedKeep();
         Prim.gluDevice(d.mlp.gateProj.out(), d.mlp.upProj.out(),
             (int64) inter, d.activation);
-        Linear.stageDeviceActivation(d.mlp.gateProj.out(), (int64) inter);
+        if (d.subNorm) {
+            this.sniffBuf("glu", li, d.mlp.gateProj.out(), (int64) inter);
+            Prim.rmsnormDevice(this.subDev, d.mlp.gateProj.out(),
+                d.ffnSubNorm.deviceWeight(), (int64) inter,
+                d.ffnSubNorm.eps, d.normForm);
+            this.sniffBuf("g-normed", li, this.subDev, (int64) inter);
+            Linear.stageDeviceActivation(this.subDev, (int64) inter);
+        } else {
+            Linear.stageDeviceActivation(d.mlp.gateProj.out(),
+                (int64) inter);
+        }
         d.mlp.downProj.matvecStagedKeep();
         Prim.addDevice(this.hsDev, d.mlp.downProj.out(), (int64) h);
+        this.sniffRow("mlp", li, h);
         return;
     }
 

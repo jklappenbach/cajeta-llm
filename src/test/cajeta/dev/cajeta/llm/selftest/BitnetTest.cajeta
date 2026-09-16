@@ -1,0 +1,510 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import dev.cajeta.llm.convert.HfToGguf;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.GgufWriter;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * The `bitnet` architecture (codebook-quants spec §8.1-8.3): config
+ * acceptance, and the sub-norm graph held to a reference forward that
+ * is computed here from the same weights.
+ */
+public class BitnetTest {
+
+    static final int32 H = 256;
+    static final int32 INTER = 256;
+    static final int32 HEADS = 4;
+    static final int32 HD = 64;
+    static final int32 VOCAB = 11;
+    static final int32 LAYERS = 2;
+    static final float32 EPS = 0.000001f;
+    static final String BADARCH = "src/test/fixtures/gguf/toy-badarch.gguf";
+
+    public BitnetTest() { return; }
+
+    static #String p(String leaf) {
+        String s #= "tmp/cajeta_llm_bitnet_" + leaf;
+        return #s;
+    }
+
+    /** The HF key list of an L-layer bitnet decoder, tied head; with
+     *  `scales`, a one-element `blk.N.<proj>.scale` per projection. */
+    static #ToyModel spec(int32 layers, boolean scales) {
+        ToyModel s = heap ToyModel(2 + layers * 20);
+        int64 h = (int64) BitnetTest.H;
+        int64 qd = (int64) (BitnetTest.HEADS * BitnetTest.HD);
+        int64 it = (int64) BitnetTest.INTER;
+        s.add("model.embed_tokens.weight", (int64) BitnetTest.VOCAB, h);
+        int32 l = 0;
+        while (l < layers) {
+            String p = "model.layers." + l + ".";
+            s.add(p + "input_layernorm.weight", h, 0);
+            s.add(p + "self_attn.q_proj.weight", qd, h);
+            s.add(p + "self_attn.k_proj.weight", qd, h);
+            s.add(p + "self_attn.v_proj.weight", qd, h);
+            s.add(p + "self_attn.o_proj.weight", h, qd);
+            s.add(p + "self_attn.inner_attn_ln.weight", qd, 0);
+            s.add(p + "post_attention_layernorm.weight", h, 0);
+            s.add(p + "mlp.gate_proj.weight", it, h);
+            s.add(p + "mlp.up_proj.weight", it, h);
+            s.add(p + "mlp.down_proj.weight", h, it);
+            s.add(p + "mlp.ffn_layernorm.weight", it, 0);
+            if (scales) {
+                String g = "blk." + l + ".";
+                s.add(g + "attn_q.scale", 1, 0);
+                s.add(g + "attn_k.scale", 1, 0);
+                s.add(g + "attn_v.scale", 1, 0);
+                s.add(g + "attn_output.scale", 1, 0);
+                s.add(g + "ffn_gate.scale", 1, 0);
+                s.add(g + "ffn_up.scale", 1, 0);
+                s.add(g + "ffn_down.scale", 1, 0);
+            }
+            l = l + 1;
+        }
+        s.add("model.norm.weight", h, 0);
+        return #s;
+    }
+
+    /** Element `j` of tensor `k`: ToyModel's grid, except a `.scale`
+     *  tensor, which is 0.5, 0.75 or 1.0 by position. */
+    static float32 val(ToyModel s, int32 k, int64 j) {
+        if (s.names.get(k).endsWith(".scale")) {
+            return 0.5f + 0.25f * (float32) (k % 3);
+        }
+        return ToyModel.valAt(k, j);
+    }
+
+    static void putF32(int8[] b, int64 at, float32 v) {
+        SafetensorsTest.putF32(b, at, v);
+        return;
+    }
+
+    static void putF16(int8[] b, int64 at, float32 v) {
+        int32 bits = Quant.f32ToHalfBits(v);
+        b[at] = (int8) (bits & 255);
+        b[at + 1] = (int8) ((bits >>> 8) & 255);
+        return;
+    }
+
+    /** Write `s` as safetensors: rank-2 tensors F16 when `f16Weights`,
+     *  rank-1 tensors always F32. Values are exact in both. */
+    static void writeSt(String path, ToyModel s, boolean f16Weights) {
+        StringBuilder hb = heap StringBuilder();
+        hb.append("{");
+        int64 off = 0;
+        int32 k = 0;
+        while (k < s.n) {
+            boolean half = f16Weights && s.d1[k] != 0;
+            int64 bytes = s.elemsOf(k) * (half ? 2L : 4L);
+            if (k > 0) { hb.append(","); }
+            hb.append("\"" + s.names.get(k) + "\":{\"dtype\":\""
+                + (half ? "F16" : "F32") + "\",\"shape\":[");
+            hb.append("" + s.d0[k]);
+            if (s.d1[k] != 0) { hb.append("," + s.d1[k]); }
+            hb.append("],\"data_offsets\":[" + off + "," + (off + bytes)
+                + "]}");
+            off = off + bytes;
+            k = k + 1;
+        }
+        hb.append("}");
+        int8[] pay = heap int8[off];
+        int64 at = 0;
+        k = 0;
+        while (k < s.n) {
+            boolean half = f16Weights && s.d1[k] != 0;
+            int64 elems = s.elemsOf(k);
+            int64 j = 0;
+            while (j < elems) {
+                if (half) {
+                    BitnetTest.putF16(pay, at, BitnetTest.val(s, k, j));
+                    at = at + 2;
+                } else {
+                    BitnetTest.putF32(pay, at, BitnetTest.val(s, k, j));
+                    at = at + 4;
+                }
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+        SafetensorsTest.writeSt(path, hb.toString(), pay, off);
+        return;
+    }
+
+    static void writeConfig(String path, boolean tie) {
+        ToyModel.writeConfigX(path, "BitnetForCausalLM", BitnetTest.H,
+            BitnetTest.INTER, BitnetTest.LAYERS, BitnetTest.HEADS,
+            BitnetTest.HEADS, 0, BitnetTest.VOCAB, 64, tie,
+            "\"bos_token_id\":1,\"eos_token_id\":2,\"pad_token_id\":8,");
+        return;
+    }
+
+    // ── the reference forward ───────────────────────────────────────────
+
+    /** Tensor `k` materialized in torch layout. */
+    static #float32[] mat(ToyModel s, int32 k) {
+        int64 n = s.elemsOf(k);
+        float32[] w #= heap float32[n];
+        int64 j = 0;
+        while (j < n) {
+            w[j] = BitnetTest.val(s, k, j);
+            j = j + 1;
+        }
+        return #w;
+    }
+
+    static float32 half(float32 v) {
+        return GgufFile.halfBitsToF32(Quant.f32ToHalfBits(v));
+    }
+
+    /**
+     * A projection as the converted file holds it: mode 0 the raw
+     * weights, 1 `weight_quant` then F16, 2 `weight_quant` then a
+     * ternary block whose d is the f16 of its absmax.
+     */
+    static #float32[] proj(ToyModel s, int32 k, int32 mode) {
+        float32[] w #= BitnetTest.mat(s, k);
+        if (mode == 0) { return #w; }
+        int64 n = (int64) w.count();
+        HfToGguf.weightQuant(w, n);
+        int64 j = 0;
+        if (mode == 1) {
+            while (j < n) {
+                w[j] = BitnetTest.half(w[j]);
+                j = j + 1;
+            }
+            return #w;
+        }
+        int64 b = 0;
+        while (b < n) {
+            float32 amax = 0.0f;
+            j = 0;
+            while (j < 256) {
+                float32 a = Math.abs(w[b + j]);
+                if (a > amax) { amax = a; }
+                j = j + 1;
+            }
+            float32 d = BitnetTest.half(amax);
+            j = 0;
+            while (j < 256) {
+                float32 v = w[b + j];
+                float32 q = 0.0f;
+                if (v > 0.0f) { q = 1.0f; }
+                if (v < 0.0f) { q = 0.0f - 1.0f; }
+                w[b + j] = q * d;
+                j = j + 1;
+            }
+            b = b + 256;
+        }
+        return #w;
+    }
+
+    static void matvec(float32[] w, float32[] x, float32[] y, int64 rows,
+            int64 cols, float32 scale) {
+        int64 r = 0;
+        while (r < rows) {
+            float32 acc = 0.0f;
+            int64 c = 0;
+            while (c < cols) {
+                acc = acc + w[r * cols + c] * x[c];
+                c = c + 1;
+            }
+            y[r] = acc * scale;
+            r = r + 1;
+        }
+        return;
+    }
+
+    static void rms(float32[] x, float32[] w, float32[] y, int64 n) {
+        float32 ss = 0.0f;
+        int64 i = 0;
+        while (i < n) {
+            ss = ss + x[i] * x[i];
+            i = i + 1;
+        }
+        float32 sc = 1.0f / Math.sqrt(ss / (float32) n + BitnetTest.EPS);
+        i = 0;
+        while (i < n) {
+            y[i] = x[i] * sc * w[i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** The Q8_K rounding the ternary routes apply to every projection
+     *  input (llama.cpp's `vec_dot_tq*_q8_K` does the same). */
+    static void q8round(float32[] x, int64 n, boolean on) {
+        if (!on) { return; }
+        int8[] xq #= heap int8[n];
+        float32[] xd #= heap float32[n / 256L];
+        int32[] xbs #= heap int32[n / 16L];
+        Quant.q8kQuantize(x, 0L, n, xq, xd, xbs);
+        int64 i = 0;
+        while (i < n) {
+            x[i] = (float32) ((int32) xq[i]) * xd[i / 256L];
+            i = i + 1;
+        }
+        return;
+    }
+
+    static boolean trace = false;
+
+    static void fp(String where, int32 l, float32[] v, int64 n) {
+        if (!BitnetTest.trace) { return; }
+        float64 acc = 0.0;
+        int64 i = 0;
+        while (i < n) {
+            acc = acc + (float64) (i + 1L) * (float64) v[i];
+            i = i + 1;
+        }
+        System.stdout.println("[REF " + where + " " + l + " " + acc + "]");
+        return;
+    }
+
+    static float32 scaleOf(ToyModel s, String name) {
+        int32 k = s.kOf(name);
+        if (k < 0) { return 1.0f; }
+        return BitnetTest.val(s, k, 0L);
+    }
+
+    /**
+     * Logits of token `t` at position 0 through llama.cpp's bitnet
+     * graph: RMS `attn_sub_norm` on the attention output before
+     * `attn_output`, RMS `ffn_sub_norm` on silu(gate)·up before
+     * `ffn_down`, tied head. One token attends only to itself, so the
+     * attention output is its own value row. With `q8` the device
+     * routes are mirrored: every projection input is Q8_K-rounded and
+     * the value row passes through the f16 K/V plane.
+     */
+    static #float32[] reference(ToyModel s, int32 t, int32 mode,
+            boolean q8) {
+        int64 h = (int64) BitnetTest.H;
+        int64 qd = (int64) (BitnetTest.HEADS * BitnetTest.HD);
+        int64 it = (int64) BitnetTest.INTER;
+        float32[] e #= BitnetTest.mat(s, s.kOf("model.embed_tokens.weight"));
+        float32[] x #= heap float32[h];
+        int64 i = 0;
+        while (i < h) {
+            x[i] = e[(int64) t * h + i];
+            i = i + 1;
+        }
+        float32[] xn #= heap float32[h];
+        float32[] v #= heap float32[qd];
+        float32[] ao #= heap float32[qd];
+        float32[] o #= heap float32[h];
+        float32[] g #= heap float32[it];
+        float32[] u #= heap float32[it];
+        float32[] gn #= heap float32[it];
+        int32 l = 0;
+        while (l < BitnetTest.LAYERS) {
+            String p = "model.layers." + l + ".";
+            String bp = "blk." + l + ".";
+            float32[] w1 #= BitnetTest.mat(s, s.kOf(p + "input_layernorm.weight"));
+            BitnetTest.rms(x, w1, xn, h);
+            BitnetTest.q8round(xn, h, q8);
+            float32[] wv #= BitnetTest.proj(s, s.kOf(p + "self_attn.v_proj.weight"), mode);
+            BitnetTest.matvec(wv, xn, v, qd, h,
+                BitnetTest.scaleOf(s, bp + "attn_v.scale"));
+            BitnetTest.fp("v", l, v, qd);
+            if (q8) {
+                i = 0;
+                while (i < qd) {
+                    v[i] = BitnetTest.half(v[i]);
+                    i = i + 1;
+                }
+            }
+            float32[] ws #= BitnetTest.mat(s, s.kOf(p + "self_attn.inner_attn_ln.weight"));
+            BitnetTest.rms(v, ws, ao, qd);
+            BitnetTest.fp("ao-normed", l, ao, qd);
+            BitnetTest.q8round(ao, qd, q8);
+            float32[] wo #= BitnetTest.proj(s, s.kOf(p + "self_attn.o_proj.weight"), mode);
+            BitnetTest.matvec(wo, ao, o, h, qd,
+                BitnetTest.scaleOf(s, bp + "attn_output.scale"));
+            i = 0;
+            while (i < h) {
+                x[i] = x[i] + o[i];
+                i = i + 1;
+            }
+            BitnetTest.fp("attn", l, x, h);
+            float32[] w2 #= BitnetTest.mat(s, s.kOf(p + "post_attention_layernorm.weight"));
+            BitnetTest.rms(x, w2, xn, h);
+            BitnetTest.q8round(xn, h, q8);
+            float32[] wg #= BitnetTest.proj(s, s.kOf(p + "mlp.gate_proj.weight"), mode);
+            float32[] wu #= BitnetTest.proj(s, s.kOf(p + "mlp.up_proj.weight"), mode);
+            BitnetTest.matvec(wg, xn, g, it, h,
+                BitnetTest.scaleOf(s, bp + "ffn_gate.scale"));
+            BitnetTest.matvec(wu, xn, u, it, h,
+                BitnetTest.scaleOf(s, bp + "ffn_up.scale"));
+            i = 0;
+            while (i < it) {
+                float32 gv = g[i];
+                float32 silu = gv / (1.0f + Math.exp(0.0f - gv));
+                g[i] = silu * u[i];
+                i = i + 1;
+            }
+            BitnetTest.fp("glu", l, g, it);
+            float32[] wf #= BitnetTest.mat(s, s.kOf(p + "mlp.ffn_layernorm.weight"));
+            BitnetTest.rms(g, wf, gn, it);
+            BitnetTest.fp("g-normed", l, gn, it);
+            BitnetTest.q8round(gn, it, q8);
+            float32[] wd #= BitnetTest.proj(s, s.kOf(p + "mlp.down_proj.weight"), mode);
+            BitnetTest.matvec(wd, gn, o, h, it,
+                BitnetTest.scaleOf(s, bp + "ffn_down.scale"));
+            i = 0;
+            while (i < h) {
+                x[i] = x[i] + o[i];
+                i = i + 1;
+            }
+            BitnetTest.fp("mlp", l, x, h);
+            l = l + 1;
+        }
+        float32[] wn #= BitnetTest.mat(s, s.kOf("model.norm.weight"));
+        BitnetTest.rms(x, wn, xn, h);
+        float32[] logits #= heap float32[(int64) BitnetTest.VOCAB];
+        BitnetTest.matvec(e, xn, logits, (int64) BitnetTest.VOCAB, h, 1.0f);
+        return #logits;
+    }
+
+    /** Every logit within `rel` of the row's largest magnitude plus
+     *  `abs` — a per-logit relative bar is meaningless at a zero
+     *  crossing of a row that is otherwise the same vector. */
+    static void compareLogits(String what, float32[] want,
+            Tensor<float32> got, float32 rel, float32 abs) {
+        float32 scale = 0.0f;
+        int32 v = 0;
+        while (v < BitnetTest.VOCAB) {
+            float32 m = Math.abs(want[v]);
+            if (m > scale) { scale = m; }
+            v = v + 1;
+        }
+        float32 tol = abs + rel * scale;
+        v = 0;
+        boolean live = false;
+        while (v < BitnetTest.VOCAB) {
+            float32 a = want[v];
+            float32 b = got.flatGet((int64) v);
+            if (b != 0.0f) { live = true; }
+            float32 diff = Math.abs(a - b);
+            if (diff > tol) {
+                Assert.fail(what + " logit " + v + ": engine " + b
+                    + " vs reference " + a + " (row scale " + scale + ")");
+            }
+            v = v + 1;
+        }
+        Assert.isTrue(live);
+        return;
+    }
+
+    static void checkGraph(boolean scales, String tag) {
+        String cfg #= BitnetTest.p(tag + "_config.json");
+        String st #= BitnetTest.p(tag + ".safetensors");
+        BitnetTest.writeConfig(cfg, true);
+        ToyModel s #= BitnetTest.spec(BitnetTest.LAYERS, scales);
+        BitnetTest.writeSt(st, s, false);
+        CausalLM m #= CausalLM.load(cfg, st, 8, false);
+        int32[] toks = heap int32[1];
+        int32 t = 3;
+        while (t < 8) {
+            toks[0] = t;
+            m.prefill(toks, 1);
+            float32[] want #= BitnetTest.reference(s, t, 0, false);
+            BitnetTest.compareLogits(tag + " token " + t, want, m.logits(),
+                0.001f, 0.001f);
+            m.resetSeq(0);
+            t = t + 1;
+        }
+        return;
+    }
+
+    /** 4.1.4: the host graph equals the reference with the sub-norms. */
+    @Test
+    public void theBitnetGraphAppliesTheSubNorms() {
+        BitnetTest.checkGraph(false, "graph");
+    }
+
+    /** 4.1.4: with `blk.N.<proj>.scale` tensors bound, every projection's
+     *  output is multiplied by its scale. */
+    @Test
+    public void theScaleTensorsMultiplyTheProjections() {
+        BitnetTest.checkGraph(true, "scaled");
+    }
+
+    /** 4.1.5: `bitnet` is accepted from GGUF metadata, reads its hparams
+     *  under `bitnet.`, ties the head when `output.weight` is absent, and
+     *  the refusal names it. */
+    @Test
+    public void modelConfigAcceptsBitnetAndNamesItInTheRefusal() {
+        String path #= BitnetTest.p("hparams.gguf");
+        GgufWriter w = heap GgufWriter();
+        w.putString("general.architecture", "bitnet");
+        w.putU32("bitnet.embedding_length", 1536);
+        w.putU32("bitnet.feed_forward_length", 4096);
+        w.putU32("bitnet.block_count", 24);
+        w.putU32("bitnet.attention.head_count", 16);
+        w.putU32("bitnet.attention.head_count_kv", 16);
+        w.putU32("bitnet.rope.dimension_count", 96);
+        w.putU32("bitnet.vocab_size", 32002);
+        w.putU32("bitnet.context_length", 2048);
+        w.putF32("bitnet.attention.layer_norm_rms_epsilon", 0.00001f);
+        w.write(path);
+        GgufFile f #= heap GgufFile(path);
+        ModelConfig c #= ModelConfig.fromGguf(f);
+        Assert.equals("BitnetForCausalLM", c.architecture);
+        Assert.isTrue(c.subNorm);
+        Assert.isTrue(c.tieWordEmbeddings);
+        Assert.equals(1536L, (int64) c.hiddenSize);
+        Assert.equals(4096L, (int64) c.intermediateSize);
+        Assert.equals(24L, (int64) c.numLayers);
+        Assert.equals(16L, (int64) c.numHeads);
+        Assert.equals(96L, (int64) c.headDim);
+        Assert.equals(32002L, (int64) c.vocabSize);
+        f.close();
+
+        GgufFile bad #= heap GgufFile(BitnetTest.BADARCH);
+        boolean threw = false;
+        try {
+            ModelConfig cb #= ModelConfig.fromGguf(bad);
+        } catch (Throwable e) {
+            threw = true;
+            String msg #= e.getMessage();
+            Assert.isTrue(msg.contains("bitnet"));
+        }
+        Assert.isTrue(threw);
+        bad.close();
+    }
+
+    /** 4.1.5, the HF side: the converter's config parse admits
+     *  BitnetForCausalLM and names it among the supported. */
+    @Test
+    public void hfConfigAcceptsBitnet() {
+        String cfg #= BitnetTest.p("hf_config.json");
+        BitnetTest.writeConfig(cfg, true);
+        ModelConfig c #= ModelConfig.parse(cfg);
+        Assert.equals("BitnetForCausalLM", c.architecture);
+        Assert.isTrue(c.subNorm);
+        Assert.isTrue(c.tieWordEmbeddings);
+        String other #= BitnetTest.p("hf_other.json");
+        ToyModel.writeConfig(other, "MambaForCausalLM", 64, 128, 1, 2, 2,
+            0, 16, 32, false);
+        boolean threw = false;
+        try {
+            ModelConfig co #= ModelConfig.parse(other);
+        } catch (Throwable e) {
+            threw = true;
+            String msg #= e.getMessage();
+            Assert.isTrue(msg.contains("BitnetForCausalLM"));
+            Assert.isTrue(msg.contains("LlamaForCausalLM"));
+        }
+        Assert.isTrue(threw);
+    }
+}

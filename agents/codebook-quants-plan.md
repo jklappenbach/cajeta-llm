@@ -193,7 +193,7 @@ every timing leg and wait for the go; filtered suite only
       and packed forms as static arrays) and prints the checksums.
 - [x] 2.2.3 `GgufFile.typeName` six ids; refusal text from `supported()`;
       `Quant.dequantize` throws on a type with no branch.
-- [ ] 2.2.4 Arbiter files under `tmp/cbq/`: `llama-imatrix` over the
+- [x] 2.2.4 Arbiter files under `tmp/cbq/`: `llama-imatrix` over the
       Q8_0 8B on a calibration text distinct from the perplexity text;
       `llama-quantize --imatrix --allow-requantize` to IQ1_S, IQ1_M,
       IQ2_XXS, IQ2_XS, IQ2_S, IQ2_M, IQ3_XXS, IQ3_XS, IQ3_S, IQ3_M;
@@ -211,7 +211,28 @@ every timing leg and wait for the go; filtered suite only
         llama8b-iq2_s    2758493600   qwen15moe-iq3_xxs 6345614336
         llama8b-iq2_m    2948285856   (imatrix over the Q4_K_M)
 
-      The reference legs (`tmp/cbq/reflegs.sh`) wait on a quiet box.
+      REFERENCE LEGS 2026-09-15 (`tmp/cbq/reflegs.sh`, quiet box,
+      llama.cpp 5306f4b, fa=true, three reps; t/s; PPL = llama-perplexity
+      on README.md, -c 2048, four chunks):
+
+        | file | GB | HIP pp512 | HIP tg128@512 | HIP pp2048 | HIP tg64@2048 | VK pp512 | VK tg128@512 | VK pp2048 | VK tg64@2048 | PPL |
+        |---|---|---|---|---|---|---|---|---|---|---|
+        | llama8b-iq1_s | 2.01 | 1237.6 | 75.1 | 1187.6 | 70.2 | 1188.8 | 90.5 | 1113.2 | 82.7 | 22.80 ± 1.09 |
+        | llama8b-iq1_m | 2.15 | 1025.9 | 74.0 | 1011.0 | 68.9 | 1195.7 | 79.8 | 1102.6 | 74.3 | 12.93 ± 0.60 |
+        | llama8b-iq2_xxs | 2.39 | 782.3 | 52.0 | 768.0 | 49.5 | 1180.7 | 78.7 | 1089.3 | 73.1 | 8.41 ± 0.38 |
+        | llama8b-iq2_xs | 2.60 | 1152.3 | 50.9 | 1117.3 | 48.7 | 1177.9 | 73.4 | 1102.2 | 68.6 | 7.27 ± 0.32 |
+        | llama8b-iq2_s | 2.75 | 1055.4 | 49.9 | 1030.6 | 47.6 | 1170.4 | 69.9 | 1110.6 | 64.8 | 6.88 ± 0.30 |
+        | llama8b-iq2_m | 2.94 | 1125.5 | 50.1 | 1104.6 | 47.9 | 1157.5 | 67.2 | 1111.8 | 63.3 | 6.47 ± 0.28 |
+        | llama8b-iq3_xxs | 3.27 | 761.3 | 48.1 | 752.1 | 46.1 | 1208.1 | 60.3 | 1152.7 | 57.0 | 6.11 ± 0.26 |
+        | llama8b-iq3_xs | 3.51 | 705.3 | 47.0 | 699.9 | 45.2 | 1210.6 | 56.2 | 1153.0 | 53.6 | 5.98 ± 0.25 |
+        | llama8b-iq3_s | 3.67 | 697.4 | 47.7 | 690.8 | 45.7 | 1257.0 | 54.9 | 1196.5 | 52.2 | 5.97 ± 0.26 |
+        | llama8b-iq3_m | 3.78 | 732.4 | 47.5 | 729.5 | 45.4 | 1254.2 | 54.1 | 1193.3 | 51.6 | 5.97 ± 0.25 |
+        | qwen15moe-iq3_xxs | 6.34 | 1173.1 | 92.8 | 1159.4 | 76.3 | 2289.3 | 139.6 | 2276.9 | 107.6 | 6.07 ± 0.26 |
+
+      Vulkan decodes every IQ file faster than HIP on this box (the HIP
+      IQ dequant kernels are the older scalar family); the parity bars of
+      Units 5-7 take the better of the two per cell. Rows are in
+      `tmp/llmbench/rows.jsonl` (stamps 20260915-1927..1950).
 - [ ] 2.2.5 The compiler findings filed in the cajeta repo:
       `cajeta.xpu.Constant<T>` declared and unwired; `@FastMath` folding
       `fpext(fptrunc x)` to x; and, found here, a static field with an
@@ -221,9 +242,9 @@ every timing leg and wait for the go; filtered suite only
       placement per Julian.
 
 ### 2.3 Acceptance
-- [ ] 2.3.1 Fixtures, manifest and `IqGrid.cajeta` committed with their
+- [x] 2.3.1 Fixtures, manifest and `IqGrid.cajeta` committed with their
       tests; llama.cpp loads and runs all eleven arbiter files; the
-      reference table is in this record.
+      reference table is in this record (under 2.2.4).
 
 ## Unit 3 — TQ2_0 and TQ1_0: the four-part template on the new layout (spec §3.3, §5, §6, §7, §8.4)
 
@@ -268,53 +289,103 @@ every timing leg and wait for the go; filtered suite only
 ## Unit 4 — The `bitnet` architecture and the converter (spec §8)
 
 ### 4.1 TDD
-- [ ] 4.1.1 `HfToGgufTest.weightQuantMatchesTheReference`: a hand-built
+- [x] 4.1.1 `HfToGgufTest.weightQuantMatchesTheReference`: a hand-built
       4×4 tensor → scale = mean|w|, every value in {−s, 0, s}; the 1e-5
       clamp on an all-zero tensor.
-- [ ] 4.1.2 `HfToGgufTest.tqPackersMatchGgmlByteForByte`: ternary × scale
+- [x] 4.1.2 `HfToGgufTest.tqPackersMatchGgmlByteForByte`: ternary × scale
       values through our packers equal ggml's `ggml_quantize_chunk`
       over the same values (new fixture pairs `tq1_0-ternary`,
       `tq2_0-ternary` from `tmp/cbq/gen.c`).
-- [ ] 4.1.3 `HfToGgufTest.roundTrip`: a synthetic two-layer
+- [x] 4.1.3 `HfToGgufTest.roundTrip`: a synthetic two-layer
       `BitnetForCausalLM` directory (config.json, one safetensors shard
       written by a test helper, a tiny `tokenizer.model`) converts at
       f16 and tq2_0; `GgufFile` opens both; `ModelConfig.fromGguf` reads
       `bitnet` hparams; every tensor of llama.cpp's `bitnet` list is
       present, `output.weight` absent, norms F32, `token_embd` F16,
       projections TQ2_0.
-- [ ] 4.1.4 `CausalLMTest.theBitnetGraphAppliesTheSubNorms`: a one-layer
+- [x] 4.1.4 `BitnetTest.theBitnetGraphAppliesTheSubNorms`: a two-layer
       bitnet model on the host equals a reference computed in the test
       — `attn_sub_norm` before `attn_output`, `ffn_sub_norm` before
-      `ffn_down`, NEOX rope, tied head; with `.scale` tensors bound the
-      projections are multiplied.
-- [ ] 4.1.5 `ModelConfigTest`: `bitnet` accepted; the refusal text names
-      it among the supported architectures.
+      `ffn_down`, tied head (one token at position 0, where NEOX rope
+      is the identity; the rope is 4.3.2's claim). `BitnetTest.
+      theScaleTensorsMultiplyTheProjections`: with `.scale` tensors
+      bound the projections are multiplied.
+- [x] 4.1.5 `BitnetTest.modelConfigAcceptsBitnetAndNamesItInTheRefusal`
+      and `hfConfigAcceptsBitnet`: `bitnet` / `BitnetForCausalLM`
+      accepted, tied head from a missing `output.weight`, and both
+      refusal texts name it among the supported architectures.
 
 ### 4.2 Coding
-- [ ] 4.2.1 `tools/convert/HfToGguf.cajeta` — `HfToGguf <dir> <out.gguf>
-      f16|tq1_0|tq2_0`: config → hparams (`bitnet.*`, rope scaling
-      linear 1.0), shards through `model.safetensors.index.json`, the
-      llama and bitnet name maps, `weight_quant` in f32, the TQ packers,
-      `SpProto` → `tokenizer.ggml.*`, `GgufWriter`.
-- [ ] 4.2.2 `ModelConfig.fromGguf` bitnet branch; NEOX rope for the arch;
+- [x] 4.2.1 `dev.cajeta.llm.convert.HfToGguf` (in the library, so the
+      suite links it; `tools/convert/hf-to-gguf.sh` builds and runs it)
+      — `HfToGguf <dir> <out.gguf> f16|tq1_0|tq2_0`: config → hparams
+      (`bitnet.*`, rope scaling linear 1.0), shards through
+      `model.safetensors.index.json`, the llama and bitnet name maps,
+      `weight_quant` in f32, the TQ packers (`Quant.tq10Quantize` /
+      `tq20Quantize`, `Quant.f32ToHalfBits`), `SpProto` + added tokens
+      → `tokenizer.ggml.*`, `GgufWriter`.
+- [x] 4.2.2 `ModelConfig.fromGguf` bitnet branch; NEOX rope for the arch;
       `attn_sub_norm` / `ffn_sub_norm` bound and applied in the layer;
       tied lm_head when `output.weight` is absent; optional `.scale`
       tensors as a scalar multiply after the projection.
 
 ### 4.3 Acceptance
-- [ ] 4.3.1 `1bitLLM/bitnet_b1_58-large` (1536 × 4096, the one member of
+- [x] 4.3.1 `1bitLLM/bitnet_b1_58-large` (1536 × 4096, the one member of
       the family a 256-weight block tiles; the 3B is 3200 × 8640)
       converted at f16, tq1_0 and tq2_0 under `tmp/cbq/`; llama.cpp
       loads all three; `llama-quantize` from our f16 to TQ1_0 and TQ2_0
       gives projection tensors byte for byte equal to ours (compared per
       tensor through `GgufFile`).
-- [ ] 4.3.2 Greedy agreement with llama.cpp CPU on both TQ files over
+      DONE 2026-09-15 (`tmp/cbq/bitnet.sh`): 266 tensors each from the
+      2.92 GB F32 safetensors; f16 1,458,846,240 B in 81 s (4.3 GB RSS,
+      held payloads), tq1_0 243,218,976 B and tq2_0 275,069,472 B in 23 s
+      (llama-quantize's are 185 / 217 MB: it packs `token_embd` as Q4_K
+      where the converter policy, like llama.cpp's own, keeps F16). `llama-quantize`
+      from our f16: `ggufdiff` (bench/GgufTensorDiff) reports 264 of 264
+      `blk.*` tensors identical for both TQ types (every projection AND
+      every norm). llama-perplexity (CPU, README, c2048 × 4): f16 7.0114,
+      tq1_0 7.0138, tq2_0 7.0138 (chunk 1: 7.90). Found on the way:
+      cajeta's JSON reader threw on `model_max_length` (an integer wider
+      than int64) — fixed in the stdlib (`JsonReader.currentNumberFitsInt64`,
+      widens to float64; tests `JsonFloat.wideIntegerWidensToFloat`,
+      `int64LimitsStayInteger`), recorded in `tmp/cbq/compiler-findings.md`.
+- [x] 4.3.2 Greedy agreement with llama.cpp CPU on both TQ files over
       fixed prompts; perplexity on the README text matches
       `llama-perplexity` at the same window.
+      DONE 2026-09-15 (`tmp/cbq/bitnet.sh cajeta`, `ppl-bos.sh`): greedy
+      "The capital of France is", 24 tokens at temp 0 — both TQ files
+      give llama-completion's text exactly (" Paris. It is the largest
+      city in the country and the second largest in Europe. It is also
+      the most populous"). Perplexity at llama-perplexity's chunk-1
+      window (BOS + README tokens, positions 1024..2046 scored; `pplprobe
+      pre=1025 eval=1023`): tq1_0 7.9014, tq2_0 7.9000 against 7.9028
+      for both TQ files (f16 chunk 1: 7.8951). Found on the way, all
+      fixed: the batched prefill's device-resident attention arm
+      (`resAttn`) skipped the attention sub-norm — chunk-4 greedy said
+      "the." while chunk 1 was right (`HfToGgufTest.checkBatched` now
+      pins it); `pplprobe` tokenized without BOS where llama-perplexity
+      heads every chunk with one (9.39 against 7.90 on the same window —
+      the probe now prepends BOS iff `Tokenizer.addsBos`, a no-op for the
+      qwen2-pre files); the CLI's streamed decode dropped each piece's
+      leading space (`Tokenizer.decodePiece`). Left open: the f16 GGUF
+      loads in llama.cpp but not in the engine — `prewarmPrefillWeights`
+      → `Linear.ensureDevice` refuses an f32-weight linear ("no host
+      bytes and no source mapping for a packed weight of 0 bytes"); f16
+      is a conversion intermediate here, so it is not on this unit.
 - [ ] 4.3.3 Legs (announced): cajeta pp512 / tg128 on both files against
       llama.cpp CPU; decode GB/s beside the Q4_K wave kernel's on the
       8B, so the bandwidth claim of spec 8.5 is a number.
-- [ ] 4.3.4 Resident bytes equal file bytes.
+- [x] 4.3.4 Resident bytes equal file bytes.
+      DONE 2026-09-15 (`tmp/cbq/bitnet-ledger.sh`, CAJETA_XPU_ALLOC_TRACE
+      through the CLI at ctx 4096): 168 `Linear.allocResident`
+      allocations (24 layers × 7 projections) sum to tq1_0 143,327,232 B
+      and tq2_0 175,177,728 B — exactly 24 × 110,592 blocks × 54 / 66 B,
+      the projection tensors' file bytes; the per-row split pads nothing
+      at these widths (1536 = 6 blocks, 4096 = 16). The rest of the 7.06 /
+      7.09 GB peak is the KV planes (0.604 GB, f16 at 4096) and 6.241 GB
+      of `Linear.ensureBatchOut` from `prewarmPrefillWeights` — every
+      layer's batch outputs held at the full 4096 rows, a prefill-design
+      cost shared by every model, not this unit's.
 
 ## Unit 5 — IQ2_XXS, IQ2_XS, IQ3_XXS: the ksigns family (spec §3.4, §4, §6.2, §7.2)
 

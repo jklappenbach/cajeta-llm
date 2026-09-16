@@ -1,0 +1,519 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.io.file.Path;
+import cajeta.lang.Cajeta;
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import dev.cajeta.llm.convert.HfToGguf;
+import dev.cajeta.llm.convert.Vocab;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.tok.Tokenizer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * The HF -> GGUF converter (codebook-quants spec §8.6-8.9): the f16
+ * narrowing, BitNet's `weight_quant`, the ternary packers against
+ * ggml's bytes, and a synthetic checkpoint round-tripped through the
+ * reader, the config and the engine.
+ */
+public class HfToGgufTest {
+
+    static final String FIX = "src/test/fixtures/gguf/kquant/";
+    static final String DIR = "tmp/cajeta_llm_hf2gguf";
+
+    public HfToGgufTest() { return; }
+
+    // ── f32 -> f16 ──────────────────────────────────────────────────────
+
+    /** Round-to-nearest-even f16 of `f`, by exact float64 arithmetic. */
+    static int32 refHalf(float32 f) {
+        int32 bits = Cajeta.f32ToBits(f);
+        int32 sign = (bits >>> 16) & 0x8000;
+        float64 a = (float64) Math.abs(f);
+        if (a >= 65520.0) { return sign | 0x7C00; }
+        if (a < 0.00006103515625) {
+            float64 q = a / 0.000000059604644775390625;
+            float64 lo = Math.floor(q);
+            float64 fr = q - lo;
+            int32 m = (int32) lo;
+            if (fr > 0.5 || (fr == 0.5 && (m & 1) == 1)) { m = m + 1; }
+            return sign | m;
+        }
+        int32 e = 0;
+        float64 m = a;
+        while (m >= 2.0) { m = m * 0.5; e = e + 1; }
+        while (m < 1.0) { m = m * 2.0; e = e - 1; }
+        float64 q = (m - 1.0) * 1024.0;
+        float64 lo = Math.floor(q);
+        float64 fr = q - lo;
+        int32 mant = (int32) lo;
+        if (fr > 0.5 || (fr == 0.5 && (mant & 1) == 1)) { mant = mant + 1; }
+        if (mant == 1024) { mant = 0; e = e + 1; }
+        if (e + 15 >= 31) { return sign | 0x7C00; }
+        return sign | ((e + 15) << 10) | mant;
+    }
+
+    @Test
+    public void f32ToHalfBitsIsRoundToNearestEven() {
+        Assert.equals(0L, (int64) Quant.f32ToHalfBits(0.0f));
+        Assert.equals(0x3C00L, (int64) Quant.f32ToHalfBits(1.0f));
+        Assert.equals(0xC100L, (int64) Quant.f32ToHalfBits(0.0f - 2.5f));
+        Assert.equals(0x7BFFL, (int64) Quant.f32ToHalfBits(65504.0f));
+        Assert.equals(0x7C00L, (int64) Quant.f32ToHalfBits(65520.0f));
+        Assert.equals(0x2E66L, (int64) Quant.f32ToHalfBits(0.1f));
+        Assert.equals(0x6800L, (int64) Quant.f32ToHalfBits(2049.0f));
+        Assert.equals(0x6802L, (int64) Quant.f32ToHalfBits(2051.0f));
+        Assert.equals(1L, (int64) Quant.f32ToHalfBits(0.00000005960464477539f));
+        Assert.equals(0L, (int64) Quant.f32ToHalfBits(0.00000001f));
+        int64 seed = 0x9E3779B97F4A7C15L;
+        int32 i = 0;
+        while (i < 200000) {
+            seed = seed ^ (seed << 13);
+            seed = seed ^ (seed >>> 7);
+            seed = seed ^ (seed << 17);
+            int32 bits = (int32) (seed >>> 32);
+            int32 exp = (bits >>> 23) & 255;
+            if (exp == 255) { exp = 254; }
+            if ((i % 7) == 0) { exp = 100 + (i % 31); }
+            bits = (bits & 0x807FFFFF) | (exp << 23);
+            float32 f = Cajeta.bitsToF32(bits);
+            int32 want = HfToGgufTest.refHalf(f);
+            int32 got = Quant.f32ToHalfBits(f);
+            if (want != got) {
+                Assert.fail("f32ToHalfBits(" + f + "): " + got + " vs " + want);
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── weight_quant (4.1.1) ───────────────────────────────────────────
+
+    @Test
+    public void weightQuantMatchesTheReference() {
+        float32[] w #= heap float32[16];
+        w[0] = 0.375f;   w[1] = 0.625f;   w[2] = 0.0f - 1.75f; w[3] = 2.5f;
+        w[4] = 0.0f;     w[5] = 1.0f;     w[6] = 0.0f - 1.0f;  w[7] = 0.5f;
+        w[8] = 1.5f;     w[9] = 0.0f - 0.5f; w[10] = 2.0f;     w[11] = 0.0f - 2.0f;
+        w[12] = 0.25f;   w[13] = 1.25f;   w[14] = 0.0f - 0.75f; w[15] = 0.0f;
+        float32 s = HfToGguf.weightQuant(w, 16L);
+        Assert.isTrue(s == 1.0f);
+        float32[] want #= heap float32[16];
+        want[0] = 0.0f;  want[1] = 1.0f;  want[2] = 0.0f - 1.0f; want[3] = 1.0f;
+        want[4] = 0.0f;  want[5] = 1.0f;  want[6] = 0.0f - 1.0f; want[7] = 0.0f;
+        want[8] = 1.0f;  want[9] = 0.0f;  want[10] = 1.0f; want[11] = 0.0f - 1.0f;
+        want[12] = 0.0f; want[13] = 1.0f; want[14] = 0.0f - 1.0f; want[15] = 0.0f;
+        int32 i = 0;
+        while (i < 16) {
+            if (w[i] != want[i]) {
+                Assert.fail("weight_quant[" + i + "] = " + w[i] + ", want " + want[i]);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 16) {
+            w[i] = want[i] * 0.03125f;
+            if ((i % 3) == 0) { w[i] = 0.0f - w[i]; }
+            i = i + 1;
+        }
+        float32 s2 = HfToGguf.weightQuant(w, 16L);
+        Assert.isTrue(s2 == 0.03125f * 10.0f / 16.0f);
+        i = 0;
+        while (i < 16) {
+            float32 a = Math.abs(w[i]);
+            Assert.isTrue(a == 0.0f || a == s2);
+            i = i + 1;
+        }
+        float32[] z #= heap float32[512];
+        float32 sz = HfToGguf.weightQuant(z, 512L);
+        Assert.isTrue(sz == 0.00001f);
+        i = 0;
+        while (i < 512) {
+            Assert.isTrue(z[i] == 0.0f);
+            i = i + 1;
+        }
+    }
+
+    // ── the packers against ggml (4.1.2) ────────────────────────────────
+
+    static #float32[] f32Of(String name) {
+        int8[] raw #= File.readAllBytes(HfToGgufTest.FIX + name + ".f32");
+        int64 n = (int64) raw.count() / 4L;
+        float32[] f #= heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            int64 b = i * 4L;
+            int32 bits = ((int32) raw[b] & 255) | (((int32) raw[b + 1] & 255) << 8)
+                | (((int32) raw[b + 2] & 255) << 16) | (((int32) raw[b + 3] & 255) << 24);
+            f[i] = Cajeta.bitsToF32(bits);
+            i = i + 1;
+        }
+        return #f;
+    }
+
+    static void checkPacker(String name, int32 ty) {
+        float32[] x #= HfToGgufTest.f32Of(name);
+        int8[] want #= File.readAllBytes(HfToGgufTest.FIX + name + ".bin");
+        int64 n = (int64) x.count();
+        int8[] got #= heap int8[(int64) want.count()];
+        if (ty == Quant.GG_TQ2_0) {
+            Quant.tq20Quantize(x, 0L, n, got, 0L);
+        } else {
+            Quant.tq10Quantize(x, 0L, n, got, 0L);
+        }
+        int64 i = 0;
+        while (i < (int64) want.count()) {
+            if (got[i] != want[i]) {
+                Assert.fail(name + ": byte " + i + " is " + got[i]
+                    + ", ggml wrote " + want[i]);
+            }
+            i = i + 1;
+        }
+        return;
+    }
+
+    @Test
+    public void tqPackersMatchGgmlByteForByte() {
+        HfToGgufTest.checkPacker("tq2_0-ternary", Quant.GG_TQ2_0);
+        HfToGgufTest.checkPacker("tq1_0-ternary", Quant.GG_TQ1_0);
+        HfToGgufTest.checkPacker("tq2_0", Quant.GG_TQ2_0);
+        HfToGgufTest.checkPacker("tq1_0", Quant.GG_TQ1_0);
+    }
+
+    // ── the round trip (4.1.3) ──────────────────────────────────────────
+
+    static void putBytes(int8[] b, int64 at, int8[] src) {
+        int64 i = 0;
+        while (i < (int64) src.count()) {
+            b[at + i] = src[i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** A SentencePiece ModelProto holding only `pieces` (field 1): each
+     *  piece a submessage of piece (1), score (2, fixed32), type (3). */
+    static #int8[] spModel(String[] pieces, float32[] scores, int32[] types) {
+        int32 n = (int32) pieces.count();
+        int64 total = 0;
+        int32 k = 0;
+        while (k < n) {
+            int64 pl = (int64) pieces[k].byteLength();
+            total = total + 2L + (2L + pl) + 5L + 2L;
+            k = k + 1;
+        }
+        int8[] out #= heap int8[total];
+        int64 at = 0;
+        k = 0;
+        while (k < n) {
+            int8[] pb #= pieces[k].toBytes();
+            int64 pl = (int64) pb.count();
+            int64 sub = (2L + pl) + 5L + 2L;
+            out[at] = (int8) 0x0A;
+            out[at + 1] = (int8) sub;
+            at = at + 2;
+            out[at] = (int8) 0x0A;
+            out[at + 1] = (int8) pl;
+            HfToGgufTest.putBytes(out, at + 2, pb);
+            at = at + 2 + pl;
+            out[at] = (int8) 0x15;
+            SafetensorsTest.putF32(out, at + 1, scores[k]);
+            at = at + 5;
+            out[at] = (int8) 0x18;
+            out[at + 1] = (int8) types[k];
+            at = at + 2;
+            k = k + 1;
+        }
+        return #out;
+    }
+
+    static void writeText(String path, String text) {
+        int8[] b #= text.toBytes();
+        File.writeAllBytes(path, b, (int64) b.count());
+        return;
+    }
+
+    /** The synthetic BitnetForCausalLM directory: config, one F16
+     *  safetensors, an eight-piece tokenizer.model, two added tokens,
+     *  and a tokenizer_config marking them special. */
+    static #ToyModel writeCheckpoint() {
+        Path d #= Path.of(HfToGgufTest.DIR);
+        d.mkdirs();
+        String dir = HfToGgufTest.DIR;
+        BitnetTest.writeConfig(dir + "/config.json", true);
+        ToyModel s #= BitnetTest.spec(BitnetTest.LAYERS, false);
+        BitnetTest.writeSt(dir + "/model.safetensors", s, true);
+        String[] pieces = heap String[8];
+        pieces[0] #= "<unk>";
+        pieces[1] #= "<s>";
+        pieces[2] #= "</s>";
+        pieces[3] #= "▁a";
+        pieces[4] #= "▁b";
+        pieces[5] #= "c";
+        pieces[6] #= "d";
+        pieces[7] #= "▁e";
+        float32[] sc = heap float32[8];
+        int32[] ty = heap int32[8];
+        int32 k = 0;
+        while (k < 8) {
+            sc[k] = 0.0f - 0.5f * (float32) k;
+            ty[k] = 1;
+            k = k + 1;
+        }
+        sc[0] = 0.0f;
+        ty[0] = 2;
+        ty[1] = 3;
+        ty[2] = 3;
+        int8[] sp #= HfToGgufTest.spModel(pieces, sc, ty);
+        File.writeAllBytes(dir + "/tokenizer.model", sp, (int64) sp.count());
+        HfToGgufTest.writeText(dir + "/added_tokens.json",
+            "{\"<pad>\": 8, \"</line>\": 9}");
+        HfToGgufTest.writeText(dir + "/tokenizer_config.json",
+            "{\"add_bos_token\": true, \"add_eos_token\": false, "
+            + "\"added_tokens_decoder\": {\"8\": {\"content\": \"<pad>\", "
+            + "\"special\": true}, \"9\": {\"content\": \"</line>\", "
+            + "\"special\": true}}}");
+        return #s;
+    }
+
+    static void expectType(GgufFile f, String name, int32 ty) {
+        int32 got = f.typeOfName(name);
+        if (got != ty) {
+            Assert.fail(name + " is " + GgufFile.typeName(got) + ", want "
+                + GgufFile.typeName(ty));
+        }
+        return;
+    }
+
+    static void checkTensors(GgufFile f, int32 projTy) {
+        Assert.isTrue(f.contains("token_embd.weight"));
+        Assert.isTrue(f.contains("output_norm.weight"));
+        Assert.isFalse(f.contains("output.weight"));
+        HfToGgufTest.expectType(f, "token_embd.weight", 1);
+        HfToGgufTest.expectType(f, "output_norm.weight", 0);
+        int32 l = 0;
+        while (l < BitnetTest.LAYERS) {
+            String g = "blk." + l + ".";
+            HfToGgufTest.expectType(f, g + "attn_norm.weight", 0);
+            HfToGgufTest.expectType(f, g + "attn_sub_norm.weight", 0);
+            HfToGgufTest.expectType(f, g + "ffn_norm.weight", 0);
+            HfToGgufTest.expectType(f, g + "ffn_sub_norm.weight", 0);
+            HfToGgufTest.expectType(f, g + "attn_q.weight", projTy);
+            HfToGgufTest.expectType(f, g + "attn_k.weight", projTy);
+            HfToGgufTest.expectType(f, g + "attn_v.weight", projTy);
+            HfToGgufTest.expectType(f, g + "attn_output.weight", projTy);
+            HfToGgufTest.expectType(f, g + "ffn_gate.weight", projTy);
+            HfToGgufTest.expectType(f, g + "ffn_up.weight", projTy);
+            HfToGgufTest.expectType(f, g + "ffn_down.weight", projTy);
+            l = l + 1;
+        }
+        int64[] sh = f.shapeOfName("blk.0.ffn_down.weight");
+        Assert.equals(2L, (int64) sh.count());
+        Assert.equals((int64) BitnetTest.H, sh[0]);
+        Assert.equals((int64) BitnetTest.INTER, sh[1]);
+        int64[] se = f.shapeOfName("token_embd.weight");
+        Assert.equals((int64) BitnetTest.VOCAB, se[0]);
+        Assert.equals((int64) BitnetTest.H, se[1]);
+        Assert.equals((int64) (2 + BitnetTest.LAYERS * 11), f.tensorCount());
+        return;
+    }
+
+    static void checkMetadata(GgufFile f, int32 fileType) {
+        Assert.equals("bitnet", f.metaString("general.architecture"));
+        Assert.equals((int64) fileType, f.metaInt("general.file_type", -1L));
+        Assert.equals(2L, f.metaInt("general.quantization_version", -1L));
+        Assert.equals((int64) BitnetTest.LAYERS, f.metaInt("bitnet.block_count", -1L));
+        Assert.equals((int64) BitnetTest.H, f.metaInt("bitnet.embedding_length", -1L));
+        Assert.equals((int64) BitnetTest.INTER, f.metaInt("bitnet.feed_forward_length", -1L));
+        Assert.equals((int64) BitnetTest.HEADS, f.metaInt("bitnet.attention.head_count", -1L));
+        Assert.equals((int64) BitnetTest.HEADS, f.metaInt("bitnet.attention.head_count_kv", -1L));
+        Assert.equals((int64) BitnetTest.HD, f.metaInt("bitnet.rope.dimension_count", -1L));
+        Assert.equals(64L, f.metaInt("bitnet.context_length", -1L));
+        Assert.equals((int64) BitnetTest.VOCAB, f.metaInt("bitnet.vocab_size", -1L));
+        float64 eps = f.metaFloat("bitnet.attention.layer_norm_rms_epsilon", 0.0);
+        Assert.isTrue(eps > 0.0000009 && eps < 0.0000011);
+        Assert.isTrue(f.metaFloat("bitnet.rope.freq_base", 0.0) == 10000.0);
+        Assert.equals("linear", f.metaString("bitnet.rope.scaling.type"));
+        Assert.isTrue(f.metaFloat("bitnet.rope.scaling.factor", 0.0) == 1.0);
+        Assert.equals("llama", f.metaString("tokenizer.ggml.model"));
+        Assert.equals("default", f.metaString("tokenizer.ggml.pre"));
+        Assert.equals(1L, f.metaInt("tokenizer.ggml.bos_token_id", -1L));
+        Assert.equals(2L, f.metaInt("tokenizer.ggml.eos_token_id", -1L));
+        Assert.equals(0L, f.metaInt("tokenizer.ggml.unknown_token_id", -1L));
+        Assert.equals(8L, f.metaInt("tokenizer.ggml.padding_token_id", -1L));
+        Assert.equals(1L, f.metaInt("tokenizer.ggml.add_bos_token", -1L));
+        Assert.equals(0L, f.metaInt("tokenizer.ggml.add_eos_token", -1L));
+        Tokenizer t #= f.tokenizer();
+        Assert.equals((int64) BitnetTest.VOCAB, (int64) t.vocabSize());
+        Assert.equals(8L, (int64) t.idOf("<pad>"));
+        Assert.equals(9L, (int64) t.idOf("</line>"));
+        Assert.equals(10L, (int64) t.idOf("[PAD10]"));
+        Assert.equals(3L, (int64) t.idOf("▁a"));
+        Assert.isTrue(t.addsBos());
+        Assert.equals(1L, (int64) t.bosToken());
+        return;
+    }
+
+    /**
+     * The converted file through the engine. With packing off every
+     * weight dequantizes to f32 and the host graph must equal the
+     * reference at f32 noise; with packing on the ternary routes run,
+     * and the bar is the Q8 floor over a reference that mirrors them
+     * (Q8_K-rounded projection inputs, f16 K/V plane) — a device norm
+     * an ulp away from the host's can still move a Q8 rounding by a
+     * whole step, so the routes are held to 5% of the row's scale
+     * while the host arm carries the exact claim.
+     */
+    static void checkEngine(String path, ToyModel s, int32 mode, String tag,
+            boolean packed) {
+        Quant.setPackingEnabled(packed);
+        Checkpoint ck #= Checkpoint.open(path);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        Assert.isTrue(cfg.subNorm);
+        Assert.isTrue(cfg.tieWordEmbeddings);
+        Assert.equals("BitnetForCausalLM", cfg.architecture);
+        CausalLM m = heap CausalLM(#cfg, 8, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        Quant.setPackingEnabled(true);
+        boolean q8 = packed && mode == 2;
+        float32 rel = 0.001f;
+        float32 abs = 0.001f;
+        if (q8) {
+            rel = 0.05f;
+            abs = 0.002f;
+        }
+        int32[] toks = heap int32[1];
+        int32 t = 3;
+        while (t < 8) {
+            toks[0] = t;
+            m.prefill(toks, 1);
+            float32[] want #= BitnetTest.reference(s, t, mode, q8);
+            BitnetTest.compareLogits(tag + " token " + t, want, m.logits(),
+                rel, abs);
+            m.resetSeq(0);
+            t = t + 1;
+        }
+        return;
+    }
+
+    /** A five-token prefill takes the batched path; its last-position
+     *  logits are held to the host chain's (packing off) at the routes'
+     *  bar — the arm the single-token checks never reach. */
+    static void checkBatched(String path, String tag) {
+        Quant.setPackingEnabled(false);
+        Checkpoint ck0 #= Checkpoint.open(path);
+        ModelConfig cfg0 #= ModelConfig.fromGguf(ck0.gguf());
+        CausalLM m0 = heap CausalLM(#cfg0, 8, 1, 0);
+        m0.bind(ck0, false);
+        ck0.close();
+        Quant.setPackingEnabled(true);
+        Checkpoint ck1 #= Checkpoint.open(path);
+        ModelConfig cfg1 #= ModelConfig.fromGguf(ck1.gguf());
+        CausalLM m1 = heap CausalLM(#cfg1, 8, 1, 0);
+        m1.bind(ck1, false);
+        ck1.close();
+        int32[] toks = heap int32[5];
+        toks[0] = 3;
+        toks[1] = 7;
+        toks[2] = 4;
+        toks[3] = 6;
+        toks[4] = 5;
+        m0.prefill(toks, 5);
+        float32[] want #= heap float32[(int64) BitnetTest.VOCAB];
+        int32 v = 0;
+        while (v < BitnetTest.VOCAB) {
+            want[v] = m0.logits().flatGet((int64) v);
+            v = v + 1;
+        }
+        m1.prefill(toks, 5);
+        BitnetTest.compareLogits(tag + " batched", want, m1.logits(),
+            0.05f, 0.002f);
+        return;
+    }
+
+    static void compareMatrix(String what, Tensor<float32> got, float32[] want) {
+        int64 n = (int64) want.count();
+        Assert.equals(n, got.size());
+        int64 i = 0;
+        while (i < n) {
+            if (got.flatGet(i) != want[i]) {
+                Assert.fail(what + "[" + i + "] = " + got.flatGet(i)
+                    + ", want " + want[i]);
+            }
+            i = i + 1;
+        }
+        return;
+    }
+
+    @Test
+    public void roundTrip() {
+        ToyModel s #= HfToGgufTest.writeCheckpoint();
+        String dir = HfToGgufTest.DIR;
+        String f16 = dir + "/out-f16.gguf";
+        String tq2 = dir + "/out-tq2_0.gguf";
+        String tq1 = dir + "/out-tq1_0.gguf";
+        HfToGguf.convert(dir, f16, "f16");
+        HfToGguf.convert(dir, tq2, "tq2_0");
+        HfToGguf.convert(dir, tq1, "tq1_0");
+
+        Vocab v #= HfToGguf.buildVocab(dir, BitnetTest.VOCAB);
+        Assert.equals("<unk>", v.tokens[0]);
+        Assert.equals(2L, (int64) v.types[0]);
+        Assert.equals("<pad>", v.tokens[8]);
+        Assert.equals(3L, (int64) v.types[8]);
+        Assert.isTrue(v.scores[8] == 0.0f - 1000.0f);
+        Assert.equals("</line>", v.tokens[9]);
+        Assert.equals(3L, (int64) v.types[9]);
+        Assert.equals("[PAD10]", v.tokens[10]);
+        Assert.equals(5L, (int64) v.types[10]);
+        Assert.isTrue(v.scores[10] == 0.0f - 10000.0f);
+        Assert.equals(0L, (int64) v.unk);
+        Assert.isTrue(v.addBos);
+        Assert.isFalse(v.addEos);
+
+        GgufFile a #= heap GgufFile(f16);
+        HfToGgufTest.checkMetadata(a, 1);
+        HfToGgufTest.checkTensors(a, 1);
+        Tensor<float32> qa #= a.loadF32("blk.0.attn_q.weight");
+        float32[] wa #= BitnetTest.proj(s, s.kOf("model.layers.0.self_attn.q_proj.weight"), 1);
+        HfToGgufTest.compareMatrix("f16 attn_q", qa, wa);
+        Tensor<float32> ea #= a.loadF32("token_embd.weight");
+        float32[] we #= BitnetTest.mat(s, s.kOf("model.embed_tokens.weight"));
+        HfToGgufTest.compareMatrix("token_embd", ea, we);
+        Tensor<float32> na #= a.loadF32("blk.1.ffn_sub_norm.weight");
+        float32[] wn #= BitnetTest.mat(s, s.kOf("model.layers.1.mlp.ffn_layernorm.weight"));
+        HfToGgufTest.compareMatrix("ffn_sub_norm", na, wn);
+        a.close();
+
+        GgufFile b #= heap GgufFile(tq2);
+        HfToGgufTest.checkMetadata(b, 37);
+        HfToGgufTest.checkTensors(b, Quant.GG_TQ2_0);
+        Tensor<float32> qb #= b.loadF32("blk.1.ffn_down.weight");
+        float32[] wb #= BitnetTest.proj(s, s.kOf("model.layers.1.mlp.down_proj.weight"), 2);
+        HfToGgufTest.compareMatrix("tq2_0 ffn_down", qb, wb);
+        b.close();
+
+        GgufFile c #= heap GgufFile(tq1);
+        HfToGgufTest.checkMetadata(c, 36);
+        HfToGgufTest.checkTensors(c, Quant.GG_TQ1_0);
+        Tensor<float32> qc #= c.loadF32("blk.0.attn_output.weight");
+        float32[] wc #= BitnetTest.proj(s, s.kOf("model.layers.0.self_attn.o_proj.weight"), 2);
+        HfToGgufTest.compareMatrix("tq1_0 attn_output", qc, wc);
+        c.close();
+
+        HfToGgufTest.checkEngine(f16, s, 1, "f16 file", true);
+        HfToGgufTest.checkEngine(tq2, s, 2, "tq2_0 file (host)", false);
+        HfToGgufTest.checkEngine(tq1, s, 2, "tq1_0 file (host)", false);
+        HfToGgufTest.checkEngine(tq2, s, 2, "tq2_0 file (routes)", true);
+        HfToGgufTest.checkEngine(tq1, s, 2, "tq1_0 file (routes)", true);
+        HfToGgufTest.checkBatched(tq2, "tq2_0 file");
+        HfToGgufTest.checkBatched(tq1, "tq1_0 file");
+    }
+}

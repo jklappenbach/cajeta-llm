@@ -43,6 +43,9 @@ public final class Linear extends InfModule {
     // device copy, uploaded with the weight.
     float32[] bias;
     KernelBuffer<float32> biasDev;
+    /** Output scale from an optional `blk.N.<proj>.scale` tensor
+     *  (codebook-quants 8.3); 1 when absent. */
+    float32 outScale;
     int32 packedTy;             // ggml type of `packed`, or -1
     int32 inDim;
     int32 outDim;
@@ -717,6 +720,7 @@ public final class Linear extends InfModule {
         this.q8 = false;
         this.winStage = null;
         this.winLen = 0L;
+        this.outScale = 1.0f;
     }
 
     /** True when the weight is held in its PACKED block form and consumed
@@ -782,6 +786,24 @@ public final class Linear extends InfModule {
 
     /** True when this projection carries a bias to apply. */
     boolean hasBias() { return this.bias != null; }
+
+    /** Bind an OPTIONAL one-element output scale; absent means 1. */
+    void bindScale(Checkpoint ckpt, String name) {
+        if (!ckpt.contains(name)) { return; }
+        Tensor<float32> t #= ckpt.loadF32(name);
+        if (t.size() != 1L) {
+            throw heap LlmException("scale binding: '" + name + "' has "
+                + t.size() + " elements; expected 1");
+        }
+        this.outScale = t.flatGet(0L);
+        return;
+    }
+
+    /** True when the output needs a scale or a bias after the GEMM —
+     *  the routes that write a fused output step aside for it. */
+    boolean hasEpilogue() {
+        return this.bias != null || this.outScale != 1.0f;
+    }
 
     /** Bind packed weight bytes directly; `p` must be exactly
      *  `[outDim x inDim]` blocks of `pty`. */
@@ -892,11 +914,18 @@ public final class Linear extends InfModule {
      * the forward path asks a projection to multiply, so the packed and
      * f32 weights differ only here.
      */
-    /** `db[doff .. doff+outDim) += bias` — the host counterpart of
-     *  Prim.addBiasRowsDevice. */
-    void addBiasHost(float32[] db, int64 doff) {
-        if (this.bias == null) { return; }
+    /** `db[doff .. doff+outDim) = db * outScale + bias` — the host
+     *  counterpart of the device epilogue. */
+    void epilogueHost(float32[] db, int64 doff) {
         int64 i = 0;
+        if (this.outScale != 1.0f) {
+            while (i < (int64) this.outDim) {
+                db[doff + i] = db[doff + i] * this.outScale;
+                i = i + 1;
+            }
+        }
+        if (this.bias == null) { return; }
+        i = 0;
         while (i < (int64) this.outDim) {
             db[doff + i] = db[doff + i] + this.bias[i];
             i = i + 1;
@@ -983,12 +1012,12 @@ public final class Linear extends InfModule {
                 throw heap LlmException("matvecInto: no host mat-vec "
                     + "for packed type " + this.packedTy);
             }
-            this.addBiasHost(db, doff);
+            this.epilogueHost(db, doff);
             return;
         }
         HostOps.matvecRow(src, srcOff, this.weight, dst, dstOff,
             this.inDim, this.outDim);
-        this.addBiasHost(dst.hostBuffer(), dst.hostBase() + dstOff);
+        this.epilogueHost(dst.hostBuffer(), dst.hostBase() + dstOff);
     }
 
     /**
@@ -1039,7 +1068,7 @@ public final class Linear extends InfModule {
                 db[doff + i] = this.yScratch[i];
                 i = i + 1;
             }
-            this.addBiasHost(db, doff);
+            this.epilogueHost(db, doff);
             return;
         }
         // Timed twin of the block above. Kept as a SEPARATE arm rather than
@@ -2437,6 +2466,10 @@ public final class Linear extends InfModule {
         }
         Linear.btLaunchNs = Linear.btLaunchNs + (t1 - t0);
         Linear.btCalls = Linear.btCalls + 1L;
+        if (this.outScale != 1.0f) {
+            Prim.scaleDevice(this.yBatch, this.outScale,
+                (int64) rows * (int64) this.outDim);
+        }
         if (this.bias != null) {
             // The GEMM wrote `rows x outDim`; the bias is one row wide and
             // broadcasts down it (spec 4.12). Stream-ordered like the GEMM
@@ -2645,7 +2678,7 @@ public final class Linear extends InfModule {
         // bias does not belong to it (spec 4.12). Step aside rather than
         // grow a concatenated-bias buffer for a route the coop GEMM
         // already beats.
-        if (this.bias != null || b.bias != null) { return false; }
+        if (this.hasEpilogue() || b.hasEpilogue()) { return false; }
         if (Linear.coopOn && Linear.backendIsVulkan()
                 && Linear.btXhSrc != null) { return false; }
         if (!Linear.fuseRouteOn()) { return false; }
@@ -2673,7 +2706,7 @@ public final class Linear extends InfModule {
     boolean fusedQkvBatchKeep(Linear kL, Linear vL, int32 rows) {
         // See fusedPairBatchKeep: biased projections take the per-
         // projection routes, which apply the bias themselves.
-        if (this.bias != null || kL.bias != null || vL.bias != null) {
+        if (this.hasEpilogue() || kL.hasEpilogue() || vL.hasEpilogue()) {
             return false;
         }
         if (!Linear.fuseRouteOn()) { return false; }
@@ -3026,6 +3059,9 @@ public final class Linear extends InfModule {
             }
         }
         this.launchRows();
+        if (this.outScale != 1.0f) {
+            Prim.scaleDevice(this.yDev, this.outScale, (int64) this.outDim);
+        }
         if (this.bias != null) {
             Prim.addBiasRowsDevice(this.yDev, this.biasDev, 1L,
                 (int64) this.outDim);
@@ -3047,7 +3083,7 @@ public final class Linear extends InfModule {
             return false;
         }
         this.ensureDevice();
-        if (this.bias != null || !this.packedAct) { return false; }
+        if (this.hasEpilogue() || !this.packedAct) { return false; }
         return (this.q8 && this.wave) || this.wave6;
     }
 
@@ -3073,7 +3109,7 @@ public final class Linear extends InfModule {
 
     boolean matvecStagedAccum(KernelBuffer<float32> dst) {
         this.ensureDevice();
-        if (this.bias != null || !this.packedAct) { return false; }
+        if (this.hasEpilogue() || !this.packedAct) { return false; }
         if (this.q8 && this.wave) {
             QuantKernel.q4kQ8WaveMatVecAccumLaunchNoSync(dst, this.payloadDev,
                 Linear.stXp, (int64) this.outDim, (int64) this.inDim, 0L);
@@ -3104,9 +3140,14 @@ public final class Linear extends InfModule {
         this.ensureDevice();
         kL.ensureDevice();
         vL.ensureDevice();
-        // Unit 9.6.5: biases ride the epilogue, all three or none.
+        // Unit 9.6.5: biases ride the epilogue, all three or none; a
+        // scaled projection takes its own route.
         boolean biased = this.bias != null;
         if ((kL.bias != null) != biased || (vL.bias != null) != biased) {
+            return false;
+        }
+        if (this.outScale != 1.0f || kL.outScale != 1.0f
+                || vL.outScale != 1.0f) {
             return false;
         }
         if (!this.packedAct || !kL.packedAct || !vL.packedAct) {

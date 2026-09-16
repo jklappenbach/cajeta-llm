@@ -1,0 +1,468 @@
+package dev.cajeta.llm.convert;
+
+import cajeta.codec.json.JsonObject;
+import cajeta.codec.json.JsonValue;
+import cajeta.collection.ArrayList;
+import cajeta.io.file.Path;
+import cajeta.lang.Cajeta;
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import dev.cajeta.llm.LlmException;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.GgufWriter;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.tok.SpProto;
+
+/**
+ * A Hugging Face `BitnetForCausalLM` checkpoint directory to one
+ * `bitnet` GGUF llama.cpp loads (codebook-quants spec §8.6-8.9):
+ * `HfToGguf <dir> <out.gguf> f16|tq1_0|tq2_0`. Projections go through
+ * BitNet's `weight_quant` and then the outtype; `token_embd` (and an
+ * untied `output`) are F16; norms F32 — llama.cpp's policy for the same
+ * outtype, so the two files compare tensor by tensor.
+ */
+public final class HfToGguf {
+
+    static final int32 TY_F32 = 0;
+    static final int32 TY_F16 = 1;
+
+    public static void run(String[] args) {
+        if (args.count() != 3) {
+            System.stdout.println("usage: HfToGguf <dir> <out.gguf> "
+                + "f16|tq1_0|tq2_0");
+            return;
+        }
+        HfToGguf.convert(args[0], args[1], args[2]);
+        return;
+    }
+
+    static int32 projTypeOf(String outtype) {
+        if (outtype.equals("f16")) { return HfToGguf.TY_F16; }
+        if (outtype.equals("tq1_0")) { return Quant.GG_TQ1_0; }
+        if (outtype.equals("tq2_0")) { return Quant.GG_TQ2_0; }
+        throw heap LlmException("HfToGguf: outtype '" + outtype
+            + "' is not supported; supported: f16, tq1_0, tq2_0");
+    }
+
+    /** llama.cpp's `general.file_type` for the outtype. */
+    static int32 fileTypeOf(int32 projTy) {
+        if (projTy == Quant.GG_TQ1_0) { return 36; }
+        if (projTy == Quant.GG_TQ2_0) { return 37; }
+        return 1;
+    }
+
+    public static void convert(String dir, String out, String outtype) {
+        int32 projTy = HfToGguf.projTypeOf(outtype);
+        String cfgPath = dir + "/config.json";
+        ModelConfig cfg #= ModelConfig.parse(cfgPath);
+        if (!cfg.architecture.equals("BitnetForCausalLM")) {
+            throw heap LlmException("HfToGguf: architecture '"
+                + cfg.architecture + "' is not supported; supported: "
+                + "BitnetForCausalLM");
+        }
+        JsonDoc cj #= JsonDoc.read(cfgPath);
+        int32 bos = HfToGguf.optInt(cj.root(), "bos_token_id", 1);
+        int32 eos = HfToGguf.optInt(cj.root(), "eos_token_id", 2);
+        int32 pad = HfToGguf.optInt(cj.root(), "pad_token_id", 0 - 1);
+        Vocab v #= HfToGguf.buildVocab(dir, cfg.vocabSize);
+
+        String ckPath = dir + "/model.safetensors.index.json";
+        Path ip #= Path.of(ckPath);
+        if (!ip.exists()) {
+            ckPath = dir + "/model.safetensors";
+        }
+        Checkpoint ck #= Checkpoint.open(ckPath);
+
+        GgufWriter w = heap GgufWriter();
+        w.putString("general.architecture", "bitnet");
+        w.putString("general.name", HfToGguf.baseName(dir));
+        w.putU32("general.file_type", HfToGguf.fileTypeOf(projTy));
+        w.putU32("general.quantization_version", 2);
+        w.putU32("bitnet.context_length", cfg.maxPositionEmbeddings);
+        w.putU32("bitnet.embedding_length", cfg.hiddenSize);
+        w.putU32("bitnet.block_count", cfg.numLayers);
+        w.putU32("bitnet.feed_forward_length", cfg.intermediateSize);
+        w.putU32("bitnet.attention.head_count", cfg.numHeads);
+        w.putU32("bitnet.attention.head_count_kv", cfg.numKvHeads);
+        w.putF32("bitnet.attention.layer_norm_rms_epsilon", cfg.rmsNormEps);
+        w.putU32("bitnet.rope.dimension_count", cfg.headDim);
+        w.putF32("bitnet.rope.freq_base", cfg.ropeTheta);
+        w.putString("bitnet.rope.scaling.type", "linear");
+        w.putF32("bitnet.rope.scaling.factor", 1.0f);
+        w.putU32("bitnet.vocab_size", cfg.vocabSize);
+        w.putString("tokenizer.ggml.model", "llama");
+        w.putString("tokenizer.ggml.pre", "default");
+        w.putArrayString("tokenizer.ggml.tokens", v.tokens);
+        w.putArrayF32("tokenizer.ggml.scores", v.scores);
+        w.putArrayI32("tokenizer.ggml.token_type", v.types);
+        w.putU32("tokenizer.ggml.bos_token_id", bos);
+        w.putU32("tokenizer.ggml.eos_token_id", eos);
+        if (v.unk >= 0) {
+            w.putU32("tokenizer.ggml.unknown_token_id", v.unk);
+        }
+        if (pad >= 0) {
+            w.putU32("tokenizer.ggml.padding_token_id", pad);
+        }
+        w.putBool("tokenizer.ggml.add_bos_token", v.addBos);
+        w.putBool("tokenizer.ggml.add_eos_token", v.addEos);
+
+        HfToGguf.addHalf(w, ck, "model.embed_tokens.weight",
+            "token_embd.weight");
+        int32 l = 0;
+        while (l < cfg.numLayers) {
+            String p = "model.layers." + l + ".";
+            String g = "blk." + l + ".";
+            HfToGguf.addNorm(w, ck, p + "input_layernorm.weight",
+                g + "attn_norm.weight");
+            HfToGguf.addProj(w, ck, p + "self_attn.q_proj.weight",
+                g + "attn_q.weight", projTy);
+            HfToGguf.addProj(w, ck, p + "self_attn.k_proj.weight",
+                g + "attn_k.weight", projTy);
+            HfToGguf.addProj(w, ck, p + "self_attn.v_proj.weight",
+                g + "attn_v.weight", projTy);
+            HfToGguf.addProj(w, ck, p + "self_attn.o_proj.weight",
+                g + "attn_output.weight", projTy);
+            HfToGguf.addNorm(w, ck, p + "self_attn.inner_attn_ln.weight",
+                g + "attn_sub_norm.weight");
+            HfToGguf.addNorm(w, ck, p + "post_attention_layernorm.weight",
+                g + "ffn_norm.weight");
+            HfToGguf.addProj(w, ck, p + "mlp.gate_proj.weight",
+                g + "ffn_gate.weight", projTy);
+            HfToGguf.addProj(w, ck, p + "mlp.up_proj.weight",
+                g + "ffn_up.weight", projTy);
+            HfToGguf.addProj(w, ck, p + "mlp.down_proj.weight",
+                g + "ffn_down.weight", projTy);
+            HfToGguf.addNorm(w, ck, p + "mlp.ffn_layernorm.weight",
+                g + "ffn_sub_norm.weight");
+            l = l + 1;
+        }
+        HfToGguf.addNorm(w, ck, "model.norm.weight", "output_norm.weight");
+        if (ck.contains("lm_head.weight")) {
+            HfToGguf.addHalf(w, ck, "lm_head.weight", "output.weight");
+        }
+        ck.close();
+        w.write(out);
+        System.stdout.println("HfToGguf: wrote " + out + " ("
+            + w.tensorCount() + " tensors, " + outtype + ")");
+        return;
+    }
+
+    // ── weight_quant and the tensor writers ────────────────────────────
+
+    /** Round half to even, as torch's `round`. */
+    static float32 rint(float32 v) {
+        float32 f = Math.floor(v);
+        float32 d = v - f;
+        if (d > 0.5f) { return f + 1.0f; }
+        if (d < 0.5f) { return f; }
+        float32 h = f * 0.5f;
+        if (Math.floor(h) == h) { return f; }
+        return f + 1.0f;
+    }
+
+    /**
+     * BitNet's `weight_quant` in place, in f32 as llama.cpp's converter
+     * runs it: scale = mean|w| clamped at 1e-5, iscale = 1/scale,
+     * w' = clamp(round(w·iscale), −1, 1) / iscale. Returns the scale.
+     */
+    public static float32 weightQuant(float32[] w, int64 n) {
+        float64 sum = 0.0;
+        int64 i = 0;
+        while (i < n) {
+            float32 a = w[i];
+            if (a < 0.0f) { a = 0.0f - a; }
+            sum = sum + (float64) a;
+            i = i + 1;
+        }
+        float32 scale = (float32) (sum / (float64) n);
+        if (scale < 0.00001f) { scale = 0.00001f; }
+        float32 iscale = 1.0f / scale;
+        i = 0;
+        while (i < n) {
+            float32 r = HfToGguf.rint(w[i] * iscale);
+            if (r > 1.0f) { r = 1.0f; }
+            if (r < 0.0f - 1.0f) { r = 0.0f - 1.0f; }
+            w[i] = r / iscale;
+            i = i + 1;
+        }
+        return scale;
+    }
+
+    static int8 b8(int32 v) {
+        if (v > 127) { v = v - 256; }
+        return (int8) v;
+    }
+
+    /** `name` widened to f32 from its stored F16, BF16 or F32 bytes. */
+    static #float32[] widen(Checkpoint ck, String name) {
+        String dt = ck.dtypeOf(name);
+        int8[] raw #= ck.loadBytes(name);
+        int64 nb = (int64) raw.count();
+        if (dt.equals("F32")) {
+            int64 n = nb / 4L;
+            float32[] f #= heap float32[n];
+            int64 i = 0;
+            while (i < n) {
+                int64 b = i * 4L;
+                int32 bits = ((int32) raw[b] & 255)
+                    | (((int32) raw[b + 1L] & 255) << 8)
+                    | (((int32) raw[b + 2L] & 255) << 16)
+                    | (((int32) raw[b + 3L] & 255) << 24);
+                f[i] = Cajeta.bitsToF32(bits);
+                i = i + 1;
+            }
+            return #f;
+        }
+        boolean half = dt.equals("F16");
+        if (!half && !dt.equals("BF16")) {
+            throw heap LlmException("HfToGguf: tensor '" + name
+                + "' is stored as " + dt + "; supported: F16, BF16, F32");
+        }
+        int64 n = nb / 2L;
+        float32[] f #= heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            int64 b = i * 2L;
+            int32 bits = ((int32) raw[b] & 255)
+                | (((int32) raw[b + 1L] & 255) << 8);
+            if (half) {
+                f[i] = GgufFile.halfBitsToF32(bits);
+            } else {
+                f[i] = Cajeta.bitsToF32(bits << 16);
+            }
+            i = i + 1;
+        }
+        return #f;
+    }
+
+    static #int8[] halfBytes(float32[] f, int64 n) {
+        int8[] b #= heap int8[n * 2L];
+        int64 i = 0;
+        while (i < n) {
+            int32 bits = Quant.f32ToHalfBits(f[i]);
+            b[i * 2L] = HfToGguf.b8(bits & 255);
+            b[i * 2L + 1L] = HfToGguf.b8((bits >>> 8) & 255);
+            i = i + 1;
+        }
+        return #b;
+    }
+
+    static #int8[] singleBytes(float32[] f, int64 n) {
+        int8[] b #= heap int8[n * 4L];
+        int64 i = 0;
+        while (i < n) {
+            int32 bits = Cajeta.f32ToBits(f[i]);
+            b[i * 4L] = HfToGguf.b8(bits & 255);
+            b[i * 4L + 1L] = HfToGguf.b8((bits >>> 8) & 255);
+            b[i * 4L + 2L] = HfToGguf.b8((bits >>> 16) & 255);
+            b[i * 4L + 3L] = HfToGguf.b8((bits >>> 24) & 255);
+            i = i + 1;
+        }
+        return #b;
+    }
+
+    /** GGUF `ne` order (fastest first) of a torch shape. */
+    static #int64[] neOf(int64[] shp) {
+        int32 nd = (int32) shp.count();
+        int64[] ne #= heap int64[nd];
+        int32 d = 0;
+        while (d < nd) {
+            ne[d] = shp[nd - 1 - d];
+            d = d + 1;
+        }
+        return #ne;
+    }
+
+    /** A norm (or any 1-D tensor): F32. */
+    static void addNorm(GgufWriter w, Checkpoint ck, String hf, String gg) {
+        float32[] f #= HfToGguf.widen(ck, hf);
+        int64 n = (int64) f.count();
+        int64[] ne #= HfToGguf.neOf(ck.shapeOf(hf));
+        int8[] b #= HfToGguf.singleBytes(f, n);
+        w.addTensor(gg, ne, HfToGguf.TY_F32, #b, n * 4L);
+        return;
+    }
+
+    /** `token_embd` / `output`: F16, straight from an F16 source. */
+    static void addHalf(GgufWriter w, Checkpoint ck, String hf, String gg) {
+        int64[] ne #= HfToGguf.neOf(ck.shapeOf(hf));
+        String dt = ck.dtypeOf(hf);
+        if (dt.equals("F16")) {
+            int8[] raw #= ck.loadBytes(hf);
+            int64 len = (int64) raw.count();
+            w.addTensor(gg, ne, HfToGguf.TY_F16, #raw, len);
+            return;
+        }
+        float32[] f #= HfToGguf.widen(ck, hf);
+        int64 n = (int64) f.count();
+        int8[] b #= HfToGguf.halfBytes(f, n);
+        w.addTensor(gg, ne, HfToGguf.TY_F16, #b, n * 2L);
+        return;
+    }
+
+    /** A projection: `weight_quant`, then the outtype — F16 when a row
+     *  is not a 256 multiple, as llama.cpp's converter falls back. */
+    static void addProj(GgufWriter w, Checkpoint ck, String hf, String gg,
+            int32 projTy) {
+        int64[] shp = ck.shapeOf(hf);
+        if ((int32) shp.count() != 2) {
+            throw heap LlmException("HfToGguf: '" + hf + "' has rank "
+                + (int32) shp.count() + "; expected 2");
+        }
+        int64 cols = shp[1];
+        float32[] f #= HfToGguf.widen(ck, hf);
+        int64 n = (int64) f.count();
+        HfToGguf.weightQuant(f, n);
+        int64[] ne #= HfToGguf.neOf(shp);
+        int32 ty = projTy;
+        if (ty != HfToGguf.TY_F16 && cols % 256L != 0L) {
+            System.stdout.println("HfToGguf: " + gg + " has " + cols
+                + " columns, not a 256 multiple; written F16");
+            ty = HfToGguf.TY_F16;
+        }
+        if (ty == HfToGguf.TY_F16) {
+            int8[] b #= HfToGguf.halfBytes(f, n);
+            w.addTensor(gg, ne, ty, #b, n * 2L);
+            return;
+        }
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 len = (n / 256L) * bb;
+        int8[] b #= heap int8[len];
+        if (ty == Quant.GG_TQ2_0) {
+            Quant.tq20Quantize(f, 0L, n, b, 0L);
+        } else {
+            Quant.tq10Quantize(f, 0L, n, b, 0L);
+        }
+        w.addTensor(gg, ne, ty, #b, len);
+        return;
+    }
+
+    // ── the vocabulary ──────────────────────────────────────────────────
+
+    static int32 optInt(JsonObject root, String key, int32 dflt) {
+        JsonValue j = root.get(key);
+        if (j == null || j.isNull()) { return dflt; }
+        return j.asInt32();
+    }
+
+    static boolean optBool(JsonObject root, String key, boolean dflt) {
+        JsonValue j = root.get(key);
+        if (j == null || j.isNull()) { return dflt; }
+        return j.asBoolean();
+    }
+
+    static int32 parseInt(String s) {
+        int8[] b #= s.toBytes();
+        int32 n = (int32) b.count();
+        int32 v = 0;
+        int32 i = 0;
+        while (i < n) {
+            int32 c = (int32) b[i];
+            if (c < 48 || c > 57) {
+                throw heap LlmException("HfToGguf: token id '" + s
+                    + "' is not a number");
+            }
+            v = v * 10 + (c - 48);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    /** llama.cpp's `does_token_look_special`. */
+    static boolean looksSpecial(String t) {
+        if (t.equals("<pad>") || t.equals("<mask>") || t.equals("<2mass>")
+                || t.equals("[@BOS@]")) {
+            return true;
+        }
+        if (t.startsWith("<|") && t.endsWith("|>")) { return true; }
+        if (t.startsWith("<unused") && t.endsWith(">")) { return true; }
+        return false;
+    }
+
+    /**
+     * `tokenizer.model` pieces, then `added_tokens.json`, then
+     * `tokenizer_config.json`'s `added_tokens_decoder`, over a
+     * `[PAD<id>]` UNUSED fill up to `vocabSize` — llama.cpp's
+     * `_create_vocab_sentencepiece` order.
+     */
+    public static #Vocab buildVocab(String dir, int32 vocabSize) {
+        SpProto sp #= SpProto.read(dir + "/tokenizer.model");
+        Vocab v = heap Vocab(vocabSize);
+        int32 i = 0;
+        while (i < vocabSize) {
+            v.tokens[i] #= "[PAD" + i + "]";
+            v.scores[i] = 0.0f - 10000.0f;
+            v.types[i] = 5;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < sp.n && i < vocabSize) {
+            v.tokens[i] #= "" + sp.pieces[i];
+            v.scores[i] = sp.scores[i];
+            v.types[i] = sp.types[i];
+            if (sp.types[i] == 2) { v.unk = i; }
+            i = i + 1;
+        }
+        JsonDoc added #= JsonDoc.read(dir + "/added_tokens.json");
+        if (added != null) {
+            JsonObject ao = added.root();
+            ArrayList<String> keys #= ao.keys();
+            int32 k = 0;
+            while (k < keys.count()) {
+                String key = keys.get(k);
+                int32 id = ao.get(key).asInt32();
+                if (id < vocabSize) {
+                    v.tokens[id] #= "" + key;
+                    v.scores[id] = 0.0f - 1000.0f;
+                    v.types[id] = 4;
+                }
+                k = k + 1;
+            }
+        }
+        JsonDoc tc #= JsonDoc.read(dir + "/tokenizer_config.json");
+        if (tc != null) {
+            JsonObject root = tc.root();
+            v.addBos = HfToGguf.optBool(root, "add_bos_token", true);
+            v.addEos = HfToGguf.optBool(root, "add_eos_token", false);
+            JsonValue dec = root.get("added_tokens_decoder");
+            if (dec != null && !dec.isNull()) {
+                JsonObject dobj = dec.object();
+                ArrayList<String> ids #= dobj.keys();
+                int32 k = 0;
+                while (k < ids.count()) {
+                    String key = ids.get(k);
+                    int32 id = HfToGguf.parseInt(key);
+                    JsonObject entry = dobj.get(key).object();
+                    String content #= entry.get("content").asString();
+                    boolean special = HfToGguf.optBool(entry, "special",
+                        false) || HfToGguf.looksSpecial(content);
+                    if (id < vocabSize) {
+                        if (special) {
+                            v.types[id] = 3;
+                            v.tokens[id] #= "" + content;
+                        } else {
+                            v.types[id] = 4;
+                            v.tokens[id] #= content.replace("▁", " ");
+                        }
+                        v.scores[id] = 0.0f - 1000.0f;
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+        return #v;
+    }
+
+    /** The last path segment of `dir`. */
+    static #String baseName(String dir) {
+        int8[] b #= dir.toBytes();
+        int32 n = (int32) b.count();
+        while (n > 0 && b[n - 1] == 47) { n = n - 1; }
+        int32 start = n;
+        while (start > 0 && b[start - 1] != 47) { start = start - 1; }
+        return dir.substring(start, n);
+    }
+}
