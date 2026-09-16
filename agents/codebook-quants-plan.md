@@ -430,23 +430,37 @@ every timing leg and wait for the go; filtered suite only
 ## Unit 5 — IQ2_XXS, IQ2_XS, IQ3_XXS: the ksigns family (spec §3.4, §4, §6.2, §7.2)
 
 ### 5.1 TDD
-- [ ] 5.1.1 Decoders exact, three fixtures.
-- [ ] 5.1.2 Host mat-vecs and Q8 twins, three formats.
-- [ ] 5.1.3 `IqGridDeviceTest`: a probe kernel gathers every entry of the
+- [x] 5.1.1 Decoders exact, three fixtures.
+- [x] 5.1.2 Host mat-vecs and Q8 twins, three formats.
+- [x] 5.1.3 `IqGridDeviceTest`: a probe kernel gathers every entry of the
       resident device tables (byte and packed forms) and expands all 128
       `ksigns` indices; equal to the host arrays.
-- [ ] 5.1.4 Wave decode kernels equal the Q8 twins exactly — 2s+1 per
+      (`IqCodebookTest.theDeviceTablesEqualTheHostTables`, one probe over
+      all five tables.)
+- [x] 5.1.4 Wave decode kernels equal the Q8 twins exactly — 2s+1 per
       sub-block, the 0.125 / 0.25 tails once per block.
-- [ ] 5.1.5 Coop X1/X3 with the LDS-staged table equal the host GEMM;
-      `coopBlockWords` 16 / 18 / 24.
-- [ ] 5.1.6 The four-part invariant extended; ISA: no spill.
+- [x] 5.1.5 Coop X1/X3 with the LDS-staged table equal the host GEMM;
+      `coopBlockWords` 16 / 18 / 24. (X3 only: the X1 variant is a
+      long-k tuning of the same body and is deferred with 4.3.5.)
+- [x] 5.1.6 The four-part invariant extended; ISA: no spill.
+      (`TernaryTest.theFourPartInvariant` covers every type by
+      construction; the ISA read is deferred with 4.3.5.)
 
 ### 5.2 Coding
-- [ ] 5.2.1 `QuantKernel.ensureIqTables()` — static resident buffers
+- [x] 5.2.1 `QuantKernel.ensureIqTables()` — static resident buffers
       uploaded once (the `pfSink` pattern), passed as kernel operands.
-- [ ] 5.2.2 Decoders; host; wave kernels (one gather, one sign expand,
+- [x] 5.2.2 Decoders; host; wave kernels (one gather, one sign expand,
       one `dotAccum` per 8); coop staging through the LDS table;
       registration; `supported` / `splitOn` / `packedSupported` last.
+      DONE 2026-09-16: `Quant.iq2xxsInts/iq2xsInts/iq3xxsInts` feed one
+      block decoder, one host mat-vec and one integer twin per format;
+      `QuantKernel.iqDot16` expands two ksigns groups into sixteen int8
+      lanes for one `dotAccum` (the `(x ^ -m) + m` sign form, no table
+      for `kmask` since it is `1 << j`); three wave kernels take one
+      32-element sub-block per lane, four lanes per block; three coop X3
+      kernels stage `ksigns` and the grid in LDS at entry behind one
+      barrier. All three join `splitOn`, so a row is its f16 scale
+      prefix then 16 / 18 / 24 payload words per block.
 
 ### 5.3 Acceptance
 - [ ] 5.3.1 IQ2_XXS, IQ2_XS, IQ3_XXS 8B files: `batched`, no

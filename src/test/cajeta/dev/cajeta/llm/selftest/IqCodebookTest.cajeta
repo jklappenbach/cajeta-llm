@@ -1,0 +1,266 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.IqGrid;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/** The ksigns family: IQ2_XXS, IQ2_XS and IQ3_XXS. */
+public class IqCodebookTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+    static final int64 ROWS = 4L;
+    static final int64 COLS = 4096L;
+
+    public IqCodebookTest() { return; }
+
+    @Test
+    public void decodersMatchTheFixtures() {
+        QuantTest.checkFormat("iq2_xxs", Quant.GG_IQ2_XXS);
+        QuantTest.checkFormat("iq2_xs", Quant.GG_IQ2_XS);
+        QuantTest.checkFormat("iq3_xxs", Quant.GG_IQ3_XXS);
+    }
+
+    /** The host mat-vec against the dequantized reference, same order. */
+    static void checkHost(String name, int32 ty) {
+        int8[] raw #= File.readAllBytes(IqCodebookTest.DIR + name + ".bin");
+        int64 blocks = (int64) raw.count() / (int64) Quant.blockBytes(ty);
+        int64 rows = 4L;
+        int64 cols = blocks / rows * 256L;
+        float32[] w #= heap float32[rows * cols];
+        Quant.dequantize(ty, raw, 0L, blocks, w, 0L);
+        float32[] x #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) {
+            x[c] = (float32) ((c % 13L) - 6L) * 0.125f;
+            c = c + 1;
+        }
+        float32[] want #= heap float32[rows];
+        int64 r = 0;
+        while (r < rows) {
+            float32 acc = 0.0f;
+            c = 0;
+            while (c < cols) {
+                acc = acc + w[r * cols + c] * x[c];
+                c = c + 1;
+            }
+            want[r] = acc;
+            r = r + 1;
+        }
+        float32[] got #= heap float32[rows];
+        Quant.iqMatVecIntoAt(ty, raw, 0L, rows, cols, x, 0L, got, 0L);
+        IqCodebookTest.compare(name + " host mat-vec", want, got, rows);
+        return;
+    }
+
+    static void compare(String what, float32[] want, float32[] got,
+            int64 rows) {
+        int64 r = 0;
+        while (r < rows) {
+            float64 a = (float64) want[r];
+            float64 b = (float64) got[r];
+            float64 diff = a - b;
+            if (diff < 0.0) { diff = 0.0 - diff; }
+            float64 mag = a < 0.0 ? 0.0 - a : a;
+            if (mag < 1.0) { mag = 1.0; }
+            if (diff / mag > 1.0e-5) {
+                Assert.fail(what + " row " + r + ": got " + got[r]
+                    + " want " + want[r]);
+            }
+            r = r + 1;
+        }
+        return;
+    }
+
+    @Test
+    public void hostMatVecsMatchTheDequantizedReference() {
+        IqCodebookTest.checkHost("iq2_xxs", Quant.GG_IQ2_XXS);
+        IqCodebookTest.checkHost("iq2_xs", Quant.GG_IQ2_XS);
+        IqCodebookTest.checkHost("iq3_xxs", Quant.GG_IQ3_XXS);
+    }
+
+    /** Tile the fixture to ROWS x COLS. */
+    static #int8[] tiled(String fixture, int32 ty) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 nBlocks = IqCodebookTest.ROWS * (IqCodebookTest.COLS / 256L);
+        int8[] fix #= File.readAllBytes(IqCodebookTest.DIR + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        Assert.isTrue(fixBlocks > 0L);
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        return #raw;
+    }
+
+    static #float32[] activations() {
+        float32[] x #= heap float32[IqCodebookTest.COLS];
+        int64 i = 0;
+        while (i < IqCodebookTest.COLS) {
+            x[i] = 0.03125f * (float32) ((i * 31L + 7L) % 61L - 30L);
+            i = i + 1;
+        }
+        return #x;
+    }
+
+    /** The q8_K-rounded activations a device kernel sees. */
+    static #float32[] rounded(int8[] xp) {
+        float32[] xq #= heap float32[IqCodebookTest.COLS];
+        int64 k = 0;
+        while (k < IqCodebookTest.COLS) {
+            int64 base = (k / 256L) * 320L;
+            int32 sb = ((int32) xp[base + 288L] & 255)
+                | (((int32) xp[base + 289L] & 255) << 8)
+                | (((int32) xp[base + 290L] & 255) << 16)
+                | (((int32) xp[base + 291L] & 255) << 24);
+            xq[k] = Cajeta.bitsToF32(sb)
+                * (float32) ((int32) xp[base + (k % 256L)]);
+            k = k + 1;
+        }
+        return #xq;
+    }
+
+    static #float32[] reference(int8[] raw, int32 ty, float32[] xq) {
+        int64 nBlocks = IqCodebookTest.ROWS * (IqCodebookTest.COLS / 256L);
+        float32[] w #= heap float32[nBlocks * 256L];
+        Quant.dequantize(ty, raw, 0L, nBlocks, w, 0L);
+        float32[] want #= heap float32[IqCodebookTest.ROWS];
+        int64 r = 0;
+        while (r < IqCodebookTest.ROWS) {
+            float32 acc = 0.0f;
+            int64 k = 0;
+            while (k < IqCodebookTest.COLS) {
+                acc = acc + w[r * IqCodebookTest.COLS + k] * xq[k];
+                k = k + 1;
+            }
+            want[r] = acc;
+            r = r + 1;
+        }
+        return #want;
+    }
+
+    /** The integer twin against the f32 host over the same rounded
+     *  activations, then the wave kernel against the twin. */
+    static void checkQ8(String fixture, int32 ty) {
+        int8[] raw #= IqCodebookTest.tiled(fixture, ty);
+        float32[] x #= IqCodebookTest.activations();
+        int8[] xq #= heap int8[IqCodebookTest.COLS];
+        float32[] xd #= heap float32[IqCodebookTest.COLS / 256L];
+        int32[] xbs #= heap int32[IqCodebookTest.COLS / 16L];
+        Quant.q8kQuantize(x, 0L, IqCodebookTest.COLS, xq, xd, xbs);
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(IqCodebookTest.COLS)];
+        Quant.q8kPack(x, 0L, IqCodebookTest.COLS, xp);
+        float32[] xr #= IqCodebookTest.rounded(xp);
+        float32[] want #= IqCodebookTest.reference(raw, ty, xr);
+        float32[] twin #= heap float32[IqCodebookTest.ROWS];
+        Quant.iqMatVecIntoQ8(ty, raw, IqCodebookTest.ROWS,
+            IqCodebookTest.COLS, xq, xd, twin, 0L);
+        IqCodebookTest.compare(fixture + " q8 twin", want, twin,
+            IqCodebookTest.ROWS);
+
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int64 bpr = IqCodebookTest.COLS / 256L;
+        int64 nBlocks = IqCodebookTest.ROWS * bpr;
+        KernelBuffer<int8> wb #= heap KernelBuffer<int8>((uint64) raw.count());
+        wb.upload(raw);
+        KernelBuffer<int8> pd #= heap KernelBuffer<int8>((uint64)
+            (IqCodebookTest.ROWS * Quant.rowResidentBytes(ty, bpr)));
+        QuantKernel.splitLaunch(pd, wb, nBlocks, 0L, ty, bpr);
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        xpb.upload(xp);
+        KernelBuffer<float32> yd #= heap KernelBuffer<float32>(
+            (uint64) IqCodebookTest.ROWS);
+        QuantKernel.iqQ8WaveMatVecLaunch(ty, yd, pd, xpb, IqCodebookTest.ROWS,
+            IqCodebookTest.COLS, 0L);
+        float32[] got #= heap float32[IqCodebookTest.ROWS];
+        yd.download(got);
+        IqCodebookTest.compare(fixture + " wave kernel", twin, got,
+            IqCodebookTest.ROWS);
+        return;
+    }
+
+    @Test
+    public void q8TwinsAndWaveKernelsAgree() {
+        IqCodebookTest.checkQ8("iq2_xxs.bin", Quant.GG_IQ2_XXS);
+        IqCodebookTest.checkQ8("iq2_xs.bin", Quant.GG_IQ2_XS);
+        IqCodebookTest.checkQ8("iq3_xxs.bin", Quant.GG_IQ3_XXS);
+    }
+
+    /** Every entry of the resident device tables equals the host array. */
+    @Test
+    public void theDeviceTablesEqualTheHostTables() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        int32[] ks = IqGrid.ksigns();
+        int32[] km = IqGrid.kmask();
+        int64[] g2xxs = IqGrid.iq2xxs();
+        int64[] g2xs = IqGrid.iq2xs();
+        int32[] g3 = IqGrid.iq3xxs();
+        int64 n = 128L + 8L + 256L * 2L + 512L * 2L + 256L;
+        KernelBuffer<int32> out #= heap KernelBuffer<int32>((uint64) n);
+        QuantKernel.iqTableProbeLaunch(out, n);
+        int32[] got #= heap int32[n];
+        out.download(got);
+        int64 i = 0;
+        while (i < 128L) {
+            Assert.equals((int64) ks[i], (int64) got[i]);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < 8L) {
+            Assert.equals((int64) km[i], (int64) got[128L + i]);
+            i = i + 1;
+        }
+        int64 base = 136L;
+        i = 0;
+        while (i < 256L) {
+            int64 v = g2xxs[i];
+            Assert.equals((int64) (int32) (v & 4294967295L),
+                (int64) got[base + i * 2L]);
+            Assert.equals((int64) (int32) ((v >> 32) & 4294967295L),
+                (int64) got[base + i * 2L + 1L]);
+            i = i + 1;
+        }
+        base = base + 512L;
+        i = 0;
+        while (i < 512L) {
+            int64 v = g2xs[i];
+            Assert.equals((int64) (int32) (v & 4294967295L),
+                (int64) got[base + i * 2L]);
+            Assert.equals((int64) (int32) ((v >> 32) & 4294967295L),
+                (int64) got[base + i * 2L + 1L]);
+            i = i + 1;
+        }
+        base = base + 1024L;
+        i = 0;
+        while (i < 256L) {
+            Assert.equals((int64) g3[i], (int64) got[base + i]);
+            i = i + 1;
+        }
+    }
+
+    @Test
+    public void coopGemmsMatchTheHost() {
+        Assert.equals(16, QuantKernel.coopBlockWords(Quant.GG_IQ2_XXS));
+        Assert.equals(18, QuantKernel.coopBlockWords(Quant.GG_IQ2_XS));
+        Assert.equals(24, QuantKernel.coopBlockWords(Quant.GG_IQ3_XXS));
+        Assert.isTrue(QuantKernel.coopColsOk(Quant.GG_IQ2_XXS, 4096L));
+        Assert.isFalse(QuantKernel.coopColsOk(Quant.GG_IQ2_XXS, 4160L));
+        CoopQuantGemmTest.checkFormat(Quant.GG_IQ2_XXS, "iq2_xxs.bin");
+        CoopQuantGemmTest.checkFormat(Quant.GG_IQ2_XS, "iq2_xs.bin");
+        CoopQuantGemmTest.checkFormat(Quant.GG_IQ3_XXS, "iq3_xxs.bin");
+    }
+}
