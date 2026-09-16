@@ -635,6 +635,33 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
 - [ ] 7.1.3 The exactness gate: every Q8-twin, coop and fixture test in
       `TernaryTest` and `IqCodebookTest` still passes after any rewrite.
       A faster kernel that is not the same kernel is not a fix.
+- [x] 7.1.5 The CPU control: would either family decode faster on the
+      CPU? This box is a Zen 5 with AVX512-VNNI and VBMI sharing one
+      LPDDR5X pool with the iGPU, so neither side wins on the bus.
+      MEASURED 2026-09-16 (`tmp/cbq/cpu-vs-gpu.sh`, llama.cpp `-ngl 0`,
+      tg128 at depth 512), converted to achieved weight bandwidth:
+
+      | file | GB | cpu t/s | cpu GB/s | cajeta GB/s | vulkan GB/s |
+      |---|---|---|---|---|---|
+      | iq2_xxs | 2.22 | 32.1 | 71 | 137 | 175 |
+      | iq2_xs | 2.42 | 31.7 | 77 | 118 | 178 |
+      | iq2_s | 2.52 | 30.9 | 78 | 121 | 176 |
+      | iq3_xxs | 3.04 | 25.1 | 76 | 154 | 181 |
+      | iq3_s | 3.45 | 21.2 | 73 | 148 | 190 |
+
+      NO for the codebook family: the CPU is half our rate and 40% of
+      Vulkan's. And it is FLAT — 71-78 GB/s on every format, whatever
+      the table work — which says the CPU is simply at its memory
+      ceiling on an 8B model and the format never enters into it. The
+      one ternary model we have is 700M, where CPU (175 t/s) and cajeta
+      (212) both sit near 50 GB/s, far under either ceiling: that model
+      is overhead-bound and answers nothing about the format.
+      What this DOES settle is the target. Vulkan reaches 175-190 GB/s
+      end to end, above this machine's CPU ceiling and near its memory
+      ceiling, while our best ISOLATED IQ2_XS kernel in 7.1.1 runs at
+      123 GB/s — below Vulkan's whole-model rate on the same file. So
+      the gap is the kernels, not the engine around them, and the
+      roofline to aim at is ~190 GB/s rather than "beat the CPU".
 - [ ] 7.1.4 A lane-mapping control at one fixed shape — one item per
       row against one wave per row — so the mapping is measured rather
       than assumed to be the ceiling (it was, at 208 against 162 GB/s,
