@@ -488,15 +488,27 @@ every timing leg and wait for the go; filtered suite only
 ## Unit 6 — IQ2_S, IQ3_S: raw signs and qh high bits (spec §3.4, 12.1)
 
 ### 6.1 TDD
-- [ ] 6.1.1 Decoders exact, two fixtures; IQ3_S's `1 + 2s` scale.
-- [ ] 6.1.2 Host mat-vecs and Q8 twins.
-- [ ] 6.1.3 Wave decode kernels and coop X1/X3; `coopBlockWords` 20 / 27.
-- [ ] 6.1.4 The 12.1 harness: the IQ2_S wave kernel with an LDS-table arm
+- [x] 6.1.1 Decoders exact, two fixtures; IQ3_S's `1 + 2s` scale.
+- [x] 6.1.2 Host mat-vecs and Q8 twins.
+- [x] 6.1.3 Wave decode kernels and coop X1/X3; `coopBlockWords` 20 / 27.
+      (X3 only, as in Unit 5; X1 rides 4.3.5.)
+- [~] 6.1.4 The 12.1 harness: the IQ2_S wave kernel with an LDS-table arm
       and an L1-table arm, bit-identical outputs, timed alternating on
       idle; the choice recorded here with both numbers.
+      Both arms SHIP and are bit-identical
+      (`IqCodebookTest.theTwoTableResidencyArmsAgreeExactly`;
+      `QuantKernel.setIqLdsTable` picks one, L1 by default). The TIMING
+      half is announced and waits on a quiet box.
 
 ### 6.2 Coding
-- [ ] 6.2.1 Decoders; host; kernels; registration; gates last.
+- [x] 6.2.1 Decoders; host; kernels; registration; gates last.
+      DONE 2026-09-16: `Quant.iq2sInts` (ten-bit index, the high two bits
+      from `qh`, raw sign bytes) and `iq3sInts` (a ninth index bit per
+      half group, `1+2s` per 32) join the Unit 5 machinery, which
+      generalized into `iqScale` and `iqStep`. Device: `iq2s`/`iq3s`
+      tables, two wave kernels plus the LDS-table twin, two coop X3
+      kernels. `Linear.routeSaid` widened to int64 — the route-record
+      mask had run out of bits and IQ3_S would have aliased `q4 deqMw4`.
 
 ### 6.3 Acceptance
 - [ ] 6.3.1 IQ2_S, IQ2_M, IQ3_S, IQ3_XS, IQ3_M 8B files (the mixes

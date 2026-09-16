@@ -63,6 +63,8 @@ public final class Quant {
     public static final int32 GG_IQ2_XS = 17;
     public static final int32 GG_IQ3_XXS = 18;
     public static final int32 GG_IQ4_NL = 20;
+    public static final int32 GG_IQ3_S = 21;
+    public static final int32 GG_IQ2_S = 22;
     public static final int32 GG_IQ4_XS = 23;
     // MXFP4 (OCP microscaling FP4): 32-elem blocks, one E8M0 scale byte
     // + 16 packed-nibble bytes = 17 bytes. GGML tensor type 39.
@@ -78,7 +80,8 @@ public final class Quant {
     public static boolean supported(int32 ty) {
         return ty == Quant.GG_F16
             || ty == Quant.GG_IQ2_XXS || ty == Quant.GG_IQ2_XS
-            || ty == Quant.GG_IQ3_XXS
+            || ty == Quant.GG_IQ3_XXS || ty == Quant.GG_IQ2_S
+            || ty == Quant.GG_IQ3_S
             || ty == Quant.GG_Q4_0 || ty == Quant.GG_Q5_0
             || ty == Quant.GG_Q4_1 || ty == Quant.GG_Q5_1
             || ty == Quant.GG_Q8_0
@@ -117,6 +120,8 @@ public final class Quant {
         if (ty == Quant.GG_IQ2_XXS) { return 66; }
         if (ty == Quant.GG_IQ2_XS) { return 74; }
         if (ty == Quant.GG_IQ3_XXS) { return 98; }
+        if (ty == Quant.GG_IQ2_S) { return 82; }
+        if (ty == Quant.GG_IQ3_S) { return 110; }
         if (ty == Quant.GG_IQ4_NL) { return 18; }
         if (ty == Quant.GG_IQ4_XS) { return 136; }
         if (ty == Quant.GG_MXFP4) { return 17; }
@@ -158,7 +163,8 @@ public final class Quant {
     public static boolean splitOn(int32 ty) {
         return ty == Quant.GG_Q8_0 || ty == Quant.GG_TQ1_0
             || ty == Quant.GG_TQ2_0 || ty == Quant.GG_IQ2_XXS
-            || ty == Quant.GG_IQ2_XS || ty == Quant.GG_IQ3_XXS;
+            || ty == Quant.GG_IQ2_XS || ty == Quant.GG_IQ3_XXS
+            || ty == Quant.GG_IQ2_S || ty == Quant.GG_IQ3_S;
     }
 
     /** Bytes of a resident row's scale prefix for `bpr` blocks: the
@@ -333,18 +339,86 @@ public final class Quant {
         }
     }
 
-    /** The sub-block multiplier's divisor: IQ2 halves eighths, IQ3
-     *  quarters. */
+    /** What multiplies the sub-block's `2s+1` (IQ3_S carries `1+2s`
+     *  already scaled, so its factor is one). */
     static float32 iqScale(int32 ty) {
         if (ty == Quant.GG_IQ3_XXS) { return 0.25f; }
+        if (ty == Quant.GG_IQ3_S) { return 1.0f; }
         return 0.125f;
+    }
+
+    /** Elements one sub-block multiplier covers. */
+    static int32 iqStep(int32 ty) {
+        if (ty == Quant.GG_IQ2_XS || ty == Quant.GG_IQ2_S) { return 16; }
+        return 32;
+    }
+
+    /** As {@link #iq2xxsInts} for IQ2_S: raw sign bytes and a ten-bit
+     *  grid index whose high two bits ride `qh`. */
+    static void iq2sInts(int8[] raw, int64 ro, int32[] t, int32[] ls8) {
+        int64[] grid = IqGrid.iq2s();
+        int32 ib = 0;
+        while (ib < 8) {
+            int32 qh = Quant.u8(raw, ro + 66L + (int64) ib);
+            int32 sc = Quant.u8(raw, ro + 74L + (int64) ib);
+            int32 l = 0;
+            while (l < 4) {
+                int32 idx = Quant.u8(raw, ro + 2L + (int64) (4 * ib + l))
+                    | ((qh << (8 - 2 * l)) & 768);
+                int32 sg = Quant.u8(raw, ro + 34L + (int64) (4 * ib + l));
+                Quant.iqGroup8(grid[(int64) idx], sg, t, 32 * ib + 8 * l);
+                l = l + 1;
+            }
+            ls8[2 * ib] = 2 * (sc & 15) + 1;
+            ls8[2 * ib + 1] = 2 * (sc >> 4) + 1;
+            ib = ib + 1;
+        }
+    }
+
+    /** As {@link #iq2xxsInts} for IQ3_S: raw sign bytes, a ninth index
+     *  bit per half group from `qh`, and a `1+2s` scale per 32. */
+    static void iq3sInts(int8[] raw, int64 ro, int32[] t, int32[] ls8) {
+        int32[] grid = IqGrid.iq3s();
+        int32 ib = 0;
+        while (ib < 8) {
+            int32 qh = Quant.u8(raw, ro + 66L + (int64) ib);
+            int32 sc = Quant.u8(raw, ro + 106L + (int64) (ib / 2));
+            int32 nib = sc & 15;
+            if ((ib - (ib / 2) * 2) == 1) { nib = sc >> 4; }
+            ls8[ib] = 1 + 2 * nib;
+            int32 l = 0;
+            while (l < 4) {
+                int32 sg = Quant.u8(raw, ro + 74L + (int64) (4 * ib + l));
+                int64 qb = ro + 2L + (int64) (8 * ib + 2 * l);
+                int32 i0 = Quant.u8(raw, qb) | ((qh << (8 - 2 * l)) & 256);
+                int32 i1 = Quant.u8(raw, qb + 1L)
+                    | ((qh << (7 - 2 * l)) & 256);
+                Quant.iqGroup4(grid[(int64) i0], sg, 0, t, 32 * ib + 8 * l);
+                Quant.iqGroup4(grid[(int64) i1], sg, 4, t,
+                    32 * ib + 8 * l + 4);
+                l = l + 1;
+            }
+            ib = ib + 1;
+        }
     }
 
     static void iqInts(int32 ty, int8[] raw, int64 ro, int32[] t,
             int32[] ls8) {
         if (ty == Quant.GG_IQ2_XXS) { Quant.iq2xxsInts(raw, ro, t, ls8); }
         else if (ty == Quant.GG_IQ2_XS) { Quant.iq2xsInts(raw, ro, t, ls8); }
+        else if (ty == Quant.GG_IQ2_S) { Quant.iq2sInts(raw, ro, t, ls8); }
+        else if (ty == Quant.GG_IQ3_S) { Quant.iq3sInts(raw, ro, t, ls8); }
         else { Quant.iq3xxsInts(raw, ro, t, ls8); }
+        return;
+    }
+
+    static void iq2sBlock(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        Quant.iqBlock(Quant.GG_IQ2_S, raw, ro, out, oo);
+        return;
+    }
+
+    static void iq3sBlock(int8[] raw, int64 ro, float32[] out, int64 oo) {
+        Quant.iqBlock(Quant.GG_IQ3_S, raw, ro, out, oo);
         return;
     }
 
@@ -354,7 +428,7 @@ public final class Quant {
         int32[] ls8 #= heap int32[16];
         Quant.iqInts(ty, raw, ro, t, ls8);
         float32 d = Quant.f16At(raw, ro) * Quant.iqScale(ty);
-        int32 step = ty == Quant.GG_IQ2_XS ? 16 : 32;
+        int32 step = Quant.iqStep(ty);
         int32 k = 0;
         while (k < 256) {
             float32 dl = d * (float32) ls8[k / step];
@@ -385,7 +459,7 @@ public final class Quant {
             float32[] y, int64 yOff) {
         int64 bb = (int64) Quant.blockBytes(ty);
         int64 bpr = cols / 256L;
-        int32 step = ty == Quant.GG_IQ2_XS ? 16 : 32;
+        int32 step = Quant.iqStep(ty);
         float32 sc = Quant.iqScale(ty);
         int32[] t #= heap int32[256];
         int32[] ls8 #= heap int32[16];
@@ -420,7 +494,7 @@ public final class Quant {
             int64 cols, int8[] xq, float32[] xd, float32[] y, int64 yOff) {
         int64 bb = (int64) Quant.blockBytes(ty);
         int64 bpr = cols / 256L;
-        int32 step = ty == Quant.GG_IQ2_XS ? 16 : 32;
+        int32 step = Quant.iqStep(ty);
         float32 sc = Quant.iqScale(ty);
         int32[] t #= heap int32[256];
         int32[] ls8 #= heap int32[16];
@@ -519,6 +593,8 @@ public final class Quant {
             else if (ty == Quant.GG_IQ2_XXS) { Quant.iq2xxsBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_IQ2_XS) { Quant.iq2xsBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_IQ3_XXS) { Quant.iq3xxsBlock(raw, ro, out, oo); }
+            else if (ty == Quant.GG_IQ2_S) { Quant.iq2sBlock(raw, ro, out, oo); }
+            else if (ty == Quant.GG_IQ3_S) { Quant.iq3sBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_IQ4_NL) { Quant.iq4nlBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_IQ4_XS) { Quant.iq4xsBlock(raw, ro, out, oo); }
             else if (ty == Quant.GG_MXFP4) { Quant.mxfp4Block(raw, ro, out, oo); }
