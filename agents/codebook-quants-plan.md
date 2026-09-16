@@ -40,9 +40,13 @@ kernel is written against it once. Reference material next (Unit 2),
 because fixtures, tables and arbiter files gate everything after. The
 ternary pair (Unit 3) is the four-part template on the new layout with
 the smallest kernels; the architecture and converter (Unit 4) give it a
-real model. The codebook tier follows by kinship — ksigns family,
-raw-sign family, the IQ1 pair — and the migration of the older formats
-closes the plan, once the split path has carried nine formats.
+real model. The codebook tier follows by kinship — ksigns family, then
+the raw-sign family. Unit 7 breaks that run deliberately: by then eight
+files have been measured against llama.cpp and every decode wave in the
+family is slow by the same 0.66–0.85×, so the cause is found once, on
+the kernels that exist, before the IQ1 pair (Unit 8) copies the shape
+again. The migration of the older formats closes the plan, once the
+split path has carried nine formats.
 
 **Rules carried:** four parts or an honest refusal (a type enters
 `Quant.supported()` and `Linear.packedSupported` last, in the same
@@ -161,7 +165,7 @@ every timing leg and wait for the go; filtered suite only
       the excess is the int8 widen twin (0.96 GB for the projections;
       the 30.8 GB expert twin replaces the packed slab) plus 0.8 GB of
       batch scratch. That twin is the one-copy rule's remaining case and
-      is item 8.2.2. Load fell by 40 % because the split streams the slab
+      is item 9.2.2. Load fell by 40 % because the split streams the slab
       from the mapping in chunks and no 30 GB host array exists any
       more (a first cut copied it byte by byte and doubled the load
       time; fixed before this record). Host RSS reads 32.3 GB against
@@ -411,9 +415,9 @@ every timing leg and wait for the go; filtered suite only
       Q4_K_M) is NOT met: 4.7 vs 4.5 ms. The tq2_0 wave kernel runs
       7.3 MB/layer in 7.9 us = 132 GB/s against the Q4_K kernel's ~200;
       that gap is 4.3.5.
-- [ ] 4.3.5 TQ1_0/TQ2_0 wave mat-vec at the Q4_K kernel's bandwidth
-      (132 -> ~200 GB/s; ISA read first). Deferred to the kernel-tuning
-      pass; Unit 5 proceeds.
+- [x] 4.3.5 TQ1_0/TQ2_0 wave mat-vec at the Q4_K kernel's bandwidth
+      (132 -> ~200 GB/s; ISA read first) — folded into Unit 7 with the
+      IQ decode gap, which has the same shape.
 - [x] 4.3.4 Resident bytes equal file bytes.
       DONE 2026-09-15 (`tmp/cbq/bitnet-ledger.sh`, CAJETA_XPU_ALLOC_TRACE
       through the CLI at ctx 4096): 169 `Linear.allocResident`
@@ -595,11 +599,8 @@ every timing leg and wait for the go; filtered suite only
       is 0.27× / 0.26× — its own item below. These are first
       measurements, not regressions: none of these files could load
       before Units 5 and 6.
-- [ ] 6.4.1 The IQ codebook decode gap: 0.66–0.85× of Vulkan's tg on
-      eight files, with the same shape as 4.3.5's ternary gap. One
-      kernel family, one cause to find — read the ISA and the achieved
-      bandwidth of `iq2xxs/iq2xs/iq2s/iq3xxs/iq3s Q8WaveMatVec` before
-      changing anything. Folds 4.3.5 in.
+- [x] 6.4.1 The IQ codebook decode gap — promoted to Unit 7, which
+      folds in 4.3.5's ternary gap as the same shape.
 - [ ] 6.4.2 The IQ3_S coop GEMM prefill gap: 0.83–0.90× of Vulkan where
       the IQ2 family clears 1.0×. The three files that miss are exactly
       the IQ3_S-heavy ones (193 / 157 / 81 tensors).
@@ -608,40 +609,89 @@ every timing leg and wait for the go; filtered suite only
       bytes), so measure what the bank admits before touching a kernel.
 
 
-## Unit 7 — IQ1_S, IQ1_M (spec §3.2, §6.3)
+## Unit 7 — The decode bandwidth gap (spec §6, §8.5, 12.1; folds 4.3.5 and 6.4.1)
+
+Every ternary and codebook decode wave mat-vec runs below llama.cpp's
+Vulkan on the same file and the same device: tg 0.66–0.85× across eight
+IQ files (6.3's legs) and 132 GB/s for TQ2_0 against the Q4_K wave
+kernel's ~200 on this GPU (4.3.3's). One kernel family, one device, and
+the Q4_K kernel sitting beside them as a worked example of the same
+shape going fast — so this is a cause to FIND, not a rewrite to guess
+at. Nothing in this unit changes a kernel before 7.2.1 records why.
 
 ### 7.1 TDD
-- [ ] 7.1.1 Decoders exact: IQ1_M's f16 rebuilt from four nibbles, the qh
-      nibble split, the delta signs.
-- [ ] 7.1.2 Host mat-vecs and Q8 twins with the delta term through the
-      pack's per-32 sums (IQ1_S) and a per-8 sum (IQ1_M).
-- [ ] 7.1.3 Wave decode kernels and coop X1/X3; `coopBlockWords` 12 / 14;
-      `scaleBytes(IQ1_M) == 0`.
-- [ ] 7.1.4 12.1 re-measured on the iq1s table (16 KB bytes, 8 KB nibbles).
+- [ ] 7.1.1 `WaveBandwidthProbe`: achieved GB/s per kernel at the real
+      shapes (4096×4096, 4096×14336, 14336×4096, 1024×4096) for Q4_K,
+      TQ1_0, TQ2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S — resident
+      bytes over the min of five interleaved repeats, one table. The
+      Q4_K row is the CONTROL: if it does not reproduce ~200 GB/s the
+      probe is wrong and nothing below it may be read.
+- [ ] 7.1.2 The ISA read per kernel (`RADV_DEBUG=shaderstats`): VGPR
+      count, scratch bytes, occupancy; a guard that asserts no scratch
+      spill on any of them. Spilling is invisible to wall-clock, so a
+      flat A/B without this read proves nothing.
+- [ ] 7.1.3 The exactness gate: every Q8-twin, coop and fixture test in
+      `TernaryTest` and `IqCodebookTest` still passes after any rewrite.
+      A faster kernel that is not the same kernel is not a fix.
+- [ ] 7.1.4 A lane-mapping control at one fixed shape — one item per
+      row against one wave per row — so the mapping is measured rather
+      than assumed to be the ceiling (it was, at 208 against 162 GB/s,
+      the last time this question came up on this device).
 
 ### 7.2 Coding
-- [ ] 7.2.1 Decoders; host; kernels; registration; gates last.
+- [ ] 7.2.1 Record 7.1.1's table and 7.1.2's ISA read in this plan, and
+      name the cause each row points at, BEFORE editing a kernel.
+- [ ] 7.2.2 The change the evidence asks for, one variable at a time,
+      each re-measured against 7.1.1's table and gated on 7.1.3.
+- [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
+      literal — an unpinned block is budgeted for 1024 threads and caps
+      VGPRs at 192, which is a despill the ISA read will show.
 
 ### 7.3 Acceptance
-- [ ] 7.3.1 IQ1_S and IQ1_M 8B files: legs, greedy agreement, perplexity,
-      resident bytes.
+- [ ] 7.3.1 Decode ≥ 0.95× the better llama.cpp backend on the eight
+      codebook files and both TQ files; prefill not regressed.
+- [ ] 7.3.2 Perplexity and the Q8 twins unchanged on the files of 5.3.1
+      and 6.3.1 — the numbers this unit may not move.
+- [ ] 7.3.3 Legs re-run and recorded (announced).
+- [ ] 7.3.4 If a gap survives with a measured, named cause that is not
+      ours (a hardware or compiler limit), it is recorded here with its
+      number and the unit closes on that — an explained gap is a
+      result, an unexplained one is not.
 
-## Unit 8 — Migrate Q4_0, Q5_0, Q3_K, Q6_K, IQ4_NL; delete the repack machinery (spec §10.2–10.3, 12.3)
+## Unit 8 — IQ1_S, IQ1_M (spec §3.2, §6.3)
 
 ### 8.1 TDD
-- [ ] 8.1.1 Per format, the existing kernel tests re-pointed to
-      `(payload, scales)`: decode, wave f32, coop X1/X3, the widen and
-      Mw8 kernels of Q3_K and Q6_K, IQ4_NL's six.
-- [ ] 8.1.2 `ResidentLayoutTest` covers every supported type with
-      `splitOn` gone; `devWBytes == payload + scales` for each.
-- [ ] 8.1.3 A test that the removed names are gone from the tree.
+- [ ] 8.1.1 Decoders exact: IQ1_M's f16 rebuilt from four nibbles, the qh
+      nibble split, the delta signs.
+- [ ] 8.1.2 Host mat-vecs and Q8 twins with the delta term through the
+      pack's per-32 sums (IQ1_S) and a per-8 sum (IQ1_M).
+- [ ] 8.1.3 Wave decode kernels and coop X1/X3; `coopBlockWords` 12 / 14;
+      `scaleBytes(IQ1_M) == 0`.
+- [ ] 8.1.4 12.1 re-measured on the iq1s table (16 KB bytes, 8 KB nibbles).
 
 ### 8.2 Coding
-- [ ] 8.2.1 The 42 kernels re-offset; `coopNeedsRepack`,
+- [ ] 8.2.1 Decoders; host; kernels; registration; gates last.
+
+### 8.3 Acceptance
+- [ ] 8.3.1 IQ1_S and IQ1_M 8B files: legs, greedy agreement, perplexity,
+      resident bytes.
+
+## Unit 9 — Migrate Q4_0, Q5_0, Q3_K, Q6_K, IQ4_NL; delete the repack machinery (spec §10.2–10.3, 12.3)
+
+### 9.1 TDD
+- [ ] 9.1.1 Per format, the existing kernel tests re-pointed to
+      `(payload, scales)`: decode, wave f32, coop X1/X3, the widen and
+      Mw8 kernels of Q3_K and Q6_K, IQ4_NL's six.
+- [ ] 9.1.2 `ResidentLayoutTest` covers every supported type with
+      `splitOn` gone; `devWBytes == payload + scales` for each.
+- [ ] 9.1.3 A test that the removed names are gone from the tree.
+
+### 9.2 Coding
+- [ ] 9.2.1 The 42 kernels re-offset; `coopNeedsRepack`,
       `blockRepack2Kernel`, `blockPadKernel`, `ensureQ6Pad`, `coopDev`
       and `splitOn` removed; the split unconditional; `coopBlockWords`
       the payload stride everywhere.
-- [ ] 8.2.2 The int8 widen twin of a Q8_0 weight — `deqFor(Q8_0)` builds
+- [ ] 9.2.2 The int8 widen twin of a Q8_0 weight — `deqFor(Q8_0)` builds
       a tile-major `deqDev` (and `ensureWidenSlab` a `deqSlabDev`) that
       the Mw8 GEMM and the sym id-kernels read — is a second copy of
       int8 data. Those kernels read the split payload in place and
@@ -650,10 +700,10 @@ every timing leg and wait for the go; filtered suite only
       the split retires was never built because the widen route served
       prefill.
 
-### 8.3 Acceptance
-- [ ] 8.3.1 Filtered suite green.
-- [ ] 8.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
+### 9.3 Acceptance
+- [ ] 9.3.1 Filtered suite green.
+- [ ] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
       Q5_0 tensors), Q3_K_M, Q6_K, the iq4_nl file, a Q4_0 8B from
       `llama-quantize`; bit gate then A/B, no decode regression.
-- [ ] 8.3.3 Resident bytes equal file bytes for every file above and the
+- [ ] 9.3.3 Resident bytes equal file bytes for every file above and the
       30B Q8_0 re-checked; the repack code gone.
