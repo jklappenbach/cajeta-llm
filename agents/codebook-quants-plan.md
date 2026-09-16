@@ -620,16 +620,18 @@ shape going fast — so this is a cause to FIND, not a rewrite to guess
 at. Nothing in this unit changes a kernel before 7.2.1 records why.
 
 ### 7.1 TDD
-- [ ] 7.1.1 `WaveBandwidthProbe`: achieved GB/s per kernel at the real
+- [x] 7.1.1 `bench/CodebookBandwidth`: achieved GB/s per kernel at the real
       shapes (4096×4096, 4096×14336, 14336×4096, 1024×4096) for Q4_K,
       TQ1_0, TQ2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S — resident
       bytes over the min of five interleaved repeats, one table. The
       Q4_K row is the CONTROL: if it does not reproduce ~200 GB/s the
       probe is wrong and nothing below it may be read.
-- [ ] 7.1.2 The ISA read per kernel (`RADV_DEBUG=shaderstats`): VGPR
+- [x] 7.1.2 The ISA read per kernel (`RADV_DEBUG=shaderstats`): VGPR
       count, scratch bytes, occupancy; a guard that asserts no scratch
       spill on any of them. Spilling is invisible to wall-clock, so a
       flat A/B without this read proves nothing.
+      GREEN on all sixteen wave kernels (`bench/KernelIsa`, which
+      already existed for exactly this); the counts are in 7.2.1.
 - [ ] 7.1.3 The exactness gate: every Q8-twin, coop and fixture test in
       `TernaryTest` and `IqCodebookTest` still passes after any rewrite.
       A faster kernel that is not the same kernel is not a fix.
@@ -639,10 +641,54 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       the last time this question came up on this device).
 
 ### 7.2 Coding
-- [ ] 7.2.1 Record 7.1.1's table and 7.1.2's ISA read in this plan, and
+- [x] 7.2.1 Record 7.1.1's table and 7.1.2's ISA read in this plan, and
       name the cause each row points at, BEFORE editing a kernel.
+      DONE 2026-09-16 (`bench/CodebookBandwidth`, `bench/KernelIsa`).
+      The control reproduces: Q4_K reads 206 GB/s at 14336×4096, so the
+      probe is sound. But GB/s is the WRONG METRIC here, and that is the
+      first finding — normalized per weight VALUE at 14336×4096:
+
+      | kernel | GB/s | G values/s | v_dot4 | vmcnt(0) | dot4 per drain | VGPR |
+      |---|---|---|---|---|---|---|
+      | tq2_0 | 193 | 805 | 32 | 1 | 32.0 | 63 |
+      | iq2xxs | 143 | 596 | 8 | 1 | 8.0 | 101 |
+      | tq1_0 | 95 | 483 | 16 | 1 | 16.0 | 149 |
+      | iq3xxs | 168 | 470 | 8 | 1 | 8.0 | 104 |
+      | iq2xs | 123 | 457 | 4 | 3 | 1.3 | 70 |
+      | iq2s | 133 | 447 | 4 | 3 | 1.3 | 66 |
+      | q4_k | 207 | 394 | 80 | 10 | 8.0 | 127 |
+      | iq3s | 157 | 392 | 4 | 4 | 1.0 | 71 |
+
+      Q4_K and IQ3_S decode values at the SAME rate (394 / 392 G/s);
+      Q4_K only looks faster in GB/s because it carries 4.5 bits per
+      weight where IQ3_S carries 3.4. So none of these kernels is
+      bandwidth-bound and spec 8.5's "bandwidth ceiling" framing does
+      not hold below 4 bits: a format that halves its bytes at the same
+      value rate takes the SAME time, and decode t/s cannot improve by
+      reading less. Time tracks values decoded.
+      THE CAUSE, and it is one cause: `dot4 per drain`. Every
+      `vmcnt(0)` is a full memory drain, and the three slowest kernels
+      issue 4 dot4s between drains while TQ2_0 issues 32. IQ2_XS, IQ2_S
+      and IQ3_S interleave single-byte loads with the table gather that
+      DEPENDS on them (the ISA shows `global_load_d16` and `u8` in
+      exactly those three), so each group of 8 stalls the wave on its
+      own index. IQ2_XXS and IQ3_XXS read the whole 8-byte descriptor
+      as dwords first, compute four indices in registers, then issue
+      their gathers together — one drain, 8 dot4s, and 30-50% more
+      throughput on strictly more table work. No kernel spills
+      (7.1.2 green: `vgpr_spill 0 scratch 0` on all sixteen), so
+      occupancy and pressure are not the story; issue order is.
+      TQ1_0 is its own row: no gather at all, yet 483 G/s and 149 VGPRs,
+      because 64 `global_load_d16` per body decode the base-three trits
+      a half-word at a time.
 - [ ] 7.2.2 The change the evidence asks for, one variable at a time,
       each re-measured against 7.1.1's table and gated on 7.1.3.
+      FIRST VARIABLE (from 7.2.1): give IQ2_XS, IQ2_S and IQ3_S the
+      descriptor read IQ2_XXS already has — the sub-block's index and
+      sign bytes as whole dwords, all indices computed in registers,
+      then the gathers issued together. Predicted: dot4 per drain 1.0
+      → 8, and the three slowest rows up toward IQ2_XXS's 596 G/s.
+      SECOND: TQ1_0's 64 half-word loads per body.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.

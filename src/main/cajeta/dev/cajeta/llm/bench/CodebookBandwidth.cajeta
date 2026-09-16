@@ -1,0 +1,180 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * Unit 7.1.1: achieved bandwidth of every ternary and codebook decode
+ * wave, at the shapes the engine dispatches, with the Q4_K wave kernel
+ * as the CONTROL — if that row does not reproduce its ~200 GB/s the
+ * probe is wrong and no row below it may be read.
+ *
+ * Weights are cycled through a pool sized past the last-level cache,
+ * as `WaveProbe` established: a repeat loop over one weight measures
+ * MALL and reads about twice the machine's roofline, which a decode
+ * never sees because it touches ~96 cold weights a token.
+ */
+public class CodebookBandwidth {
+
+    static final int64 POOL_BYTES = 167772160L;
+
+    static int32 tyAt(int32 i) {
+        if (i == 0) { return Quant.GG_Q4_K; }
+        if (i == 1) { return Quant.GG_TQ2_0; }
+        if (i == 2) { return Quant.GG_TQ1_0; }
+        if (i == 3) { return Quant.GG_IQ2_XXS; }
+        if (i == 4) { return Quant.GG_IQ2_XS; }
+        if (i == 5) { return Quant.GG_IQ2_S; }
+        if (i == 6) { return Quant.GG_IQ3_XXS; }
+        return Quant.GG_IQ3_S;
+    }
+
+    static #String nameAt(int32 i) {
+        if (i == 0) { return #"q4_k  "; }
+        if (i == 1) { return #"tq2_0 "; }
+        if (i == 2) { return #"tq1_0 "; }
+        if (i == 3) { return #"iq2xxs"; }
+        if (i == 4) { return #"iq2xs "; }
+        if (i == 5) { return #"iq2s  "; }
+        if (i == 6) { return #"iq3xxs"; }
+        return #"iq3s  ";
+    }
+
+    /** Resident bytes of one row of `bpr` blocks. */
+    static int64 rowBytesOf(int32 ty, int64 bpr) {
+        if (Quant.splitOn(ty)) {
+            return Quant.rowResidentBytes(ty, bpr);
+        }
+        return bpr * (int64) Quant.blockBytes(ty);
+    }
+
+    /**
+     * Pseudo-random payload with SANE scales: every f16 field is a
+     * normal near 1.0, so nothing in the timing is a denormal path.
+     */
+    static void fillResident(int8[] p, int32 ty, int64 rows, int64 bpr,
+            int32 salt) {
+        int64 n = (int64) p.count();
+        int64 z = 0;
+        while (z < n) {
+            p[z] = (int8) ((z * 31L + (int64) salt * 7L) % 251L);
+            z = z + 1;
+        }
+        if (!Quant.splitOn(ty)) {
+            ScalingProbe.fillBlocks(p, ty, salt);
+            return;
+        }
+        int64 rb = Quant.rowResidentBytes(ty, bpr);
+        int64 r = 0;
+        while (r < rows) {
+            int64 b = 0;
+            while (b < bpr) {
+                int64 o = r * rb + b * 2L;
+                p[o] = (int8) ((int32) (b % 16L));
+                p[o + 1L] = (int8) 60;
+                b = b + 1;
+            }
+            r = r + 1;
+        }
+        return;
+    }
+
+    static void launch(int32 ty, KernelBuffer<float32> y,
+            KernelBuffer<int8> w, KernelBuffer<int8> xp, int64 rows,
+            int64 cols) {
+        if (ty == Quant.GG_Q4_K) {
+            QuantKernel.q4kQ8WaveMatVecLaunch(y, w, xp, rows, cols, 0L);
+        } else if (ty == Quant.GG_TQ2_0) {
+            QuantKernel.tq20Q8WaveMatVecLaunch(y, w, xp, rows, cols, 0L);
+        } else if (ty == Quant.GG_TQ1_0) {
+            QuantKernel.tq10Q8WaveMatVecLaunch(y, w, xp, rows, cols, 0L);
+        } else {
+            QuantKernel.iqQ8WaveMatVecLaunch(ty, y, w, xp, rows, cols, 0L);
+        }
+        return;
+    }
+
+    /** One pass over the pool; milliseconds per launch. */
+    static float64 timePass(int32 ty, KernelBuffer<float32> y,
+            KernelBuffer<int8> pool, KernelBuffer<int8> xp, int64 rows,
+            int64 cols, int64 rowBytes, int64 copies) {
+        int64 wbytes = rows * rowBytes;
+        int64 t0 = Clock.nanoTime();
+        int64 k = 0;
+        while (k < copies) {
+            KernelBuffer<int8> w #= pool.slice((uint64) (k * wbytes),
+                (uint64) wbytes);
+            CodebookBandwidth.launch(ty, y, w, xp, rows, cols);
+            k = k + 1;
+        }
+        return (float64) (Clock.nanoTime() - t0) / 1000000.0
+            / (float64) copies;
+    }
+
+    static void sweep(int32 ti, int64 rows, int64 cols,
+            KernelBuffer<int8> xp) {
+        int32 ty = CodebookBandwidth.tyAt(ti);
+        int64 bpr = cols / (int64) Quant.blockElems(ty);
+        int64 rowBytes = CodebookBandwidth.rowBytesOf(ty, bpr);
+        int64 nbytes = rows * rowBytes;
+        int64 copies = CodebookBandwidth.POOL_BYTES / nbytes + 1L;
+        int8[] big #= heap int8[copies * nbytes];
+        CodebookBandwidth.fillResident(big, ty, rows * copies, bpr, 5);
+        KernelBuffer<int8> pool #= heap KernelBuffer<int8>(
+            (uint64) (copies * nbytes));
+        pool.upload(big);
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) rows);
+        CodebookBandwidth.timePass(ty, y, pool, xp, rows, cols, rowBytes,
+            copies);
+        float64 best = 0.0;
+        int32 r = 0;
+        while (r < 5) {
+            float64 ms = CodebookBandwidth.timePass(ty, y, pool, xp, rows,
+                cols, rowBytes, copies);
+            if (r == 0 || ms < best) { best = ms; }
+            r = r + 1;
+        }
+        float64 mb = (float64) nbytes / 1048576.0;
+        String nm #= CodebookBandwidth.nameAt(ti);
+        System.stdout.println("  " + nm + "  " + rows + "x" + cols
+            + "   " + mb + " MB   " + best + " ms   "
+            + (mb / best * 1000.0 / 1024.0) + " GB/s");
+        return;
+    }
+
+    public static int32 run(String[] args) {
+        int64[] rowsOf #= heap int64[4];
+        int64[] colsOf #= heap int64[4];
+        rowsOf[0] = 4096L;  colsOf[0] = 4096L;
+        rowsOf[1] = 14336L; colsOf[1] = 4096L;
+        rowsOf[2] = 4096L;  colsOf[2] = 14336L;
+        rowsOf[3] = 1024L;  colsOf[3] = 4096L;
+        int32 si = 0;
+        while (si < 4) {
+            int64 cols = colsOf[si];
+            float32[] hx #= heap float32[cols];
+            int64 i = 0;
+            while (i < cols) {
+                hx[i] = 0.02f * (float32) ((i % 11L) - 5L);
+                i = i + 1;
+            }
+            int8[] xph #= heap int8[Quant.q8kPackedBytes(cols)];
+            Quant.q8kPack(hx, 0L, cols, xph);
+            KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+                (uint64) xph.count());
+            xp.upload(xph);
+            System.stdout.println("== " + rowsOf[si] + "x" + cols);
+            int32 ti = 0;
+            while (ti < 8) {
+                CodebookBandwidth.sweep(ti, rowsOf[si], cols, xp);
+                ti = ti + 1;
+            }
+            si = si + 1;
+        }
+        return 0;
+    }
+}
