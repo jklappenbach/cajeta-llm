@@ -372,17 +372,57 @@ every timing leg and wait for the go; filtered suite only
       → `Linear.ensureDevice` refuses an f32-weight linear ("no host
       bytes and no source mapping for a packed weight of 0 bytes"); f16
       is a conversion intermediate here, so it is not on this unit.
-- [ ] 4.3.3 Legs (announced): cajeta pp512 / tg128 on both files against
+- [x] 4.3.3 Legs (announced): cajeta pp512 / tg128 on both files against
       llama.cpp CPU; decode GB/s beside the Q4_K wave kernel's on the
       8B, so the bandwidth claim of spec 8.5 is a number.
+      DONE 2026-09-15 (`tmp/cbq/bitnet-legs*.sh`, `tmp/llmbench/leg.sh`
+      gained a `cpu` engine = the HIP build at -ngl 0; 3 reps, t/s,
+      llama.cpp fa=0/fa=1):
+
+      | file | engine | pp512 | tg128@512 | pp2048 | tg64@2048 |
+      |---|---|---|---|---|---|
+      | tq1_0 | cajeta | 4072 | 165.5 | 2060 | 98.0 |
+      | tq1_0 | llama.cpp CPU | 743 / 763 | 168 / 160 | 716 / 729 | 108 / 88 |
+      | tq2_0 | cajeta | 5426 | 211.8 | 2300 | 112.1 |
+      | tq2_0 | llama.cpp CPU | 1450 / 1539 | 175 / 163 | 1360 / 1311 | 107 / 86 |
+      | q4_k_m (same model, llama-quantize from our f16) | cajeta | 5747 | 222.3 | | |
+      | q4_k_m | llama.cpp CPU | 3088 / 5608 | 131 / 127 | | |
+      | q4_k_m | llama.cpp HIP | 6745 / 7166 | 169 / 196 | | |
+      | q4_k_m | llama.cpp Vulkan | 7544 / 9680 | 202 / 268 | | |
+      | Llama-3.1-8B q4_k_m | cajeta | 1546 | 41.9 | | |
+
+      The first pass measured 39-41 t/s decode on EVERY bitnet file, the
+      same 24 ms/token as the 8B: the profile put 19.4 ms of it in
+      `HostOps.rowsDotRow` — a tied model had no lm_head Linear at all,
+      and scored its logits on the host against the f32 embedding table
+      (32002 x 1536, scalar). Fixed in this unit: F16 is now a packed
+      weight type (eight halves a block, `Quant.f16Block/f16MatVecInto`,
+      `QuantKernel.f16F32WaveMatVecKernel` over f32 activations,
+      `f16F16CoopX3Kernel` for the batched GEMM, so the four-part
+      invariant holds), the head is always a Linear and a tied model
+      binds it to `token_embd` (`CausalLM.headLinear`), and the
+      embedding table stays packed. Decode went 24 -> 4.7 ms/token on
+      tq2_0; the f16 GGUF runs in the engine as well (greedy identical,
+      ppl 7.8949 vs llama-perplexity 7.8951). Bandwidth: the 8B Q4_K_M
+      streams 4.92 GB in 23.9 ms = 206 GB/s; bitnet tq2_0 moves ~350 MB
+      (273 MB weights + 75 MB K/V at depth 512) in 4.7 ms = 74 GB/s, so
+      the 700M model's token is attention and launch count, not weight
+      bytes — and spec 8.5's bar (TQ2_0 faster than the same model's
+      Q4_K_M) is NOT met: 4.7 vs 4.5 ms. The tq2_0 wave kernel runs
+      7.3 MB/layer in 7.9 us = 132 GB/s against the Q4_K kernel's ~200;
+      that gap is 4.3.5.
+- [ ] 4.3.5 TQ1_0/TQ2_0 wave mat-vec at the Q4_K kernel's bandwidth
+      (132 -> ~200 GB/s; ISA read first). Deferred to the kernel-tuning
+      pass; Unit 5 proceeds.
 - [x] 4.3.4 Resident bytes equal file bytes.
       DONE 2026-09-15 (`tmp/cbq/bitnet-ledger.sh`, CAJETA_XPU_ALLOC_TRACE
-      through the CLI at ctx 4096): 168 `Linear.allocResident`
-      allocations (24 layers × 7 projections) sum to tq1_0 143,327,232 B
-      and tq2_0 175,177,728 B — exactly 24 × 110,592 blocks × 54 / 66 B,
-      the projection tensors' file bytes; the per-row split pads nothing
-      at these widths (1536 = 6 blocks, 4096 = 16). The rest of the 7.06 /
-      7.09 GB peak is the KV planes (0.604 GB, f16 at 4096) and 6.241 GB
+      through the CLI at ctx 4096): 169 `Linear.allocResident`
+      allocations (24 layers × 7 projections + the tied F16 head) sum to
+      tq1_0 241,637,376 B and tq2_0 273,487,872 B — exactly 24 × 110,592
+      blocks × 54 / 66 B plus 32002 × 1536 × 2 B, the projection and
+      token_embd tensors' file bytes; the per-row split pads nothing at
+      these widths (1536 = 6 blocks, 4096 = 16). The rest of the 7.15 /
+      7.19 GB peak is the KV planes (0.604 GB, f16 at 4096) and 6.241 GB
       of `Linear.ensureBatchOut` from `prewarmPrefillWeights` — every
       layer's batch outputs held at the full 4096 rows, a prefill-design
       cost shared by every model, not this unit's.

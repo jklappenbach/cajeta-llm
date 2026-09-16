@@ -1,0 +1,236 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.convert.HfToGguf;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+
+/** F16 as a packed weight type, and the tied head of a ternary file
+ *  as a device-routed Linear over it. */
+public class F16HeadTest {
+
+    public F16HeadTest() { return; }
+
+    static int64 step(int64 s) {
+        int64 x = s;
+        x = x ^ (x << 13);
+        x = x ^ (x >> 7);
+        x = x ^ (x << 17);
+        return x;
+    }
+
+    static float32 unit(int64 s) {
+        return (float32) ((s >> 20) & 65535L) / 32768.0f - 1.0f;
+    }
+
+    /** `n` halves as bytes in `raw`, their exact values in `vals`. */
+    static void fill(int8[] raw, float32[] vals, int64 n, int64 seed) {
+        int64 s = seed;
+        int64 i = 0;
+        while (i < n) {
+            s = F16HeadTest.step(s);
+            float32 v = F16HeadTest.unit(s);
+            if (i % 97L == 3L) { v = v * 0.00001f; }
+            int32 h = Quant.f32ToHalfBits(v);
+            int32 lo = h & 255;
+            int32 hi = (h >> 8) & 255;
+            if (lo > 127) { lo = lo - 256; }
+            if (hi > 127) { hi = hi - 256; }
+            raw[i * 2L] = (int8) lo;
+            raw[i * 2L + 1L] = (int8) hi;
+            vals[i] = GgufFile.halfBitsToF32(h);
+            i = i + 1;
+        }
+        return;
+    }
+
+    static void fillX(float32[] x, int64 n, int64 seed) {
+        int64 s = seed;
+        int64 i = 0;
+        while (i < n) {
+            s = F16HeadTest.step(s);
+            x[i] = F16HeadTest.unit(s);
+            i = i + 1;
+        }
+        return;
+    }
+
+    static void checkRows(String what, float32[] vals, float32[] x,
+            float32[] y, int64 rows, int64 cols) {
+        int64 r = 0;
+        while (r < rows) {
+            float64 ref = 0.0;
+            float64 mag = 0.0;
+            int64 j = 0;
+            while (j < cols) {
+                float64 t = (float64) vals[r * cols + j] * (float64) x[j];
+                ref = ref + t;
+                if (t < 0.0) { mag = mag - t; } else { mag = mag + t; }
+                j = j + 1;
+            }
+            float64 d = (float64) y[r] - ref;
+            if (d < 0.0) { d = 0.0 - d; }
+            boolean ok = d <= 0.000002 * mag + 0.000001;
+            if (!ok) {
+                System.stdout.println(what + ": row " + r + " got " + y[r]
+                    + " want " + ref);
+            }
+            Assert.isTrue(ok);
+            r = r + 1;
+        }
+        return;
+    }
+
+    @Test
+    public void f16IsAPackedTypeOfEightHalves() {
+        Assert.isTrue(Quant.supported(Quant.GG_F16));
+        Assert.equals(8L, (int64) Quant.blockElems(Quant.GG_F16));
+        Assert.equals(16L, (int64) Quant.blockBytes(Quant.GG_F16));
+        Assert.isFalse(Quant.splitOn(Quant.GG_F16));
+        Assert.isTrue(QuantKernel.hasKernel(Quant.GG_F16));
+        Assert.isTrue(QuantKernel.hasF32Kernel(Quant.GG_F16));
+        int64 n = 64;
+        int8[] raw = heap int8[n * 2L];
+        float32[] vals = heap float32[n];
+        F16HeadTest.fill(raw, vals, n, 11L);
+        float32[] out = heap float32[n];
+        Quant.dequantize(Quant.GG_F16, raw, 0L, n / 8L, out, 0L);
+        int64 i = 0;
+        while (i < n) {
+            Assert.isTrue(out[i] == vals[i]);
+            i = i + 1;
+        }
+    }
+
+    @Test
+    public void f16HostMatVecMatchesTheDot() {
+        int64 rows = 7;
+        int64 cols = 40;
+        int8[] raw = heap int8[rows * cols * 2L];
+        float32[] vals = heap float32[rows * cols];
+        F16HeadTest.fill(raw, vals, rows * cols, 3L);
+        float32[] x = heap float32[cols];
+        F16HeadTest.fillX(x, cols, 5L);
+        float32[] y = heap float32[rows];
+        Quant.f16MatVecInto(raw, rows, cols, x, 0L, y, 0L);
+        F16HeadTest.checkRows("host f16 mat-vec", vals, x, y, rows, cols);
+    }
+
+    static void checkWave(int64 rows, int64 cols, int64 seed) {
+        int8[] raw = heap int8[rows * cols * 2L];
+        float32[] vals = heap float32[rows * cols];
+        F16HeadTest.fill(raw, vals, rows * cols, seed);
+        float32[] x = heap float32[cols];
+        F16HeadTest.fillX(x, cols, seed + 100L);
+        KernelBuffer<int8> w = heap KernelBuffer<int8>((uint64) (rows * cols * 2L));
+        w.upload(raw, rows * cols * 2L);
+        KernelBuffer<float32> xd = heap KernelBuffer<float32>((uint64) cols);
+        xd.upload(x, cols);
+        KernelBuffer<float32> yd = heap KernelBuffer<float32>((uint64) rows);
+        QuantKernel.f16F32WaveMatVecLaunch(yd, w, xd, rows, cols, 0L, 0L);
+        float32[] y = heap float32[rows];
+        yd.download(y, rows);
+        F16HeadTest.checkRows("f16 wave " + rows + "x" + cols, vals, x, y,
+            rows, cols);
+        return;
+    }
+
+    @Test
+    public void f16WaveMatVecMatchesTheHostDot() {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        F16HeadTest.checkWave(64L, 1536L, 5L);
+        F16HeadTest.checkWave(3L, 40L, 9L);
+    }
+
+    @Test
+    public void aTiedHeadIsAPackedDeviceLinear() {
+        ToyModel s #= HfToGgufTest.writeCheckpoint();
+        String path = HfToGgufTest.DIR + "/head-tq2_0.gguf";
+        HfToGguf.convert(HfToGgufTest.DIR, path, "tq2_0");
+        Quant.setPackingEnabled(true);
+        Checkpoint ck #= Checkpoint.open(path);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        Assert.isTrue(cfg.tieWordEmbeddings);
+        CausalLM m = heap CausalLM(#cfg, 16, 1, 0);
+        m.bind(ck, false);
+        Linear head = m.headLinear();
+        Assert.isTrue(head != null);
+        Assert.equals((int64) Quant.GG_F16, (int64) head.packedType());
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu") && !be.equals("none")) {
+            Assert.isTrue(head.isDeviceRouted());
+        }
+        ck.close();
+        HfToGgufTest.checkEngine(path, s, 2, "tied head (routes)", true);
+        HfToGgufTest.checkEngine(path, s, 2, "tied head (host)", false);
+    }
+
+    @Test
+    public void f16CoopGemmMatchesTheHostGemm() {
+        if (!CoopQuantGemmTest.coopHere()) { return; }
+        int64 rows = 128;
+        int64 out = 128;
+        int64 cols = 256;
+        int8[] raw = heap int8[out * cols * 2L];
+        float32[] vals = heap float32[out * cols];
+        F16HeadTest.fill(raw, vals, out * cols, 21L);
+        float32[] x = heap float32[rows * cols];
+        int64 i = 0;
+        while (i < rows * cols) {
+            x[i] = (float32) ((i * 31L + 7L) % 61L - 30L) * 0.0625f;
+            i = i + 1;
+        }
+        KernelBuffer<int8> wD = heap KernelBuffer<int8>((uint64) (out * cols * 2L));
+        wD.upload(raw, out * cols * 2L);
+        KernelBuffer<int32> wW #= wD.wordView();
+        KernelBuffer<float32> xfD = heap KernelBuffer<float32>((uint64) (rows * cols));
+        xfD.upload(x, rows * cols);
+        KernelBuffer<float16> xhD = heap KernelBuffer<float16>((uint64) (rows * cols));
+        QuantKernel.f32ToF16LaunchNoSync(xhD, xfD, rows * cols);
+        KernelBuffer<float32> yD = heap KernelBuffer<float32>((uint64) (rows * out));
+        QuantKernel.coopBatchLaunchNoSync(Quant.GG_F16, yD, wW, xhD, rows,
+            out, cols);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] y = heap float32[rows * out];
+        yD.download(y, rows * out);
+        int64 t = 0;
+        while (t < rows) {
+            int64 o = 0;
+            while (o < out) {
+                float64 ref = 0.0;
+                float64 mag = 0.0;
+                int64 c = 0;
+                while (c < cols) {
+                    float64 p = (float64) vals[o * cols + c]
+                        * (float64) x[t * cols + c];
+                    ref = ref + p;
+                    if (p < 0.0) { mag = mag - p; } else { mag = mag + p; }
+                    c = c + 1;
+                }
+                float64 d = (float64) y[t * out + o] - ref;
+                if (d < 0.0) { d = 0.0 - d; }
+                boolean ok = d <= 0.000002 * mag + 0.00001;
+                if (!ok) {
+                    System.stdout.println("f16 coop: token " + t + " out " + o
+                        + " got " + y[t * out + o] + " want " + ref);
+                }
+                Assert.isTrue(ok);
+                o = o + 1;
+            }
+            t = t + 1;
+        }
+    }
+}
