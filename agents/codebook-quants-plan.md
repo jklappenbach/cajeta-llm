@@ -715,7 +715,37 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       sign bytes as whole dwords, all indices computed in registers,
       then the gathers issued together. Predicted: dot4 per drain 1.0
       → 8, and the three slowest rows up toward IQ2_XXS's 596 G/s.
-      SECOND: TQ1_0's 64 half-word loads per body.
+      DONE 2026-09-16. The ISA half of the prediction landed exactly:
+      `vmcnt(0)` 3/3/4 → 1/1/1, `v_dot4` 4 → 8 on all three, and every
+      `global_load_u8`/`d16` gone; VGPRs 66/70/71 → 104/104/117 with no
+      spill, which is values in flight rather than pressure. The
+      throughput half landed PARTLY — at 14336×4096:
+
+      | kernel | GB/s before → after | G values/s before → after |
+      |---|---|---|
+      | iq3s | 157 → 181 (+15.1%) | 392 → 451 |
+      | iq2s | 133 → 149 (+11.5%) | 447 → 498 |
+      | iq2xs | 123 → 141 (+14.6%) | 457 → 524 |
+      | iq2xxs (control, untouched) | 143 → 144 (+1.0%) | 596 → 601 |
+      | q4_k (control, untouched) | 207 → 206 (−0.2%) | 394 → 394 |
+
+      Both controls held flat, so the 11–15% is the change and not
+      drift. But none of the three reached IQ2_XXS's 596: one drain per
+      body was necessary and is not sufficient, so a second cost
+      remains — most likely `iqDot16`'s 32 ALU ops per 16 lanes
+      building the weight vector, which IQ2_XXS pays too and which is
+      now the tallest thing left. Exactness gate green throughout
+      (229/229).
+      A METHOD NOTE worth more than the 15%: the first attempt at this
+      change reported "no ISA difference" twice. The edit had never
+      been applied — its script aborted on a bad assertion, in a
+      backgrounded call whose output nothing read — and the flat result
+      was a faithful measurement of unchanged code. Then the edit
+      landed and STILL changed nothing, because `iqU32` was itself four
+      byte loads. Read the instrument's own output before believing a
+      null result twice.
+      SECOND VARIABLE: `iqDot16`'s vector build, then TQ1_0's 64
+      half-word loads per body.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
