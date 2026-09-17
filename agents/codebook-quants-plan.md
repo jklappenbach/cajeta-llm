@@ -1907,6 +1907,31 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       the split retires was never built because the widen route served
       prefill.
 
+- [x] 9.2.3 The fused reduce+pack leaves no f32 attention output, and
+      an o-projection on the f32 route has nothing to read. Found by
+      9.3.2's iq4_nl file, which THREW on both arms —
+      `matvecStagedKeep: no staged device activation for packed type 20`
+      — where `nofd` generates, so the cause is the flash-decode
+      staging and not the migration. It is a live regression from Unit
+      7's GQA-4 widening (020f8ae): before that, llama-3-8B took the
+      scalar attend pair, which stages a real f32 row. It reaches every
+      format OUTSIDE `Linear.qAct` — IQ4_NL, IQ4_XS, Q4_1, Q5_1, IQ1_S,
+      IQ1_M, F16 — on any GQA-4 or GQA-8 model, which is why no file in
+      the suite saw it: the toy fixtures and every 8B in the tree carry
+      only `qAct` types.
+      FIX: `Linear.ensureStagedF32` materializes the f32 form lazily —
+      the remembered source when there is one, else a reduce of the same
+      split partials through `AttnKernel.reduceF32LaunchNoSync`. The
+      fused path keeps its saved launch for the packed consumers that
+      are the common case, and the f32 route pays one reduce only when
+      it actually asks.
+      GATED BOTH WAYS: the lazy reduce must reproduce the attend pair's
+      row at GQA x8 and at GQA x4, and — the does-not-fire half — an
+      ordinary device staging must still copy its remembered source, so
+      the partials branch cannot hijack the path every other layer
+      takes. 270/270.
+
+
 ### 9.3 Acceptance
 - [ ] 9.3.1 Filtered suite green.
 - [~] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
