@@ -13143,6 +13143,99 @@ public final class QuantKernel {
         return false;
     }
 
+    /**
+     * 6.4.3 cause 3 — the IQ3_XXS id twin of
+     * {@link #iq3xxsQ8WaveMatVecKernel}: one wave per (selection slot,
+     * row) against the bank's whole slab, the dot loop unchanged. The
+     * codebook experts dispatched one launch per expert per projection
+     * because this kernel did not exist.
+     */
+    @Kernel
+    public static void iq3xxsQ8IdMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> slab, KernelBuffer<int8> xp,
+            KernelBuffer<int32> grid, KernelBuffer<int32> sel,
+            uint32 rowsPerExpert, int64 blocksPerRow, int64 xRowBlocks,
+            int64 yOff) {
+        uint32 lane = KernelThread.x();
+        uint32 wave = KernelThread.globalIdX() / 32;
+        uint32 kk = wave / rowsPerExpert;
+        uint32 row = wave - kk * rowsPerExpert;
+        int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+        int64 rowBytes = prefix + blocksPerRow * 96L;
+        float32 acc = 0.0f;
+        if (row < rowsPerExpert) {
+            int64 i = (int64) sel[(int64) kk] * (int64) rowsPerExpert
+                + (int64) row;
+            int64 xbase = (int64) kk * xRowBlocks;
+            int64 sub = (int64) (lane & 7);
+            int64 b = (int64) (lane >> 3);
+            while (b < blocksPerRow) {
+                int64 xb = (xbase + b) * 320L + sub * 32L;
+                float32 v = QuantKernel.iq3xxsSub(slab, xp, grid,
+                    i * rowBytes + prefix + b * 96L, sub, xb);
+                acc = acc + QuantKernel.scaleAtDev(slab,
+                    i * rowBytes / 2L + b)
+                    * QuantKernel.q8kScaleAtDev(xp, xbase + b) * 0.25f * v;
+                b = b + 4L;
+            }
+        }
+        float32 tot = Wave.reduceSumF32(acc);
+        if (lane == 0 && row < rowsPerExpert) {
+            y[yOff + (int64) kk * (int64) rowsPerExpert + (int64) row] = tot;
+        }
+    }
+
+    /**
+     * The IQ4_NL id twin of {@link #iq4nlQ8WaveMatVecKernel}. The
+     * activation is q8_K packed to `xRowBlocks` PADDED blocks a row, so
+     * a weight whose width is not a multiple of 256 (this is the down
+     * projection's shape) still reads the integer route.
+     */
+    @Kernel
+    public static void iq4nlQ8IdMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> slab, KernelBuffer<int8> xp,
+            KernelBuffer<int32> sel, uint32 rowsPerExpert,
+            int64 blocksPerRow, int64 xRowBlocks, int64 yOff) {
+        uint32 lane = KernelThread.x();
+        uint32 wave = KernelThread.globalIdX() / 32;
+        uint32 kk = wave / rowsPerExpert;
+        uint32 row = wave - kk * rowsPerExpert;
+        int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+        int64 rowBytes = prefix + blocksPerRow * 16L;
+        Vector<int8,16> kv = QuantKernel.iq4Kv();
+        float32 acc = 0.0f;
+        if (row < rowsPerExpert) {
+            int64 i = (int64) sel[(int64) kk] * (int64) rowsPerExpert
+                + (int64) row;
+            int64 xbase = (int64) kk * xRowBlocks;
+            int64 wb = (int64) lane;
+            while (wb < blocksPerRow) {
+                int64 ro = i * rowBytes + prefix + wb * 16L;
+                float32 d = QuantKernel.scaleAtDev(slab,
+                    i * rowBytes / 2L + wb);
+                Vector<int8,16> qs = slab.vload<16>(ro);
+                Vector<int8,16> dl = (qs & 15).lut4(kv);
+                Vector<int8,16> dh = ((qs >> 4) & 15).lut4(kv);
+                int64 ab = xbase + wb / 8L;
+                int64 xb = ab * 320L + (wb % 8L) * 32L;
+                Vector<int8,16> a0 = xp.vload<16>(xb);
+                Vector<int8,16> a1 = xp.vload<16>(xb + 16L);
+                int32 dot = dl.dotSum(a0, 0) + dh.dotSum(a1, 0);
+                Vector<int8,4> dv = xp.vload<4>(ab * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+                acc = acc + d * xs * (float32) dot;
+                wb = wb + 32L;
+            }
+        }
+        float32 tot = Wave.reduceSumF32(acc);
+        if (lane == 0 && row < rowsPerExpert) {
+            y[yOff + (int64) kk * (int64) rowsPerExpert + (int64) row] = tot;
+        }
+    }
+
     public static boolean idMatVecLaunchNoSync(int32 ggmlType,
             KernelBuffer<float32> y, KernelBuffer<int8> slab,
             KernelBuffer<int8> xp, KernelBuffer<int32> sel, int32 used,
@@ -13162,6 +13255,21 @@ public final class QuantKernel {
             q6kQ8IdMatVecKernel.launch(s, grid: [wgs], block: [32])
                 (y, slab, xp, sel, (uint32) rowsPerExpert, cols / 256L,
                  xRowBlocks, 0L);
+            return true;
+        }
+        if (ggmlType == Quant.GG_IQ4_NL) {
+            iq4nlQ8IdMatVecKernel.launch(s,
+                grid: [(uint32) (rowsPerExpert * (int64) used)], block: [32])
+                (y, slab, xp, sel, (uint32) rowsPerExpert, cols / 32L,
+                 xRowBlocks, 0L);
+            return true;
+        }
+        if (ggmlType == Quant.GG_IQ3_XXS) {
+            QuantKernel.ensureIqTables();
+            iq3xxsQ8IdMatVecKernel.launch(s,
+                grid: [(uint32) (rowsPerExpert * (int64) used)], block: [32])
+                (y, slab, xp, QuantKernel.iq3xxsDev, sel,
+                 (uint32) rowsPerExpert, cols / 256L, xRowBlocks, 0L);
             return true;
         }
         return false;

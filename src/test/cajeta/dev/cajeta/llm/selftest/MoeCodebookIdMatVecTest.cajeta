@@ -1,0 +1,168 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.Linear;
+
+/**
+ * 6.4.3 cause 3 — the codebook banks' indirected mat-vec against the
+ * per-expert wave launches it replaces.
+ *
+ * The two decompositions run an identical per-row dot loop over the same
+ * slab bytes and the same staged activation, so the outputs must be
+ * BIT-identical — `==`, not a tolerance. Without these kernels a decode
+ * step dispatched one launch per selected expert per projection, 384 a
+ * token on the Qwen1.5-MoE against llama.cpp's ~72.
+ */
+public class MoeCodebookIdMatVecTest {
+
+    public MoeCodebookIdMatVecTest() { return; }
+
+    @Test
+    public void iq3xxsIdMatVecMatchesThePerExpertWaveLaunches() {
+        MoeCodebookIdMatVecTest.check(Quant.GG_IQ3_XXS, "iq3_xxs.bin");
+    }
+
+    @Test
+    public void iq4nlIdMatVecMatchesThePerExpertWaveLaunches() {
+        MoeCodebookIdMatVecTest.check(Quant.GG_IQ4_NL, "iq4_nl.bin");
+    }
+
+    /** A slab of `E` experts, each `rows` x `cols` in the resident
+     *  layout, from file blocks tiled cyclically.
+     *
+     *  The per-expert offset is in whole BLOCKS. Rotating resident bytes
+     *  instead shifts the f16 scale field onto payload bytes and
+     *  manufactures NaN scales, which read as a kernel disagreement
+     *  because NaN never equals itself. */
+    static #KernelBuffer<int8> slabOf(int32 ty, String fixture, int64 E,
+            int64 rows, int64 cols) {
+        int8[] src #= File.readAllBytes(
+            "src/test/fixtures/gguf/kquant/" + fixture);
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 srcBlocks = (int64) src.count() / bb;
+        int64 bpr = cols / (int64) Quant.blockElems(ty);
+        int64 resRow = Quant.rowResidentBytes(ty, bpr);
+        int64 slabBytes = E * rows * resRow;
+        int8[] slabH #= heap int8[slabBytes];
+        int8[] raw #= heap int8[rows * bpr * bb];
+        int8[] one #= heap int8[rows * resRow];
+        int64 e = 0;
+        while (e < E) {
+            int64 b = 0;
+            while (b < rows * bpr) {
+                int64 sb = (b + e * 7L) % srcBlocks;
+                int64 q = 0;
+                while (q < bb) {
+                    raw[b * bb + q] = src[sb * bb + q];
+                    q = q + 1;
+                }
+                b = b + 1;
+            }
+            Quant.splitInto(ty, raw, 0L, rows, bpr, one, 0L);
+            int64 j = 0;
+            while (j < rows * resRow) {
+                slabH[e * rows * resRow + j] = one[j];
+                j = j + 1;
+            }
+            e = e + 1;
+        }
+        KernelBuffer<int8> slab #= heap KernelBuffer<int8>(
+            (uint64) (slabBytes + 4L));
+        slab.upload(slabH, slabBytes);
+        return #slab;
+    }
+
+    static void check(int32 ty, String fixture) {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        if (!Linear.residentEnabled()) { return; }
+        int64 E = 6L;
+        int64 rows = 64L;
+        int64 cols = 2048L;
+        int32 used = 3;
+        KernelBuffer<int8> slab #= MoeCodebookIdMatVecTest.slabOf(ty,
+            fixture, E, rows, cols);
+        float32[] xv #= heap float32[cols];
+        int64 j = 0;
+        while (j < cols) {
+            xv[j] = (float32) ((j % 25L) - 12L) / 64.0f;
+            j = j + 1;
+        }
+        KernelBuffer<float32> xf #= heap KernelBuffer<float32>((uint64) cols);
+        xf.upload(xv, cols);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) ((cols / 256L) * 320L));
+        QuantKernel.q8kPackLaunchNoSync(xp, xf, cols);
+
+        int32[] ids #= heap int32[used];
+        ids[0] = 4;
+        ids[1] = 0;
+        ids[2] = 3;
+        KernelBuffer<int32> sel #= heap KernelBuffer<int32>((uint64) used);
+        sel.upload(ids, (int64) used);
+        int64 n = (int64) used * rows;
+        KernelBuffer<float32> yId #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> yWv #= heap KernelBuffer<float32>((uint64) n);
+
+        boolean ok = QuantKernel.idMatVecLaunchNoSync(ty, yId, slab, xp,
+            sel, used, rows, cols, 0L);
+        if (!ok) {
+            Assert.fail("ty=" + ty + ": no id mat-vec kernel");
+        }
+        int64 resRow = Quant.rowResidentBytes(ty,
+            cols / (int64) Quant.blockElems(ty));
+        int32 k = 0;
+        while (k < used) {
+            KernelBuffer<int8> ex #= slab.slice(
+                (uint64) ((int64) ids[k] * rows * resRow),
+                (uint64) (rows * resRow));
+            if (ty == Quant.GG_IQ4_NL) {
+                QuantKernel.iq4nlQ8WaveMatVecLaunchNoSync(yWv, ex, xp,
+                    rows, cols, (int64) k * rows);
+            } else {
+                QuantKernel.iqQ8WaveMatVecLaunchNoSync(ty, yWv, ex, xp,
+                    rows, cols, (int64) k * rows);
+            }
+            k = k + 1;
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a #= heap float32[n];
+        float32[] b #= heap float32[n];
+        yId.download(a, n);
+        yWv.download(b, n);
+        int64 diff = 0L;
+        int64 nan = 0L;
+        boolean nz = false;
+        int64 i = 0;
+        while (i < n) {
+            if (a[i] != b[i]) {
+                if (diff < 4L) {
+                    System.stdout.println("   ty=" + ty + " row " + i
+                        + ": id " + a[i] + " wave " + b[i]);
+                }
+                diff = diff + 1L;
+            }
+            if (a[i] != 0.0f && a[i] == a[i]) { nz = true; }
+            if (a[i] != a[i]) { nan = nan + 1L; }
+            i = i + 1;
+        }
+        Assert.equals(0L, diff);
+        // A NaN output compares unequal to itself, so it would read as a
+        // kernel disagreement AND satisfy a bare non-zero check.
+        Assert.equals(0L, nan);
+        Assert.isTrue(nz);
+        System.stdout.println("   ty=" + ty + " id == wave over " + n
+            + " rows");
+        return;
+    }
+}
