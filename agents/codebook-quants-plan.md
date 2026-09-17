@@ -498,7 +498,7 @@ every timing leg and wait for the go; filtered suite only
       prefix then 16 / 18 / 24 payload words per block.
 
 ### 5.3 Acceptance
-- [~] 5.3.1 IQ2_XXS, IQ2_XS, IQ3_XXS 8B files: `batched`, no
+- [x] 5.3.1 IQ2_XXS, IQ2_XS, IQ3_XXS 8B files: `batched`, no
       `batch-refused`; legs against llama.cpp HIP and Vulkan (pp ≥ 1.0×,
       tg ≥ 0.95×); greedy agreement; perplexity within the floor;
       resident bytes equal file bytes.
@@ -529,8 +529,10 @@ every timing leg and wait for the go; filtered suite only
       iq3_xxs 0.997 of Vulkan against the 0.95 bar, and iq3_xxs — the
       file Unit 5 could not open — is measured for the first time.
       Prefill: iq2_xxs 1.071 and iq2_xs 1.053 clear 1.0x; iq3_xxs is
-      0.992, and its coop kernel is the IQ3 family of 6.4.2. STILL `~`
-      on that one number.
+      0.992, and its coop kernel is the IQ3 family of 6.4.2. CLOSED
+      2026-09-17 when 6.4.2's doubled token tile reached every IQ coop
+      kernel: prefill 1.331 / 1.341 / 1.273, decode 0.952 / 0.952 /
+      0.993. Both halves met on all three.
 - [x] 6.1.1 Decoders exact, two fixtures; IQ3_S's `1 + 2s` scale.
 - [x] 6.1.2 Host mat-vecs and Q8 twins.
 - [x] 6.1.3 Wave decode kernels and coop X1/X3; `coopBlockWords` 20 / 27.
@@ -571,7 +573,7 @@ every timing leg and wait for the go; filtered suite only
       mask had run out of bits and IQ3_S would have aliased `q4 deqMw4`.
 
 ### 6.3 Acceptance
-- [~] 6.3.1 IQ2_S, IQ2_M, IQ3_S, IQ3_XS, IQ3_M 8B files (the mixes
+- [x] 6.3.1 IQ2_S, IQ2_M, IQ3_S, IQ3_XS, IQ3_M 8B files (the mixes
       exercise Units 5 and 6 together): legs, greedy agreement,
       perplexity, resident bytes.
       DONE 2026-09-16, legs included (`tmp/cbq/u6-accept.sh`,
@@ -602,7 +604,10 @@ every timing leg and wait for the go; filtered suite only
       iq2_m 0.961, iq3_s 0.998, iq3_xs 1.007, iq3_m 0.995. Prefill
       splits exactly on whether the file carries IQ3_S — iq2_s 1.055
       and iq2_m 1.103 clear, iq3_xs 0.876, iq3_m 0.856 and iq3_s 0.828
-      do not, which is 6.4.2 and nothing else. STILL `~` on those three.
+      do not, which is 6.4.2 and nothing else. CLOSED 2026-09-17 by
+      6.4.2's rollout: prefill 1.357 / 1.348 / 1.130 / 1.204 / 1.135,
+      decode 0.976 / 0.968 / 0.999 / 1.009 / 0.995. Both halves met on
+      all five.
       Perplexity moved within the floor and 7.3.2 carries the table and
       the control that names the cause.
 - [~] 6.3.2 The IQ3_XXS Qwen1.5-MoE: every expert tensor `batched`,
@@ -688,6 +693,36 @@ every timing leg and wait for the go; filtered suite only
       54.99 / 56.92 / 53.91 against 55.03 / 56.97 / 53.97.
       iq3_xs gains least because only 157 of its tensors are IQ3_S; the
       rest still take the 128-token tile, which is the rollout below.
+      ROLLED OUT TO ALL FIVE IQ COOP KERNELS, because the four the item
+      did not name are the same body with the same 128-token tile, and
+      iq3_xs gained least (+23.6%) precisely because only 157 of its
+      tensors were IQ3_S while the rest still took the old tile. Same
+      transformation each time, 212-219 vgpr, no spill anywhere, LDS
+      unchanged. Every file re-measured on the shipped code, five reps a
+      side, means:
+
+      | file | prefill | vulkan | was | now | decode | now |
+      |---|---|---|---|---|---|---|
+      | iq2_xxs | 1597.7 | 1200.3 | 1.071 | 1.331 | 75.39 | 0.952 |
+      | iq2_xs | 1578.6 | 1177.3 | 1.053 | 1.341 | 70.05 | 0.952 |
+      | iq2_s | 1589.5 | 1171.6 | 1.055 | 1.357 | 68.44 | 0.976 |
+      | iq2_m | 1569.4 | 1164.3 | 1.103 | 1.348 | 65.08 | 0.968 |
+      | iq3_xxs | 1532.9 | 1204.4 | 0.992 | 1.273 | 59.93 | 0.993 |
+      | iq3_xs | 1464.1 | 1216.0 | 0.876 | 1.204 | 56.96 | 1.009 |
+      | iq3_s | 1419.6 | 1255.9 | 0.828 | 1.130 | 54.99 | 0.999 |
+      | iq3_m | 1435.1 | 1264.5 | 0.856 | 1.135 | 53.92 | 0.995 |
+
+      EIGHT OF EIGHT ON BOTH BARS, prefill 1.13-1.36x and decode
+      0.952-1.009x. Decode is untouched by construction — no decode
+      kernel was edited — and the table above is the evidence rather
+      than the claim. This closes 5.3.1's last number (iq3_xxs prefill,
+      which sat at 0.992) and 6.3.1's three.
+      A METHOD NOTE PAID FOR TWICE TONIGHT: read the numbers from
+      `rows.jsonl`, never from a monitor's notification. The tail-based
+      watcher re-emitted lines from the PREVIOUS round twice, once with
+      a prefill 4% off and once with a whole stale file's row, and both
+      times the durable per-rep record settled it. Reps within a round
+      agree to 0.6%.
       A NOTE ON THE TEST, because it failed first for the right reason.
       `CoopQuantGemmTest.checkN256` staged its weights with
       `blockRepack2Launch`, but every IQ codebook format is `splitOn` —
