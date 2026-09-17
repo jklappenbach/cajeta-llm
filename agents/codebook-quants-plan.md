@@ -751,8 +751,26 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       VGPRs at 192, which is a despill the ISA read will show.
 
 ### 7.3 Acceptance
-- [ ] 7.3.1 Decode ≥ 0.95× the better llama.cpp backend on the eight
+- [~] 7.3.1 Decode ≥ 0.95× the better llama.cpp backend on the eight
       codebook files and both TQ files; prefill not regressed.
+      AFTER 7.2.2's first variable (tg128 at depth 512, same box):
+
+      | file | before | after | gain | GB/s | × vulkan |
+      |---|---|---|---|---|---|
+      | iq2_xs | 48.7 | 56.8 | +16.6% | 138 | 0.77 |
+      | iq2_s | 47.8 | 55.7 | +16.5% | 141 | 0.80 |
+      | iq3_s | 42.8 | 48.9 | +14.3% | 169 | 0.89 |
+      | iq3_xxs | 50.7 | 52.3 | +3.2% | 159 | 0.88 |
+      | iq2_xxs (control) | 61.7 | 61.5 | −0.3% | 136 | 0.78 |
+
+      The kernel gain reaches the model nearly one to one — 11–15% in
+      the probe, 14–17% end to end — which says the decode path around
+      these kernels adds no overhead worth hunting. The two controls
+      behave exactly as the file census predicts: `iq2_xxs`, whose
+      kernel was untouched, does not move; `iq3_xxs`, whose file also
+      carries 64 IQ2_S and 33 IQ3_S tensors, gains a partial 3.2%.
+      NOT MET: 0.77–0.89× against the 0.95 bar, and prefill is
+      unchanged. The gap is now ~1.2× rather than ~1.5×.
 - [ ] 7.3.2 Perplexity and the Q8 twins unchanged on the files of 5.3.1
       and 6.3.1 — the numbers this unit may not move.
 - [ ] 7.3.3 Legs re-run and recorded (announced).
