@@ -788,6 +788,12 @@ every timing leg and wait for the go; filtered suite only
       IQ4_NL gained least and the reason is worth chasing later — its
       per-launch time barely moved (197 -> 180 us) where IQ3_XXS's fell
       with the tile, so that kernel is not padding-bound.
+      UNIT 9 PULLED FORWARD 2026-09-17, and its first format paid: with
+      IQ4_NL migrated the runtime repack is gone and MoE prefill is
+      902.1 against Vulkan's 2277.8 — 0.396, from 0.268 when this item
+      opened and 0.286 after the halved tile alone. Decode is unmoved at
+      0.262, which the census predicts: its 384 launches a token are
+      cause 3, the grouped id-GEMM, untouched.
       BLOCKED ON UNIT 9 for the rest. Causes 2 and 4 are Unit 9's items
       by definition — the repack machinery and the IQ4_NL migration —
       and cause 3 needs a grouped id-GEMM over the expert dimension that
@@ -1786,10 +1792,44 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
 - [ ] 9.1.3 A test that the removed names are gone from the tree.
 
 ### 9.2 Coding
-- [ ] 9.2.1 The 42 kernels re-offset; `coopNeedsRepack`,
+- [~] 9.2.1 The 42 kernels re-offset; `coopNeedsRepack`,
       `blockRepack2Kernel`, `blockPadKernel`, `ensureQ6Pad`, `coopDev`
       and `splitOn` removed; the split unconditional; `coopBlockWords`
       the payload stride everywhere.
+      PULLED FORWARD 2026-09-17 at Julian's direction, because 6.4.3 is
+      blocked on it. THREE OF FIVE FORMATS MIGRATED: IQ4_NL, Q4_0, Q5_0.
+      `coopNeedsRepack` is down to Q3_K and Q6_K.
+      IQ4_NL FIRST, because it is 6.4.3's blocker: the Qwen MoE's 1420
+      `blockRepack2Kernel` launches were its IQ4_NL experts. Its three
+      coop kernels and its item-per-row mat-vec now read the split
+      layout (`rowWords = pw + bpr*4`, the scale from the prefix word,
+      payload at `ro` with no `+1` word) and `coopBlockWords` is the
+      payload stride, 4. MoE PREFILL 657 -> 895 t/s, and
+      `blockRepack2Kernel` is gone from the profile entirely.
+      Q4_0 AND Q5_0 followed, same shape: six kernels each (Q8 wave, f32
+      wave, item-per-row, coop X1/X3, widen), `coopBlockWords` 5 -> 4 and
+      6 -> 5. The host side needed nothing — `Linear.runScaleImage`
+      already branches on `splitOn`, so the scale image follows the
+      format in automatically.
+      COVERAGE, honestly: the Q8-wave and f32 routes of all three are
+      gated by `LegacyWaveMatVecTest` and `CoopQuantGemmTest` against
+      real fixtures, and that gate FIRED on IQ4_NL (a wrong dispatch
+      order and three stale staging sites, both caught). The WIDEN route
+      (`q40WidenKernel`/`q50WidenKernel` feeding `symWmmaDeqMw8`) has no
+      format-specific test and no file in the tree carries Q4_0 or Q5_0
+      tensors — the 8B Q4_K_M here is q4_K + q6_K only. It is migrated
+      but UNVERIFIED until 9.3.2's Q4_0 file exists, which that item
+      already calls for.
+      SPLITKERNEL IS NOW THE MoE's TOP ITEM at 23.4%, 336 launches at
+      875 us against 264 at 367. A 32-element block splits two scale
+      bytes per sixteen payload bytes, far finer than a 256-element
+      block's two per 108, so the IQ4_NL/Q4_0/Q5_0 split is scattered
+      and slow. It is one-time work per tensor that a fresh process per
+      leg rep pays every time; llama.cpp charges the equivalent to load.
+      Worth its own look once Q3_K and Q6_K land.
+      REMAINING: Q3_K (5 kernels) and Q6_K (22 — the widen, Mw4/Mw8, the
+      id kernels, the scale image, `q6kPadKernel` and `ensureQ6Pad`),
+      then the predicate removals and 9.2.2's `deqFor(Q8_0)` twin.
 - [ ] 9.2.2 The int8 widen twin of a Q8_0 weight — `deqFor(Q8_0)` builds
       a tile-major `deqDev` (and `ensureWidenSlab` a `deqSlabDev`) that
       the Mw8 GEMM and the sym id-kernels read — is a second copy of
