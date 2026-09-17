@@ -1909,8 +1909,45 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
 
 ### 9.3 Acceptance
 - [ ] 9.3.1 Filtered suite green.
-- [ ] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
+- [~] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
       Q5_0 tensors), Q3_K_M, Q6_K, the iq4_nl file, a Q4_0 8B from
       `llama-quantize`; bit gate then A/B, no decode regression.
-- [ ] 9.3.3 Resident bytes equal file bytes for every file above and the
+      THREE OF FIVE DONE 2026-09-17, against a binary built from the
+      commit BEFORE the Q6_K migration (353087e) in a worktree, so the
+      arms differ only by the change under test. Quiet box, arm order
+      alternating by file, three reps, rep 1 discarded as cold
+      ([[bench-first-model-runs-cold]] — it read 27.1 against 32.6 on
+      the 6.6 GB file).
+      THE BIT GATE IS EXACT: the greedy stream of all three files
+      hashes IDENTICALLY before and after. The split moves bytes; it
+      does not touch a value, and this is the proof rather than the
+      claim.
+
+      | file | pre | post | delta |
+      |---|---|---|---|
+      | Q6_K 8B | 32.61 | 32.87 | +0.8% |
+      | Q4_K_M 8B | 43.18 | 43.42 | +0.6% |
+      | Q3_K_M 8B | 49.80 | 49.88 | +0.2% |
+
+      NO REGRESSION ANYWHERE, and all three are marginally FASTER — the
+      Q6_K row largest, which is what the retired 212-byte pad predicts:
+      that copy is 2 bytes a block of 6.59 GB, about 63 MB of write and
+      read that no longer happens.
+      OWED: the iq4_nl file and a Q4_0 8B, neither of which exists in
+      the tree yet — both need `llama-quantize`. They are the only two
+      files that would exercise Q4_0's and IQ4_NL's WIDEN route, which
+      is the coverage gap 9.2.1 records.
+- [~] 9.3.3 Resident bytes equal file bytes for every file above and the
       30B Q8_0 re-checked; the repack code gone.
+      EXACT ON THE PURE Q6_K 8B, which is the file this unit most had to
+      prove: `CAJETA_XPU_ALLOC_TRACE` reports 6,156,165,120 bytes in 225
+      `allocResident` allocations. The file carries 226 Q6_K tensors
+      totalling 6,587,105,280, and `token_embd` — 128256 x 4096 / 256 x
+      210 = 430,940,160 — stays in the Embedding rather than a Linear.
+      6,587,105,280 - 430,940,160 = 6,156,165,120. To the byte.
+      THE REPACK CODE IS GONE: `q6kPadKernel`, `q6kPadLaunch`,
+      `Linear.ensureQ6Pad`, `q6PadDev` and `q6PadW` deleted;
+      `coopNeedsRepack` returns false for every type, so `coopDev` is
+      never allocated. Those two copies were the whole excess over file
+      bytes for these formats.
+      OWED: the 30B Q8_0 re-check, and the two files 9.3.2 still needs.
