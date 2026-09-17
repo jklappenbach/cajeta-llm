@@ -610,7 +610,7 @@ every timing leg and wait for the go; filtered suite only
       all five.
       Perplexity moved within the floor and 7.3.2 carries the table and
       the control that names the cause.
-- [~] 6.3.2 The IQ3_XXS Qwen1.5-MoE: every expert tensor `batched`,
+- [x] 6.3.2 The IQ3_XXS Qwen1.5-MoE: every expert tensor `batched`,
       perplexity within the MoE floor of llama.cpp's, legs.
       DONE 2026-09-16, legs included (they miss badly — item 6.4.3):
       all 24 layers report
@@ -620,6 +620,22 @@ every timing leg and wait for the go; filtered suite only
       set no expert residency budget, so its first answer was 24 ×
       "an expert is not admitted" — the trap `PplProbe` already
       documents; the probe now sets the budget the engine's AUTO would.
+      RE-VERIFIED 2026-09-17 on the post-Unit-9 build, because none of
+      the above carried: this file's experts include IQ4_NL, which the
+      migration moved onto the split layout, and the binaries that gave
+      those answers predate it. Routes: 24 `batch-route resident` and 4
+      `batch-route coop`, no `batch-refused`. Perplexity 5.47719 against
+      llama.cpp's 5.4781, -0.017% — inside the floor, and tighter than
+      2026-09-16's -0.17%. Greedy agrees with llama.cpp's CPU stream on
+      the tokens it shares.
+      THE LEDGER LEG OF THAT SCRIPT MEASURES NOTHING ON A MoE and is not
+      quoted: `allocResident` over a 2-token generation reads 678 MB of
+      a 6.35 GB file, which is the same artifact 6.4.3 opened on — a
+      short generation admits a handful of experts. The residency figure
+      that means something is `residentKb` under a 512-token prompt,
+      recorded there.
+      The legs ride 6.4.3's re-measurement; the gap has been that item's
+      since it opened.
 
 ### 5.4 / 6.4 Legs (measured 2026-09-16, quiet box)
 
