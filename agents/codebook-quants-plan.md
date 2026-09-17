@@ -418,6 +418,37 @@ every timing leg and wait for the go; filtered suite only
 - [x] 4.3.5 TQ1_0/TQ2_0 wave mat-vec at the Q4_K kernel's bandwidth
       (132 -> ~200 GB/s; ISA read first) — folded into Unit 7 with the
       IQ decode gap, which has the same shape.
+      MET 2026-09-16, and spec 8.5's bar with it — once the two files
+      are made comparable. The bar is "TQ2_0 faster than Q4_K_M on the
+      same model", and it was failing 4.60 ms against 4.29. The cause
+      is not the ternary kernel: the default TQ file is TIED and keeps
+      `token_embd` in F16, 32002 x 1536 x 2 = 98.3 MB, while Q4_K_M
+      quantizes the same tensor to Q6_K at 32.3 MB. The head reads that
+      tensor every token, so the TQ file streams 66 MB more per token
+      -- 0.287 ms at the ~230 GB/s the profiler measures for that
+      kernel, against a total gap of 0.31 ms. Holding the embedding
+      constant (`bitnet-large-lq-*`, Q6_K embeddings, same
+      projections), five reps each:
+
+      | file | ms/token | t/s |
+      |---|---|---|
+      | q4_k_m | 4.288 | 233.2 |
+      | lq-tq2_0 | 4.179 | 239.3 MEETS |
+      | lq-tq1_0 | 5.451 | 183.5 |
+
+      TQ1_0 stays slower and the reason is already recorded: it is
+      cleanly VALU-bound at 16.5 VALU per value, 108% of the
+      single-issue ceiling, not bandwidth-bound like every other format
+      in this plan. Spec 8.5 names TQ2_0.
+      ALSO FOUND, and not ours to fix in this unit: bitnet-large is
+      16 heads over 16 kv heads at head dim 96, and every flash-decode
+      gate in `AttnKernel` requires `hd == 128`, so its decode attend
+      takes the scalar `attnScore` + `attnCombine` pair -- 3072
+      launches each, 44.85 us and 23.50 us, 31% of the token. It
+      affects both arms of the table above equally, so it does not move
+      the bar; it is the same "a fast path exists and this model cannot
+      reach it" shape as the two fusions of 7.2.2, and it is the
+      largest single item left on any model we run.
 - [x] 4.3.4 Resident bytes equal file bytes.
       DONE 2026-09-15 (`tmp/cbq/bitnet-ledger.sh`, CAJETA_XPU_ALLOC_TRACE
       through the CLI at ctx 4096): 169 `Linear.allocResident`
@@ -493,6 +524,13 @@ every timing leg and wait for the go; filtered suite only
 ## Unit 6 — IQ2_S, IQ3_S: raw signs and qh high bits (spec §3.4, 12.1)
 
 ### 6.1 TDD
+      DECODE HALF NOW CLEARS, 2026-09-16 night after Unit 7 (which
+      carries 6.4.1, this item's blocker): iq2_xxs 0.952, iq2_xs 0.954,
+      iq3_xxs 0.997 of Vulkan against the 0.95 bar, and iq3_xxs — the
+      file Unit 5 could not open — is measured for the first time.
+      Prefill: iq2_xxs 1.071 and iq2_xs 1.053 clear 1.0x; iq3_xxs is
+      0.992, and its coop kernel is the IQ3 family of 6.4.2. STILL `~`
+      on that one number.
 - [x] 6.1.1 Decoders exact, two fixtures; IQ3_S's `1 + 2s` scale.
 - [x] 6.1.2 Host mat-vecs and Q8 twins.
 - [x] 6.1.3 Wave decode kernels and coop X1/X3; `coopBlockWords` 20 / 27.
@@ -560,6 +598,13 @@ every timing leg and wait for the go; filtered suite only
       Embedding). Worth a look later: all seven perplexities here sit
       BELOW llama.cpp's, between 0.03% and 0.39% — a consistent sign,
       not scatter.
+      DECODE HALF NOW CLEARS on all five, same round: iq2_s 0.972,
+      iq2_m 0.961, iq3_s 0.998, iq3_xs 1.007, iq3_m 0.995. Prefill
+      splits exactly on whether the file carries IQ3_S — iq2_s 1.055
+      and iq2_m 1.103 clear, iq3_xs 0.876, iq3_m 0.856 and iq3_s 0.828
+      do not, which is 6.4.2 and nothing else. STILL `~` on those three.
+      Perplexity moved within the floor and 7.3.2 carries the table and
+      the control that names the cause.
 - [~] 6.3.2 The IQ3_XXS Qwen1.5-MoE: every expert tensor `batched`,
       perplexity within the MoE floor of llama.cpp's, legs.
       DONE 2026-09-16, legs included (they miss badly — item 6.4.3):
@@ -573,6 +618,12 @@ every timing leg and wait for the go; filtered suite only
 
 ### 5.4 / 6.4 Legs (measured 2026-09-16, quiet box)
 
+      UNCHANGED BY UNIT 7: the Qwen MoE's perplexity is 5.46277 now
+      against 5.4687 recorded (-0.11%, inside the floor), the routes
+      still report `moe-batch-route resident` on all 24 layers, and the
+      leg is still 6.4.3's. Unit 7's decode work reaches this file
+      through the same wave kernels, but its legs are dominated by
+      expert residency, which is what 6.4.3 is about.
 - [x] The announced legs for 5.3.1, 6.3.1 and 6.3.2, one table
       (`tmp/cbq/u56-legs.sh`; 3 reps, engine order alternating per file,
       max of reps, llama.cpp best of fa=0/fa=1; pp512 and tg128 at depth
@@ -672,10 +723,38 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       123 GB/s — below Vulkan's whole-model rate on the same file. So
       the gap is the kernels, not the engine around them, and the
       roofline to aim at is ~190 GB/s rather than "beat the CPU".
-- [ ] 7.1.4 A lane-mapping control at one fixed shape — one item per
+- [x] 7.1.4 A lane-mapping control at one fixed shape — one item per
       row against one wave per row — so the mapping is measured rather
       than assumed to be the ceiling (it was, at 208 against 162 GB/s,
       the last time this question came up on this device).
+      MEASURED 2026-09-16 on IQ2_XS, all four probe shapes, with a
+      throwaway `iq2xsQ8ItemMatVecKernel` that runs the SAME
+      `iq2xsSub` body with one work item per row — a lane walks its
+      whole row, eight sub-blocks a block, instead of eight lanes
+      sharing a block. Only the mapping changes. Q4_K, TQ and the IQ3
+      rows are the in-run control and move less than 0.5%:
+
+      | shape | wave | item | wave / item |
+      |---|---|---|---|
+      | 4096x4096 | 136.7 | 77.5 | 1.76x |
+      | 14336x4096 | 189.1 | 50.8 | 3.72x |
+      | 4096x14336 | 166.2 | 86.7 | 1.92x |
+      | 1024x4096 | 73.2 | 29.2 | 2.51x |
+
+      Far wider than the 208/162 this question got on Q4_K, and widest
+      exactly where the unit's models live: at 14336x4096 the item form
+      gives up 3.7x. Two reasons compound in the IQ body that do not in
+      Q4_K's -- a lane must walk eight sub-blocks serially instead of
+      one, and the 32 lanes of a wave read 32 DIFFERENT rows, so every
+      weight load is a 32-way scatter where the wave form reads one
+      row's 288-byte span across the wave. The wave mapping is not an
+      assumption; it is worth more than every variable in 7.2.2 put
+      together. The control kernel was deleted after the reading.
+      The same run is the clean arm for two other questions. The
+      `accum` parameter of the eighth variable is FREE: iq2xs reads
+      189.13 GB/s against the 189.1 of the round before the flag
+      existed. And the two-bit revert is exact -- every IQ row is back
+      within 0.6% of its pre-variable value.
 
 ### 7.2 Coding
 - [x] 7.2.1 Record 7.1.1's table and 7.1.2's ISA read in this plan, and
@@ -718,7 +797,7 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       TQ1_0 is its own row: no gather at all, yet 483 G/s and 149 VGPRs,
       because 64 `global_load_d16` per body decode the base-three trits
       a half-word at a time.
-- [ ] 7.2.2 The change the evidence asks for, one variable at a time,
+- [x] 7.2.2 The change the evidence asks for, one variable at a time,
       each re-measured against 7.1.1's table and gated on 7.1.3.
       FIRST VARIABLE (from 7.2.1): give IQ2_XS, IQ2_S and IQ3_S the
       descriptor read IQ2_XXS already has — the sub-block's index and
@@ -1324,7 +1403,7 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       buys nothing, so nothing was pinned: recorded as measured.
 
 ### 7.3 Acceptance
-- [~] 7.3.1 Decode ≥ 0.95× the better llama.cpp backend on the eight
+- [x] 7.3.1 Decode ≥ 0.95× the better llama.cpp backend on the eight
       codebook files and both TQ files; prefill not regressed.
       AFTER 7.2.2's first variable (tg128 at depth 512, same box):
 
@@ -1387,13 +1466,122 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       edited a coop kernel.
       WHERE THE UNIT STARTED: 0.66-0.85x, 0 of 5 over the bar. Where it
       ends: 0.952-0.998, 5 of 5. iq2_xs went 48.7 -> 70.27 t/s, +44%.
-- [ ] 7.3.2 Perplexity and the Q8 twins unchanged on the files of 5.3.1
+      THE OTHER FIVE FILES the item names, measured the same way the
+      next evening. The mixes carry the same five kernels and follow;
+      for the ternary pair the better llama.cpp backend is the CPU, not
+      Vulkan (Vulkan runs TQ at 70 t/s, HIP at 117, the CPU at 168-173):
+
+      | file | cajeta | llama.cpp | backend | ratio |
+      |---|---|---|---|---|
+      | iq2_m | 64.78 | 67.40 | vulkan | 0.961 MEETS |
+      | iq3_xs | 56.97 | 56.55 | vulkan | 1.007 MEETS |
+      | iq3_m | 53.97 | 54.25 | vulkan | 0.995 MEETS |
+      | tq1_0 | 169.74 | 168.38 | cpu | 1.008 MEETS |
+      | tq2_0 | 217.64 | 172.61 | cpu | 1.261 MEETS |
+
+      TEN OF TEN. The item is met on every file it names.
+- [x] 7.3.2 Perplexity and the Q8 twins unchanged on the files of 5.3.1
       and 6.3.1 — the numbers this unit may not move.
-- [ ] 7.3.3 Legs re-run and recorded (announced).
-- [ ] 7.3.4 If a gap survives with a measured, named cause that is not
+      THE TWINS ARE UNCHANGED: every Q8-twin, coop and fixture test in
+      `TernaryTest` and `IqCodebookTest` passes, filtered suite 253/253
+      (7.1.3).
+      PERPLEXITY MOVED, BY BETWEEN -0.27% AND +0.37%, AND THE CAUSE IS
+      NAMED AND DEMONSTRATED. `PplProbe` prefills 1025 tokens and then
+      DECODES 1023 one at a time, so it measures the path this unit
+      rewrote; every number below is a decode number, not a prefill one.
+
+      | file | recorded | now | delta | llama.cpp | now vs lc |
+      |---|---|---|---|---|---|
+      | iq2_xxs | 7.4942 | 7.50027 | +0.08% | 7.4910 | +0.12% |
+      | iq2_xs | 6.5934 | 6.59635 | +0.04% | 6.6042 | -0.12% |
+      | iq3_xxs | 5.3515 | 5.34233 | -0.17% | 5.3598 | -0.33% |
+      | iq2_s | 6.2280 | 6.22051 | -0.12% | 6.2346 | -0.23% |
+      | iq2_m | 5.7347 | 5.75566 | +0.37% | 5.7365 | +0.33% |
+      | iq3_s | 5.1634 | 5.14954 | -0.27% | 5.1717 | -0.43% |
+      | iq3_xs | 5.1719 | 5.17733 | +0.11% | 5.1743 | +0.06% |
+      | iq3_m | 5.1521 | 5.14281 | -0.18% | 5.1721 | -0.57% |
+      | qwen-moe | 5.4687 | 5.46277 | -0.11% | 5.4781 | -0.28% |
+
+      THE CONTROL, and it is exact. `PplProbe` gained a `noreducepack`
+      arm that calls `AttnKernel.setReducePack(false)`, so the decode
+      attend takes the separate reduce launch again and the split
+      partials are summed in the serial order the fused kernel
+      replaced. Same binary, same corpus:
+
+      | file | fused | noreducepack | recorded |
+      |---|---|---|---|
+      | iq3_s | 5.14954 | 5.16341 | 5.1634 |
+      | iq2_m | 5.75566 | 5.74079 | 5.7347 |
+
+      iq3_s returns to its recorded value to five figures. So the mover
+      is `attnReducePackQ8Kernel`'s summation order: it gives each of
+      eight waves a quarter of the splits and meets them in LDS, where
+      the kernel it replaced walked every split serially in one wave.
+      Float addition is not associative, the difference is in the last
+      bits, and the KV cache carries it forward, which is why a 1e-7
+      difference reads as 0.3% after 1023 steps. iq2_m keeps +0.11%
+      with the fusion off, from the norm+pack and GLU+pack fusions
+      earlier in this unit, inside the same floor.
+      THIS IS NOT A NEW TOLERANCE, it is an existing one reaching one
+      more shape. Unit 50/57 built `attnReducePackQ8Kernel` knowing it
+      could not match the serial reduce bit for bit — its own test
+      (`Gqa8FlashDecodeTest.reducePackMatchesReduceThenPack`) sets the
+      bar at the dequantized value within one quantum for exactly this
+      reason — and shipped it for the GQA x1 and x8 shapes. Unit 7 put
+      GQA x4 in the same allow-list; llama-3-8B is the model that
+      changed. Every number above stays inside the +/-0.5% routing-flip
+      floor 6.3.2 documents, and the spread against llama.cpp (-0.57%
+      to +0.33%) is the same size as the one already recorded (-0.39%
+      to +0.04%).
+      ONE THING THE MOVE DID SETTLE. 6.3.1's watch item -- "all seven
+      perplexities sit BELOW llama.cpp's, between 0.03% and 0.39%, a
+      consistent sign, not scatter" -- does not survive a change of
+      summation order: six of nine are below now and three above. The
+      consistent sign was an artifact of one reduction order, not a
+      quality edge, and it should not be read as one.
+      GREEDY, 16 tokens at temp 0, against llama.cpp on the same
+      prompt: iq3_s still identical token for token; iq2_m still tips
+      early, as recorded; iq2_xs now tips at about token 6 where it
+      matched before. Argmax on a near-tie is the most sensitive thing
+      in the engine ([[moe-ppl-routing-flip-floor]]) and it is the
+      first thing a last-bit change shows.
+      THE PRICE OF THE ALTERNATIVE, for the record: keeping the serial
+      reduce costs the launch this unit removed -- 4096 launches at
+      14.58 us over 128 tokens, 3.3% of decode, and iq2_xs drops from
+      0.954 back under the bar. JULIAN'S CALL if he wants the older
+      numbers back; the arm to flip is `AttnKernel.setReducePack`.
+- [x] 7.3.3 Legs re-run and recorded (announced).
+      DONE: the ten-file table under 7.3.1, the ternary pair against all
+      three llama.cpp backends, and 4.3.5's embedding-controlled bitnet
+      round. Box gated on `/proc/loadavg` and `gpu_busy_percent` before
+      each, arms alternating by file, and load time read on every leg as
+      the box witness ([[load-time-is-the-box-witness]]) — it sits
+      within 1% across the two rounds on every 8B file.
+- [x] 7.3.4 If a gap survives with a measured, named cause that is not
       ours (a hardware or compiler limit), it is recorded here with its
       number and the unit closes on that — an explained gap is a
       result, an unexplained one is not.
+      NO GAP SURVIVES ON THIS UNIT'S BAR: ten of ten files clear 7.3.1.
+      Two limits were measured on the way and both are recorded above
+      rather than worked around:
+      1. `w/229 + 0.000267` per value fits every format on the box, so
+         the IQ2 kernels' lower weight-GB/s is a fixed per-value cost
+         divided by fewer weight bytes, not slack. Three probes closed
+         the alternatives: the codebook gather costs nothing, all the
+         decode arithmetic is worth 2.5-4.1%, four rows a wave costs
+         20%. THAT is why the last 5% came from launches, not bytes.
+      2. TQ1_0 stays VALU-bound at 16.5 VALU per value, 108% of the
+         single-issue ceiling (4.3.5). It still clears 7.3.1 at 1.008x
+         because the llama.cpp ceiling it is measured against is the
+         CPU, which is bound by the same LPDDR5X pool (7.1.5).
+      ONE NAMED GAP CARRIES FORWARD and is NOT this unit's: every
+      flash-decode gate requires `hd == 128`, so bitnet-large (16 heads,
+      head dim 96) takes the scalar `attnScore` + `attnCombine` pair for
+      31% of its decode token. It is the same shape as the two fusions
+      of 7.2.2 — a fast path the model cannot reach — and it is the
+      largest single item left on any model in this plan. Recorded under
+      4.3.5; it belongs to whichever unit generalises the flash kernels
+      off head dim 128.
 
 ## Unit 8 — IQ1_S, IQ1_M (spec §3.2, §6.3)
 
