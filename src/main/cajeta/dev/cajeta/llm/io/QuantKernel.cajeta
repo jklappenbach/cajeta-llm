@@ -6443,6 +6443,48 @@ public final class QuantKernel {
         }
     }
 
+    /**
+     * The DWORD form of {@link #splitScaleKernel}: one work item per
+     * dword of a row's scale prefix, so two blocks' f16 scales are
+     * assembled in registers and stored once through the word view.
+     *
+     * The chunk must start and end on a row — a prefix dword spans two
+     * blocks of the SAME row, so a chunk ending mid-row would write half
+     * a dword. `splitLaunch` checks and keeps the per-block kernel for
+     * the rest.
+     */
+    @Kernel
+    public static void splitScaleWordKernel(KernelBuffer<int32> outW,
+            KernelBuffer<int8> src, uint32 total, int64 rowBase,
+            uint32 blockBytes, uint32 scaleOffset, int64 bpr,
+            int64 prefixWords, int64 rowWords) {
+        uint32 t = KernelThread.globalIdX();
+        if (t < total) {
+            int64 w = ((int64) t) % prefixWords;
+            int64 r = ((int64) t) / prefixWords;
+            int64 j0 = w * 2L;
+            int64 s0 = (r * bpr + j0) * (int64) blockBytes
+                + (int64) scaleOffset;
+            int32 v = ((int32) src[s0] & 255)
+                | (((int32) src[s0 + 1L] & 255) << 8);
+            if (j0 + 1L < bpr) {
+                int64 s1 = s0 + (int64) blockBytes;
+                int32 hi = ((int32) src[s1] & 255)
+                    | (((int32) src[s1 + 1L] & 255) << 8);
+                v = v | (hi << 16);
+            }
+            outW[(rowBase + r) * rowWords + w] = v;
+        }
+    }
+
+    static int64 scaleWordLaunches;
+
+    /** Scale-prefix splits that took the dword kernel (9.2.7). A chunk
+     *  that neither starts nor ends on a row takes the per-block one. */
+    public static int64 scaleWordLaunchCount() {
+        return QuantKernel.scaleWordLaunches;
+    }
+
     /** Split `nBlocks` file blocks of `ty` from `src`, the first being
      *  block `blockBase` of a tensor with `bpr` blocks per row, into
      *  the resident array `out`; synchronous. */
@@ -6466,11 +6508,24 @@ public final class QuantKernel {
                 (outW, src, (uint32) total, blockBase,
                  (uint32) Quant.blockBytes(ty), (uint32) pw,
                  (uint32) srcPayOff, bpr, prefix / 4L, rowBytes / 4L);
-            splitScaleKernel.launch(s,
-                grid: [(uint32) ((nBlocks + 255L) / 256L)], block: [256])
-                (out, src, (uint32) nBlocks, blockBase,
-                 (uint32) Quant.blockBytes(ty), (uint32) scaleB,
-                 (uint32) scaleOff, bpr, rowBytes);
+            if (scaleB == 2L && blockBase % bpr == 0L
+                    && nBlocks % bpr == 0L) {
+                int64 pfw = prefix / 4L;
+                int64 st = (nBlocks / bpr) * pfw;
+                QuantKernel.scaleWordLaunches =
+                    QuantKernel.scaleWordLaunches + 1L;
+                splitScaleWordKernel.launch(s,
+                    grid: [(uint32) ((st + 255L) / 256L)], block: [256])
+                    (outW, src, (uint32) st, blockBase / bpr,
+                     (uint32) Quant.blockBytes(ty), (uint32) scaleOff,
+                     bpr, pfw, rowBytes / 4L);
+            } else {
+                splitScaleKernel.launch(s,
+                    grid: [(uint32) ((nBlocks + 255L) / 256L)], block: [256])
+                    (out, src, (uint32) nBlocks, blockBase,
+                     (uint32) Quant.blockBytes(ty), (uint32) scaleB,
+                     (uint32) scaleOff, bpr, rowBytes);
+            }
             s.sync();
             return;
         }
