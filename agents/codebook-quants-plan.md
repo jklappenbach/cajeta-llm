@@ -791,7 +791,10 @@ every timing leg and wait for the go; filtered suite only
       UNIT 9 PULLED FORWARD 2026-09-17, and its first format paid: with
       IQ4_NL migrated the runtime repack is gone and MoE prefill is
       902.1 against Vulkan's 2277.8 — 0.396, from 0.268 when this item
-      opened and 0.286 after the halved tile alone. Decode is unmoved at
+      opened and 0.286 after the halved tile alone. Completing the other
+      four formats leaves it there (896 t/s in the profile): this model
+      carries no Q6_K, Q3_K, Q4_0 or Q5_0 tensors, so the rest of the
+      unit is worth nothing HERE and everything to the files that do. Decode is unmoved at
       0.262, which the census predicts: its 384 launches a token are
       cause 3, the grouped id-GEMM, untouched.
       BLOCKED ON UNIT 9 for the rest. Causes 2 and 4 are Unit 9's items
@@ -1820,13 +1823,21 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       tensors — the 8B Q4_K_M here is q4_K + q6_K only. It is migrated
       but UNVERIFIED until 9.3.2's Q4_0 file exists, which that item
       already calls for.
-      SPLITKERNEL IS NOW THE MoE's TOP ITEM at 23.4%, 336 launches at
-      875 us against 264 at 367. A 32-element block splits two scale
-      bytes per sixteen payload bytes, far finer than a 256-element
-      block's two per 108, so the IQ4_NL/Q4_0/Q5_0 split is scattered
-      and slow. It is one-time work per tensor that a fresh process per
-      leg rep pays every time; llama.cpp charges the equivalent to load.
-      Worth its own look once Q3_K and Q6_K land.
+      SPLITKERNEL IS NOW THE MoE's TOP ITEM at 23.2%, 336 launches at
+      866 us, and the CAUSE IS ITS LANE MAPPING, not the work. It runs
+      ONE WAVE PER BLOCK — `b = globalIdX() / 64`, then
+      `i = lane; while (i < blockBytes) { ...; i = i + 64; }` — so for
+      IQ4_NL's 18-byte block lanes 0..17 copy ONE BYTE each and lanes
+      18..63 idle: 28% lane occupancy and a byte at a time. A
+      256-element block (108-210 bytes) fills the wave but still copies
+      bytewise. Two fixes, either cheap: pack several small blocks per
+      wave, or copy dwords with a byte tail (every payload is a whole
+      number of dwords by construction, and the scale field is two
+      bytes). It is one-time work per tensor that a fresh process per
+      leg rep pays every time and llama.cpp charges to load — but it is
+      23% of this model's prefill and the largest single item left in
+      6.4.3 after the repack. NOT DONE: outside this unit's items, and
+      recorded here so it is a short job rather than a rediscovery.
       Q3_K FOLLOWED, and it is cheaper than the byte count suggests
       because of where its scale lives. Q3_K is `hmask, qs, scales, d`
       and Q6_K is `ql, qh, scales, d` — the f16 is at the END of the
