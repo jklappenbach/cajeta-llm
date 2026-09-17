@@ -1999,6 +1999,30 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       NOT ADDED: the accum form. `matvecStagedAccum` has branches for
       waveIq, Q4_K and Q6_K, and none for Q4_0/Q5_0, so IQ4_NL keeps
       their behaviour rather than growing a sixth.
+      MEASURED on the iq4_nl 8B, ABBA, three reps a pass:
+
+      | arm | decode t/s | weight GB/s |
+      |---|---|---|
+      | f32 wave | 42.55 - 42.82 | 202 |
+      | integer wave | 44.12 - 44.93 | 211 |
+
+      +4.9%, AND THAT IS THE WHOLE HEADROOM: Q4_0 measures 213 GB/s on
+      this route, so IQ4_NL has arrived at the same wall. The f32 wave
+      was already at 202, which is why this leg is worth 5% where the
+      route fix before it was worth 59%. Both f32 passes agree to 0.3%,
+      both integer passes to 1.8%; load 2977-3075 across twelve runs
+      with no systematic split between arms.
+      The greedy streams agree for 4 of 128 tokens and then diverge —
+      the activation quantization, which is why the route is behind
+      `q8Route`. The kernel is exact to 2.0e-06 against a host
+      reference carrying the same quantization, and that is the gate.
+      NOISE WORTH NAMING: prefill read 814/796 in the integer arm's
+      second pass against 833-841 everywhere else. Prefill is the coop
+      GEMM, which this change does not touch, so it is the box, not the
+      code — recorded rather than averaged away.
+      CUMULATIVE for this file: 28.60 before the migration, 26.39 after
+      it, 42.90 with the route fix, 44.93 here. 1.57x over where it
+      started.
 
 
 ### 9.3 Acceptance
