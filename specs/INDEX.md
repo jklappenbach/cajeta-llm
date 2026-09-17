@@ -5,4 +5,4 @@
 | [prefill-routes-spec](prefill-routes-spec.md) | [prefill-routes-plan](../agents/prefill-routes-plan.md) | draft |
 | [prepared-weights-spec](prepared-weights-spec.md) | — | draft |
 | [codebook-quants-spec](codebook-quants-spec.md) | [codebook-quants-plan](../agents/codebook-quants-plan.md) | active |
-| [route-table-spec](route-table-spec.md) | — | draft |
+| [route-table-spec](route-table-spec.md) | — | moved → `cajeta/specs/route-table-spec.md` (xpu layer; this package is the first registrant) |
