@@ -949,6 +949,37 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       so 12.1 must be RE-DECIDED after (a), not before.
       (c) The 64-bit address arithmetic of the old third variable,
       still 38–41 instructions per body and untouched by this change.
+      END TO END, quiet box, alternating arms, mean of three:
+
+      | file | before | after | gain | vulkan | ratio | was |
+      |---|---|---|---|---|---|---|
+      | iq2_xs | 61.56 | 65.14 | +5.8% | 73.23 | 0.890 | 0.843 |
+      | iq2_xxs | 66.44 | 69.48 | +4.6% | 78.14 | 0.889 | 0.850 |
+      | iq2_s | 60.37 | 62.51 | +3.5% | 69.80 | 0.896 | 0.865 |
+      | iq3_xxs | 56.44 | 56.26 | −0.3% | 58.56 | 0.961 | 0.939 |
+      | iq3_s | 51.97 | 51.96 | −0.0% | 54.84 | 0.947 | 0.947 |
+
+      `iq3_s` is the model-level control and it is textbook: an
+      IQ3_S-dominated file whose kernel was not touched, −0.0% with
+      the ratio unchanged to three places. `iq3_xxs` moved −0.3% while
+      ITS Vulkan arm slowed 2.5% in the same slot, so read its 0.961 as
+      "about at the bar, re-measure", not as a gain.
+      A TRAP THAT COST A RUN: the first A/B after this change reported
+      +0.3%. `tmp/cbq/u7-ab.sh` called `leg.sh`, which executes whatever
+      `schedthroughput` is on disk, and that exe predated the commit by
+      seventeen minutes. `stat -c %y` against the commit time found it.
+      The script now builds first and prints the artifact's mtime. When
+      the isolated probe moves and the model does not, check the
+      binary's timestamp BEFORE theorising.
+      WHERE THE IQ2 FAMILY STANDS: 0.889–0.896, needing about 6.7%
+      more decode, which is ~10% more from the IQ2_XS kernel since it
+      holds 68% of decode. Of the 10 loads now left per body, FIVE are
+      grid gathers and TWO are activations. That makes (a) and (b)
+      above one change rather than two, and it is what llama.cpp
+      actually does: a wider workgroup covering four rows, activations
+      loaded once for all four, and the grid staged in LDS where the
+      stage is amortised over eight waves instead of one. Spec 12.1
+      must be re-decided as part of it, not before it.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
