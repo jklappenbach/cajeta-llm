@@ -1026,6 +1026,40 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       says a wider workgroup is not affordable here — parallelism is
       worth more than the loads it would save. Re-testing LDS would now
       have to come with a bigger BLOCK, not more rows per wave.
+      END TO END, five reps each side, arm order flipped from the
+      three-rep round (which had the Vulkan arm bouncing 3% between
+      rounds on unchanged code — read ratios from the five-rep run):
+
+      | file | cajeta | vulkan | ratio |
+      |---|---|---|---|
+      | iq3_s | 52.20 | 54.88 | 0.951 MEETS |
+      | iq3_xxs | 56.96 | 60.15 | 0.947 |
+      | iq2_s | 64.24 | 69.35 | 0.926 |
+      | iq2_xxs | 70.68 | 78.22 | 0.904 |
+      | iq2_xs | 65.96 | 73.06 | 0.903 |
+
+      Unit 7 has taken iq2_xs from 48.7 t/s and 0.66 to 65.96 and
+      0.903, +35%.
+      WHAT REMAINS IS THE IQ2 FAMILY, and the target is exact. Every
+      kernel on this box tops out near 206 GB/s — q4_k 207, iq3s 203,
+      tq2_0 193 — against a ~256 GB/s LPDDR5X peak, so ~206 is the
+      practical streaming ceiling and IQ3_S clearing the bar is a
+      consequence of reaching it. iq2xs is at 189 and iq2xxs at 185.
+      +8.8% on iq2xs is 0.75 ms/token off a kernel holding ~65% of
+      decode, which is exactly the 4.9% that turns 0.903 into 0.95:
+      "become bandwidth-bound like the others" and "clear 7.3.1" are
+      the same statement. Re-profile and re-read the ISA before
+      choosing the next variable — two changes have landed since the
+      last read and the binding constraint has moved each time.
+      SECOND CANDIDATE, worth raising because it is now the same size
+      as the gap: 17% of decode is not a mat-vec, and `q8kPackKernel`
+      is 0.44 ms/token of it (129 launches at 3.2 us). llama.cpp pays
+      none of it — it reads f32 activations. The count is already
+      minimal (four per layer, one per distinct activation vector, plus
+      the head; the "we pack once per linear" hypothesis is REFUTED, it
+      would be 225), so it can only be FUSED into the kernel that
+      produces each vector — the norm, the attention output, the GLU.
+      That is ~2.8% on every format, not just IQ2.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
