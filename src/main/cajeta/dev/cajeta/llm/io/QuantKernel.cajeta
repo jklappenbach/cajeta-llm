@@ -4970,6 +4970,16 @@ public final class QuantKernel {
             int64 rows, int64 outDim, int64 cols) {
         int64 wgL = (outDim / 128L) * (rows / 128L);
         KernelStream s = QuantKernel.stream();
+        // 6.4.3: a ragged MoE expert batch takes the halved tile rather
+        // than paying for 128 rows it does not have.
+        if (QuantKernel.coopN64 && rows % 128L != 0L && rows % 64L == 0L) {
+            iq4nlF16CoopN64Kernel.launch(s,
+                grid: [(uint32) ((outDim / 128L) * (rows / 64L))],
+                block: [256])
+                (y, packed, xh, (uint32) rows, (uint32) outDim,
+                 (uint32) (outDim / 128L), cols / 32L);
+            return;
+        }
         if (cols > 8192L) {
             iq4nlF16CoopX1Kernel.launch(s,
                 grid: [(uint32) wgL], block: [256])
@@ -8161,6 +8171,618 @@ public final class QuantKernel {
         a13.store(y, (cb + 48) * outDim + rb + 16, 1, outDim);
     }
 
+    /** 6.4.3's HALVED token tile for IQ2XXS — an MoE expert gets about
+     *  34 of 512 tokens and the 128 tile pays for all 128, so a
+     *  ragged batch takes 64 and reads the slab twice instead. */
+    @Kernel
+    public static void iq2xxsF16CoopN64Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            KernelBuffer<int32> ks, KernelBuffer<int32> grid,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        Shared<int32> sks = shared int32[128];
+        Shared<int32> sgd = shared int32[512];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 64;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 4;
+        uint32 warpC = sg / 4;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 16L;
+        int64 kSteps = blocksPerRow * 4L;
+        int64 cols = blocksPerRow * 256L;
+        uint32 fi = lane;
+        while (fi < 128) { sks[(int64) fi] = ks[(int64) fi]; fi = fi + 256; }
+        fi = lane;
+        while (fi < 512) { sgd[(int64) fi] = grid[(int64) fi]; fi = fi + 256; }
+        Barrier.workgroup();
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        int64 st = 0;
+        while (st < kSteps) {
+            int64 blk = st >> 2;
+            int64 sub = (st & 3L) * 2L + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int32 dwd = packed[rowBase + blk / 2L];
+            int32 dsh = (int32) (blk & 1L) * 16;
+            float32 d = GgufFile.halfBitsToF32((dwd >> dsh) & 65535);
+            int64 qw = rowBase + pw + blk * 16L + sub * 2L;
+            int32 a0 = packed[qw];
+            int32 a1 = packed[qw + 1L];
+            float32 dl = d * (float32) (2 * ((a1 >> 28) & 15) + 1) * 0.125f;
+            int32 l = 0;
+            while (l < 4) {
+                int32 idx = (a0 >> (8 * l)) & 255;
+                int32 sgn = sks[(int64) ((a1 >> (7 * l)) & 127)];
+                int32 glo = sgd[(int64) (2 * idx)];
+                int32 ghi = sgd[(int64) (2 * idx + 1)];
+                int32 j = 0;
+                while (j < 8) {
+                    int32 w = glo;
+                    int32 sh = 8 * j;
+                    if (j >= 4) { w = ghi; sh = 8 * (j - 4); }
+                    int32 v = (w >> sh) & 255;
+                    if (((sgn >> j) & 1) != 0) { v = 0 - v; }
+                    sa[sBase + (int64) (8 * l + j)] = (float16)
+                        (dl * (float32) v);
+                    j = j + 1;
+                }
+                l = l + 1;
+            }
+            Barrier.workgroup();
+            int32 ks2 = 0;
+            while (ks2 < 4) {
+                uint32 ko = (uint32) (16 * ks2);
+                uint32 ab = (warpR * 32) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 64
+                    + warpC * 32)) * cols + st * 64L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                ks2 = ks2 + 1;
+            }
+            Barrier.workgroup();
+            st = st + 1L;
+        }
+        uint32 rb = to * 128 + warpR * 32;
+        uint32 cb = tt * 64 + warpC * 32;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+    }
+
+    /** 6.4.3's HALVED token tile for IQ2XS — an MoE expert gets about
+     *  34 of 512 tokens and the 128 tile pays for all 128, so a
+     *  ragged batch takes 64 and reads the slab twice instead. */
+    @Kernel
+    public static void iq2xsF16CoopN64Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            KernelBuffer<int32> ks, KernelBuffer<int32> grid,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        Shared<int32> sks = shared int32[128];
+        Shared<int32> sgd = shared int32[1024];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 64;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 4;
+        uint32 warpC = sg / 4;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 18L;
+        int64 kSteps = blocksPerRow * 4L;
+        int64 cols = blocksPerRow * 256L;
+        uint32 fi = lane;
+        while (fi < 128) { sks[(int64) fi] = ks[(int64) fi]; fi = fi + 256; }
+        fi = lane;
+        while (fi < 1024) { sgd[(int64) fi] = grid[(int64) fi]; fi = fi + 256; }
+        Barrier.workgroup();
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        int64 st = 0;
+        while (st < kSteps) {
+            int64 blk = st >> 2;
+            int64 sub = (st & 3L) * 2L + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int32 dwd = packed[rowBase + blk / 2L];
+            int32 dsh = (int32) (blk & 1L) * 16;
+            float32 d = GgufFile.halfBitsToF32((dwd >> dsh) & 65535);
+            int64 qw = rowBase + pw + blk * 18L + sub * 2L;
+            int32 w0 = packed[qw];
+            int32 w1 = packed[qw + 1L];
+            int32 scw = packed[rowBase + pw + blk * 18L + 16L + sub / 4L];
+            int32 sc = (scw >> (8 * (int32) (sub & 3L))) & 255;
+            int32 l = 0;
+            while (l < 4) {
+                int32 q = (w0 >> (16 * l)) & 65535;
+                if (l >= 2) { q = (w1 >> (16 * (l - 2))) & 65535; }
+                int32 sgn = sks[(int64) (q >> 9)];
+                int32 idx = q & 511;
+                int32 glo = sgd[(int64) (2 * idx)];
+                int32 ghi = sgd[(int64) (2 * idx + 1)];
+                int32 lsx = sc & 15;
+                if (l >= 2) { lsx = sc >> 4; }
+                float32 dl = d * (float32) (2 * lsx + 1) * 0.125f;
+                int32 j = 0;
+                while (j < 8) {
+                    int32 w = glo;
+                    int32 sh = 8 * j;
+                    if (j >= 4) { w = ghi; sh = 8 * (j - 4); }
+                    int32 v = (w >> sh) & 255;
+                    if (((sgn >> j) & 1) != 0) { v = 0 - v; }
+                    sa[sBase + (int64) (8 * l + j)] = (float16)
+                        (dl * (float32) v);
+                    j = j + 1;
+                }
+                l = l + 1;
+            }
+            Barrier.workgroup();
+            int32 ks2 = 0;
+            while (ks2 < 4) {
+                uint32 ko = (uint32) (16 * ks2);
+                uint32 ab = (warpR * 32) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 64
+                    + warpC * 32)) * cols + st * 64L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                ks2 = ks2 + 1;
+            }
+            Barrier.workgroup();
+            st = st + 1L;
+        }
+        uint32 rb = to * 128 + warpR * 32;
+        uint32 cb = tt * 64 + warpC * 32;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+    }
+
+    /** 6.4.3's HALVED token tile for IQ2S — an MoE expert gets about
+     *  34 of 512 tokens and the 128 tile pays for all 128, so a
+     *  ragged batch takes 64 and reads the slab twice instead. */
+    @Kernel
+    public static void iq2sF16CoopN64Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            KernelBuffer<int32> grid, uint32 tokens, uint32 outDim,
+            uint32 nRowTiles, int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        Shared<int32> sgd = shared int32[2048];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 64;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 4;
+        uint32 warpC = sg / 4;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 20L;
+        int64 kSteps = blocksPerRow * 4L;
+        int64 cols = blocksPerRow * 256L;
+        uint32 fi = lane;
+        while (fi < 2048) { sgd[(int64) fi] = grid[(int64) fi]; fi = fi + 256; }
+        Barrier.workgroup();
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        int64 st = 0;
+        while (st < kSteps) {
+            int64 blk = st >> 2;
+            int64 sub = (st & 3L) * 2L + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int32 dwd = packed[rowBase + blk / 2L];
+            int32 dsh = (int32) (blk & 1L) * 16;
+            float32 d = GgufFile.halfBitsToF32((dwd >> dsh) & 65535);
+            int64 base = rowBase + pw + blk * 20L;
+            int32 idxw = packed[base + sub];
+            int32 sgnw = packed[base + 8L + sub];
+            int32 qhw = packed[base + 16L + sub / 4L];
+            int32 scw = packed[base + 18L + sub / 4L];
+            int32 qh = (qhw >> (8 * (int32) (sub & 3L))) & 255;
+            int32 sc = (scw >> (8 * (int32) (sub & 3L))) & 255;
+            int32 l = 0;
+            while (l < 4) {
+                int32 idx = ((idxw >> (8 * l)) & 255)
+                    | ((qh << (8 - 2 * l)) & 768);
+                int32 sgn = (sgnw >> (8 * l)) & 255;
+                int32 glo = sgd[(int64) (2 * idx)];
+                int32 ghi = sgd[(int64) (2 * idx + 1)];
+                int32 lsx = sc & 15;
+                if (l >= 2) { lsx = sc >> 4; }
+                float32 dl = d * (float32) (2 * lsx + 1) * 0.125f;
+                int32 j = 0;
+                while (j < 8) {
+                    int32 w = glo;
+                    int32 sh = 8 * j;
+                    if (j >= 4) { w = ghi; sh = 8 * (j - 4); }
+                    int32 v = (w >> sh) & 255;
+                    if (((sgn >> j) & 1) != 0) { v = 0 - v; }
+                    sa[sBase + (int64) (8 * l + j)] = (float16)
+                        (dl * (float32) v);
+                    j = j + 1;
+                }
+                l = l + 1;
+            }
+            Barrier.workgroup();
+            int32 ks2 = 0;
+            while (ks2 < 4) {
+                uint32 ko = (uint32) (16 * ks2);
+                uint32 ab = (warpR * 32) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 64
+                    + warpC * 32)) * cols + st * 64L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                ks2 = ks2 + 1;
+            }
+            Barrier.workgroup();
+            st = st + 1L;
+        }
+        uint32 rb = to * 128 + warpR * 32;
+        uint32 cb = tt * 64 + warpC * 32;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+    }
+
+    /** 6.4.3's HALVED token tile for IQ3XXS — an MoE expert gets about
+     *  34 of 512 tokens and the 128 tile pays for all 128, so a
+     *  ragged batch takes 64 and reads the slab twice instead. */
+    @Kernel
+    public static void iq3xxsF16CoopN64Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            KernelBuffer<int32> ks, KernelBuffer<int32> grid,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        Shared<int32> sks = shared int32[128];
+        Shared<int32> sgd = shared int32[256];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 64;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 4;
+        uint32 warpC = sg / 4;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 24L;
+        int64 kSteps = blocksPerRow * 4L;
+        int64 cols = blocksPerRow * 256L;
+        uint32 fi = lane;
+        while (fi < 128) { sks[(int64) fi] = ks[(int64) fi]; fi = fi + 256; }
+        fi = lane;
+        while (fi < 256) { sgd[(int64) fi] = grid[(int64) fi]; fi = fi + 256; }
+        Barrier.workgroup();
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        int64 st = 0;
+        while (st < kSteps) {
+            int64 blk = st >> 2;
+            int64 sub = (st & 3L) * 2L + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int32 dwd = packed[rowBase + blk / 2L];
+            int32 dsh = (int32) (blk & 1L) * 16;
+            float32 d = GgufFile.halfBitsToF32((dwd >> dsh) & 65535);
+            int64 qw = rowBase + pw + blk * 24L + sub * 2L;
+            int32 w0 = packed[qw];
+            int32 w1 = packed[qw + 1L];
+            int32 a = packed[rowBase + pw + blk * 24L + 16L + sub];
+            float32 dl = d * (float32) (2 * ((a >> 28) & 15) + 1) * 0.25f;
+            int32 l = 0;
+            while (l < 4) {
+                int32 sgn = sks[(int64) ((a >> (7 * l)) & 127)];
+                int32 k0 = 2 * l;
+                int32 wq0 = w0;
+                if (k0 >= 4) { wq0 = w1; }
+                int32 q0 = (wq0 >> (8 * (k0 & 3))) & 255;
+                int32 k1 = 2 * l + 1;
+                int32 wq1 = w0;
+                if (k1 >= 4) { wq1 = w1; }
+                int32 q1 = (wq1 >> (8 * (k1 & 3))) & 255;
+                int32 glo = sgd[(int64) q0];
+                int32 ghi = sgd[(int64) q1];
+                int32 j = 0;
+                while (j < 8) {
+                    int32 w = glo;
+                    int32 sh = 8 * j;
+                    if (j >= 4) { w = ghi; sh = 8 * (j - 4); }
+                    int32 v = (w >> sh) & 255;
+                    if (((sgn >> j) & 1) != 0) { v = 0 - v; }
+                    sa[sBase + (int64) (8 * l + j)] = (float16)
+                        (dl * (float32) v);
+                    j = j + 1;
+                }
+                l = l + 1;
+            }
+            Barrier.workgroup();
+            int32 ks2 = 0;
+            while (ks2 < 4) {
+                uint32 ko = (uint32) (16 * ks2);
+                uint32 ab = (warpR * 32) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 64
+                    + warpC * 32)) * cols + st * 64L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                ks2 = ks2 + 1;
+            }
+            Barrier.workgroup();
+            st = st + 1L;
+        }
+        uint32 rb = to * 128 + warpR * 32;
+        uint32 cb = tt * 64 + warpC * 32;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+    }
+
+    /** 6.4.3's HALVED token tile for IQ3S — an MoE expert gets about
+     *  34 of 512 tokens and the 128 tile pays for all 128, so a
+     *  ragged batch takes 64 and reads the slab twice instead. */
+    @Kernel
+    public static void iq3sF16CoopN64Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            KernelBuffer<int32> grid, uint32 tokens, uint32 outDim,
+            uint32 nRowTiles, int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        Shared<int32> sgd = shared int32[512];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 64;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 4;
+        uint32 warpC = sg / 4;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 27L;
+        int64 kSteps = blocksPerRow * 4L;
+        int64 cols = blocksPerRow * 256L;
+        uint32 fi = lane;
+        while (fi < 512) { sgd[(int64) fi] = grid[(int64) fi]; fi = fi + 256; }
+        Barrier.workgroup();
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        int64 st = 0;
+        while (st < kSteps) {
+            int64 blk = st >> 2;
+            int64 sub = (st & 3L) * 2L + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int32 dwd = packed[rowBase + blk / 2L];
+            int32 dsh = (int32) (blk & 1L) * 16;
+            float32 d = GgufFile.halfBitsToF32((dwd >> dsh) & 65535);
+            int64 base = rowBase + pw + blk * 27L;
+            int32 qhw = packed[base + 16L + sub / 4L];
+            int32 qh = (qhw >> (8 * (int32) (sub & 3L))) & 255;
+            int32 sgnw = packed[base + 18L + sub];
+            int32 scw = packed[base + 26L];
+            int32 sc = (scw >> (8 * (int32) (sub / 2L))) & 255;
+            int32 nib = sc & 15;
+            if ((sub & 1L) == 1L) { nib = sc >> 4; }
+            float32 dl = d * (float32) (1 + 2 * nib);
+            int32 w0 = packed[base + sub * 2L];
+            int32 w1 = packed[base + sub * 2L + 1L];
+            int32 l = 0;
+            while (l < 4) {
+                int32 sgn = (sgnw >> (8 * l)) & 255;
+                int32 k0 = 2 * l;
+                int32 wq0 = w0;
+                if (k0 >= 4) { wq0 = w1; }
+                int32 q0 = (wq0 >> (8 * (k0 & 3))) & 255;
+                int32 k1 = 2 * l + 1;
+                int32 wq1 = w0;
+                if (k1 >= 4) { wq1 = w1; }
+                int32 q1 = (wq1 >> (8 * (k1 & 3))) & 255;
+                int32 glo = sgd[(int64) (q0 | ((qh << (8 - 2 * l)) & 256))];
+                int32 ghi = sgd[(int64) (q1 | ((qh << (7 - 2 * l)) & 256))];
+                int32 j = 0;
+                while (j < 8) {
+                    int32 w = glo;
+                    int32 sh = 8 * j;
+                    if (j >= 4) { w = ghi; sh = 8 * (j - 4); }
+                    int32 v = (w >> sh) & 255;
+                    if (((sgn >> j) & 1) != 0) { v = 0 - v; }
+                    sa[sBase + (int64) (8 * l + j)] = (float16)
+                        (dl * (float32) v);
+                    j = j + 1;
+                }
+                l = l + 1;
+            }
+            Barrier.workgroup();
+            int32 ks2 = 0;
+            while (ks2 < 4) {
+                uint32 ko = (uint32) (16 * ks2);
+                uint32 ab = (warpR * 32) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 64
+                    + warpC * 32)) * cols + st * 64L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                ks2 = ks2 + 1;
+            }
+            Barrier.workgroup();
+            st = st + 1L;
+        }
+        uint32 rb = to * 128 + warpR * 32;
+        uint32 cb = tt * 64 + warpC * 32;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+    }
+
+    /** 6.4.3's HALVED token tile for IQ4NL — an MoE expert gets about
+     *  34 of 512 tokens and the 128 tile pays for all 128, so a
+     *  ragged batch takes 64 and reads the slab twice instead. */
+    @Kernel
+    public static void iq4nlF16CoopN64Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            uint32 tokens, uint32 outDim, uint32 nRowTiles,
+            int64 blocksPerRow) {
+        Shared<float16> sa = shared float16[128 * 72];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 nTokTiles = tokens / 64;
+        uint32 tt = wg % nTokTiles;
+        uint32 to = wg / nTokTiles;
+        uint32 aRow = lane & 127;
+        uint32 aHalf = lane >> 7;
+        uint32 sg = lane / 32;
+        uint32 warpR = sg % 4;
+        uint32 warpC = sg / 4;
+        // `blocksPerRow` is 32-ELEMENT blocks (cols/32), not
+        // superblocks — this format has no 256 structure, and the
+        // compute tile only needs cols % 64 == 0 (BK=64). That is
+        // what lets Qwen-72B's ffn_down (29568 = 924 blocks) batch.
+        int64 rowWords = blocksPerRow * 5L;
+        int64 kBlocks = blocksPerRow;
+        int64 cols = kBlocks * 32L;
+        CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+        CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+        int64 kb = 0;
+        while (kb < kBlocks) {
+            int64 kbh = kb + (int64) aHalf;
+            int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+            int64 rowBase = ((int64) (to * 128 + aRow)) * rowWords;
+            int64 ro = rowBase + kbh * 5L;
+            float32 d = GgufFile.halfBitsToF32(packed[ro] & 65535);
+            Vector<int32,4> qv = packed.vload<4>(ro + 1L);
+            int32 e = 0;
+            while (e < 4) {
+                int32 w = qv[e];
+                int32 bi = 0;
+                while (bi < 4) {
+                    int32 by = (w >> (8 * bi)) & 255;
+                    int64 j = (int64) (4 * e + bi);
+                    sa[sBase + j] = (float16)
+                        (d * (float32) QuantKernel.iq4KvS(by & 15));
+                    sa[sBase + j + 16L] = (float16)
+                        (d * (float32) QuantKernel.iq4KvS((by >> 4) & 15));
+                    bi = bi + 1;
+                }
+                e = e + 1;
+            }
+            Barrier.workgroup();
+            int32 ks = 0;
+            while (ks < 4) {
+                uint32 ko = (uint32) (16 * ks);
+                uint32 ab = (warpR * 32) * 72 + ko;
+                uint32 bb2 = (uint32) (((int64) (tt * 64
+                    + warpC * 32)) * cols + kb * 32L + (int64) ko);
+                uint32 cst = (uint32) cols;
+                CooperativeMatrix<float16,16,16,0> t0;
+                CooperativeMatrix<float16,16,16,0> t1;
+                t0.load(sa, ab, 0, 72);
+                t1.load(sa, ab + 1152, 0, 72);
+                CooperativeMatrix<float16,16,16,1> u0;
+                CooperativeMatrix<float16,16,16,1> u1;
+                u0.load(xh, bb2, 1, cst);
+                u1.load(xh, bb2 + 16 * cst, 1, cst);
+                a00.mma(t0, u0);
+                a01.mma(t0, u1);
+                a10.mma(t1, u0);
+                a11.mma(t1, u1);
+                ks = ks + 1;
+            }
+            Barrier.workgroup();
+            kb = kb + 2L;
+        }
+        uint32 rb = to * 128 + warpR * 32;
+        uint32 cb = tt * 64 + warpC * 32;
+        a00.store(y, cb * outDim + rb, 1, outDim);
+        a01.store(y, (cb + 16) * outDim + rb, 1, outDim);
+        a10.store(y, cb * outDim + rb + 16, 1, outDim);
+        a11.store(y, (cb + 16) * outDim + rb + 16, 1, outDim);
+    }
     /** 6.4.2's doubled token tile for IQ2XXS — the X3 body with a
      *  256-token tile, so each staged slab is dequantized once per
      *  256 tokens. Needs `tokens % 256 == 0`. */
@@ -8887,9 +9509,18 @@ public final class QuantKernel {
         int64 bpr = cols / 256L;
         // 6.4.2: the doubled token tile where the batch allows it — the
         // A side these formats spend most of their time on is read once
-        // per 256 tokens instead of once per 128.
+        // per 256 tokens instead of once per 128. 6.4.3: and the HALVED
+        // one where the batch is ragged, which is every MoE expert.
         boolean n2 = QuantKernel.coopN256 && rows % 256L == 0L;
         uint32 w2 = (uint32) ((outDim / 128L) * (rows / 256L));
+        boolean n6 = QuantKernel.coopN64 && rows % 128L != 0L
+            && rows % 64L == 0L;
+        uint32 w6 = (uint32) ((outDim / 128L) * (rows / 64L));
+        if (n6) {
+            QuantKernel.iqF16CoopN64Launch(ty, y, packed, xh, rows, outDim,
+                cols);
+            return;
+        }
         if (ty == Quant.GG_IQ2_XXS) {
             if (n2) {
                 iq2xxsF16CoopN256Kernel.launch(s, grid: [w2], block: [256])
@@ -8989,6 +9620,60 @@ public final class QuantKernel {
             (y, packed, xh, QuantKernel.iq3sDev, (uint32) rows,
              (uint32) outDim, (uint32) (outDim / 128L), cols / 256L);
         return;
+    }
+
+    /** 6.4.3's halved token tile, by format. */
+    public static void iqF16CoopN64Launch(int32 ty,
+            KernelBuffer<float32> y, KernelBuffer<int32> packed,
+            KernelBuffer<float16> xh, int64 rows, int64 outDim, int64 cols) {
+        QuantKernel.ensureIqTables();
+        KernelStream s = QuantKernel.stream();
+        uint32 w6 = (uint32) ((outDim / 128L) * (rows / 64L));
+        uint32 tk = (uint32) rows;
+        uint32 od = (uint32) outDim;
+        uint32 rt = (uint32) (outDim / 128L);
+        int64 bpr = cols / 256L;
+        if (ty == Quant.GG_IQ2_XXS) {
+            iq2xxsF16CoopN64Kernel.launch(s, grid: [w6], block: [256])
+                (y, packed, xh, QuantKernel.iqKsignsDev,
+                 QuantKernel.iq2xxsDev, tk, od, rt, bpr);
+        } else if (ty == Quant.GG_IQ2_XS) {
+            iq2xsF16CoopN64Kernel.launch(s, grid: [w6], block: [256])
+                (y, packed, xh, QuantKernel.iqKsignsDev,
+                 QuantKernel.iq2xsDev, tk, od, rt, bpr);
+        } else if (ty == Quant.GG_IQ3_XXS) {
+            iq3xxsF16CoopN64Kernel.launch(s, grid: [w6], block: [256])
+                (y, packed, xh, QuantKernel.iqKsignsDev,
+                 QuantKernel.iq3xxsDev, tk, od, rt, bpr);
+        } else if (ty == Quant.GG_IQ2_S) {
+            iq2sF16CoopN64Kernel.launch(s, grid: [w6], block: [256])
+                (y, packed, xh, QuantKernel.iq2sDev, tk, od, rt, bpr);
+        } else {
+            iq3sF16CoopN64Kernel.launch(s, grid: [w6], block: [256])
+                (y, packed, xh, QuantKernel.iq3sDev, tk, od, rt, bpr);
+        }
+        return;
+    }
+
+    static boolean coopN64 = true;
+
+    /** 6.4.3's A/B arm: off sends every ragged batch back to the
+     *  128-token tile with its dead rows. */
+    public static void setCoopN64(boolean on) { QuantKernel.coopN64 = on; }
+
+    public static boolean coopN64On() { return QuantKernel.coopN64; }
+
+    /** The token-tile granularity a format's coop GEMM can be padded
+     *  to: 64 where a halved tile exists, else the 128 the X3 pair
+     *  needs. */
+    public static int64 coopPadGrain(int32 ty) {
+        if (!QuantKernel.coopN64) { return 128L; }
+        if (ty == Quant.GG_IQ2_XXS || ty == Quant.GG_IQ2_XS
+                || ty == Quant.GG_IQ2_S || ty == Quant.GG_IQ3_XXS
+                || ty == Quant.GG_IQ3_S || ty == Quant.GG_IQ4_NL) {
+            return 64L;
+        }
+        return 128L;
     }
 
     static boolean coopN256 = true;

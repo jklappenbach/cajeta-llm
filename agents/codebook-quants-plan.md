@@ -732,9 +732,68 @@ every timing leg and wait for the go; filtered suite only
       `coopView` like `checkFormatAt` does, and the red-to-green
       transition is the evidence that the case is a live gate rather
       than a shape the suite never reaches.
-- [ ] 6.4.3 The Qwen1.5-MoE at 0.27× / 0.26×. Expert residency is the
+- [~] 6.4.3 The Qwen1.5-MoE at 0.27× / 0.26×. Expert residency is the
       first suspect (the CLI ledger held 678 MB of 6.3 GB of expert
       bytes), so measure what the bank admits before touching a kernel.
+      MEASURED FIRST, as the item says, and THE NAMED SUSPECT IS
+      REFUTED. `residentKb` reads 6,969,468 — 6.97 GB — against a 6.3 GB
+      expert set, so the bank now admits essentially everything and
+      residency is not the cause. Re-measured baseline 2026-09-17 after
+      Unit 7 and 6.4.2, which reached this file not at all: prefill
+      615.3 against Vulkan's 2297.5 (0.268x), decode 36.75 against
+      138.11 (0.266x).
+      WHAT THE PREFILL CENSUS SAYS (512 tokens, device time):
+
+      | kernel | ms | share | what it is |
+      |---|---|---|---|
+      | iq4nlF16CoopX3 | 299.3 | 29.1% | per-expert GEMM |
+      | blockRepack2Kernel | 189.7 | 18.4% | layout conversion |
+      | iq3xxsF16CoopX3 | 184.9 | 18.0% | per-expert GEMM |
+      | iq3xxsF16CoopN256 | 102.3 | 9.9% | the shared expert |
+      | splitKernel | 95.7 | 9.3% | layout conversion |
+
+      FOUR CAUSES, none of them residency:
+      1. THE EXPERT GEMM PAYS FOR ROWS IT DOES NOT HAVE.
+         `Linear.cajeta` padded every coop batch to 128 tokens
+         (`(rows + 127) / 128 * 128`), and with top-4 over 60 experts a
+         512-token prefill gives each expert about 34. That is 3.7x of
+         dead rows, and 3.7x is the size of the whole gap. Confirmed by
+         arithmetic: the expert GEMMs run at ~11 TFLOP/s on the rows
+         they compute and ~2.9 effective.
+      2. LAYOUT CONVERSION AT RUNTIME is 27.7% of prefill —
+         `blockRepack2Kernel` 1420 launches (one per expert per layer,
+         on first admission) and `splitKernel` 264. This is Unit 9's
+         item 9.2.1 (`coopNeedsRepack`, the repack machinery) showing up
+         as a third of the MoE's prefill. llama.cpp charges the same
+         work to LOAD; we charge it to the first prefill that touches an
+         expert, and a fresh process per leg rep pays it every time.
+      3. DECODE STILL DISPATCHES PER EXPERT: 288 `iq3xxsQ8WaveMatVec`
+         and 96 `iq4nlMatVec` launches a token, 384 where llama.cpp
+         issues about 72.
+      4. IQ4_NL DECODES THROUGH `iq4nlMatVecKernel`, the ONE-ITEM-PER-ROW
+         kernel 7.1.4 measured at 1.8-3.7x worse than a wave — 3072
+         launches, 90.4 ms, 7.2%. IQ4_NL has no resident wave mat-vec
+         because it is one of Unit 9's unmigrated formats.
+      CAUSE 1 IS FIXED HERE, because it is not Unit 9's and it helps any
+      ragged batch anywhere. A 64-token tile for all five codebook coop
+      kernels and IQ4_NL's (`*F16CoopN64Kernel`: the X3 body with
+      `warpC` over 32 tokens and four accumulators instead of eight),
+      and `Linear` now pads to the finest tile the format has
+      (`QuantKernel.coopPadGrain`). 86-148 vgpr, no spill — LIGHTER than
+      the X3 kernels they relieve, so occupancy improves too. Prefill
+      612 -> 657 t/s, 0.268 -> 0.286; `iq3xxsF16Coop` 184.9 -> 126.8 ms
+      (-31%), `iq4nlF16Coop` 299.3 -> 283.2 (-5%). Dense prefill is
+      untouched: a 512-token chunk still pads to 512 and takes N256
+      (iq3_s 1420.7 t/s against 1419.6, decode 54.78 against 54.99).
+      IQ4_NL gained least and the reason is worth chasing later — its
+      per-launch time barely moved (197 -> 180 us) where IQ3_XXS's fell
+      with the tile, so that kernel is not padding-bound.
+      BLOCKED ON UNIT 9 for the rest. Causes 2 and 4 are Unit 9's items
+      by definition — the repack machinery and the IQ4_NL migration —
+      and cause 3 needs a grouped id-GEMM over the expert dimension that
+      the codebook formats do not have. Re-open this item when Unit 9
+      lands; nothing else here is worth doing before it, because a third
+      of the prefill is work Unit 9 deletes outright.
 
 
 ## Unit 7 — The decode bandwidth gap (spec §6, §8.5, 12.1; folds 4.3.5 and 6.4.1)
