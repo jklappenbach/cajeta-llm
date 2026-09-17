@@ -1087,7 +1087,7 @@ every timing leg and wait for the go; filtered suite only
       body's own rate on these shapes, so the remaining 14% to
       llama.cpp (Vulkan) on prefill is a kernel-rate question under
       7.2.1's method (ISA read first, one variable at a time).
-- [~] 6.4.6 The grouped coop bodies' rate: prefill past 0.856x. The
+- [x] 6.4.6 The grouped coop bodies' rate: prefill past 0.856x. The
       6.4.4 census left two kernels at 61% of the prefill window, down's
       `iq4nlF16CoopIdN64` 2.4x slower a launch than gate/up's iq3xxs
       twin at equal FLOPs. ISA READ FIRST (KernelIsa manifests):
@@ -1170,8 +1170,32 @@ every timing leg and wait for the go; filtered suite only
       prefill: the grouped bodies 55 ms, the shared expert's dense
       N256 bodies 47 ms (same expansion, 16-19 TFLOPS, no ragged
       waste), the f32 router GEMM 10 ms (203 us a launch for 126
-      MFLOP), and ~50 ms the device is idle — the host-anchored
-      routing (sync, download, top-k, map build, upload) once a layer.
+      MFLOP), and the device idle ~10% of the window (a 50 ms scan of
+      the device tier: the prefill sits at 90% busy, decode at 80%).
+      The scan also shows where the other 48 grouped launches live:
+      not a second prefill but one full-size launch a layer spread
+      through the LOAD phase, [250, 1550) ms at 17% device-busy — a
+      per-layer warm-up forward interleaved with the upload, 1.3 s of
+      the 2.1 s load. Not this item's; noted for the load leg.
+      NEXT PROBE: every wave in a workgroup loads its own activation
+      tiles from global — the four row-waves sharing one token slab
+      fetch it four times, and every row tile refetches it — ~800 MB
+      of L2 traffic a launch against 66 MB of slab. PROBED (all tile
+      loads pointed at one cache-resident block, timing only): 778 ->
+      640 us (iq3xxs), 753 -> 665 us (iq4nl). Activation traffic is
+      ~15% of a launch, so staging the token slab through LDS (9 KB
+      more, one more barrier, likely one group/CU) is bounded at a few
+      percent of prefill and is NOT built. Reverted.
+      WHERE THIS LEAVES 6.4.6: prefill 1.194x of llama.cpp (Vulkan),
+      decode 0.876x (untouched by this item). The ~640 us that remain
+      in a grouped launch are the body itself — expansion, the LDS
+      round trip, two barriers a k-step — at 23 TFLOPS effective
+      against 59; the shared expert's dense N256 bodies (47 ms a
+      prefill, 24%) sit at the same 28% of peak with no ragged waste.
+      A body-level redesign (weights AND activations staged, a wider
+      token tile per wave) is the next lever and a new item, not a
+      residue of this one. Also noted: the 1.3 s per-layer warm-up
+      inside load, for the load leg.
 - [ ] 6.4.5 The precision choice on the down projection. The zero-sync
       row runs down through the integer id kernel on q8_K-packed
       gate*up; the route it replaced ran the f32 wave. Router faithful
