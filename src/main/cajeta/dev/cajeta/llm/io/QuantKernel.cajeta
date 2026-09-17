@@ -6351,6 +6351,64 @@ public final class QuantKernel {
     }
 
     /**
+     * The DWORD form of {@link #splitKernel}: one work item per payload
+     * dword rather than one wave per block.
+     *
+     * The scale sits at one END of the block by construction, so a
+     * block's payload is a single contiguous run in the source, and its
+     * destination is dword-aligned because the row prefix is padded to
+     * one. The byte form gave every block a 64-lane wave and walked it
+     * a byte at a time: an 18-byte IQ4_NL block left 46 lanes idle and
+     * issued 18 byte-writes where this issues 4 dword-writes, coalesced
+     * across the wave.
+     */
+    @Kernel
+    public static void splitPayloadKernel(KernelBuffer<int32> outW,
+            KernelBuffer<int8> src, uint32 total, int64 blockBase,
+            uint32 blockBytes, uint32 payloadWords, uint32 srcPayloadOff,
+            int64 bpr, int64 prefixWords, int64 rowWords) {
+        uint32 t = KernelThread.globalIdX();
+        if (t < total) {
+            int64 b = (int64) (t / payloadWords);
+            int64 k = (int64) (t % payloadWords);
+            int64 gb = blockBase + b;
+            int64 row = gb / bpr;
+            int64 j = gb - row * bpr;
+            int64 so = b * (int64) blockBytes + (int64) srcPayloadOff
+                + k * 4L;
+            int32 w = ((int32) src[so] & 255)
+                | (((int32) src[so + 1L] & 255) << 8)
+                | (((int32) src[so + 2L] & 255) << 16)
+                | (((int32) src[so + 3L] & 255) << 24);
+            outW[row * rowWords + prefixWords
+                + j * (int64) payloadWords + k] = w;
+        }
+    }
+
+    /** The scale half of the dword split: one work item per block, two
+     *  bytes each, into the row's scale prefix. */
+    @Kernel
+    public static void splitScaleKernel(KernelBuffer<int8> out,
+            KernelBuffer<int8> src, uint32 nBlocks, int64 blockBase,
+            uint32 blockBytes, uint32 scaleBytes, uint32 scaleOffset,
+            int64 bpr, int64 rowBytes) {
+        uint32 t = KernelThread.globalIdX();
+        if (t < nBlocks) {
+            int64 b = (int64) t;
+            int64 gb = blockBase + b;
+            int64 row = gb / bpr;
+            int64 j = gb - row * bpr;
+            int64 so = b * (int64) blockBytes + (int64) scaleOffset;
+            int64 sco = row * rowBytes + j * (int64) scaleBytes;
+            uint32 q = 0;
+            while (q < scaleBytes) {
+                out[sco + (int64) q] = src[so + (int64) q];
+                q = q + 1;
+            }
+        }
+    }
+
+    /**
      * The resident-layout split (codebook-quants spec §10): file block
      * `blockBase + b` lands in its row's scale prefix and payload run of
      * `out`. One wave per block, lane l copying bytes l, l+64, ...; runs
@@ -6393,6 +6451,29 @@ public final class QuantKernel {
             int32 ty, int64 bpr) {
         KernelStream s = QuantKernel.stream();
         int64 prefix = Quant.rowPrefixBytes(ty, bpr);
+        int64 rowBytes = Quant.rowResidentBytes(ty, bpr);
+        int64 pay = (int64) Quant.payloadBytes(ty);
+        int64 scaleB = (int64) Quant.scaleBytes(ty);
+        int64 scaleOff = (int64) Quant.scaleOffset(ty);
+        if (pay % 4L == 0L && prefix % 4L == 0L && rowBytes % 4L == 0L) {
+            KernelBuffer<int32> outW #= out.wordView();
+            int64 pw = pay / 4L;
+            int64 total = nBlocks * pw;
+            int64 srcPayOff = 0L;
+            if (scaleOff == 0L) { srcPayOff = scaleB; }
+            splitPayloadKernel.launch(s,
+                grid: [(uint32) ((total + 255L) / 256L)], block: [256])
+                (outW, src, (uint32) total, blockBase,
+                 (uint32) Quant.blockBytes(ty), (uint32) pw,
+                 (uint32) srcPayOff, bpr, prefix / 4L, rowBytes / 4L);
+            splitScaleKernel.launch(s,
+                grid: [(uint32) ((nBlocks + 255L) / 256L)], block: [256])
+                (out, src, (uint32) nBlocks, blockBase,
+                 (uint32) Quant.blockBytes(ty), (uint32) scaleB,
+                 (uint32) scaleOff, bpr, rowBytes);
+            s.sync();
+            return;
+        }
         splitKernel.launch(s, grid: [(uint32) nBlocks], block: [64])
             (out, src, (uint32) nBlocks, blockBase,
              (uint32) Quant.blockBytes(ty), (uint32) Quant.payloadBytes(ty),

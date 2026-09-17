@@ -2025,6 +2025,44 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       started.
 
 
+- [x] 9.2.6 `splitKernel`'s lane mapping, recorded under 9.2.1 and 6.4.3
+      and deferred twice. It gave every block a 64-lane wave and walked
+      it a byte at a time, so an 18-byte IQ4_NL block left 46 lanes idle.
+      Now one work item per payload DWORD: the scale sits at one end by
+      construction, so a block's payload is a single contiguous run in
+      the source and its destination is dword-aligned because the row
+      prefix is padded to one. The scales go in a second kernel, one
+      item per block, which keeps the word view unaliased. The byte
+      kernel stays for a payload that is not dword-clean — every split
+      type is, but Unit 8's IQ1 pair is not migrated yet.
+      MEASURED, ABBA, three reps a pass, on LOAD MS because that is
+      where the split runs:
+
+      | file | block | pre | post | delta |
+      |---|---|---|---|---|
+      | iq4_nl 8B | 18 B (4 dw) | 2883 | 2578 | -10.6% |
+      | MoE iq3_xxs | 98 B (24 dw) | 2265 | 2090 | -7.7% |
+      | Q6_K 8B | 210 B (52 dw) | 3333 | 3326 | -0.2% |
+
+      Prefill and decode flat on all three, which is right for bind-time
+      work.
+      Q6_K IS THE CONTROL AND IT COULD HAVE REFUTED THIS. A 210-byte
+      block already fills the wave (3.3 iterations, ~77%) and still
+      issues 210 byte-writes against 52 dword-writes — so if the DWORD
+      conversion were doing the work, Q6_K would have gained. It did
+      not. The gain is the lane mapping alone, and the 16x cut in
+      dispatched threads that comes with it (one 64-thread workgroup per
+      block becomes four items).
+      UNRECONCILED, and it should not be trusted until it is: 9.2.1
+      records this kernel as 23.2% of MoE PREFILL, 336 launches at
+      866 us. The saving here is 175 ms on that model and it lands in
+      LOAD, not prefill — MoE prefill read 906 t/s on both arms. 866 us
+      of GPU time cannot explain 175 ms of wall, so that attribution was
+      measuring GPU-busy inside a phase where most of this cost is
+      invisible. The 23.2% figure needs re-deriving before anyone calls
+      it the MoE's top item again.
+
+
 ### 9.3 Acceptance
 - [~] 9.3.1 Filtered suite green.
       `LinearKernelRouteTest` was never IN the filtered suite, and
