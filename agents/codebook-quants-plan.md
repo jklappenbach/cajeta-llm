@@ -632,9 +632,19 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       flat A/B without this read proves nothing.
       GREEN on all sixteen wave kernels (`bench/KernelIsa`, which
       already existed for exactly this); the counts are in 7.2.1.
-- [ ] 7.1.3 The exactness gate: every Q8-twin, coop and fixture test in
+- [x] 7.1.3 The exactness gate: every Q8-twin, coop and fixture test in
       `TernaryTest` and `IqCodebookTest` still passes after any rewrite.
       A faster kernel that is not the same kernel is not a fix.
+      HELD THROUGH EVERY VARIABLE of 7.2.2 — the filtered suite was run
+      after each edit and never went green on a shortcut: it grew 229 ->
+      240 -> 253 as the fused paths that the unit reached needed cases
+      of their own (`NormPackTest`'s four fused-width cases,
+      `Gqa8FlashDecodeTest.reducePackMatchesReduceThenPackGqa4`). The
+      suite now carries `Gqa8FlashDecodeTest`, `ResidentMoeDecodeTest`,
+      `QkNormBatchTest` and `BackendParityTest` as well. The seventh
+      variable also passes the end-to-end form of the same gate: the
+      greedy stream of 128 tokens on llama8b-iq2_xs is byte-identical
+      across the change.
 - [x] 7.1.5 The CPU control: would either family decode faster on the
       CPU? This box is a Zen 5 with AVX512-VNNI and VBMI sharing one
       LPDDR5X pool with the iGPU, so neither side wins on the bus.
@@ -1174,9 +1184,144 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       — give `rmsnormRowF32` the wave form too, so both shift together
       — would recover 0.12% while touching a kernel every model runs,
       and is not worth it. The variant and its bench were deleted.
-- [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
+      SIXTH VARIABLE MEASURED AND REVERTED, 2026-09-16. The two-bit
+      codebook was built exactly as predicted and is FLAT, so the
+      gather-width reading of the table above is REFUTED. The three
+      IQ2 kernels gathered `IqGrid.iq2xxs2b/iq2xs2b/iq2s2b` (one
+      `int32` per entry, verified byte-for-byte against the int64
+      tables), spread the eight two-bit codes to byte lanes, OR'd the
+      sign bit in at bit 2 and took magnitude AND sign from one
+      `Vector.lut4` over {8, 25, 43, 0, -8, -25, -43, 0}. `b64` per
+      body went 10 -> 0 and the codebook halved, exactly as written
+      down. Same box, `iq3xxs`/`iq3s`/`q4_k` as in-run controls
+      (198.9 / 202.6 / 205.8 against the reference round's 199.7 /
+      203.2 / 207, so the box is 0.3-0.6% slower and the arms are
+      comparable):
+
+      | kernel | 8-byte grid | 2-bit grid | control-adjusted |
+      |---|---|---|---|
+      | iq2xxs | 184.8 | 183.7 | -0.2% |
+      | iq2xs | 189.1 | 187.5 | -0.5% |
+      | iq2s | 188.6 | 190.5 | +1.4% |
+
+      A COMPILER FIX CAME OUT OF IT AND STAYS. `Vector.lut4` lowered to
+      THREE `v_perm_b32` per dword unconditionally — one per table
+      half plus a select off the index's bit 3 — even when the index
+      cannot reach the high half. `AmdgpuKernelLowering::byteLut16` now
+      peels the receiver's slot load and bitcasts, and when the index
+      is visibly `& <constant with bit 3 clear in every byte>` it emits
+      the low perm alone: 48 perms per body -> 16, VGPR 60. LLVM will
+      not do this for us — the selector DOES fold to the constant
+      `0x03020100` under `-O2`, but nothing simplifies
+      `llvm.amdgcn.perm(a, b, 0x03020100)` to `b` (checked directly
+      against llvm-22). Worth 0 to 3% here and inert for `& 15` users
+      (mxfp4, iq4_nl), which is every other caller today.
+      THEN THE THREE-PROBE SWEEP THAT SAID WHERE THE TIME IS. Each
+      probe keeps the loop shape, the load count and the launch
+      geometry and varies ONE mechanism, at 14336x4096:
+
+      | probe | iq2xxs | iq2xs | iq2s |
+      |---|---|---|---|
+      | shipping (2-bit) | 183.7 | 187.5 | 190.5 |
+      | every gather masked to 8 entries | 181.2 | 187.7 | 190.4 |
+      | all decode arithmetic deleted | 190.5 | 195.1 | 195.3 |
+      | four rows per wave (iq2xs only) | - | 149.2 | - |
+
+      The codebook gather COSTS NOTHING: collapse all 32 lanes onto one
+      cache line and the number does not move. Deleting every sign,
+      spread, permute and expansion — leaving the loads, the four
+      `v_dot4` and the scales — buys 2.5-4.1%. And four rows per wave
+      reproduces its earlier regression (-20%) now that the codebook is
+      half the size, so it is register pressure, not the table.
+      WHAT IS LEFT IS A FIXED PER-VALUE COST, and it fits every format
+      on the box with two constants. Let w be weight bytes per value;
+      time per value is `w/229 + 0.000267` (us-scale), so the reported
+      weight-GB/s is `w / (w/229 + b)`:
+
+      | kernel | w | predicted | measured |
+      |---|---|---|---|
+      | q4_k | 0.563 | 207 (fit) | 206-207 |
+      | iq3s | 0.410 | 200 | 202.6 |
+      | iq3xxs | 0.365 | 196 | 198.9 |
+      | iq2s | 0.305 | 191 | 190.5 |
+      | iq2xs | 0.289 | 189 | 187.5 |
+      | iq2xxs | 0.246 | 184 (fit) | 183.7 |
+
+      THE IQ2 KERNELS ARE ALREADY AT THE SAME MACHINE LIMIT AS Q4_K.
+      Their lower weight-GB/s is arithmetic, not slack: the same fixed
+      cost divided by fewer weight bytes. 1/229 GB/s is the streaming
+      rate and `b` is the per-value overhead every format pays — of
+      which the measured arithmetic is 0.000061, about a quarter. A
+      format at 0.289 bytes per value cannot reach 207 while `b` is
+      that size, whatever the kernel does with the codebook.
+      SEVENTH VARIABLE, and the one that paid: GQA x4 in unit 50's
+      fused reduce+pack allow-list — the last unfused pack per dense
+      layer, named as open in the pack-fusion record above.
+      `attendDecodePartialsLaunchNoSync` served `nH == nKv` and
+      `nH == 8 * nKv`; llama-3-8B is `nH == 4 * nKv`, so every dense
+      layer paid a separate `attnFlashDecodeReduceKernel` AND a
+      separate `q8kPackKernel`. Both GQA kernels already write `part`
+      indexed by q-head — the comment on the x8 kernel says so — and
+      `attnReducePackQ8Kernel` reads it that way, so the fused form
+      needed only the ratio in the gate and the x4 kernel in the
+      branch. The test oracle `attendDecodePairLaunchNoSync` picks the
+      same kernel by ratio, so the new case isolates the FUSION.
+      Profiled on llama8b-iq2_xs, 128 tokens:
+
+      | kernel | before | after |
+      |---|---|---|
+      | attnFlashDecodeReduceKernel | 4096 x 14.58 us = 59.7 ms | gone |
+      | q8kPackKernel | 4288 x 3.54 us = 15.2 ms | 192 x 20.0 us = 3.8 ms |
+      | attnReducePackQ8Kernel | - | 4096 x 6.10 us = 25.0 ms |
+
+      46 ms of 1.79 s and 8192 fewer launches a run; decode 15.288 ->
+      14.852 ms/token under the profiler, -2.9%. The reduce was the
+      one non-mat-vec kernel whose cost was latency rather than work:
+      14.58 us to combine ~131 KB of partials is 9 GB/s.
+      THE DECODE CENSUS AFTER IT, same run, device time per token:
+      iq2xs wave 9.69 ms (71%), the Q5_K head 1.55 (11.4%), attention
+      0.67 (4.9%), q4k+q2k 0.81 (6.0%), norm+pack 0.36, add 0.24,
+      glu+pack 0.12, qkPrep 0.09, rope 0.04. Weight mat-vec is 88% and
+      the model above says that 88% is at the machine limit, so what
+      remains to win is the 12% and it is already down to launch-sized
+      pieces.
+      EIGHTH VARIABLE, the same shape of finding once more: the
+      accumulate form existed and could not be reached. Unit 48 built
+      `Linear.matvecStagedAccum` so "the residual add rides the
+      o-projection's store", and it served the Q4_K and Q6_K wave
+      routes only — an IQ model fell through to a separate `addF32`
+      launch. The MLP tail never even asked: its residual was an
+      unconditional `Prim.addDevice` after `matvecStagedKeep`. So a
+      dense layer paid TWO whole launches of a 5-VGPR kernel, 65 a
+      token, to add 4096 floats twice.
+      The five IQ wave kernels take the `accum` flag the Q4_K and Q6_K
+      kernels already carried, `matvecStagedAccum` serves `waveIq`, and
+      the down projection asks for it. `addF32` 8320 launches -> 640,
+      30.2 ms -> 11.7 ms over 128 tokens; decode 14.852 -> 14.709
+      ms/token under the profiler. The greedy stream is byte-identical
+      across both variables — the add is the same f32 add in the same
+      order, only the launch is gone.
+- [x] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
+      AUDITED AND NOT NEEDED, which the ISA read settles rather than
+      assumes. 27 launch sites pass a non-literal block; only an integer
+      LITERAL pins `amdgpu-flat-work-group-size` (`Compiler.cpp`'s
+      `constBlockThreads` takes `IntegerLiteralExpression` alone, and a
+      non-constant dim at ANY site erases the kernel from the map), and
+      `@Occupancy(maxThreads)` overrides it where present. Of those
+      sites exactly ONE reaches a live decode kernel —
+      `q2kQ8WaveMatVecKernel` through `waveRowBlock()`, 4 launches a
+      token on this file. It builds at vgpr 68, sgpr 21, no spill and
+      no scratch, so the 192 cap is nowhere near it and pinning would
+      change nothing. Across all 240 kernels in the exe NOT ONE spills
+      or sits at 192; the only scratch in the tree is the stdlib's
+      portable `CooperativeMatrix` tile (`matmulBf16/F32/F64`), which
+      the compiler already names as the tile rather than pressure. The
+      rest of the non-literal sites are the one-item-per-row f32
+      mat-vec family and the WMMA prefill paths, none of them on this
+      unit's route. Pinning a kernel that does not want the registers
+      buys nothing, so nothing was pinned: recorded as measured.
 
 ### 7.3 Acceptance
 - [~] 7.3.1 Decode ≥ 0.95× the better llama.cpp backend on the eight
@@ -1220,6 +1365,28 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       at the start of the unit. The IQ2 family is the gap now, 8–16
       points short, and it is the family with bandwidth headroom left
       (161–183 GB/s against Q4_K's 205 on the same box).
+      MET, on all five files, after 7.2.2's seventh and eighth
+      variables (the GQA x4 reduce+pack fusion and the accumulate form
+      on both residual adds). Five reps a side, arm order alternating
+      by file, one window, quiet box:
+
+      | file | cajeta | vulkan | ratio | was |
+      |---|---|---|---|---|
+      | iq3_s | 55.03 | 55.12 | 0.998 MEETS | 0.980 |
+      | iq3_xxs | 60.33 | 60.52 | 0.997 MEETS | 0.973 |
+      | iq2_s | 68.38 | 70.36 | 0.972 MEETS | 0.956 |
+      | iq2_xs | 70.27 | 73.65 | 0.954 MEETS | 0.931 |
+      | iq2_xxs | 75.49 | 79.26 | 0.952 MEETS | 0.940 |
+
+      PREFILL IS NOT REGRESSED, measured in the same window (pp512,
+      `-fa`): 1279.7 / 1240.2 / 1235.4 / 1202.3 / 1036.6 against
+      Vulkan's 1195.1 / 1177.6 / 1171.3 / 1211.8 / 1252.9, so
+      1.07 / 1.05 / 1.06 / 0.99 / 0.83. The IQ2 files keep the
+      1.04-1.11x they had; the last row is IQ3_S's coop GEMM, which is
+      6.4.2 and untouched by this unit -- none of the eight variables
+      edited a coop kernel.
+      WHERE THE UNIT STARTED: 0.66-0.85x, 0 of 5 over the bar. Where it
+      ends: 0.952-0.998, 5 of 5. iq2_xs went 48.7 -> 70.27 t/s, +44%.
 - [ ] 7.3.2 Perplexity and the Q8 twins unchanged on the files of 5.3.1
       and 6.3.1 — the numbers this unit may not move.
 - [ ] 7.3.3 Legs re-run and recorded (announced).
