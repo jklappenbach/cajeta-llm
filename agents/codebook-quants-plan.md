@@ -751,7 +751,7 @@ every timing leg and wait for the go; filtered suite only
       `coopView` like `checkFormatAt` does, and the red-to-green
       transition is the evidence that the case is a live gate rather
       than a shape the suite never reaches.
-- [~] 6.4.3 The Qwen1.5-MoE at 0.27× / 0.26×. Expert residency is the
+- [x] 6.4.3 The Qwen1.5-MoE at 0.27× / 0.26×. Expert residency is the
       first suspect (the CLI ledger held 678 MB of 6.3 GB of expert
       bytes), so measure what the bank admits before touching a kernel.
       MEASURED FIRST, as the item says, and THE NAMED SUSPECT IS
@@ -1149,11 +1149,33 @@ every timing leg and wait for the go; filtered suite only
             runs each case twice, so the counter's reset is covered).
             LANDED 2026-09-17: bit gate exact; decode 7.29 -> 7.11 ms a
             token, 140.6 t/s (ABBA x3, pre binary 8.22).
-      - [ ] 6.4.3.8 Bit gate after each item: the greedy stream of
+      - [x] 6.4.3.8 Bit gate after each item: the greedy stream of
             `schedthroughput qwen15moe prompt=512 gen=128` hashes
             identically to `tmp/cbq/st-pre643` (the V-d binary); the
             legs ABBA x3 at the end; the item closes at decode >= 1.0x of
-            llama.cpp (Vulkan) or with the residue named.
+            llama.cpp (Vulkan) or with the residue named. HELD on every
+            item (md5 56a6a744f993ddc2 throughout). CLOSING LEGS
+            2026-09-17 (`tmp/cbq/u6438-legs.log`, engine order
+            alternating, 3 reps each, quiet box):
+
+            | 512x128 | cajeta | llama.cpp (Vulkan) | llama.cpp (HIP) |
+            |---|---|---|---|
+            | prefill t/s | 2758 | 2295 | 1177 |
+            | | 1.20x | | 2.34x |
+            | decode t/s | 140.8 | 138.4 | 92.9 |
+            | | 1.017x | | 1.52x |
+
+            Decode 0.878x -> 1.017x in one evening, every step
+            bit-exact; the residue of 6.4.3.1's tally is three launches a
+            layer (6.4.3.9), not taken.
+      - [ ] 6.4.3.9 HELD, not started: the last three fusable launches a
+            layer — the shared expert's gate logit into its gate-up-GLU
+            launch (one extra 256-lane workgroup running
+            `routerF32MatVecKernel`'s tree), and the two q8_K packs of
+            the GLU outputs by a last-arriving-wave counter per 256-row
+            block (`q8kPackKernel`'s arithmetic verbatim; the routed pack
+            pads 1408 to 1536). ~72 launches x 2.5 us = ~0.2 ms a token,
+            ~1.04x. Julian's call whether the item is worth its counters.
 
 
 - [x] 6.4.4 Cause 5: the grouped prefill id-GEMM for the codebook
