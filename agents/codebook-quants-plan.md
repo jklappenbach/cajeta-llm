@@ -1014,7 +1014,7 @@ every timing leg and wait for the go; filtered suite only
       STILL OPEN on prefill (cause 5) and on that choice.
 
 
-- [ ] 6.4.4 Cause 5: the grouped prefill id-GEMM for the codebook
+- [~] 6.4.4 Cause 5: the grouped prefill id-GEMM for the codebook
       banks. `ExpertBank.idGemmReady()` admits Q4_K and Q6_K (and the
       widened symmetric slab); the codebook banks fall to one coop
       launch per expert — sixteen workgroups, 8.9 GB/s, 3810 in series
@@ -1028,6 +1028,39 @@ every timing leg and wait for the go; filtered suite only
       the per-expert GEMMs over the same slab. ISA read is done (89
       VGPRs, no spill, 3 groups/CU) — the launch shape is the whole
       cause. Admission is a route-table row, not a fifth list (9.2.9).
+      SPIKED AND MEASURED 2026-09-17, IQ3_XXS (gate, up):
+      `iq3xxsF16CoopIdN64Kernel` — the N64 body verbatim, a prologue
+      that reads expert / t0 / mEnd from the 64-row chunk map, weight
+      rows from the bank's whole slab, activation rows from ONE f16
+      stage of the gathered batch, and a guarded tail store (spill to a
+      per-wave LDS tile, land rows below mEnd) because in one launch the
+      next chunk's rows are live. Bit-identical to the per-expert
+      launches over ragged groups of 34 / 70 / 0 / 5 rows, canary rows
+      past the batch untouched (`MoeCodebookIdGemmTest`).
+      THE GATE WENT PER BANK: `idPath` had required all three banks
+      ready, so an IQ4_NL down would have refused the whole layer — the
+      same trap as cause 3. Gate/up grouped, down per-expert, the route
+      record names the mix. And the 64-row maps were uploaded only
+      under `anyMw` (WMMA banks), which would have left the coop-id
+      branch reading a stale `meta` — zero chunks, nothing launched,
+      suite green. Found by reading; widened.
+
+      | | before | after | llama.cpp (Vulkan) |
+      |---|---|---|---|
+      | prefill t/s | 908 | **1107** | 2302 |
+      | | 0.393x | **0.481x** | |
+      | decode t/s | 122.1 | 122.3 | 140.1 |
+
+      Census: `iq3xxsF16CoopN64` 2540 launches / 127 ms became
+      `iq3xxsF16CoopIdN64` 96 / 94 ms (982 us a launch, ~600
+      workgroups); the per-expert copy-outs went with them. Down is
+      untouched at 1270 / 231.66 ms and is now the largest item at 31%
+      of the after-load window: the IQ4_NL twin is the next step, same
+      shape, the N64 iq4nl body. After that the grouped launch itself
+      reads ~59 GB/s — the coop body's rate, a kernel question, not a
+      launch one. `hasCoopIdKernel(ty)` is a registration list in
+      `QuantKernel`, the shape the audit walks; it becomes a row.
+      OPEN on the IQ4_NL twin.
 - [ ] 6.4.5 The precision choice on the down projection. The zero-sync
       row runs down through the integer id kernel on q8_K-packed
       gate*up; the route it replaced ran the f32 wave. Router faithful

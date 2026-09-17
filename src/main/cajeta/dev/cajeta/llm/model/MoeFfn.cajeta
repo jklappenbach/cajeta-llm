@@ -1330,7 +1330,11 @@ public final class MoeFfn extends InfModule {
      *  the epi-id kernel otherwise. */
     void idGemm(ExpertBank bank, KernelBuffer<float32> y,
             KernelBuffer<int8> xp, int32 nT, int32 nC, int32 groups) {
-        if (bank.idMwReady()) {
+        if (!bank.idMwReady() && bank.coopIdReady()) {
+            bank.gemmIdBatchCoop(y, Linear.btXh, MoeFfn.map64EDev,
+                MoeFfn.map64T0Dev, MoeFfn.map64M1Dev, MoeFfn.metaDev, nC,
+                groups);
+        } else if (bank.idMwReady()) {
             bank.gemmIdBatchMw(y, xp, MoeFfn.map64EDev, MoeFfn.map64T0Dev,
                 MoeFfn.map64M1Dev, MoeFfn.metaDev, nC, groups);
         } else {
@@ -1648,9 +1652,16 @@ public final class MoeFfn extends InfModule {
         // per-group loop below stays as the fallback (vulkan, exotic
         // formats), and hundreds of serialized small GEMMs are exactly
         // what it costs.
-        boolean idPath = Linear.wmmaOn && !Linear.backendIsVulkan()
-            && this.gateB.idGemmReady() && this.upB.idGemmReady()
-            && this.downB.idGemmReady();
+        // 6.4.4: the gate is PER BANK. A bank is grouped when it has
+        // either id-GEMM family; the others take the per-group loop.
+        // One unready bank used to send all three to that loop.
+        boolean devId = Linear.wmmaOn && !Linear.backendIsVulkan();
+        boolean idPathUp = devId
+            && (this.gateB.idGemmReady() || this.gateB.coopIdReady())
+            && (this.upB.idGemmReady() || this.upB.coopIdReady());
+        boolean idPathDown = devId
+            && (this.downB.idGemmReady() || this.downB.coopIdReady());
+        boolean idPath = idPathUp || idPathDown;
         int32 nT = 0;
         int32 nC = 0;
         int32 groups = 0;
@@ -1658,7 +1669,8 @@ public final class MoeFfn extends InfModule {
         // epi-id kernels (q6k, or an outDim off the 128 grid) keep the
         // 16-row tile maps. A bank picks by idMwReady().
         boolean anyMw = this.gateB.idMwReady() || this.upB.idMwReady()
-            || this.downB.idMwReady();
+            || this.downB.idMwReady() || this.gateB.coopIdReady()
+            || this.upB.coopIdReady() || this.downB.coopIdReady();
         boolean any16 = !this.gateB.idMwReady() || !this.upB.idMwReady()
             || !this.downB.idMwReady();
         if (idPath) {
@@ -1699,8 +1711,15 @@ public final class MoeFfn extends InfModule {
                 MoeFfn.metaH[0] = nC;
                 MoeFfn.metaDev.upload(MoeFfn.metaH, 1L);
             }
+        }
+        if (idPathUp) {
             QuantKernel.q8kPackLaunchNoSync(MoeFfn.xpBxDev, MoeFfn.bxDev,
                 (int64) np * h);
+            if (this.gateB.coopIdReady() || this.upB.coopIdReady()) {
+                Linear.stageBatchFromDevice(MoeFfn.bxDev,
+                    (int32) (np + 128L), this.hidden, Linear.nextStageTag());
+                Linear.ensureBtXh(np + 128L);
+            }
             this.idGemm(this.gateB, MoeFfn.bgDev, MoeFfn.xpBxDev, nT, nC,
                 groups);
             this.idGemm(this.upB, MoeFfn.buDev, MoeFfn.xpBxDev, nT, nC,
@@ -1729,7 +1748,7 @@ public final class MoeFfn extends InfModule {
         }
         int64 fbg20 = Clock.nanoTime();
         Prim.gluDevice(MoeFfn.bgDev, MoeFfn.buDev, (int64) np * wid, act);
-        if (idPath) {
+        if (idPathDown) {
             // 9.5: one row per expert slot, packed on a block boundary
             // with a zero tail, so a remainder width (1408) never
             // straddles rows. The flat pack block-for-block when the
@@ -1765,8 +1784,12 @@ public final class MoeFfn extends InfModule {
         MoeFfn.phaseSync();
         MoeFfn.fbTailNs = MoeFfn.fbTailNs + (Clock.nanoTime() - fbt0);
         this.addSharedBatchDev(xDev, rows, act);
-        if (idPath) {
+        if (idPathUp && idPathDown) {
             this.sayBatchRoute("resident: id GEMMs");
+        } else if (idPathUp) {
+            this.sayBatchRoute("resident: id GEMMs gate/up, a GEMM per expert group down");
+        } else if (idPathDown) {
+            this.sayBatchRoute("resident: a GEMM per expert group gate/up, id GEMM down");
         } else {
             this.sayBatchRoute("resident: a GEMM per expert group");
         }

@@ -1,0 +1,179 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.Linear;
+
+/**
+ * 6.4.4 — the grouped coop GEMM against the per-expert coop launches it
+ * replaces, over one slab, one f16 batch and ragged groups. Same body,
+ * same arithmetic order, so BIT-identical on every row below each
+ * group's end; and a tail row that a full-tile store would have
+ * clobbered belongs to the next group, which the guarded store must
+ * leave alone.
+ */
+public class MoeCodebookIdGemmTest {
+
+    public MoeCodebookIdGemmTest() { return; }
+
+    @Test
+    public void iq3xxsGroupedCoopGemmMatchesThePerExpertLaunches() {
+        MoeCodebookIdGemmTest.check(Quant.GG_IQ3_XXS, "iq3_xxs.bin");
+    }
+
+    static void check(int32 ty, String fixture) {
+        String be #= Device.activeBackend();
+        if (be.equals("cpu") || be.equals("none")) { return; }
+        if (!Linear.residentEnabled()) { return; }
+        int64 E = 4L;
+        int64 rows = 256L;
+        int64 cols = 512L;
+        int64 bpr = cols / 256L;
+        int8[] src #= File.readAllBytes("src/test/fixtures/gguf/kquant/" + fixture);
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 srcBlocks = (int64) src.count() / bb;
+        int64 resRow = Quant.rowResidentBytes(ty, bpr);
+        int64 rowWords = resRow / 4L;
+        int8[] raw #= heap int8[rows * bpr * bb];
+        int8[] one #= heap int8[rows * resRow];
+        int8[] slabH #= heap int8[E * rows * resRow];
+        int64 e = 0L;
+        while (e < E) {
+            int64 b = 0L;
+            while (b < rows * bpr) {
+                int64 sb = (b + e * 7L) % srcBlocks;
+                int64 q = 0L;
+                while (q < bb) { raw[b * bb + q] = src[sb * bb + q]; q = q + 1L; }
+                b = b + 1L;
+            }
+            Quant.splitInto(ty, raw, 0L, rows, bpr, one, 0L);
+            int64 j = 0L;
+            while (j < rows * resRow) { slabH[e * rows * resRow + j] = one[j]; j = j + 1L; }
+            e = e + 1L;
+        }
+        KernelBuffer<int8> slab #= heap KernelBuffer<int8>((uint64) (E * rows * resRow + 4L));
+        slab.upload(slabH, E * rows * resRow);
+        KernelBuffer<int32> slabW #= slab.wordView();
+
+        // Ragged groups: 34, 70, 0 and 5 tokens; +128 rows of slack as
+        // the engine keeps, so a padded read past the last group is
+        // in capacity.
+        int32[] gm #= heap int32[4];
+        gm[0] = 34; gm[1] = 70; gm[2] = 0; gm[3] = 5;
+        int64 np = 109L;
+        int64 npp = np + 128L;
+        float32[] xv #= heap float32[npp * cols];
+        int64 i = 0L;
+        while (i < npp * cols) {
+            xv[i] = (float32) (((7L * (i % cols) + 3L * (i / cols)) % 41L) - 20L) / 16.0f;
+            i = i + 1L;
+        }
+        KernelBuffer<float32> xf #= heap KernelBuffer<float32>((uint64) (npp * cols));
+        xf.upload(xv, npp * cols);
+        KernelBuffer<float16> xh #= heap KernelBuffer<float16>((uint64) (npp * cols));
+        QuantKernel.f32ToF16LaunchNoSync(xh, xf, npp * cols);
+
+        // The 64-row chunk map, as MoeFfn builds it.
+        int32[] mE #= heap int32[8];
+        int32[] mT #= heap int32[8];
+        int32[] mM #= heap int32[8];
+        int32 nC = 0;
+        int32 g0 = 0;
+        int32 ex = 0;
+        while (ex < 4) {
+            int32 m = gm[ex];
+            int32 tw = 0;
+            while (tw * 64 < m) {
+                mE[nC] = ex; mT[nC] = g0 + tw * 64; mM[nC] = g0 + m;
+                nC = nC + 1; tw = tw + 1;
+            }
+            g0 = g0 + m;
+            ex = ex + 1;
+        }
+        KernelBuffer<int32> mapE #= heap KernelBuffer<int32>((uint64) 8);
+        KernelBuffer<int32> mapT0 #= heap KernelBuffer<int32>((uint64) 8);
+        KernelBuffer<int32> mapM1 #= heap KernelBuffer<int32>((uint64) 8);
+        mapE.upload(mE, 8L); mapT0.upload(mT, 8L); mapM1.upload(mM, 8L);
+        int32[] metaH #= heap int32[4];
+        metaH[0] = nC;
+        KernelBuffer<int32> meta #= heap KernelBuffer<int32>((uint64) 4);
+        meta.upload(metaH, 4L);
+
+        // Grouped: one launch; the y rows past np are a canary.
+        KernelBuffer<float32> yId #= heap KernelBuffer<float32>((uint64) (npp * rows));
+        float32[] canary #= heap float32[npp * rows];
+        i = 0L;
+        while (i < npp * rows) { canary[i] = -777.0f; i = i + 1L; }
+        yId.upload(canary, npp * rows);
+        QuantKernel.coopIdLaunchNoSync(ty, yId, slabW, xh, mapE, mapT0, mapM1,
+            meta, (int64) nC, rows, cols, rows);
+
+        // Per expert: the N64 launch on the expert's slab slice and the
+        // group's padded rows into its own buffer, then only m rows kept.
+        KernelBuffer<float32> yRef #= heap KernelBuffer<float32>((uint64) (npp * rows));
+        yRef.upload(canary, npp * rows);
+        g0 = 0;
+        ex = 0;
+        while (ex < 4) {
+            int32 m = gm[ex];
+            if (m > 0) {
+                int64 pad = ((int64) m + 63L) / 64L * 64L;
+                KernelBuffer<int32> pw #= slabW.slice(
+                    (uint64) ((int64) ex * rows * rowWords), (uint64) (rows * rowWords));
+                KernelBuffer<float16> xs #= xh.slice(
+                    (uint64) ((int64) g0 * cols), (uint64) (pad * cols));
+                KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) (pad * rows));
+                QuantKernel.coopBatchLaunchNoSync(ty, yb, pw, xs, pad, rows, cols);
+                KernelBuffer<float32> dst #= yRef.slice(
+                    (uint64) ((int64) g0 * rows), (uint64) ((int64) m * rows));
+                QuantKernel.f32CopyLaunchNoSync(dst, yb, (int64) m * rows);
+                KernelStream s0 = QuantKernel.stream();
+                s0.sync();
+            }
+            g0 = g0 + m;
+            ex = ex + 1;
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a #= heap float32[npp * rows];
+        float32[] b #= heap float32[npp * rows];
+        yId.download(a, npp * rows);
+        yRef.download(b, npp * rows);
+        int64 diff = 0L;
+        int64 nan = 0L;
+        int64 clobbered = 0L;
+        boolean nz = false;
+        i = 0L;
+        while (i < npp * rows) {
+            if (i < np * rows) {
+                if (a[i] != b[i]) {
+                    if (diff < 4L) {
+                        System.stdout.println("   row " + (i / rows) + " col " + (i % rows)
+                            + ": grouped " + a[i] + " per-expert " + b[i]);
+                    }
+                    diff = diff + 1L;
+                }
+                if (a[i] != a[i]) { nan = nan + 1L; }
+                if (a[i] != 0.0f && a[i] == a[i]) { nz = true; }
+            } else if (a[i] != -777.0f) {
+                clobbered = clobbered + 1L;
+            }
+            i = i + 1L;
+        }
+        Assert.equals(0L, diff);
+        Assert.equals(0L, nan);
+        Assert.equals(0L, clobbered);
+        Assert.isTrue(nz);
+        System.stdout.println("   ty=" + ty + " grouped == per-expert over " + np
+            + " rows in " + nC + " chunks; canary intact");
+        return;
+    }
+}
