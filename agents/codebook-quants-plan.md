@@ -742,7 +742,11 @@ every timing leg and wait for the go; filtered suite only
       Unit 7 and 6.4.2, which reached this file not at all: prefill
       615.3 against Vulkan's 2297.5 (0.268x), decode 36.75 against
       138.11 (0.266x).
-      WHAT THE PREFILL CENSUS SAYS (512 tokens, device time):
+      WHAT THE CENSUS SAYS (512 tokens, device time). CORRECTED
+      2026-09-17 under 9.2.6: these shares are of the WHOLE RUN's device
+      time, not of prefill, and `splitKernel` is a LOAD row that does
+      not belong in this table at all — windowed to the measured prefill
+      its count is zero.
 
       | kernel | ms | share | what it is |
       |---|---|---|---|
@@ -760,13 +764,18 @@ every timing leg and wait for the go; filtered suite only
          dead rows, and 3.7x is the size of the whole gap. Confirmed by
          arithmetic: the expert GEMMs run at ~11 TFLOP/s on the rows
          they compute and ~2.9 effective.
-      2. LAYOUT CONVERSION AT RUNTIME is 27.7% of prefill —
-         `blockRepack2Kernel` 1420 launches (one per expert per layer,
-         on first admission) and `splitKernel` 264. This is Unit 9's
-         item 9.2.1 (`coopNeedsRepack`, the repack machinery) showing up
-         as a third of the MoE's prefill. llama.cpp charges the same
-         work to LOAD; we charge it to the first prefill that touches an
-         expert, and a fresh process per leg rep pays it every time.
+      2. LAYOUT CONVERSION AT RUNTIME, and the two halves of it fall
+         in DIFFERENT PHASES — which the 27.7% first written here hid
+         by summing them. `blockRepack2Kernel`, 1420 launches at one per
+         expert per layer on first admission, is 176.9 ms and 25.5% OF
+         PREFILL: that one is real, and the migration collected it.
+         `splitKernel`, 264 launches and 96.9 ms, is bind-time work in
+         LOAD and was never part of prefill. This is Unit 9's item 9.2.1
+         (`coopNeedsRepack`, the repack machinery) showing up as a
+         quarter of the MoE's prefill, not a third. llama.cpp charges
+         both to LOAD; we charged the repack to the first prefill that
+         touches an expert, and a fresh process per leg rep pays it
+         every time.
       3. DECODE STILL DISPATCHES PER EXPERT: 288 `iq3xxsQ8WaveMatVec`
          and 96 `iq4nlMatVec` launches a token, 384 where llama.cpp
          issues about 72.
@@ -1823,8 +1832,11 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       tensors — the 8B Q4_K_M here is q4_K + q6_K only. It is migrated
       but UNVERIFIED until 9.3.2's Q4_0 file exists, which that item
       already calls for.
-      SPLITKERNEL IS NOW THE MoE's TOP ITEM at 23.2%, 336 launches at
-      866 us, and the CAUSE IS ITS LANE MAPPING, not the work. It runs
+      SPLITKERNEL IS NOW THE MoE's TOP ITEM at 336 launches and
+      290.95 ms — 65.4% of the LOAD phase's device time, 23.2% of the
+      whole run's (the figure first recorded here read the `avg` column
+      as a total and called the share prefill's; re-derived under 9.2.6)
+      — and the CAUSE IS ITS LANE MAPPING, not the work. It runs
       ONE WAVE PER BLOCK — `b = globalIdX() / 64`, then
       `i = lane; while (i < blockBytes) { ...; i = i + 64; }` — so for
       IQ4_NL's 18-byte block lanes 0..17 copy ONE BYTE each and lanes
@@ -1834,9 +1846,9 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       wave, or copy dwords with a byte tail (every payload is a whole
       number of dwords by construction, and the scale field is two
       bytes). It is one-time work per tensor that a fresh process per
-      leg rep pays every time and llama.cpp charges to load — but it is
-      23% of this model's prefill and the largest single item left in
-      6.4.3 after the repack. NOT DONE: outside this unit's items, and
+      leg rep pays every time and llama.cpp charges to load — and it is
+      two thirds of this model's LOAD and the largest single item left
+      in 6.4.3 after the repack. NOT DONE: outside this unit's items, and
       recorded here so it is a short job rather than a rediscovery.
       Q3_K FOLLOWED, and it is cheaper than the byte count suggests
       because of where its scale lives. Q3_K is `hmask, qs, scales, d`
@@ -2053,14 +2065,37 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       not. The gain is the lane mapping alone, and the 16x cut in
       dispatched threads that comes with it (one 64-thread workgroup per
       block becomes four items).
-      UNRECONCILED, and it should not be trusted until it is: 9.2.1
-      records this kernel as 23.2% of MoE PREFILL, 336 launches at
-      866 us. The saving here is 175 ms on that model and it lands in
-      LOAD, not prefill — MoE prefill read 906 t/s on both arms. 866 us
-      of GPU time cannot explain 175 ms of wall, so that attribution was
-      measuring GPU-busy inside a phase where most of this cost is
-      invisible. The 23.2% figure needs re-deriving before anyone calls
-      it the MoE's top item again.
+      RECONCILED 2026-09-17 off the SAVED TRACES — `prof-moe2/3/4`
+      under `tmp/cbq/` through `cajeta profile summary`, so no new run.
+      9.2.1's figure was wrong twice and both errors were in the
+      READING, not the profiler.
+      THE UNIT: "866 us" is the `avg` column. The row is `splitKernel |
+      count 336 | self 290.95 ms | total 290.95 ms | avg 865.92 us | max
+      3.54 ms | 23.2%`. The total is 291 ms; 866 us is ONE launch of
+      336. A whole-model split moves ~7 GB in and 7 GB out, so 866 us
+      would have been 14 TB/s — the reading should have refused itself.
+      THE DENOMINATOR: 23.2% is of the RUN's device self time, 1.25 s
+      over load, prefill and decode. Windowed to the measured prefill
+      the count is ZERO. All 336 launches fall in LOAD, where they are
+      65.4% of the phase. The saving landing in load is not the anomaly;
+      load is the only place it could have landed.
+      THE WORK IS CONSERVED ACROSS THE MIGRATION, which is the
+      independent check that neither number is invented. Before IQ4_NL
+      moved (`prof-moe2`): `blockRepack2Kernel` 1324 launches / 176.9 ms
+      IN PREFILL, 25.5% of it, and `splitKernel` 264 / 96.9 ms IN LOAD.
+      After (`prof-moe4`): no repack at all, `splitKernel` 336 /
+      291.0 ms, all of it in load. Prefill gave up 207 ms of wall
+      (778.8 -> 572.0, 657 -> 895 t/s) for the 176.9 ms of repack it
+      stopped doing, and load took the same work as split. 9.2.1's claim
+      was about load from the beginning.
+      AND THE A/B CLOSES ON IT: 291 ms before this item, 175 ms saved,
+      ~116 ms left — 14 GB of traffic at 48 GB/s becoming 121, against
+      this device's 206 GB/s ceiling. Both ends are physical.
+      WHAT THE ERROR WAS: a per-launch average read as a total, and a
+      whole-run share read as a phase share. Both are columns of the
+      same row, and the arithmetic refutes the misreading in one line —
+      bytes over time against a known ceiling. The 6.4.3 census carries
+      the same defect and is corrected there.
 
 
 ### 9.3 Acceptance
