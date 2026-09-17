@@ -2752,7 +2752,6 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       policy. The first two move; the third is a row's `needs`. After
       9.2.9; route-table spec §7.
 
-### 9.3 Acceptance
 - [ ] 9.2.11 `GgufFile.halfBitsToF32` in kernels -> `KernelBuffer.halfView()`
       reads. 125 call sites decode an f16 scale by bit manipulation
       with a subnormal loop (40 instructions, six branches a call);
@@ -2762,6 +2761,7 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       Each kernel gains a `packedH` parameter; each launcher a half
       view kept beside the word view (`ExpertBank.slabH` is the
       pattern). Bit gate per kernel, the format's existing test.
+### 9.3 Acceptance
 - [~] 9.3.1 Filtered suite green.
       `LinearKernelRouteTest` was never IN the filtered suite, and
       adding it for 9.2.4 found `legacyWidensAreExact` red since
