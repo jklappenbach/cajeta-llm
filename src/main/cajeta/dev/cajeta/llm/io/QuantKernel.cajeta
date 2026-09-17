@@ -15488,19 +15488,27 @@ public final class QuantKernel {
 
     /**
      * `HostOps.argmaxRow` on the device: tok[0] = the smallest index of
-     * the largest value in v[0, n). A strictly greater value wins and a
-     * tie keeps the smaller index, so the answer is the host's.
+     * the largest value in v[0, n). Each workgroup reduces 1024 elements
+     * to a (value, index) partial; the last workgroup to arrive reduces
+     * the partials. A strictly greater value wins and a tie keeps the
+     * smaller index, so the answer is the host's.
      */
     @Kernel
     public static void argmaxRowKernel(KernelBuffer<int32> tok,
-            KernelBuffer<float32> v, uint32 n) {
+            KernelBuffer<float32> v, uint32 n, KernelBuffer<float32> pv,
+            KernelBuffer<int32> pi, KernelBuffer<int32> counter) {
         Shared<float32> bv = shared float32[256];
         Shared<int32> bi = shared int32[256];
+        Shared<int32> tk = shared int32[1];
         uint32 tid = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 groups = (n + 1023) / 1024;
         float32 best = 0.0f;
         int32 bestI = -1;
-        uint32 i = tid;
-        while (i < n) {
+        uint32 i = wg * 1024 + tid;
+        uint32 end = wg * 1024 + 1024;
+        if (end > n) { end = n; }
+        while (i < end) {
             float32 x = v[(int64) i];
             if (bestI < 0 || x > best) { best = x; bestI = (int32) i; }
             i = i + 256;
@@ -15526,13 +15534,66 @@ public final class QuantKernel {
             Barrier.workgroup();
             rs = rs / 2;
         }
+        if (tid == 0) {
+            pv[(int64) wg] = bv[0];
+            pi[(int64) wg] = bi[0];
+            Barrier.deviceMemory(MemoryOrder.Release);
+            int32 old = counter.atomicAdd(0L, 1, MemoryOrder.AcqRel);
+            tk[0] = old;
+        }
+        Barrier.workgroup();
+        if ((uint32) tk[0] != groups - 1) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        if (tid == 0) { counter[0L] = 0; }
+        float32 gb = 0.0f;
+        int32 gi = -1;
+        uint32 g = tid;
+        while (g < groups) {
+            float32 x = pv[(int64) g];
+            int32 xi = pi[(int64) g];
+            int32 take = 0;
+            if (xi >= 0) {
+                if (gi < 0) { take = 1; }
+                else if (x > gb) { take = 1; }
+                else if (x == gb && xi < gi) { take = 1; }
+            }
+            if (take != 0) { gb = x; gi = xi; }
+            g = g + 256;
+        }
+        Barrier.workgroup();
+        bv[tid] = gb;
+        bi[tid] = gi;
+        Barrier.workgroup();
+        rs = 128;
+        while (rs > 0) {
+            if (tid < rs) {
+                float32 ov = bv[tid + rs];
+                int32 oi = bi[tid + rs];
+                float32 mv = bv[tid];
+                int32 mi = bi[tid];
+                int32 take = 0;
+                if (mi < 0) { take = 1; }
+                else if (oi >= 0) {
+                    if (ov > mv) { take = 1; }
+                    else if (ov == mv && oi < mi) { take = 1; }
+                }
+                if (take != 0) { bv[tid] = ov; bi[tid] = oi; }
+            }
+            Barrier.workgroup();
+            rs = rs / 2;
+        }
         if (tid == 0) { tok[0L] = bi[0]; }
     }
 
+    /** `pv`/`pi` hold one partial per 1024 elements; `counter` is one
+     *  zeroed word the launch leaves zeroed. */
     public static void argmaxRowLaunchNoSync(KernelBuffer<int32> tok,
-            KernelBuffer<float32> v, int64 n) {
+            KernelBuffer<float32> v, int64 n, KernelBuffer<float32> pv,
+            KernelBuffer<int32> pi, KernelBuffer<int32> counter) {
+        uint32 groups = (uint32) ((n + 1023L) / 1024L);
         KernelStream s = QuantKernel.stream();
-        argmaxRowKernel.launch(s, grid: [1], block: [256])(tok, v, (uint32) n);
+        argmaxRowKernel.launch(s, grid: [groups], block: [256])
+            (tok, v, (uint32) n, pv, pi, counter);
         return;
     }
 

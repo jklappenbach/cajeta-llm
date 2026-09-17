@@ -1142,6 +1142,13 @@ every timing leg and wait for the go; filtered suite only
             (ties, the last index, index 0). LANDED 2026-09-17: bit gate
             exact; decode 7.38 -> 7.29 ms a token, 137.2 t/s (ABBA x3,
             pre binary 8.23) — 0.99x of llama.cpp (Vulkan)'s 138.4.
+            The census then showed the argmax itself at 194 us: one
+            workgroup walking 152k logits. Rewritten as 149 workgroups of
+            1024 elements with a last-arriving reduction of the partials,
+            the same first-occurrence rule at both levels (the test now
+            runs each case twice, so the counter's reset is covered).
+            LANDED 2026-09-17: bit gate exact; decode 7.29 -> 7.11 ms a
+            token, 140.6 t/s (ABBA x3, pre binary 8.22).
       - [ ] 6.4.3.8 Bit gate after each item: the greedy stream of
             `schedthroughput qwen15moe prompt=512 gen=128` hashes
             identically to `tmp/cbq/st-pre643` (the V-d binary); the
