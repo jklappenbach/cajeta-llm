@@ -980,6 +980,52 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       loaded once for all four, and the grid staged in LDS where the
       stage is amortised over eight waves instead of one. Spec 12.1
       must be re-decided as part of it, not before it.
+      FIFTH VARIABLE: rows per wave. DONE 2026-09-16, and the first
+      prediction was WRONG in a way worth keeping.
+      FOUR rows per wave, the number llama.cpp uses, made IQ2_XS 11.8%
+      SLOWER — 179.5 → 158.4 GB/s, reproducible to 0.2% with every
+      other kernel identical between the two binaries. The ISA was
+      exactly as designed: the activation `global_load_b128` stayed at
+      2 for four rows instead of becoming 8, loads per row fell 10 →
+      7.75, VGPRs 52 → 100 with no spill.
+      THE ERROR WAS READING THEIR ROW COUNT WITHOUT THEIR THREAD COUNT.
+      llama.cpp puts 16 threads on a row in a 64-thread workgroup, so
+      four rows arrive with four times the threads: they REDISTRIBUTE
+      parallelism at `rows x 16` threads. Keeping our 32 lanes and
+      quartering the workgroup count took us from `rows x 32` to
+      `rows x 8`. Waves in flight fell 14336 → 3584 while loads fell
+      only 22%, and this kernel hides gather latency by having many
+      waves resident. TWO rows per wave lands on their thread count,
+      `rows x 16`, and that is where the optimum is:
+
+      | rows/wave | loads/row | VGPR | vmcnt(0) | GB/s |
+      |---|---|---|---|---|
+      | 1 | 10 | 52 | 1 | 179.5 |
+      | 2 | 8.5 | 66 | 1 | 190.1 |
+      | 4 | 7.75 | 100 | 3 | 158.4 |
+
+      Applied to all five, the answer splits BY FORMAT:
+
+      | kernel | before | after | |
+      |---|---|---|---|
+      | iq2xxs | 173.9 | 184.8 | +6.3% |
+      | iq2xs | 179.1 | 189.1 | +5.6% |
+      | iq2s | 182.9 | 188.6 | +3.1% |
+      | iq3xxs | 199.5 | 199.7 | +0.1% (reverted to one row) |
+      | iq3s | 202.9 | 203.2 | +0.1% (reverted to one row) |
+      | q4_k / tq2_0 / tq1_0 | - | - | +0.4 / +0.8 / +0.2% |
+
+      At two rows IQ3_XXS and IQ3_S measured −2.0% and −1.3%: both
+      were already at 199–203 GB/s against Q4_K's 206, so fewer loads
+      buy a kernel at the byte ceiling nothing while the lost
+      parallelism still costs. They keep one row per wave. This is a
+      per-format launch policy, the same shape as Q4_K's GEMM.
+      Exactness gate 229/229 at every step.
+      12.1 (L1 vs LDS) STILL STANDS UNCHANGED: the LDS case needed a
+      wider workgroup to amortise the stage, and the measurement above
+      says a wider workgroup is not affordable here — parallelism is
+      worth more than the loads it would save. Re-testing LDS would now
+      have to come with a bigger BLOCK, not more rows per wave.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.

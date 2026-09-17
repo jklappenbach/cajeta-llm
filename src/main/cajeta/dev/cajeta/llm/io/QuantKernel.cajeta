@@ -6623,117 +6623,179 @@ public final class QuantKernel {
      * the split layout: a lane takes one 32-element sub-block, four
      * lanes per block.
      */
+    /** One 32-value sub-block of one IQ2_XXS row: the descriptor pair,
+     *  the four codebook gathers and the two dots, scaled by the
+     *  sub-block scale. */
+    @Device
+    static float32 iq2xxsSub(KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            KernelBuffer<int32> grid, int64 po, int64 xb) {
+        int32 a0 = QuantKernel.iqU32(packed, po);
+        int32 a1 = QuantKernel.iqU32(packed, po + 4L);
+        int32 ls = 2 * ((a1 >> 28) & 15) + 1;
+        int32 si = 0;
+        int32 pp = 0;
+        while (pp < 2) {
+            int32 l0 = 2 * pp;
+            int32 idx0 = (a0 >> (8 * l0)) & 255;
+            int32 idx1 = (a0 >> (8 * l0 + 8)) & 255;
+            int32 s0 = QuantKernel.iqSign7((a1 >> (7 * l0)) & 127);
+            int32 s1 = QuantKernel.iqSign7((a1 >> (7 * l0 + 7)) & 127);
+            si = si + QuantKernel.iqDot16(xp, xb + (int64) (l0 * 8),
+                grid[(int64) (2 * idx0)], grid[(int64) (2 * idx0 + 1)], s0,
+                grid[(int64) (2 * idx1)], grid[(int64) (2 * idx1 + 1)], s1);
+            pp = pp + 1;
+        }
+        return (float32) (si * ls);
+    }
+
     @Kernel
     public static void iq2xxsQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             KernelBuffer<int32> ks, KernelBuffer<int32> grid,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
         uint32 lane = KernelThread.x();
-        uint32 row = KernelThread.globalIdX() / 32;
+        int64 r0 = (int64) (KernelThread.globalIdX() / 32) * 2L;
+        int64 nr = (int64) rows;
         int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
         int64 rowBytes = prefix + blocksPerRow * 64L;
-        float32 acc = 0.0f;
-        if (row < rows) {
-            int64 i = (int64) row;
+        float32 acc0 = 0.0f;
+        float32 acc1 = 0.0f;
+        if (r0 < nr) {
+            int64 r1 = r0 + 1L;
+            if (r1 >= nr) { r1 = nr - 1L; }
             int64 sub = (int64) (lane & 7);
             int64 b = (int64) (lane >> 3);
             while (b < blocksPerRow) {
-                int64 po = i * rowBytes + prefix + b * 64L + sub * 8L;
-                int32 a0 = QuantKernel.iqU32(packed, po);
-                int32 a1 = QuantKernel.iqU32(packed, po + 4L);
-                int32 ls = 2 * ((a1 >> 28) & 15) + 1;
                 int64 xb = b * 320L + sub * 32L;
-                int32 si = 0;
-                int32 pp = 0;
-                while (pp < 2) {
-                    int32 l0 = 2 * pp;
-                    int32 idx0 = (a0 >> (8 * l0)) & 255;
-                    int32 idx1 = (a0 >> (8 * l0 + 8)) & 255;
-                    int32 s0 = QuantKernel.iqSign7((a1 >> (7 * l0)) & 127);
-                    int32 s1 = QuantKernel.iqSign7((a1 >> (7 * l0 + 7)) & 127);
-                    si = si + QuantKernel.iqDot16(xp, xb + (int64) (l0 * 8),
-                        grid[(int64) (2 * idx0)], grid[(int64) (2 * idx0 + 1)],
-                        s0,
-                        grid[(int64) (2 * idx1)], grid[(int64) (2 * idx1 + 1)],
-                        s1);
-                    pp = pp + 1;
-                }
-                float32 d = QuantKernel.scaleAtDev(packed,
-                    i * rowBytes / 2L + b);
-                float32 xs = QuantKernel.q8kScaleAtDev(xp, b);
-                acc = acc + d * xs * 0.125f * (float32) (si * ls);
+                int64 ob = prefix + b * 64L + sub * 8L;
+                float32 v0 = QuantKernel.iq2xxsSub(packed, xp, grid,
+                    r0 * rowBytes + ob, xb);
+                float32 v1 = QuantKernel.iq2xxsSub(packed, xp, grid,
+                    r1 * rowBytes + ob, xb);
+                float32 k = QuantKernel.q8kScaleAtDev(xp, b) * 0.125f;
+                acc0 = acc0 + QuantKernel.scaleAtDev(packed,
+                    r0 * rowBytes / 2L + b) * k * v0;
+                acc1 = acc1 + QuantKernel.scaleAtDev(packed,
+                    r1 * rowBytes / 2L + b) * k * v1;
                 b = b + 4L;
             }
         }
-        float32 tot = Wave.reduceSumF32(acc);
-        if (lane == 0 && row < rows) {
-            y[yOff + (int64) row] = tot;
+        float32 t0 = Wave.reduceSumF32(acc0);
+        float32 t1 = Wave.reduceSumF32(acc1);
+        if (lane == 0) {
+            if (r0 < nr) { y[yOff + r0] = t0; }
+            if (r0 + 1L < nr) { y[yOff + r0 + 1L] = t1; }
         }
+    }
+
+    /** One 32-value sub-block of one IQ2_XS row: the packed reads, the
+     *  eight codebook gathers and the two dots, already scaled by the
+     *  sub-block scales. */
+    @Device
+    static float32 iq2xsSub(KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            KernelBuffer<int32> grid, int64 bo, int64 sub, int64 xb) {
+        int64 po = bo + sub * 8L;
+        int32 w0 = QuantKernel.iqU32(packed, po);
+        int32 w1 = QuantKernel.iqU32(packed, po + 4L);
+        int32 scw = QuantKernel.iqU32(packed, bo + 64L + (sub / 4L) * 4L);
+        int32 sc = (scw >> (8 * (int32) (sub & 3L))) & 255;
+        int32 q0 = w0 & 65535;
+        int32 q1 = (w0 >> 16) & 65535;
+        int32 q2 = w1 & 65535;
+        int32 q3 = (w1 >> 16) & 65535;
+        int32 g0a = grid[(int64) (2 * (q0 & 511))];
+        int32 g0b = grid[(int64) (2 * (q0 & 511) + 1)];
+        int32 g1a = grid[(int64) (2 * (q1 & 511))];
+        int32 g1b = grid[(int64) (2 * (q1 & 511) + 1)];
+        int32 g2a = grid[(int64) (2 * (q2 & 511))];
+        int32 g2b = grid[(int64) (2 * (q2 & 511) + 1)];
+        int32 g3a = grid[(int64) (2 * (q3 & 511))];
+        int32 g3b = grid[(int64) (2 * (q3 & 511) + 1)];
+        int32 sA = QuantKernel.iqDot16(xp, xb, g0a, g0b,
+            QuantKernel.iqSign7(q0 >> 9), g1a, g1b,
+            QuantKernel.iqSign7(q1 >> 9));
+        int32 sB = QuantKernel.iqDot16(xp, xb + 16L, g2a, g2b,
+            QuantKernel.iqSign7(q2 >> 9), g3a, g3b,
+            QuantKernel.iqSign7(q3 >> 9));
+        int32 lsA = 2 * (sc & 15) + 1;
+        int32 lsB = 2 * ((sc >> 4) & 15) + 1;
+        return (float32) (sA * lsA + sB * lsB);
     }
 
     /** The IQ2_XS twin of {@link #iq2xxsQ8WaveMatVecKernel}: the sign
      *  index rides the high seven bits of each `qs` entry and the
-     *  sub-block scales are a byte pair per 64. */
+     *  sub-block scales are a byte pair per 64. Two rows per wave, so
+     *  the activation sub-block is loaded once and dotted twice. */
     @Kernel
     public static void iq2xsQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             KernelBuffer<int32> ks, KernelBuffer<int32> grid,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
         uint32 lane = KernelThread.x();
-        uint32 row = KernelThread.globalIdX() / 32;
+        int64 r0 = (int64) (KernelThread.globalIdX() / 32) * 2L;
+        int64 nr = (int64) rows;
         int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
         int64 rowBytes = prefix + blocksPerRow * 72L;
-        float32 acc = 0.0f;
-        if (row < rows) {
-            int64 i = (int64) row;
+        float32 acc0 = 0.0f;
+        float32 acc1 = 0.0f;
+        if (r0 < nr) {
+            int64 r1 = r0 + 1L;
+            if (r1 >= nr) { r1 = nr - 1L; }
             int64 sub = (int64) (lane & 7);
             int64 b = (int64) (lane >> 3);
             while (b < blocksPerRow) {
-                int64 bo = i * rowBytes + prefix + b * 72L;
-                int64 po = bo + sub * 8L;
-                int32 w0 = QuantKernel.iqU32(packed, po);
-                int32 w1 = QuantKernel.iqU32(packed, po + 4L);
-                int32 scw = QuantKernel.iqU32(packed,
-                    bo + 64L + (sub / 4L) * 4L);
-                int32 sc = (scw >> (8 * (int32) (sub & 3L))) & 255;
-                int32 q0 = w0 & 65535;
-                int32 q1 = (w0 >> 16) & 65535;
-                int32 q2 = w1 & 65535;
-                int32 q3 = (w1 >> 16) & 65535;
-                int32 s0 = QuantKernel.iqSign7(q0 >> 9);
-                int32 s1 = QuantKernel.iqSign7(q1 >> 9);
-                int32 s2 = QuantKernel.iqSign7(q2 >> 9);
-                int32 s3 = QuantKernel.iqSign7(q3 >> 9);
-                int32 g0a = grid[(int64) (2 * (q0 & 511))];
-                int32 g0b = grid[(int64) (2 * (q0 & 511) + 1)];
-                int32 g1a = grid[(int64) (2 * (q1 & 511))];
-                int32 g1b = grid[(int64) (2 * (q1 & 511) + 1)];
-                int32 g2a = grid[(int64) (2 * (q2 & 511))];
-                int32 g2b = grid[(int64) (2 * (q2 & 511) + 1)];
-                int32 g3a = grid[(int64) (2 * (q3 & 511))];
-                int32 g3b = grid[(int64) (2 * (q3 & 511) + 1)];
                 int64 xb = b * 320L + sub * 32L;
-                float32 d = QuantKernel.scaleAtDev(packed,
-                    i * rowBytes / 2L + b);
                 float32 xs = QuantKernel.q8kScaleAtDev(xp, b);
-                int32 sA = QuantKernel.iqDot16(xp, xb, g0a, g0b, s0,
-                    g1a, g1b, s1);
-                int32 sB = QuantKernel.iqDot16(xp, xb + 16L, g2a, g2b, s2,
-                    g3a, g3b, s3);
-                int32 lsA = 2 * (sc & 15) + 1;
-                int32 lsB = 2 * ((sc >> 4) & 15) + 1;
-                acc = acc + d * xs * 0.125f * (float32) (sA * lsA + sB * lsB);
+                int64 ob = prefix + b * 72L;
+                float32 v0 = QuantKernel.iq2xsSub(packed, xp, grid,
+                    r0 * rowBytes + ob, sub, xb);
+                float32 v1 = QuantKernel.iq2xsSub(packed, xp, grid,
+                    r1 * rowBytes + ob, sub, xb);
+                float32 k = xs * 0.125f;
+                acc0 = acc0 + QuantKernel.scaleAtDev(packed,
+                    r0 * rowBytes / 2L + b) * k * v0;
+                acc1 = acc1 + QuantKernel.scaleAtDev(packed,
+                    r1 * rowBytes / 2L + b) * k * v1;
                 b = b + 4L;
             }
         }
-        float32 tot = Wave.reduceSumF32(acc);
-        if (lane == 0 && row < rows) {
-            y[yOff + (int64) row] = tot;
+        float32 t0 = Wave.reduceSumF32(acc0);
+        float32 t1 = Wave.reduceSumF32(acc1);
+        if (lane == 0) {
+            if (r0 < nr) { y[yOff + r0] = t0; }
+            if (r0 + 1L < nr) { y[yOff + r0 + 1L] = t1; }
         }
     }
 
-    /** The IQ3_XXS twin: two 4-value grid words per group of eight, the
-     *  scales and signs in a dword per 32. */
+    /** One 32-value sub-block of one IQ3_XXS row: the sign/scale dword,
+     *  the eight index bytes, the gathers and the two dots. */
+    @Device
+    static float32 iq3xxsSub(KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            KernelBuffer<int32> grid, int64 bo, int64 sub, int64 xb) {
+        int64 po = bo + sub * 8L;
+        int32 a = QuantKernel.iqU32(packed, bo + 64L + sub * 4L);
+        int32 ls = 2 * ((a >> 28) & 15) + 1;
+        int32 si = 0;
+        int32 pp = 0;
+        while (pp < 2) {
+            int32 l0 = 2 * pp;
+            int32 s0 = QuantKernel.iqSign7((a >> (7 * l0)) & 127);
+            int32 s1 = QuantKernel.iqSign7((a >> (7 * l0 + 7)) & 127);
+            int32 q0 = QuantKernel.iqByte(packed, po + (int64) (2 * l0));
+            int32 q1 = QuantKernel.iqByte(packed, po + (int64) (2 * l0 + 1));
+            int32 q2 = QuantKernel.iqByte(packed, po + (int64) (2 * l0 + 2));
+            int32 q3 = QuantKernel.iqByte(packed, po + (int64) (2 * l0 + 3));
+            si = si + QuantKernel.iqDot16(xp, xb + (int64) (l0 * 8),
+                grid[(int64) q0], grid[(int64) q1], s0,
+                grid[(int64) q2], grid[(int64) q3], s1);
+            pp = pp + 1;
+        }
+        return (float32) (si * ls);
+    }
+
+    /** The IQ3_XXS twin. ONE row per wave: at 199-203 GB/s this format is already at
+     *  Q4_K's byte rate, so trading waves for fewer loads only costs
+     *  parallelism (measured -1.3%/-2.0% at two rows). */
     @Kernel
     public static void iq3xxsQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
@@ -6749,33 +6811,12 @@ public final class QuantKernel {
             int64 sub = (int64) (lane & 7);
             int64 b = (int64) (lane >> 3);
             while (b < blocksPerRow) {
-                int64 bo = i * rowBytes + prefix + b * 96L;
-                int64 po = bo + sub * 8L;
-                int32 a = QuantKernel.iqU32(packed, bo + 64L + sub * 4L);
-                int32 ls = 2 * ((a >> 28) & 15) + 1;
                 int64 xb = b * 320L + sub * 32L;
-                int32 si = 0;
-                int32 pp = 0;
-                while (pp < 2) {
-                    int32 l0 = 2 * pp;
-                    int32 s0 = QuantKernel.iqSign7((a >> (7 * l0)) & 127);
-                    int32 s1 = QuantKernel.iqSign7((a >> (7 * l0 + 7)) & 127);
-                    int32 q0 = QuantKernel.iqByte(packed, po + (int64) (2 * l0));
-                    int32 q1 = QuantKernel.iqByte(packed,
-                        po + (int64) (2 * l0 + 1));
-                    int32 q2 = QuantKernel.iqByte(packed,
-                        po + (int64) (2 * l0 + 2));
-                    int32 q3 = QuantKernel.iqByte(packed,
-                        po + (int64) (2 * l0 + 3));
-                    si = si + QuantKernel.iqDot16(xp, xb + (int64) (l0 * 8),
-                        grid[(int64) q0], grid[(int64) q1], s0,
-                        grid[(int64) q2], grid[(int64) q3], s1);
-                    pp = pp + 1;
-                }
-                float32 d = QuantKernel.scaleAtDev(packed,
-                    i * rowBytes / 2L + b);
-                float32 xs = QuantKernel.q8kScaleAtDev(xp, b);
-                acc = acc + d * xs * 0.25f * (float32) (si * ls);
+                float32 v = QuantKernel.iq3xxsSub(packed, xp, grid,
+                    i * rowBytes + prefix + b * 96L, sub, xb);
+                acc = acc + QuantKernel.scaleAtDev(packed,
+                    i * rowBytes / 2L + b)
+                    * QuantKernel.q8kScaleAtDev(xp, b) * 0.25f * v;
                 b = b + 4L;
             }
         }
@@ -6783,6 +6824,39 @@ public final class QuantKernel {
         if (lane == 0 && row < rows) {
             y[yOff + (int64) row] = tot;
         }
+    }
+
+    /** One 32-value sub-block of one IQ2_S row: the index, sign, qh and
+     *  scale dwords, the eight gathers and the two dots. */
+    @Device
+    static float32 iq2sSub(KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            KernelBuffer<int32> grid, int64 bo, int64 sub, int64 xb) {
+        int32 idxw = QuantKernel.iqU32(packed, bo + sub * 4L);
+        int32 sgnw = QuantKernel.iqU32(packed, bo + 32L + sub * 4L);
+        int32 qhw = QuantKernel.iqU32(packed, bo + 64L + (sub / 4L) * 4L);
+        int32 scw = QuantKernel.iqU32(packed, bo + 72L + (sub / 4L) * 4L);
+        int32 bsh = 8 * (int32) (sub & 3L);
+        int32 qh = (qhw >> bsh) & 255;
+        int32 sc = (scw >> bsh) & 255;
+        int32 i0 = (idxw & 255) | ((qh << 8) & 768);
+        int32 i1 = ((idxw >> 8) & 255) | ((qh << 6) & 768);
+        int32 i2 = ((idxw >> 16) & 255) | ((qh << 4) & 768);
+        int32 i3 = ((idxw >> 24) & 255) | ((qh << 2) & 768);
+        int32 g0a = grid[(int64) (2 * i0)];
+        int32 g0b = grid[(int64) (2 * i0 + 1)];
+        int32 g1a = grid[(int64) (2 * i1)];
+        int32 g1b = grid[(int64) (2 * i1 + 1)];
+        int32 g2a = grid[(int64) (2 * i2)];
+        int32 g2b = grid[(int64) (2 * i2 + 1)];
+        int32 g3a = grid[(int64) (2 * i3)];
+        int32 g3b = grid[(int64) (2 * i3 + 1)];
+        int32 sA = QuantKernel.iqDot16(xp, xb, g0a, g0b, sgnw & 255,
+            g1a, g1b, (sgnw >> 8) & 255);
+        int32 sB = QuantKernel.iqDot16(xp, xb + 16L, g2a, g2b,
+            (sgnw >> 16) & 255, g3a, g3b, (sgnw >> 24) & 255);
+        int32 lsA = 2 * (sc & 15) + 1;
+        int32 lsB = 2 * ((sc >> 4) & 15) + 1;
+        return (float32) (sA * lsA + sB * lsB);
     }
 
     /** The IQ2_S twin: raw sign bytes, and the grid index's high two
@@ -6793,54 +6867,37 @@ public final class QuantKernel {
             KernelBuffer<int32> grid, uint32 rows, int64 blocksPerRow,
             int64 yOff) {
         uint32 lane = KernelThread.x();
-        uint32 row = KernelThread.globalIdX() / 32;
+        int64 r0 = (int64) (KernelThread.globalIdX() / 32) * 2L;
+        int64 nr = (int64) rows;
         int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
         int64 rowBytes = prefix + blocksPerRow * 80L;
-        float32 acc = 0.0f;
-        if (row < rows) {
-            int64 i = (int64) row;
+        float32 acc0 = 0.0f;
+        float32 acc1 = 0.0f;
+        if (r0 < nr) {
+            int64 r1 = r0 + 1L;
+            if (r1 >= nr) { r1 = nr - 1L; }
             int64 sub = (int64) (lane & 7);
             int64 b = (int64) (lane >> 3);
             while (b < blocksPerRow) {
-                int64 bo = i * rowBytes + prefix + b * 80L;
-                int32 idxw = QuantKernel.iqU32(packed, bo + sub * 4L);
-                int32 sgnw = QuantKernel.iqU32(packed, bo + 32L + sub * 4L);
-                int32 qhw = QuantKernel.iqU32(packed,
-                    bo + 64L + (sub / 4L) * 4L);
-                int32 scw = QuantKernel.iqU32(packed,
-                    bo + 72L + (sub / 4L) * 4L);
-                int32 bsh = 8 * (int32) (sub & 3L);
-                int32 qh = (qhw >> bsh) & 255;
-                int32 sc = (scw >> bsh) & 255;
-                int32 i0 = (idxw & 255) | ((qh << 8) & 768);
-                int32 i1 = ((idxw >> 8) & 255) | ((qh << 6) & 768);
-                int32 i2 = ((idxw >> 16) & 255) | ((qh << 4) & 768);
-                int32 i3 = ((idxw >> 24) & 255) | ((qh << 2) & 768);
-                int32 g0a = grid[(int64) (2 * i0)];
-                int32 g0b = grid[(int64) (2 * i0 + 1)];
-                int32 g1a = grid[(int64) (2 * i1)];
-                int32 g1b = grid[(int64) (2 * i1 + 1)];
-                int32 g2a = grid[(int64) (2 * i2)];
-                int32 g2b = grid[(int64) (2 * i2 + 1)];
-                int32 g3a = grid[(int64) (2 * i3)];
-                int32 g3b = grid[(int64) (2 * i3 + 1)];
                 int64 xb = b * 320L + sub * 32L;
-                float32 d = QuantKernel.scaleAtDev(packed,
-                    i * rowBytes / 2L + b);
-                float32 xs = QuantKernel.q8kScaleAtDev(xp, b);
-                int32 sA = QuantKernel.iqDot16(xp, xb, g0a, g0b, sgnw & 255,
-                    g1a, g1b, (sgnw >> 8) & 255);
-                int32 sB = QuantKernel.iqDot16(xp, xb + 16L, g2a, g2b,
-                    (sgnw >> 16) & 255, g3a, g3b, (sgnw >> 24) & 255);
-                int32 lsA = 2 * (sc & 15) + 1;
-                int32 lsB = 2 * ((sc >> 4) & 15) + 1;
-                acc = acc + d * xs * 0.125f * (float32) (sA * lsA + sB * lsB);
+                int64 ob = prefix + b * 80L;
+                float32 v0 = QuantKernel.iq2sSub(packed, xp, grid,
+                    r0 * rowBytes + ob, sub, xb);
+                float32 v1 = QuantKernel.iq2sSub(packed, xp, grid,
+                    r1 * rowBytes + ob, sub, xb);
+                float32 k = QuantKernel.q8kScaleAtDev(xp, b) * 0.125f;
+                acc0 = acc0 + QuantKernel.scaleAtDev(packed,
+                    r0 * rowBytes / 2L + b) * k * v0;
+                acc1 = acc1 + QuantKernel.scaleAtDev(packed,
+                    r1 * rowBytes / 2L + b) * k * v1;
                 b = b + 4L;
             }
         }
-        float32 tot = Wave.reduceSumF32(acc);
-        if (lane == 0 && row < rows) {
-            y[yOff + (int64) row] = tot;
+        float32 t0 = Wave.reduceSumF32(acc0);
+        float32 t1 = Wave.reduceSumF32(acc1);
+        if (lane == 0) {
+            if (r0 < nr) { y[yOff + r0] = t0; }
+            if (r0 + 1L < nr) { y[yOff + r0 + 1L] = t1; }
         }
     }
 
@@ -6908,13 +6965,43 @@ public final class QuantKernel {
         }
     }
 
-    /** The IQ3_S twin: raw sign bytes, a ninth index bit per half group
-     *  from `qh`, and a `1+2s` scale per 32. */
+    /** One 32-value sub-block of one IQ3_S row: the qh/scale dwords,
+     *  the two index dwords, the eight gathers and the two dots. */
+    @Device
+    static float32 iq3sSub(KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            KernelBuffer<int32> grid, int64 bo, int64 sub, int64 xb) {
+        int32 qhw = QuantKernel.iqU32(packed, bo + 64L + (sub / 4L) * 4L);
+        int32 scw = QuantKernel.iqU32(packed, bo + 104L);
+        int32 qh = (qhw >> (8 * (int32) (sub & 3L))) & 255;
+        int32 sc = (scw >> (8 * (int32) (sub / 2L))) & 255;
+        int32 nib = sc & 15;
+        if ((sub & 1L) == 1L) { nib = sc >> 4; }
+        int32 ls = 1 + 2 * nib;
+        int32 q0w = QuantKernel.iqU32(packed, bo + sub * 8L);
+        int32 q1w = QuantKernel.iqU32(packed, bo + sub * 8L + 4L);
+        int32 sgw = QuantKernel.iqU32(packed, bo + 72L + sub * 4L);
+        int32 g00 = grid[(int64) ((q0w & 255) | ((qh << 8) & 256))];
+        int32 g01 = grid[(int64) (((q0w >> 8) & 255) | ((qh << 7) & 256))];
+        int32 g10 = grid[(int64) (((q0w >> 16) & 255) | ((qh << 6) & 256))];
+        int32 g11 = grid[(int64) (((q0w >> 24) & 255) | ((qh << 5) & 256))];
+        int32 g20 = grid[(int64) ((q1w & 255) | ((qh << 4) & 256))];
+        int32 g21 = grid[(int64) (((q1w >> 8) & 255) | ((qh << 3) & 256))];
+        int32 g30 = grid[(int64) (((q1w >> 16) & 255) | ((qh << 2) & 256))];
+        int32 g31 = grid[(int64) (((q1w >> 24) & 255) | ((qh << 1) & 256))];
+        int32 si = QuantKernel.iqDot16(xp, xb, g00, g01, sgw & 255,
+            g10, g11, (sgw >> 8) & 255)
+            + QuantKernel.iqDot16(xp, xb + 16L, g20, g21,
+                (sgw >> 16) & 255, g30, g31, (sgw >> 24) & 255);
+        return (float32) (si * ls);
+    }
+
+    /** The IQ3_S twin. ONE row per wave: at 199-203 GB/s this format is already at
+     *  Q4_K's byte rate, so trading waves for fewer loads only costs
+     *  parallelism (measured -1.3%/-2.0% at two rows). */
     @Kernel
     public static void iq3sQ8WaveMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
-            KernelBuffer<int32> grid, uint32 rows, int64 blocksPerRow,
-            int64 yOff) {
+            KernelBuffer<int32> grid, uint32 rows, int64 blocksPerRow, int64 yOff) {
         uint32 lane = KernelThread.x();
         uint32 row = KernelThread.globalIdX() / 32;
         int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
@@ -6925,41 +7012,12 @@ public final class QuantKernel {
             int64 sub = (int64) (lane & 7);
             int64 b = (int64) (lane >> 3);
             while (b < blocksPerRow) {
-                int64 bo = i * rowBytes + prefix + b * 108L;
-                int32 qhw = QuantKernel.iqU32(packed,
-                    bo + 64L + (sub / 4L) * 4L);
-                int32 scw = QuantKernel.iqU32(packed, bo + 104L);
-                int32 qh = (qhw >> (8 * (int32) (sub & 3L))) & 255;
-                int32 sc = (scw >> (8 * (int32) (sub / 2L))) & 255;
-                int32 nib = sc & 15;
-                if ((sub & 1L) == 1L) { nib = sc >> 4; }
-                int32 ls = 1 + 2 * nib;
-                int32 q0w = QuantKernel.iqU32(packed, bo + sub * 8L);
-                int32 q1w = QuantKernel.iqU32(packed, bo + sub * 8L + 4L);
-                int32 sgw = QuantKernel.iqU32(packed, bo + 72L + sub * 4L);
-                int32 g00 = grid[(int64) ((q0w & 255) | ((qh << 8) & 256))];
-                int32 g01 = grid[(int64) (((q0w >> 8) & 255)
-                    | ((qh << 7) & 256))];
-                int32 g10 = grid[(int64) (((q0w >> 16) & 255)
-                    | ((qh << 6) & 256))];
-                int32 g11 = grid[(int64) (((q0w >> 24) & 255)
-                    | ((qh << 5) & 256))];
-                int32 g20 = grid[(int64) ((q1w & 255) | ((qh << 4) & 256))];
-                int32 g21 = grid[(int64) (((q1w >> 8) & 255)
-                    | ((qh << 3) & 256))];
-                int32 g30 = grid[(int64) (((q1w >> 16) & 255)
-                    | ((qh << 2) & 256))];
-                int32 g31 = grid[(int64) (((q1w >> 24) & 255)
-                    | ((qh << 1) & 256))];
                 int64 xb = b * 320L + sub * 32L;
-                int32 si = QuantKernel.iqDot16(xp, xb, g00, g01, sgw & 255,
-                    g10, g11, (sgw >> 8) & 255)
-                    + QuantKernel.iqDot16(xp, xb + 16L, g20, g21,
-                        (sgw >> 16) & 255, g30, g31, (sgw >> 24) & 255);
-                float32 d = QuantKernel.scaleAtDev(packed,
-                    i * rowBytes / 2L + b);
-                float32 xs = QuantKernel.q8kScaleAtDev(xp, b);
-                acc = acc + d * xs * (float32) (si * ls);
+                float32 v = QuantKernel.iq3sSub(packed, xp, grid,
+                    i * rowBytes + prefix + b * 108L, sub, xb);
+                acc = acc + QuantKernel.scaleAtDev(packed,
+                    i * rowBytes / 2L + b)
+                    * QuantKernel.q8kScaleAtDev(xp, b) * 1.0f * v;
                 b = b + 4L;
             }
         }
@@ -6977,11 +7035,13 @@ public final class QuantKernel {
         uint32 ur = (uint32) rows;
         int64 bpr = cols / 256L;
         if (ty == Quant.GG_IQ2_XXS) {
-            iq2xxsQ8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+            iq2xxsQ8WaveMatVecKernel.launch(s, grid: [(ur + 1) / 2],
+                block: [32])
                 (y, packed, xp, QuantKernel.iqKsignsDev,
                  QuantKernel.iq2xxsDev, ur, bpr, yOff);
         } else if (ty == Quant.GG_IQ2_XS) {
-            iq2xsQ8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+            iq2xsQ8WaveMatVecKernel.launch(s, grid: [(ur + 1) / 2],
+                block: [32])
                 (y, packed, xp, QuantKernel.iqKsignsDev,
                  QuantKernel.iq2xsDev, ur, bpr, yOff);
         } else if (ty == Quant.GG_IQ3_XXS) {
@@ -6993,7 +7053,8 @@ public final class QuantKernel {
                 iq2sQ8WaveMatVecLdsKernel.launch(s, grid: [ur], block: [32])
                     (y, packed, xp, QuantKernel.iq2sDev, ur, bpr, yOff);
             } else {
-                iq2sQ8WaveMatVecKernel.launch(s, grid: [ur], block: [32])
+                iq2sQ8WaveMatVecKernel.launch(s, grid: [(ur + 1) / 2],
+                    block: [32])
                     (y, packed, xp, QuantKernel.iq2sDev, ur, bpr, yOff);
             }
         } else {
