@@ -294,7 +294,7 @@ public final class CausalLM extends InfModule {
     /** Logit `i` of the last step — the measurement surface for the
      *  top-2 gap at a divergence. */
     public float32 logitAt(int32 i) {
-        return this.pool.logits.flatGet((int64) i);
+        return this.logits().flatGet((int64) i);
     }
 
     public PagedKvCache kvCache() {
@@ -340,10 +340,30 @@ public final class CausalLM extends InfModule {
         return this.cfg.vocabSize;
     }
 
-    /** The logits of the most recent step — a borrow of pooled storage. */
+    /** The logits of the most recent step — a borrow of pooled storage,
+     *  fetched from the device on demand when the step took its argmax
+     *  there and no one has asked for the row. */
     public Tensor<float32> logits() {
+        if (this.logitsStale) {
+            this.lmHead.fetchInto(this.pool.logits, 0L);
+            this.logitsStale = false;
+        }
         return this.pool.logits;
     }
+
+    /** The argmax of the most recent step: the device's word when the
+     *  fused tail took it there, else the host scan. */
+    int32 lastStepArgmax() {
+        if (this.logitsStale) { return this.lastArgmax; }
+        return HostOps.argmaxRow(this.pool.logits, this.cfg.vocabSize);
+    }
+
+    /** Greedy decode takes its argmax on the device and skips the logits
+     *  fetch; off for a bench arm that wants the host path. */
+    public static void setDeviceArgmax(boolean on) {
+        CausalLM.deviceArgmax = on;
+    }
+    static boolean deviceArgmax = true;
 
     /**
      * Run the prompt `tokens[0, n)` from the current position of the
@@ -410,7 +430,7 @@ public final class CausalLM extends InfModule {
         int32 seqPos2 = this.seqLength(seq);
         this.forwardRows(seq, hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
             n, seqPos2);
-        return HostOps.argmaxRow(this.pool.logits, this.cfg.vocabSize);
+        return this.lastStepArgmax();
     }
 
     /**
@@ -441,7 +461,7 @@ public final class CausalLM extends InfModule {
         this.forwardRows(seq, p.x, p.xn, p.q, p.k, p.v, p.attnOut,
             p.attnProj, p.gate, p.up, p.mlpOut, 1, seqPos);
         int64 ta0 = Clock.nanoTime();
-        int32 am = HostOps.argmaxRow(p.logits, this.cfg.vocabSize);
+        int32 am = this.lastStepArgmax();
         CausalLM.dtArgmaxNs = CausalLM.dtArgmaxNs
             + (Clock.nanoTime() - ta0);
         return am;
@@ -476,6 +496,7 @@ public final class CausalLM extends InfModule {
         // worst of both. rows==1 because only decode has a residual chain
         // short enough for one buffer.
         boolean resident = rows == 1 && this.deviceResidentReady();
+        this.logitsStale = false;
         if (rows == 1 && !this.decSaid) {
             // The decode twin of `prefill-mode` (unit 38): which path
             // this engine's decode actually takes, said once, by the
@@ -770,11 +791,26 @@ public final class CausalLM extends InfModule {
                 this.model.norm.eps, this.cfg.normForm);
             Linear.stageDeviceActivation(this.xnDev, (int64) h);
             this.lmHead.matvecStagedKeep();
+            boolean devAm = CausalLM.deviceArgmax;
+            if (devAm) {
+                if (this.tokDev == null) {
+                    this.tokDev = heap KernelBuffer<int32>((uint64) 1);
+                    this.tokHost = heap int32[1];
+                }
+                QuantKernel.argmaxRowLaunchNoSync(this.tokDev,
+                    this.lmHead.out(), (int64) this.cfg.vocabSize);
+            }
             int64 tf1 = Clock.nanoTime();
             KernelStream fs = QuantKernel.stream();
             fs.sync();
             int64 tf2 = Clock.nanoTime();
-            this.lmHead.fetchInto(this.pool.logits, 0L);
+            if (devAm) {
+                this.tokDev.download(this.tokHost, 1L);
+                this.lastArgmax = this.tokHost[0];
+                this.logitsStale = true;
+            } else {
+                this.lmHead.fetchInto(this.pool.logits, 0L);
+            }
             CausalLM.dtNormNs = CausalLM.dtNormNs
                 + (tf1 - tf0);
             CausalLM.dtSyncNs = CausalLM.dtSyncNs
@@ -835,6 +871,10 @@ public final class CausalLM extends InfModule {
     // the residual stream and one for the norm output, allocated once.
     KernelBuffer<float32> hsDev;
     KernelBuffer<float32> xnDev;
+    KernelBuffer<int32> tokDev;    // the fused tail's argmax word
+    int32[] tokHost;
+    boolean logitsStale;           // pool.logits not fetched this step
+    int32 lastArgmax;
     KernelBuffer<float32> moeDev;   // unit 38: MoE crossing up-leg
     KernelBuffer<float32> subDev;   // bitnet sub-norm output (8.1)
     float32[] hsHost;

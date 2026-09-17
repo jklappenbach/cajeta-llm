@@ -1132,9 +1132,16 @@ every timing leg and wait for the go; filtered suite only
             IQ3_XXS wave kernel down to the o-projection; ~340 launches a
             token (was ~600), decode idle 13.4% of the window (was
             18.7%). 0.979x of llama.cpp (Vulkan)'s 138.4 from here.
-      - [ ] 6.4.3.7 The token tail (~0.3 ms): argmax on device, the token
-            id to a host-visible word; the embed gather from that id on
-            device.
+      - [x] 6.4.3.7 The token tail (~0.3 ms): the argmax on the device
+            (`argmaxRowKernel`, the host scan's first-occurrence answer),
+            one word downloaded instead of the 608 KB logits row; the row
+            is fetched on demand by `logits()` when a sampler or a probe
+            asks. The embed gather stays on the host: the table is packed
+            on the host and a device copy is a load-time item of its own.
+            TDD: `QuantKernelTest.argmaxRowKernelMatchesTheHostScan`
+            (ties, the last index, index 0). LANDED 2026-09-17: bit gate
+            exact; decode 7.38 -> 7.29 ms a token, 137.2 t/s (ABBA x3,
+            pre binary 8.23) — 0.99x of llama.cpp (Vulkan)'s 138.4.
       - [ ] 6.4.3.8 Bit gate after each item: the greedy stream of
             `schedthroughput qwen15moe prompt=512 gen=128` hashes
             identically to `tmp/cbq/st-pre643` (the V-d binary); the
