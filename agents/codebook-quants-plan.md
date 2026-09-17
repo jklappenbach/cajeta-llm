@@ -1722,10 +1722,48 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
 ## Unit 8 — IQ1_S, IQ1_M (spec §3.2, §6.3)
 
 ### 8.1 TDD
-- [ ] 8.1.1 Decoders exact: IQ1_M's f16 rebuilt from four nibbles, the qh
+- [x] 8.1.1 Decoders exact: IQ1_M's f16 rebuilt from four nibbles, the qh
       nibble split, the delta signs.
-- [ ] 8.1.2 Host mat-vecs and Q8 twins with the delta term through the
+      DONE 2026-09-17, and both passed against ggml's own `.f32`
+      fixtures on the first run.
+      THE DELTA NEEDS NO TERM OF ITS OWN, which is simpler than this
+      unit assumed. Spec 6.3 expected `+/-0.125` to ride the Q8 pack's
+      per-32 sums (IQ1_S) and a per-8 sum (IQ1_M), because a delta is
+      not an integer and the IQ family decodes through an INTEGER path
+      (`iqInts` fills 256 signed `t` and the per-sub-block multipliers,
+      then `d * ls8[k/step] * t[k]`). But the iq1s grid's values are
+      -1/0/+1 and the delta is exactly an eighth, so `8*g +/- 1` IS an
+      integer — it lands in {-9,-7,-1,1,7,9} — and the whole family
+      keeps the integer path at a 0.125 scale, which `iqScale` already
+      returns by default. `Quant.iq1Group8` writes `8*v + 1` or
+      `8*v - 1` and nothing else changes: host mat-vec, Q8 twin and
+      block decode all inherit it. The device kernels will too — the
+      values fit int8 for `dp4a` and a 256-value block sums to at most
+      292k, well inside int32 — so the bsums trick is not needed
+      anywhere.
+      TWO SMALLER THINGS the spec names and the decoders confirm:
+      IQ1_M has NO leading f16 (`Quant.iqBlockScale` rebuilds it from
+      the high nibble of each of four scale words, and every caller of
+      the old `f16At(raw, ro)` now goes through it), and its `qh`
+      carries the index's high three bits and the delta sign a NIBBLE at
+      a time where IQ1_S packs multiplier, sign and three index triples
+      into one `qh` word per 32.
+      GATES HELD, per 8.2.1's "gates last". Adding IQ1 to
+      `Quant.supported` before the kernels exist fails
+      `TernaryTest.theFourPartInvariant`, which demands supported ==
+      hasKernel == coopSupports == packedSupported — exactly as it
+      should. `Quant.decodable` carries the decode-only state so
+      `blockElems` still answers for IQ1, and `supported` stays false
+      until 8.1.3 lands.
+- [~] 8.1.2 Host mat-vecs and Q8 twins with the delta term through the
       pack's per-32 sums (IQ1_S) and a per-8 sum (IQ1_M).
+      HOST HALF DONE: `theIq1HostMatVecsMatchTheDequantized` runs both
+      formats' `iqMatVecIntoAt` against their own dequantized weights.
+      `iqMatVecIntoQ8` (the twin) inherits the same `iqInts` and needs
+      no IQ1 code either. The twin is only CHECKED against the wave
+      kernel (`IqCodebookTest.checkQ8` launches it), so that half waits
+      on 8.1.3. Per 8.1.1, the delta term the item describes does not
+      exist — it is folded into the integer value.
 - [ ] 8.1.3 Wave decode kernels and coop X1/X3; `coopBlockWords` 12 / 14;
       `scaleBytes(IQ1_M) == 0`.
 - [ ] 8.1.4 12.1 re-measured on the iq1s table (16 KB bytes, 8 KB nibbles).
