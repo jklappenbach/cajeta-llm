@@ -1011,10 +1011,14 @@ every timing leg and wait for the go; filtered suite only
       that pays the delta back in bandwidth. The tap stays: null
       guarded, two short methods, and it is the instrument that turned
       "inside the floor" into a named cause in one afternoon.
-      STILL OPEN on prefill (cause 5) and on that choice.
+      CAUSE 5 COLLECTED under 6.4.4: prefill 0.393x -> 0.856x. What
+      remains on this item is the precision choice (6.4.5) and two
+      kernel-rate residues — the grouped coop bodies at ~50-60 GB/s on
+      prefill, and decode's last 12% — both under 7.2.1's method, and
+      neither a launch count any more.
 
 
-- [~] 6.4.4 Cause 5: the grouped prefill id-GEMM for the codebook
+- [x] 6.4.4 Cause 5: the grouped prefill id-GEMM for the codebook
       banks. `ExpertBank.idGemmReady()` admits Q4_K and Q6_K (and the
       widened symmetric slab); the codebook banks fall to one coop
       launch per expert — sixteen workgroups, 8.9 GB/s, 3810 in series
@@ -1060,7 +1064,29 @@ every timing leg and wait for the go; filtered suite only
       reads ~59 GB/s — the coop body's rate, a kernel question, not a
       launch one. `hasCoopIdKernel(ty)` is a registration list in
       `QuantKernel`, the shape the audit walks; it becomes a row.
-      OPEN on the IQ4_NL twin.
+      THE IQ4_NL TWIN LANDED the same afternoon: the iq4nl N64 body
+      under the same prologue and guarded tail, `coopIdReady` asking the
+      format's own column rule (`coopColsOk`: 64 for IQ4_NL, so down's
+      1408 is admitted), one f16 stage of the GLU output before the
+      down GEMM. Bit-identical to the per-expert launches at 1408 wide,
+      canary intact. `iq4nlF16CoopN64` 1270 launches / 232 ms became
+      `iq4nlF16CoopIdN64` 48 / 121 ms (2.52 ms a launch), and the route
+      record reads `resident: id GEMMs` with no mix.
+
+      | 512x128, ABBA x3 | opened | after cause 3 | **after cause 5** | llama.cpp (Vulkan) | llama.cpp (HIP) |
+      |---|---|---|---|---|---|
+      | prefill t/s | 615.3 | 908.5 | **1966** | 2296 | 1180 |
+      | | 0.268x | 0.394x | **0.856x** | | 1.67x |
+      | decode t/s | 36.75 | 122.1 | 122.4 | 139.0 | 93.0 |
+      | | 0.266x | 0.878x | 0.881x | | 1.32x |
+
+      Prefill 2.16x on this item, 3.2x since 6.4.3 opened; cajeta now
+      clears llama.cpp's HIP build on both legs of this model. DONE.
+      What the census leaves for the next item is not a launch count:
+      the two grouped launches read ~60 and ~50 GB/s of slab, the coop
+      body's own rate on these shapes, so the remaining 14% to
+      llama.cpp (Vulkan) on prefill is a kernel-rate question under
+      7.2.1's method (ISA read first, one variable at a time).
 - [ ] 6.4.5 The precision choice on the down projection. The zero-sync
       row runs down through the integer id kernel on q8_K-packed
       gate*up; the route it replaced ran the f32 wave. Router faithful

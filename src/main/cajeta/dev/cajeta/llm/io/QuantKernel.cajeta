@@ -8915,9 +8915,160 @@ public final class QuantKernel {
         }
     }
 
+    /** The IQ4_NL twin of {@link #iq3xxsF16CoopIdN64Kernel}: the iq4nl
+     *  N64 body, 32-element blocks (`cols % 64 == 0` suffices), the
+     *  same chunk-map prologue and guarded tail store. */
+    @Kernel
+    public static void iq4nlF16CoopIdN64Kernel(KernelBuffer<float32> y,
+            KernelBuffer<int32> packed, KernelBuffer<float16> xh,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, KernelBuffer<int32> meta,
+            uint32 outDim, uint32 nRowTiles, int64 blocksPerRow,
+            int64 rowsPerExpert) {
+        Shared<float16> sa = shared float16[128 * 72];
+        Shared<float32> fs = shared float32[8 * 256];
+        uint32 lane = KernelThread.x();
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 mapIdx = wg / nRowTiles;
+        uint32 to = wg % nRowTiles;
+        uint32 nChunks = (uint32) meta[0L];
+        if (mapIdx < nChunks) {
+            uint32 ex = (uint32) mapE[(int64) mapIdx];
+            uint32 tq = (uint32) mapT0[(int64) mapIdx];
+            uint32 mEnd = (uint32) mapM1[(int64) mapIdx];
+            uint32 aRow = lane & 127;
+            uint32 aHalf = lane >> 7;
+            uint32 sg = lane / 32;
+            uint32 warpR = sg % 4;
+            uint32 warpC = sg / 4;
+            int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+            int64 rowWords = pw + blocksPerRow * 4L;
+            int64 kBlocks = blocksPerRow;
+            int64 cols = kBlocks * 32L;
+            CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
+            CooperativeMatrix<float32,16,16,2> a01; a01.splat(0.0f);
+            CooperativeMatrix<float32,16,16,2> a10; a10.splat(0.0f);
+            CooperativeMatrix<float32,16,16,2> a11; a11.splat(0.0f);
+            int64 kb = 0;
+            while (kb < kBlocks) {
+                int64 kbh = kb + (int64) aHalf;
+                int64 sBase = (int64) aRow * 72L + (int64) (32 * aHalf);
+                int64 rowBase = ((int64) ex * rowsPerExpert
+                    + (int64) (to * 128 + aRow)) * rowWords;
+                int64 ro = rowBase + pw + kbh * 4L;
+                int32 dwd = packed[rowBase + kbh / 2L];
+                float32 d = GgufFile.halfBitsToF32(
+                    (dwd >> ((int32) (kbh & 1L) * 16)) & 65535);
+                Vector<int32,4> qv = packed.vload<4>(ro);
+                int32 e = 0;
+                while (e < 4) {
+                    int32 w = qv[e];
+                    int32 bi = 0;
+                    while (bi < 4) {
+                        int32 by = (w >> (8 * bi)) & 255;
+                        int64 j = (int64) (4 * e + bi);
+                        sa[sBase + j] = (float16)
+                            (d * (float32) QuantKernel.iq4KvS(by & 15));
+                        sa[sBase + j + 16L] = (float16)
+                            (d * (float32) QuantKernel.iq4KvS((by >> 4) & 15));
+                        bi = bi + 1;
+                    }
+                    e = e + 1;
+                }
+                Barrier.workgroup();
+                int32 ks = 0;
+                while (ks < 4) {
+                    uint32 ko = (uint32) (16 * ks);
+                    uint32 ab = (warpR * 32) * 72 + ko;
+                    uint32 bb2 = (uint32) (((int64) (tq
+                        + warpC * 32)) * cols + kb * 32L + (int64) ko);
+                    uint32 cst = (uint32) cols;
+                    CooperativeMatrix<float16,16,16,0> t0;
+                    CooperativeMatrix<float16,16,16,0> t1;
+                    t0.load(sa, ab, 0, 72);
+                    t1.load(sa, ab + 1152, 0, 72);
+                    CooperativeMatrix<float16,16,16,1> u0;
+                    CooperativeMatrix<float16,16,16,1> u1;
+                    u0.load(xh, bb2, 1, cst);
+                    u1.load(xh, bb2 + 16 * cst, 1, cst);
+                    a00.mma(t0, u0);
+                    a01.mma(t0, u1);
+                    a10.mma(t1, u0);
+                    a11.mma(t1, u1);
+                    ks = ks + 1;
+                }
+                Barrier.workgroup();
+                kb = kb + 2L;
+            }
+            uint32 rb = to * 128 + warpR * 32;
+            uint32 cb = tq + warpC * 32;
+            uint32 wl = lane & 31;
+            uint32 fo = sg * 256;
+            if (cb + 16 <= mEnd) {
+                a00.store(y, cb * outDim + rb, 1, outDim);
+                a10.store(y, cb * outDim + rb + 16, 1, outDim);
+            } else {
+                a00.store(fs, fo, 1, 16);
+                uint32 q = 0;
+                while (q < 8) {
+                    uint32 el = wl + 32 * q;
+                    uint32 tk = el / 16;
+                    uint32 oc = el % 16;
+                    if (cb + tk < mEnd) {
+                        y[(int64) (cb + tk) * (int64) outDim + (int64) (rb + oc)]
+                            = fs[(int64) (fo + el)];
+                    }
+                    q = q + 1;
+                }
+                a10.store(fs, fo, 1, 16);
+                q = 0;
+                while (q < 8) {
+                    uint32 el = wl + 32 * q;
+                    uint32 tk = el / 16;
+                    uint32 oc = el % 16;
+                    if (cb + tk < mEnd) {
+                        y[(int64) (cb + tk) * (int64) outDim + (int64) (rb + 16 + oc)]
+                            = fs[(int64) (fo + el)];
+                    }
+                    q = q + 1;
+                }
+            }
+            uint32 cb2 = cb + 16;
+            if (cb2 + 16 <= mEnd) {
+                a01.store(y, cb2 * outDim + rb, 1, outDim);
+                a11.store(y, cb2 * outDim + rb + 16, 1, outDim);
+            } else {
+                a01.store(fs, fo, 1, 16);
+                uint32 q2 = 0;
+                while (q2 < 8) {
+                    uint32 el = wl + 32 * q2;
+                    uint32 tk = el / 16;
+                    uint32 oc = el % 16;
+                    if (cb2 + tk < mEnd) {
+                        y[(int64) (cb2 + tk) * (int64) outDim + (int64) (rb + oc)]
+                            = fs[(int64) (fo + el)];
+                    }
+                    q2 = q2 + 1;
+                }
+                a11.store(fs, fo, 1, 16);
+                q2 = 0;
+                while (q2 < 8) {
+                    uint32 el = wl + 32 * q2;
+                    uint32 tk = el / 16;
+                    uint32 oc = el % 16;
+                    if (cb2 + tk < mEnd) {
+                        y[(int64) (cb2 + tk) * (int64) outDim + (int64) (rb + 16 + oc)]
+                            = fs[(int64) (fo + el)];
+                    }
+                    q2 = q2 + 1;
+                }
+            }
+        }
+    }
+
     /** Which formats carry a grouped coop GEMM (6.4.4). */
     public static boolean hasCoopIdKernel(int32 ty) {
-        return ty == Quant.GG_IQ3_XXS;
+        return ty == Quant.GG_IQ3_XXS || ty == Quant.GG_IQ4_NL;
     }
 
     /** One launch over `nChunksMax` 64-row chunks of the group-major
@@ -8928,9 +9079,16 @@ public final class QuantKernel {
             KernelBuffer<int32> mapM1, KernelBuffer<int32> meta,
             int64 nChunksMax, int64 outDim, int64 cols,
             int64 rowsPerExpert) {
-        QuantKernel.ensureIqTables();
         int64 nrt = outDim / 128L;
         KernelStream s = QuantKernel.stream();
+        if (ty == Quant.GG_IQ4_NL) {
+            iq4nlF16CoopIdN64Kernel.launch(s,
+                grid: [(uint32) (nChunksMax * nrt)], block: [256])
+                (y, slabW, xh, mapE, mapT0, mapM1, meta, (uint32) outDim,
+                 (uint32) nrt, cols / 32L, rowsPerExpert);
+            return;
+        }
+        QuantKernel.ensureIqTables();
         iq3xxsF16CoopIdN64Kernel.launch(s,
             grid: [(uint32) (nChunksMax * nrt)], block: [256])
             (y, slabW, xh, QuantKernel.iqKsignsDev, QuantKernel.iq3xxsDev,
