@@ -929,13 +929,31 @@ every timing leg and wait for the go; filtered suite only
       `[diag] route` record diff between the two routes (7.3.2's
       arbiter), so the +0.41% is shown to be top-k flips and not a
       numeric fault in one of the three changed paths.
-      WHAT REMAINS IS PREFILL, and the census names it without
-      inference: 0.393x with the expert coop GEMMs dominating device
-      time — `iq4nlF16CoopN64` 1270 launches / 231 ms at 182 us each,
-      `iq3xxsF16CoopN64` 2540 / 127 ms — inside a prefill window that
-      is ~91% device-busy. Prefill is GEMM-bound, not dispatch-bound.
-      That is a fifth cause, and it is the coop kernels' rate on ragged
-      expert batches, not anything this item's four causes covered.
+      WHAT REMAINS IS PREFILL: 0.393x with the expert coop GEMMs
+      dominating device time — `iq4nlF16CoopN64` 1270 launches / 231 ms
+      at 182 us each, `iq3xxsF16CoopN64` 2540 / 127 ms — inside a
+      prefill window that is ~91% device-busy. I first wrote "GEMM-bound,
+      not dispatch-bound" from that 91%, and the ARITHMETIC REFUTES IT:
+      one down launch is one expert, 2048 x 1408 at 18/32 B = 1.62 MB,
+      in 182 us = 8.9 GB/s, 4% of the ceiling. Its grid is
+      `(outDim/128) * (rows/64)` = 16 x 1 = SIXTEEN workgroups for ~34
+      routed tokens padded to 64; gate/up get 11. The device is "busy"
+      running grids that cannot fill it, 3810 of them in series. That
+      is cause 3's shape on the prefill side — per-expert dispatch
+      where llama.cpp issues one grouped `mul_mat_id` — and it is CAUSE
+      5, named.
+      AND IT IS THE FOURTH FORMAT LIST: the grouped prefill id-GEMM
+      exists (`gemmIdBatchMw` / `gemmIdBatchWide`, the WMMA Mw family
+      with an expert map), and `ExpertBank.idGemmReady()` reads
+      `(packedTy == 12 || packedTy == 14) && colsN % 256 == 0`. The
+      codebook banks are refused it and fall to the per-expert coop
+      launch above. Route-table spec §1.1 gains a line.
+      THE FIX IS BIGGER THAN CAUSE 3's: the id-GEMMs are WMMA kernels
+      (`q4kWmmaIdMwKernel`, `q6kWmmaIdMwKernel`, `symWmmaDeqIdMw8`) with
+      an expert map, not wave mat-vecs with a `sel` index — a codebook
+      variant is a new kernel family, or an id variant of the coop
+      family that reads the same map. The ISA read of the N64 kernels
+      (7.2.1's method) is taken before either is drafted.
       THE ARBITER RAN (`bench/MoeRowArbiter`, `pplprobe ... norowmoe`):
       both routes from ONE binary, `setSharedRow(false)` reproducing
       the old refusal at the same clause. WHAT IT SETTLED: arm B reads

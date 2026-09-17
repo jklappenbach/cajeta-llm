@@ -34,6 +34,11 @@ The consequence is measured, not argued. On 2026-09-17 alone:
   codebook bytes through it: wrong logits, no crash.
 - The fix for the second added `codebookId()`: one more list of the
   same shape.
+- `ExpertBank.idGemmReady()` reads `(packedTy == 12 || packedTy == 14)`;
+  the grouped prefill id-GEMM refuses the codebook banks, which fall
+  to one coop launch per expert — sixteen workgroups each, 8.9 GB/s
+  against a 206 GB/s ceiling, 3810 of them in series. Cause 5 of the
+  same item, found by arithmetic the same afternoon.
 
 This is the eighth or ninth time the class has been solved, and each
 time from scratch, because the knowledge lives in prose and in whoever
