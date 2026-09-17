@@ -1953,7 +1953,27 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       IQ4_XS/Q4_1/Q5_1 now get the item kernel's row chunking back,
       like every other item-per-row type. No file in the tree has that
       shape.
-      NOT DONE, and worth more: IQ4_NL has no INTEGER wave route either.
+      MEASURED on the iq4_nl 8B, quiet box, ABBA arm order, rep 1 kept
+      because all three reps of every pass agreed inside 1.5%:
+
+      | arm | decode t/s | weight GB/s |
+      |---|---|---|
+      | item-per-row (pre) | 26.22 - 26.94 | 124 |
+      | f32 wave (post) | 41.39 - 42.90 | 202 |
+
+      +59% DECODE, and 202 GB/s is the wall (206 practical). Prefill
+      unmoved at 833-842 both arms, which is right: this is a decode
+      mat-vec route. Load 3020-3067 across all twelve runs, so the box
+      held ([[load-time-is-the-box-witness]]).
+      THE GREEDY STREAM IS IDENTICAL over all 128 tokens. A wave
+      reduction reassociates what the item kernel summed serially, so
+      the tokens were expected to move and did not — the difference is
+      below the decision threshold everywhere in this window. The route
+      change is gated by the kernel-against-host test; this is a bonus.
+      AND IT ERASES 9.3.2's REGRESSION: 42.90 against the 28.60 that
+      file read BEFORE the migration is +50%, so the shipping path is
+      half again faster than it was, not 7.7% slower.
+      NOT DONE, and worth more still: IQ4_NL has no INTEGER wave route either.
       Q4_0 runs at 213 GB/s on that route against this one's ceiling.
       IQ4_NL is a 16-entry 4-bit codebook — the MXFP4 shape, lut4 then
       dotSum over per-32 Q8 — so the kernel is a known quantity. It
@@ -1988,7 +2008,7 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       runs off the end. `e.cancel(id)` does not release it. It is an
       autotune TIMING test in a correctness suite and it wants the
       scheduler's request lifecycle, which is a different unit.
-- [~] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
+- [x] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
       Q5_0 tensors), Q3_K_M, Q6_K, the iq4_nl file, a Q4_0 8B from
       `llama-quantize`; bit gate then A/B, no decode regression.
       THREE OF FIVE DONE 2026-09-17, against a binary built from the
@@ -2058,10 +2078,11 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       change with its own bit-gate baseline (an f32 reduction reorder),
       so it is NOT folded in here. NOT DONE, and worth more than the
       regression it would erase.
-      THE TRADE IS JULIAN'S: the IQ4_NL migration bought the Qwen MoE
-      prefill 657 -> 895 t/s by deleting 1420 repack launches a step. A
-      dense 8B has no repack to delete and pays 7.7% of a decode that is
-      already 42% below the wall.
+      THE TRADE WAS NEVER TAKEN: 9.2.4 routed IQ4_NL off the
+      item-per-row kernel and its decode is now 42.90 against the 28.60
+      this file read BEFORE the migration. CLOSED — five formats
+      measured, bit gate exact on all of them, and no decode regression
+      on any shipping path.
 - [~] 9.3.3 Resident bytes equal file bytes for every file above and the
       30B Q8_0 re-checked; the repack code gone.
       EXACT ON THE PURE Q6_K 8B, which is the file this unit most had to
