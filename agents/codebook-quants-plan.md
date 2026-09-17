@@ -796,15 +796,83 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       it was the untouched control for the first variable and stayed
       flat there, and it pays this cost in full. Three controls flat,
       five treated kernels up 11–23%. Exactness gate green (229/229).
-      End to end the gain arrives DAMPED, and that is the finding:
-      11–23% in the kernel became 3.6–6.6% in the model, where the
-      first variable's 11–15% became 14–17%. Solving for the share of
-      decode these kernels still hold gives 0.33 on iq2_s and 0.56 on
-      iq2_xxs. After two variables the codebook mat-vec is no longer
-      the dominant term of decode, so a third variable aimed at it
-      would be spending against a shrinking fraction. What the
-      remaining 45–67% is has not been measured yet, and measuring it
-      is the next step rather than guessing a third kernel change.
+      End to end the gain arrives DAMPED: 11–23% in the kernel became
+      3.6–6.6% in the model, where the first variable's 11–15% became
+      14–17%. Solving Amdahl backwards from that says the kernels hold
+      only a third of decode — and that inference is WRONG, which is
+      why the profiler ran instead of a third edit. `CAJETA_PROFILER=1`
+      with `CAJETA_PROFILER_GPU_RING=262144` (the default ring drops
+      897 per mille on a decode of this length and the summary then
+      silently covers only the tail) on llama8b-iq2_s, 128 tokens at
+      depth 512:
+
+      | decode kernel | ms/token | share |
+      |---|---|---|
+      | iq2xs wave (156 calls) | 10.00 | 60.1% |
+      | iq3s wave (36) | 1.67 | 10.0% |
+      | q5k wave — the output head (1) | 1.60 | 9.6% |
+      | q4k wave (32) | 0.46 | 2.7% |
+      | **weight mat-vec** | **13.73** | **82.5%** |
+      | rmsnorm (65) | 0.69 | 4.1% |
+      | attn decode reduce (32) | 0.65 | 3.9% |
+      | attn decode gqa4 (32) | 0.50 | 3.0% |
+      | q8k pack (129) | 0.44 | 2.6% |
+      | glu, add, qkPrep (129) | 0.64 | 3.8% |
+      | **everything else** | **2.91** | **17.5%** |
+
+      2130 ms of device work over 128 tokens is 16.64 ms/token against
+      16.9 measured, so decode is device-bound with about 1 ms/token of
+      gaps across ~612 launches. The mat-vec is 82.5%, not 33%. The
+      damping is composition, not Amdahl: an `iq2_s` file is mostly
+      IQ2_XS tensors (+15.2%, not the +22.9% IQ2_S got), and 12.3% of
+      its decode is q5_K and q4_K tensors this change never touched —
+      the Q5_K output head alone is 9.6%, reading 361 MB per token at
+      230 GB/s, already at the bandwidth ceiling.
+      Weighting the probe's per-kernel gains by that census predicts
+      +9.0%, and +6.5 to +8.6% arrived — see 7.3.1.
+      The first leg run said +3.6 to +6.6% and was WRONG: a browser was
+      playing video. On this APU that costs 1.9–2.8% of decode, and
+      the tell was LOAD TIME, which is host I/O and cannot be touched
+      by a kernel edit — it had risen 2–7% while prefill, whose
+      kernels are byte-identical, fell 1.8–7.3%. Read load time on
+      every leg; a move over ~1.5% is the box, not the code.
+      THIRD VARIABLE, named from a clean disassembly: 64-bit address
+      arithmetic. `KernelIsa`'s bundled disassembler is stale — it
+      prints `.long` for VOP3 opcodes it cannot name AND a phantom
+      `v_cndmask` from each one's second dword, so its totals are right
+      by accident and its opcode names are not. Re-read with
+      `llvm-objdump --mcpu=gfx1151`:
+
+      | kernel | VALU | addr64 | quarter-rate | % of VALU ceiling |
+      |---|---|---|---|---|
+      | iq2xxs | 168 | 38 | 14 | 47% |
+      | iq2xs | 176 | 40 | 17 | 45% |
+      | iq2s | 181 | 40 | 17 | 47% |
+      | iq3xxs | 179 | 41 | 16 | 41% |
+      | iq3s | 206 | 43 | 16 | 44% |
+      | tq10 | 1055 | 154 | 7 | 108% |
+      | q4k | 871 | 73 | 26 | 14% |
+      | tq20 | 170 | 31 | 5 | 19% |
+
+      The ceiling column is wave-instructions per second against 40 CUs
+      x 2 SIMD32 at 2.9 GHz. It sorts the set cleanly: TQ1_0 is over
+      100%, so it is dual-issuing and genuinely instruction-bound —
+      its 16.5 VALU per value is the whole story and the plan's other
+      named target. Q4_K and TQ2_0 sit at 14–19% of VALU and
+      193–205 GB/s: bandwidth-bound. The IQ family saturates NEITHER
+      wall, 41–47% of VALU and 63–79% of bandwidth.
+      What it does spend: 38–43 instructions per body on 64-bit byte
+      offsets, of which 14–17 are quarter-rate `v_mul_lo_u32` /
+      `v_mad_u64_u32` (see the standing note that RDNA integer multiply
+      is quarter-rate). Counted at 4x that is about a third of the
+      body's VALU cycles, and it produces no weight values. The
+      indices are 32-bit and the bases are loop-invariant, so the
+      multiplies belong outside the loop — reduce first, then scale.
+      PREDICTED: addr64 down by two thirds, quarter-rate ops toward
+      zero, VALU per value from 5.5 to about 4.3 on iq2xs, and at that
+      count the IQ2 family reaches Q4_K's 205 GB/s, which is 764 G
+      values/s and would clear 7.3.1 for every file. Loads, `vmcnt(0)`
+      and `v_dot4` must not move. Q4_K and TQ2_0 stay flat.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
@@ -830,25 +898,27 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       carries 64 IQ2_S and 33 IQ3_S tensors, gains a partial 3.2%.
       NOT MET: 0.77–0.89× against the 0.95 bar, and prefill is
       unchanged. The gap is now ~1.2× rather than ~1.5×.
-      AFTER 7.2.2's second variable (same box, same leg):
+      AFTER 7.2.2's second variable. Measured on a QUIET box against
+      llama.cpp Vulkan (`-fa`) in ONE window with the arm order
+      alternating by file, mean of three reps on both sides:
 
-      | file | before | after | gain | × vulkan |
-      |---|---|---|---|---|
-      | iq2_xxs | 61.5 | 65.2 | +6.1% | 0.83 |
-      | iq2_xs | 56.8 | 60.3 | +6.2% | 0.82 |
-      | iq2_s | 55.6 | 59.3 | +6.6% | 0.85 |
-      | iq3_xxs | 52.3 | 55.0 | +5.1% | 0.93 |
-      | iq3_s | 48.9 | 50.7 | +3.6% | 0.92 |
+      | file | before | after | gain | vulkan | ratio |
+      |---|---|---|---|---|---|
+      | iq2_xxs | 61.44 | 66.65 | +8.5% | 78.19 | 0.850 |
+      | iq2_xs | 56.77 | 61.61 | +8.5% | 73.06 | 0.843 |
+      | iq2_s | 55.65 | 60.46 | +8.6% | 69.78 | 0.865 |
+      | iq3_xxs | 52.28 | 56.44 | +8.0% | 60.09 | 0.939 |
+      | iq3_s | 48.82 | 51.98 | +6.5% | 54.88 | 0.947 |
 
-      Prefill is untouched by construction (the coop GEMMs never call
-      `iqDot16`) and measured 1.8–7.3% LOWER, alongside load times
-      2–7% higher on the same files — load is host I/O and cannot
-      have been changed by a kernel edit, so the box ran a few percent
-      slow for this run and the decode gains are, if anything,
-      understated.
-      STILL NOT MET: 0.82–0.93× against 0.95. Two files are now
-      within 3 points of the bar and the worst is 0.82, from 0.66 at
-      the start of the unit.
+      Two quiet runs of the same binary agree to 0.6%, and tonight's
+      Vulkan numbers land within 1% of the reference table above, so
+      the older reference was sound. Prefill is untouched by
+      construction — the coop GEMMs never call `iqDot16`.
+      STILL NOT MET: 0.843–0.947 against 0.95, but iq3_s misses by
+      three tenths of a point and iq3_xxs by one, against 0.66–0.85
+      at the start of the unit. The IQ2 family is the gap now, 8–16
+      points short, and it is the family with bandwidth headroom left
+      (161–183 GB/s against Q4_K's 205 on the same box).
 - [ ] 7.3.2 Perplexity and the Q8 twins unchanged on the files of 5.3.1
       and 6.3.1 — the numbers this unit may not move.
 - [ ] 7.3.3 Legs re-run and recorded (announced).
