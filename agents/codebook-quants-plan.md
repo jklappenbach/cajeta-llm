@@ -1155,6 +1155,25 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       A dense layer now pays TWO packs, not four: the attention output
       and — on the sub-norm shapes only — the GLU. Fusing the
       attention one needs GQA-4 in Unit 50's reduce+pack allow-list.
+      THE PRICE OF BIT-EXACTNESS, measured rather than assumed. A
+      throwaway variant of the fused kernel carrying Unit 54's per-wave
+      reduction, alternated against the shipping tree, min of five over
+      500 launches:
+
+      | dim | tree | wave | cost |
+      |---|---|---|---|
+      | 2048 | 3.76 us | 3.45 us | +9.1% |
+      | 4096 | 5.19 us | 4.92 us | +5.5% |
+      | 14336 | 12.60 us | 12.27 us | +2.7% |
+
+      A flat ~0.3 us per launch whatever the width — the barriers, not
+      the data. At 64 fused norms a token that is 17 us on a 14 ms
+      token, 0.12% of decode, below the A/B's noise floor. Unit 54's
+      optimisation was worth a tenth of a percent here and interchange-
+      ability costs exactly that, so the tree stays. The third option
+      — give `rmsnormRowF32` the wave form too, so both shift together
+      — would recover 0.12% while touching a kernel every model runs,
+      and is not worth it. The variant and its bench were deleted.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
