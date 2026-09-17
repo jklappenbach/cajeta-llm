@@ -1087,6 +1087,45 @@ every timing leg and wait for the go; filtered suite only
       body's own rate on these shapes, so the remaining 14% to
       llama.cpp (Vulkan) on prefill is a kernel-rate question under
       7.2.1's method (ISA read first, one variable at a time).
+- [~] 6.4.6 The grouped coop bodies' rate: prefill past 0.856x. The
+      6.4.4 census left two kernels at 61% of the prefill window, down's
+      `iq4nlF16CoopIdN64` 2.4x slower a launch than gate/up's iq3xxs
+      twin at equal FLOPs. ISA READ FIRST (KernelIsa manifests):
+
+      | kernel | vgpr | spill | LDS | groups/CU |
+      |---|---|---|---|---|
+      | `iq4nlF16CoopIdN64` | 90 | 0 | 26624 | 2 |
+      | `iq3xxsF16CoopIdN64` | 148 | 0 | 28160 | 2 |
+      | `iq4nlF16CoopN64` (dense) | 89 | 0 | 18432 | 3 |
+
+      Two variables, one at a time. A: the iq4nl body's expansion is
+      `iq4KvS`, a sixteen-branch if-chain, called sixteen times a lane a
+      k-step, where the decode kernel does the same remap in two
+      `v_perm_b32` through `Vector.lut4`. B: the guarded tail's 8 KB LDS
+      tile (`fs`) is exactly the difference between 2 and 3 resident
+      groups on both grouped kernels.
+      A LANDED 2026-09-17: `packed.vload<4>(ro).asBytes()`, `lut4` on
+      the low and high nibbles, thirty-two constant-lane stores into the
+      f16 stage (a runtime lane index allocas). Bit gate unchanged
+      (`MoeCodebookIdGemmTest`, 309 green, the one pre-existing 9.3.1
+      failure). `iq4nlF16CoopIdN64` 48 launches / 121 ms became 48 /
+      43.4 ms (2.52 -> 0.904 ms a launch); the iq3xxs twin sits at 0.978
+      ms, so the two bodies now run within 8% of each other.
+
+      | 512x128, ABBA x3 | after cause 5 | **after A** | llama.cpp (Vulkan) | llama.cpp (HIP) |
+      |---|---|---|---|---|
+      | prefill t/s | 1966 | **2424** | 2301 | 1178 |
+      | | 0.856x | **1.053x** | | 2.06x |
+      | decode t/s | 122.4 | 122.1 | 139.3 | 93.2 |
+      | | 0.881x | 0.877x | | 1.31x |
+
+      Prefill now clears llama.cpp (Vulkan) on this model. B is open:
+      the two grouped kernels are 137 ms of a ~215 ms prefill at 2
+      groups/CU, and the layout that removes the tail entirely is a
+      chunk-major batch (every chunk owns its 64 rows, so the coop store
+      never crosses into a neighbour and `fs` and the copy loops go).
+      Ceiling probe before the refactor: the kernels with the guard
+      removed, timing only.
 - [ ] 6.4.5 The precision choice on the down projection. The zero-sync
       row runs down through the integer id kernel on q8_K-packed
       gate*up; the route it replaced ran the f32 wave. Router faithful
