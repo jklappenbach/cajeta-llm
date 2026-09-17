@@ -652,9 +652,51 @@ every timing leg and wait for the go; filtered suite only
       before Units 5 and 6.
 - [x] 6.4.1 The IQ codebook decode gap — promoted to Unit 7, which
       folds in 4.3.5's ternary gap as the same shape.
-- [ ] 6.4.2 The IQ3_S coop GEMM prefill gap: 0.83–0.90× of Vulkan where
+- [x] 6.4.2 The IQ3_S coop GEMM prefill gap: 0.83–0.90× of Vulkan where
       the IQ2 family clears 1.0×. The three files that miss are exactly
       the IQ3_S-heavy ones (193 / 157 / 81 tensors).
+      MET 2026-09-17, and the cause was weight REUSE, not the kernel's
+      work. `iq3sF16CoopX3Kernel` is 79.8% of an IQ3_S prefill at 2.22 ms
+      a launch against `iq2xsF16CoopX3Kernel`'s 1.74 — and the two
+      disassemble to 728 and 733 instructions with near-identical mixes,
+      so the 1.28x is not work. Normalising the launch counts and fitting
+      total coop time against BYTES PER BLOCK over the three files gives
+      `t = 302.6 + 4.951 x bytes` ms, which predicts iq3_s at 837 against
+      833 measured — 0.5%. So 64% of the IQ3_S coop time is weight
+      traffic and 36% is the shared activation-plus-MMA floor, and the
+      A side is read once per 128-token tile.
+      THE FIX WAS ALREADY WRITTEN FOR ANOTHER FORMAT. Unit 32's
+      `q4kF16CoopN256Kernel` doubles the token tile for exactly this
+      reason and records the decomposition that motivated it — "mma
+      ceiling 57%, A-side load+dequant 27%, B-side 17%... the lever was
+      weight REUSE, not arithmetic". It was worth +6% on Q4_K because
+      Q4_K's A side is 27%; IQ3_S's is 64%. `iq3sF16CoopN256Kernel` is
+      the X3 body with the token tile at 256: `warpR = sg % 2` over 64
+      rows and `warpC = sg / 2` over 64 tokens, sixteen accumulators
+      instead of eight, B left in global (staging it would cost 36 KB of
+      LDS on top of the codebook, and the A side is the lever). vgpr 212,
+      no spill, LDS unchanged at 20480.
+
+      | file | before | after | vulkan | was | now |
+      |---|---|---|---|---|---|
+      | iq3_s | 1036.6 | 1410.4 | 1266.1 | 0.828 | 1.114 MEETS |
+      | iq3_xs | 1061.8 | 1312.3 | 1209.4 | 0.876 | 1.085 MEETS |
+      | iq3_m | 1079.0 | 1445.3 | 1258.9 | 0.856 | 1.148 MEETS |
+
+      The kernel itself went 2.22 -> 1.51 ms a launch, -32%, against a
+      predicted -32%. DECODE IS UNTOUCHED, measured in the same window:
+      54.99 / 56.92 / 53.91 against 55.03 / 56.97 / 53.97.
+      iq3_xs gains least because only 157 of its tensors are IQ3_S; the
+      rest still take the 128-token tile, which is the rollout below.
+      A NOTE ON THE TEST, because it failed first for the right reason.
+      `CoopQuantGemmTest.checkN256` staged its weights with
+      `blockRepack2Launch`, but every IQ codebook format is `splitOn` —
+      the coop GEMM reads the split resident layout, an f16 scale prefix
+      then payload words. The kernel read garbage and the test said so
+      (-473248 against -0.0937). It now takes `splitLaunch` and
+      `coopView` like `checkFormatAt` does, and the red-to-green
+      transition is the evidence that the case is a live gate rather
+      than a shape the suite never reaches.
 - [ ] 6.4.3 The Qwen1.5-MoE at 0.27× / 0.26×. Expert residency is the
       first suspect (the CLI ledger held 678 MB of 6.3 GB of expert
       bytes), so measure what the bank admits before touching a kernel.
