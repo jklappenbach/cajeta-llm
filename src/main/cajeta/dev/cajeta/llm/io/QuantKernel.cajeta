@@ -281,12 +281,13 @@ public final class QuantKernel {
         uint32 gi = KernelThread.globalIdX();
         if (gi < rows) {
             int64 i = (int64) gi;
-            int64 rowBytes = blocksPerRow * 210L;
+            int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+            int64 rowBytes = prefix + blocksPerRow * 208L;
             float32 acc = 0.0f;
             int64 b = 0;
             while (b < blocksPerRow) {
-                int64 ro = i * rowBytes + b * 210L;
-                float32 d = QuantKernel.f16AtDev(packed, ro + 208L);
+                int64 ro = i * rowBytes + prefix + b * 208L;
+                float32 d = QuantKernel.scaleAtDev(packed, (i * rowBytes) / 2L + (int64) b);
                 int64 xb = xOff + b * 256L;
                 Vector<float32,4> accv = x.vload<4>(xb) * 0.0f;
                 int32 sb = 0;
@@ -1599,44 +1600,8 @@ public final class QuantKernel {
     }
 
     /**
-     * One-time repack for the Q6_K mmq route: Q6_K blocks are 210 bytes,
-     * which is NOT dword-aligned, so a word view of the raw tensor cannot
-     * address block payloads. Pad each block to 212 bytes (53 dwords);
-     * bytes 0..209 keep the ggml layout (ql 0..127, qh 128..191,
-     * scales 192..207, d 208..209). One thread per block; scalar byte
-     * copies are slow on this backend but this runs once per tensor.
-     */
-    @Kernel
-    public static void q6kPadKernel(KernelBuffer<int8> dst,
-            KernelBuffer<int8> src, uint32 nBlocks) {
-        // One WAVE per block, lane l copies bytes l, l+64, l+128, 192+l
-        // (the tail guard covers 192..209) — coalesced within the wave,
-        // 4 iterations per lane instead of 210.
-        uint32 lane = KernelThread.x();
-        uint32 b = KernelThread.globalIdX() / 64;
-        if (b < nBlocks) {
-            int64 so = (int64) b * 210L;
-            int64 dof = (int64) b * 212L;
-            uint32 i = lane;
-            while (i < 210) {
-                dst[dof + (int64) i] = src[so + (int64) i];
-                i = i + 64;
-            }
-        }
-    }
-
-    public static void q6kPadLaunch(KernelBuffer<int8> dst,
-            KernelBuffer<int8> src, int64 nBlocks) {
-        KernelStream s = QuantKernel.stream();
-        q6kPadKernel.launch(s, grid: [(uint32) nBlocks], block: [64])
-            (dst, src, (uint32) nBlocks);
-        s.sync();
-        return;
-    }
-
-    /**
      * BATCHED Q6_K, LDS-TILED — {@link #q4kQ8MmqKernel}'s twin over the
-     * 212-byte PADDED layout ({@link #q6kPadKernel}). Same tile: one
+     * resident split layout (Unit 9). Same tile: one
      * 256-thread workgroup per 64-row x 32-token tile, one 256-column
      * super-block staged per step.
      *
@@ -1666,7 +1631,8 @@ public final class QuantKernel {
         uint32 wg = KernelThread.globalIdX() / 256;
         uint32 rowTile = wg % nRowTiles;
         uint32 tokTile = wg / nRowTiles;
-        int64 rowWords = blocksPerRow * 53L;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 52L;
         int64 xRowWords = blocksPerRow * 80L;
 
         uint32 wRow = tid / 4;            // 64 rows, 4 threads each
@@ -1705,7 +1671,8 @@ public final class QuantKernel {
         int64 b = 0;
         while (b < blocksPerRow) {
             // ── stage weights: q-32 int8 + signed scales + d ────────
-            int64 ro = wBase + b * 53L;
+            int64 ro = wBase + pw
+                + b * 52L;
             int32 sb4 = 0;
             while (sb4 < 4) {
                 int32 sb = (int32) wG * 4 + sb4;
@@ -1744,7 +1711,8 @@ public final class QuantKernel {
                     j = j + 1;
                 }
                 sd[(int64) wRow] = GgufFile.halfBitsToF32(
-                    packed[ro + 52L] & 65535);
+                (packed[wBase + b / 2L]
+                    >> ((int32) (b & 1L) * 16)) & 65535);
             }
             // ── stage activations (same q8k layout as the Q4 twin) ──
             int64 xb = aBase + b * 80L;
@@ -2638,7 +2606,7 @@ public final class QuantKernel {
      * The Q6_K twin of {@link #q4kF16CoopKernel}: identical tile/compute
      * structure, staging swapped for the 212-byte PADDED layout the mmq
      * twin reads (53 dwords: ql 0..31, qh 32..47, 16 int8 scales 48..51,
-     * d f16 at 52 — see q6kPadKernel). Each BK=32 slice is two 16-value
+     * d f16 in the row's scale prefix). Each BK=32 slice is two 16-value
      * sub-blocks; d*scale folds at staging and the -32 offset applies
      * per value, so no mins correction exists anywhere.
      */
@@ -2658,7 +2626,8 @@ public final class QuantKernel {
         uint32 sg = lane / 32;
         uint32 warpR = sg % 2;
         uint32 warpC = sg / 2;
-        int64 rowWords = blocksPerRow * 53L;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 52L;
         int64 kBlocks = blocksPerRow * 8L;
         int64 cols = kBlocks * 32L;
         CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
@@ -2684,9 +2653,11 @@ public final class QuantKernel {
             int64 kbh = kb + (int64) halfSel;
             int64 blk = kbh >> 3;
             int32 g32 = (int32) (kbh & 7L);
-            int64 ro = ((int64) (to * 128 + lane)) * rowWords
-                + blk * 53L;
-            float32 d = GgufFile.halfBitsToF32(packed[ro + 52L] & 65535);
+            int64 ro = ((int64) (to * 128 + lane)) * rowWords + pw
+                + blk * 52L;
+            float32 d = GgufFile.halfBitsToF32(
+                (packed[((int64) (to * 128 + lane)) * rowWords + blk / 2L]
+                    >> ((int32) (blk & 1L) * 16)) & 65535);
             int64 sBase = (int64) lane * 72L
                 + (int64) (32 * halfSel);
             int32 half = 0;
@@ -2820,7 +2791,8 @@ public final class QuantKernel {
         uint32 sg = lane / 32;
         uint32 warpR = sg % 2;
         uint32 warpC = sg / 2;
-        int64 rowWords = blocksPerRow * 53L;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 52L;
         int64 kBlocks = blocksPerRow * 8L;
         int64 cols = kBlocks * 32L;
         CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
@@ -2844,9 +2816,11 @@ public final class QuantKernel {
             int64 kbh = kb + (int64) aHalf;
             int64 blk = kbh >> 3;
             int32 g32 = (int32) (kbh & 7L);
-            int64 ro = ((int64) (to * 128 + aRow)) * rowWords
-                + blk * 53L;
-            float32 d = GgufFile.halfBitsToF32(packed[ro + 52L] & 65535);
+            int64 ro = ((int64) (to * 128 + aRow)) * rowWords + pw
+                + blk * 52L;
+            float32 d = GgufFile.halfBitsToF32(
+                (packed[((int64) (to * 128 + aRow)) * rowWords + blk / 2L]
+                    >> ((int32) (blk & 1L) * 16)) & 65535);
             int64 sBase = (int64) aRow * 72L
                 + (int64) (32 * aHalf);
             int32 half = 0;
@@ -2983,7 +2957,8 @@ public final class QuantKernel {
         uint32 sg = lane / 32;
         uint32 warpR = sg % 2;
         uint32 warpC = sg / 2;
-        int64 rowWords = blocksPerRow * 53L;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 52L;
         int64 kBlocks = blocksPerRow * 8L;
         int64 cols = kBlocks * 32L;
         CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
@@ -3007,9 +2982,11 @@ public final class QuantKernel {
             int64 kbh = kb + (int64) aHalf;
             int64 blk = kbh >> 3;
             int32 g32 = (int32) (kbh & 7L);
-            int64 ro = ((int64) (to * 128 + aRow)) * rowWords
-                + blk * 53L;
-            float32 d = GgufFile.halfBitsToF32(packed[ro + 52L] & 65535);
+            int64 ro = ((int64) (to * 128 + aRow)) * rowWords + pw
+                + blk * 52L;
+            float32 d = GgufFile.halfBitsToF32(
+                (packed[((int64) (to * 128 + aRow)) * rowWords + blk / 2L]
+                    >> ((int32) (blk & 1L) * 16)) & 65535);
             int64 sBase = (int64) aRow * 72L
                 + (int64) (32 * aHalf);
             int32 half = 0;
@@ -3261,7 +3238,8 @@ public final class QuantKernel {
         uint32 sg = lane / 32;
         uint32 warpR = sg % 2;
         uint32 warpC = sg / 2;
-        int64 rowWords = blocksPerRow * 53L;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 52L;
         int64 kBlocks = blocksPerRow * 8L;
         int64 cols = kBlocks * 32L;
         CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
@@ -3276,10 +3254,11 @@ public final class QuantKernel {
             int64 blk = kbh >> 3;
             int32 gq = (int32) (kbh & 7L);
             if (lane < 64) {
-                int64 ro = ((int64) (to * 64 + lane)) * rowWords
-                    + blk * 53L;
+                int64 ro = ((int64) (to * 64 + lane)) * rowWords + pw
+                + blk * 52L;
                 float32 d = GgufFile.halfBitsToF32(
-                    packed[ro + 52L] & 65535);
+                (packed[((int64) (to * 64 + lane)) * rowWords + blk / 2L]
+                    >> ((int32) (blk & 1L) * 16)) & 65535);
                 int64 sBase = (int64) lane * 72L
                     + (int64) (32 * halfSel);
                 int32 half = 0;
@@ -3480,7 +3459,8 @@ public final class QuantKernel {
         uint32 sg = lane / 32;
         uint32 warpR = sg % 2;
         uint32 warpC = sg / 2;
-        int64 rowWords = blocksPerRow * 53L;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 52L;
         int64 kBlocks = blocksPerRow * 8L;
         int64 cols = kBlocks * 32L;
         CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
@@ -3496,9 +3476,11 @@ public final class QuantKernel {
             int64 kbh = kb + (int64) aHalf;
             int64 blk = kbh >> 3;
             int32 g32 = (int32) (kbh & 7L);
-            int64 ro = ((int64) (to * 128 + aRow)) * rowWords
-                + blk * 53L;
-            float32 d = GgufFile.halfBitsToF32(packed[ro + 52L] & 65535);
+            int64 ro = ((int64) (to * 128 + aRow)) * rowWords + pw
+                + blk * 52L;
+            float32 d = GgufFile.halfBitsToF32(
+                (packed[((int64) (to * 128 + aRow)) * rowWords + blk / 2L]
+                    >> ((int32) (blk & 1L) * 16)) & 65535);
             int64 sBase = (int64) aRow * 72L
                 + (int64) (32 * aHalf);
             int32 half = 0;
@@ -3599,7 +3581,8 @@ public final class QuantKernel {
         uint32 sg = lane / 32;
         uint32 warpR = sg % 4;
         uint32 warpC = sg / 4;
-        int64 rowWords = blocksPerRow * 53L;
+        int64 pw = (blocksPerRow * 2L + 3L) / 4L;
+        int64 rowWords = pw + blocksPerRow * 52L;
         int64 kBlocks = blocksPerRow * 8L;
         int64 cols = kBlocks * 32L;
         CooperativeMatrix<float32,16,16,2> a00; a00.splat(0.0f);
@@ -3615,9 +3598,11 @@ public final class QuantKernel {
             int64 kbh = kb + (int64) aHalf;
             int64 blk = kbh >> 3;
             int32 g32 = (int32) (kbh & 7L);
-            int64 ro = ((int64) (to * 128 + aRow)) * rowWords
-                + blk * 53L;
-            float32 d = GgufFile.halfBitsToF32(packed[ro + 52L] & 65535);
+            int64 ro = ((int64) (to * 128 + aRow)) * rowWords + pw
+                + blk * 52L;
+            float32 d = GgufFile.halfBitsToF32(
+                (packed[((int64) (to * 128 + aRow)) * rowWords + blk / 2L]
+                    >> ((int32) (blk & 1L) * 16)) & 65535);
             int64 sBase = (int64) aRow * 72L
                 + (int64) (32 * aHalf);
             int32 half = 0;
@@ -6343,7 +6328,7 @@ public final class QuantKernel {
     }
 
     /**
-     * Generic block byte-pad, {@link #q6kPadKernel} without the hard-coded
+     * Generic block byte-pad, the retired Q6 pad without the hard-coded
      * 210/212 — for Q3_K (110 -> 112), whose hmask/qs/scales/d already land
      * on dword boundaries and only need the block STRIDE made a multiple of
      * four. One wave per block, lane l copying bytes l, l+64, ...
@@ -10007,7 +9992,7 @@ public final class QuantKernel {
         if (ty == Quant.GG_Q3_K) { return 27; }
         if (ty == Quant.GG_Q4_K) { return 36; }
         if (ty == Quant.GG_Q5_K) { return 44; }
-        if (ty == Quant.GG_Q6_K) { return 53; }
+        if (ty == Quant.GG_Q6_K) { return 52; }
         if (ty == Quant.GG_TQ1_0) { return 13; }
         if (ty == Quant.GG_TQ2_0) { return 16; }
         return 0;
@@ -10016,7 +10001,7 @@ public final class QuantKernel {
     /** True when {@link #coopBlockWords} differs from the ggml block size,
      *  i.e. the tensor needs a one-time device repack before the GEMM. */
     public static boolean coopNeedsRepack(int32 ty) {
-        return ty == Quant.GG_Q6_K;
+        return false;
     }
 
     /** Dispatch the coop (f16-staged) batched GEMM by weight type. */
@@ -10200,15 +10185,16 @@ public final class QuantKernel {
         uint32 r = tile * 32 + lane;
         if (tile < nTiles && r < rows) {
             int64 i = (int64) i32;
-            int64 rowBytes = blocksPerRow * 210L;
+            int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+            int64 rowBytes = prefix + blocksPerRow * 208L;
             int64 xRowBytes = blocksPerRow * 320L;
             int64 xBase = (int64) r * xRowBytes;
             float32 acc = 0.0f;
             Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
             int64 b = 0;
             while (b < blocksPerRow) {
-                int64 ro = i * rowBytes + b * 210L;
-                float32 d = QuantKernel.f16AtDev(packed, ro + 208L);
+                int64 ro = i * rowBytes + prefix + b * 208L;
+                float32 d = QuantKernel.scaleAtDev(packed, (i * rowBytes) / 2L + (int64) b);
                 int64 xb = xBase + b * 320L;
                 Vector<int8,4> dvs = xp.vload<4>(xb + 288L);
                 float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
@@ -11072,7 +11058,8 @@ public final class QuantKernel {
             }
         }
         if (row < limit && which == 2 && vQ6 != 0) {
-            uint32 rowBytes = (uint32) blocksPerRow * 210;   // unit 61: uint32 offsets
+            uint32 prefix = (uint32) (((blocksPerRow * 2L + 3L) / 4L) * 4L);
+            uint32 rowBytes = prefix + (uint32) blocksPerRow * 208;
             uint32 bpr = (uint32) blocksPerRow;
             uint32 rb = row * rowBytes;
             int32 m = (int32) (rl % 4);
@@ -11081,11 +11068,12 @@ public final class QuantKernel {
             uint32 b = rl / 4;  // 8 blocks in flight
             Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
             while (b < bpr) {
-                uint32 ro = rb + b * 210;
+                uint32 ro = rb + prefix + b * 208;
                 uint32 rqa = ro + (uint32) (64 * g + 16 * a);
                 uint32 rqh = ro + (uint32) (32 * g + 16 * a);
                 uint32 rs0 = ro + (uint32) (8 * g + a);
-                float32 d = QuantKernel.f16AtDev(wv, (int64) ro + 208L);
+                float32 d = QuantKernel.scaleAtDev(wv,
+                    (int64) rb / 2L + (int64) b);
                 uint32 xb = b * 320;
                 uint32 xa0 = xb + (uint32) (16 * (8 * g + a));
                 // 9.6.5: THIS block's scale. This read `xr`, a name
@@ -11379,7 +11367,8 @@ public final class QuantKernel {
         uint32 R = 4;
         if (lpr < 32) { rpw = 32 / lpr; sub = lane / lpr; rl = lane - sub * lpr; R = 1; }
         uint32 row0 = wave * R * rpw + sub;
-        uint32 rowBytes = (uint32) blocksPerRow * 210;   // unit 61: uint32 offsets
+        uint32 prefix = (uint32) (((blocksPerRow * 2L + 3L) / 4L) * 4L);
+        uint32 rowBytes = prefix + (uint32) blocksPerRow * 208;   // unit 61: uint32 offsets
         uint32 bpr = (uint32) blocksPerRow;
         float32 acc0 = 0.0f;
         float32 acc1 = 0.0f;
@@ -11411,7 +11400,7 @@ public final class QuantKernel {
                 Vector<int8,16> a_2 = xp.vload<16>((int64) xa0 + 64L);
                 Vector<int8,16> a_3 = xp.vload<16>((int64) xa0 + 96L);
                 // slot 0
-                uint32 ro0 = rb0 + b * 210;
+                uint32 ro0 = rb0 + prefix + b * 208;
                 uint32 rqa0 = ro0 + (uint32) (64 * g + 16 * a);
                 uint32 rqh0 = ro0 + (uint32) (32 * g + 16 * a);
                 uint32 rsc0 = ro0 + (uint32) (8 * g);
@@ -11419,9 +11408,10 @@ public final class QuantKernel {
                 Vector<int8,16> qlB0 = packed.vload<16>((int64) rqa0 + 32L);
                 Vector<int8,16> qh0 = packed.vload<16>((int64) rqh0 + 128L);
                 Vector<int8,8> scv0 = packed.vload<8>((int64) rsc0 + 192L);
-                Vector<int8,4> dh0 = packed.vload<4>((int64) ro0 + 206L);
+                float32 dsc0 = QuantKernel.scaleAtDev(packed,
+                    (int64) rb0 / 2L + (int64) b);
                 // slot 1
-                uint32 ro1 = rb1 + b * 210;
+                uint32 ro1 = rb1 + prefix + b * 208;
                 uint32 rqa1 = ro1 + (uint32) (64 * g + 16 * a);
                 uint32 rqh1 = ro1 + (uint32) (32 * g + 16 * a);
                 uint32 rsc1 = ro1 + (uint32) (8 * g);
@@ -11429,9 +11419,10 @@ public final class QuantKernel {
                 Vector<int8,16> qlB1 = packed.vload<16>((int64) rqa1 + 32L);
                 Vector<int8,16> qh1 = packed.vload<16>((int64) rqh1 + 128L);
                 Vector<int8,8> scv1 = packed.vload<8>((int64) rsc1 + 192L);
-                Vector<int8,4> dh1 = packed.vload<4>((int64) ro1 + 206L);
+                float32 dsc1 = QuantKernel.scaleAtDev(packed,
+                    (int64) rb1 / 2L + (int64) b);
                 // slot 2
-                uint32 ro2 = rb2 + b * 210;
+                uint32 ro2 = rb2 + prefix + b * 208;
                 uint32 rqa2 = ro2 + (uint32) (64 * g + 16 * a);
                 uint32 rqh2 = ro2 + (uint32) (32 * g + 16 * a);
                 uint32 rsc2 = ro2 + (uint32) (8 * g);
@@ -11439,9 +11430,10 @@ public final class QuantKernel {
                 Vector<int8,16> qlB2 = packed.vload<16>((int64) rqa2 + 32L);
                 Vector<int8,16> qh2 = packed.vload<16>((int64) rqh2 + 128L);
                 Vector<int8,8> scv2 = packed.vload<8>((int64) rsc2 + 192L);
-                Vector<int8,4> dh2 = packed.vload<4>((int64) ro2 + 206L);
+                float32 dsc2 = QuantKernel.scaleAtDev(packed,
+                    (int64) rb2 / 2L + (int64) b);
                 // slot 3
-                uint32 ro3 = rb3 + b * 210;
+                uint32 ro3 = rb3 + prefix + b * 208;
                 uint32 rqa3 = ro3 + (uint32) (64 * g + 16 * a);
                 uint32 rqh3 = ro3 + (uint32) (32 * g + 16 * a);
                 uint32 rsc3 = ro3 + (uint32) (8 * g);
@@ -11449,7 +11441,8 @@ public final class QuantKernel {
                 Vector<int8,16> qlB3 = packed.vload<16>((int64) rqa3 + 32L);
                 Vector<int8,16> qh3 = packed.vload<16>((int64) rqh3 + 128L);
                 Vector<int8,8> scv3 = packed.vload<8>((int64) rsc3 + 192L);
-                Vector<int8,4> dh3 = packed.vload<4>((int64) ro3 + 206L);
+                float32 dsc3 = QuantKernel.scaleAtDev(packed,
+                    (int64) rb3 / 2L + (int64) b);
                 float32 xs = Cajeta.bitsToF32(((int32) dvs[0] & 255)
                     | (((int32) dvs[1] & 255) << 8)
                     | (((int32) dvs[2] & 255) << 16)
@@ -11464,8 +11457,7 @@ public final class QuantKernel {
                 int32 as_1 = sv_1[0] + sv_1[1] + sv_1[2] + sv_1[3];
                 int32 as_2 = sv_2[0] + sv_2[1] + sv_2[2] + sv_2[3];
                 int32 as_3 = sv_3[0] + sv_3[1] + sv_3[2] + sv_3[3];
-                float32 d0 = GgufFile.halfBitsToF32(((int32) dh0[2] & 255)
-                    | (((int32) dh0[3] & 255) << 8)) * xs;
+                float32 d0 = dsc0 * xs;
                 int32 s0_0 = (int32) scv0[0];
                 int32 s1_0 = (int32) scv0[2];
                 int32 s2_0 = (int32) scv0[4];
@@ -11500,8 +11492,7 @@ public final class QuantKernel {
                 acc0 = acc0 + d0 * (float32) (s1_0 * t1_0);
                 acc0 = acc0 + d0 * (float32) (s2_0 * t2_0);
                 acc0 = acc0 + d0 * (float32) (s3_0 * t3_0);
-                float32 d1 = GgufFile.halfBitsToF32(((int32) dh1[2] & 255)
-                    | (((int32) dh1[3] & 255) << 8)) * xs;
+                float32 d1 = dsc1 * xs;
                 int32 s0_1 = (int32) scv1[0];
                 int32 s1_1 = (int32) scv1[2];
                 int32 s2_1 = (int32) scv1[4];
@@ -11536,8 +11527,7 @@ public final class QuantKernel {
                 acc1 = acc1 + d1 * (float32) (s1_1 * t1_1);
                 acc1 = acc1 + d1 * (float32) (s2_1 * t2_1);
                 acc1 = acc1 + d1 * (float32) (s3_1 * t3_1);
-                float32 d2 = GgufFile.halfBitsToF32(((int32) dh2[2] & 255)
-                    | (((int32) dh2[3] & 255) << 8)) * xs;
+                float32 d2 = dsc2 * xs;
                 int32 s0_2 = (int32) scv2[0];
                 int32 s1_2 = (int32) scv2[2];
                 int32 s2_2 = (int32) scv2[4];
@@ -11572,8 +11562,7 @@ public final class QuantKernel {
                 acc2 = acc2 + d2 * (float32) (s1_2 * t1_2);
                 acc2 = acc2 + d2 * (float32) (s2_2 * t2_2);
                 acc2 = acc2 + d2 * (float32) (s3_2 * t3_2);
-                float32 d3 = GgufFile.halfBitsToF32(((int32) dh3[2] & 255)
-                    | (((int32) dh3[3] & 255) << 8)) * xs;
+                float32 d3 = dsc3 * xs;
                 int32 s0_3 = (int32) scv3[0];
                 int32 s1_3 = (int32) scv3[2];
                 int32 s2_3 = (int32) scv3[4];
@@ -11876,7 +11865,8 @@ public final class QuantKernel {
         uint32 kk = wave / wpe;
         uint32 rowBase = (wave - kk * wpe) * rpw;
         uint32 row = rowBase + sub;
-        uint32 rowBytes = (uint32) blocksPerRow * 210;   // unit 61: uint32 offsets
+        uint32 prefix = (uint32) (((blocksPerRow * 2L + 3L) / 4L) * 4L);
+        uint32 rowBytes = prefix + (uint32) blocksPerRow * 208;   // unit 61: uint32 offsets
         uint32 bpr = (uint32) blocksPerRow;
         uint32 xrb = (uint32) xRowBlocks;
         float32 acc = 0.0f;
@@ -11889,11 +11879,11 @@ public final class QuantKernel {
             uint32 b = rl / 4;  // 8 blocks in flight
             Vector<int32,4> z4 = heap Vector<int32,4>(0, 0, 0, 0);
             while (b < bpr) {
-                uint32 ro = rb + b * 210;
+                uint32 ro = rb + prefix + b * 208;
                 uint32 rqa = ro + (uint32) (64 * g + 16 * a);
                 uint32 rqh = ro + (uint32) (32 * g + 16 * a);
                 uint32 rs0 = ro + (uint32) (8 * g + a);
-                float32 d = QuantKernel.f16AtDev(packed, (int64) ro + 208L);
+                float32 d = QuantKernel.scaleAtDev(packed, ((int64) (rb)) / 2L + (int64) b);
                 uint32 xb = (xbase + b) * 320;
                 uint32 xa0 = xb + (uint32) (16 * (8 * g + a));
                 Vector<int8,4> dvs = xp.vload<4>((int64) xb + 288L);
@@ -12438,7 +12428,8 @@ public final class QuantKernel {
         Shared<int32> tk = shared int32[1];
         uint32 lane = KernelThread.x() % 32;
         uint32 row = KernelThread.globalIdX() / 32;
-        uint32 rowBytes = (uint32) blocksPerRow * 210;   // unit 61: uint32 offsets
+        uint32 prefix = (uint32) (((blocksPerRow * 2L + 3L) / 4L) * 4L);
+        uint32 rowBytes = prefix + (uint32) blocksPerRow * 208;   // unit 61: uint32 offsets
         uint32 bpr = (uint32) blocksPerRow;
         uint32 xrb = (uint32) xRowBlocks;
         float32 acc = 0.0f;
@@ -12455,11 +12446,11 @@ public final class QuantKernel {
                 uint32 rb = ((uint32) sel[(int64) k] * rowsPerExpert + row) * rowBytes;
                 uint32 xbase = k * xrb;
                 float32 wk = wSel[(int64) k];
-                uint32 ro = rb + b * 210;
+                uint32 ro = rb + prefix + b * 208;
                 uint32 rqa = ro + (uint32) (64 * g + 16 * a);
                 uint32 rqh = ro + (uint32) (32 * g + 16 * a);
                 uint32 rs0 = ro + (uint32) (8 * g + a);
-                float32 d = QuantKernel.f16AtDev(packed, (int64) ro + 208L);
+                float32 d = QuantKernel.scaleAtDev(packed, ((int64) (rb)) / 2L + (int64) b);
                 uint32 xb = (xbase + b) * 320;
                 uint32 xa0 = xb + (uint32) (16 * (8 * g + a));
                 Vector<int8,4> dvs = xp.vload<4>((int64) xb + 288L);
@@ -15038,10 +15029,15 @@ public final class QuantKernel {
         Quant.q8kPack(x, xOff, cols, xp);
         float32[] yh #= heap float32[rows];
         KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        // Unit 9: Q6_K is resident in the split layout.
+        int64 bprQ = cols / 256L;
+        int8[] devW #= heap int8[rows
+            * Quant.rowResidentBytes(Quant.GG_Q6_K, bprQ)];
+        Quant.splitInto(Quant.GG_Q6_K, packed, 0L, rows, bprQ, devW, 0L);
         KernelBuffer<int8> pb #= heap KernelBuffer<int8>(
-            (uint64) packed.count());
+            (uint64) devW.count());
         KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
-        pb.upload(packed);
+        pb.upload(devW);
         xpb.upload(xp);
         QuantKernel.q6kQ8WaveMatVecLaunch(yb, pb, xpb, rows, cols, 0L);
         yb.download(yh);

@@ -1853,10 +1853,40 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       by enclosing FUNCTION NAME, never by a line shape that repeats.
       Reverted and re-applied by name; `compareInto` is absent from the
       diff.
-      REMAINING: Q6_K (22 kernels — the widen, Mw4/Mw8, the id kernels,
-      the scale image, `q6kPadKernel` and `ensureQ6Pad`), then the
-      predicate removals and 9.2.2's `deqFor(Q8_0)` twin. Q6_K's
-      payload offsets do not move either, so it is 22 x three lines.
+      Q6_K LANDED TOO — ALL FIVE FORMATS ARE MIGRATED and
+      `coopNeedsRepack` returns false for every type. Its 22 kernels
+      went three lines each as predicted (row stride, block base, the
+      scale through `scaleAtDev`), scripted by ENCLOSING FUNCTION NAME
+      after the earlier slip. Four needed hand treatment:
+      `q6kQ8WaveMatVecKernel` reads its scale as `vload<4>(ro + 206L)`
+      bytes [2],[3] for four rows at once; `q6kWmmaIdMwKernel` has a
+      SECOND block base (`qlo`/`qho`) that no `int64 ro = ` regex
+      matches; the scale image and the widen index from the row start;
+      and `qkvWaveMatVecKernel` carries its own Q6 branch behind
+      `vQ6 != 0`, which only the fused-QKV test reaches.
+      THE PAD MACHINERY IS DELETED: `q6kPadKernel`, `q6kPadLaunch`,
+      `Linear.ensureQ6Pad`, `q6PadDev` and `q6PadW`. It existed only
+      because 210 is not dword-aligned; the 208-byte payload is, so the
+      coop GEMM reads `payloadDev.wordView()` like every other format
+      and the `mmq q6` route takes `packedW`. `coopBlockWords(Q6_K)` is
+      52, the payload stride.
+      SEVEN GATES FIRED ACROSS THE Q6_K PASS and every one was a real
+      miss: the coop tile dispatch had to match IQ4_NL and Q6_K by TYPE
+      before the `splitOn` predicate (both are now split but neither
+      uses the codebook launcher); `q6kQ8WaveMatVecIntoDevice`, the
+      fused-QKV test's `bv6`, `MoeIdMw8Test.q6kSlab` and `MmqProbe`'s
+      `checkMmq6` all staged file blocks; and the missed `qlo`/`qho`
+      base showed up as the MoE id test alone.
+      VERIFIED: 267/267 including `q6kKernelIsBitIdenticalToSerial` and
+      thirteen other Q6_K gates (Wmma, Mw4, Mw8, Epi, coop, N256), and
+      the 8B Q4_K_M — whose 33 Q6_K tensors include the output head —
+      loads and generates, matching llama.cpp's greedy for 14 of 16
+      tokens before the usual near-tie divergence.
+      REMAINING FOR THIS ITEM: the predicate cleanup `coopNeedsRepack`
+      (now constant false), `blockRepack2Kernel`, `blockPadKernel`,
+      `coopDev` and `splitOn` itself — `splitOn` is now every format
+      with a nonzero `scaleBytes` except MXFP4, so it can become that
+      question — plus 9.2.2's `deqFor(Q8_0)` int8 twin.
 - [ ] 9.2.2 The int8 widen twin of a Q8_0 weight — `deqFor(Q8_0)` builds
       a tile-major `deqDev` (and `ensureWidenSlab` a `deqSlabDev`) that
       the Mw8 GEMM and the sym id-kernels read — is a second copy of
