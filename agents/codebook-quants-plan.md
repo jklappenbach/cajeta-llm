@@ -1196,6 +1196,156 @@ every timing leg and wait for the go; filtered suite only
       token tile per wave) is the next lever and a new item, not a
       residue of this one. Also noted: the 1.3 s per-layer warm-up
       inside load, for the load leg.
+- [x] 6.4.7 THE COOP BODY REDESIGN (Julian, 2026-09-17: "let's redesign
+      the body, then"). The grouped bodies run at ~23 TFLOPS effective
+      and the shared expert's dense N256 bodies at ~16, against 59
+      dense-WMMA; 6.4.6's probes refuted occupancy, global-load latency
+      and activation traffic (15%) as the bound. What is left is the
+      body's own per-k-step structure: expand a 128x64 weight tile into
+      LDS, barrier, 16 LDS tile loads + 8 global tile loads + 16 mma a
+      wave, barrier. The same rule as 7.2.1: no tile shape is chosen
+      before the cost of each phase is measured and llama.cpp's
+      factoring is read.
+      - [x] 6.4.7.1 MEASURED 2026-09-17, timing-only probes on both
+            grouped bodies, one phase varied each (two of them crashed
+            the run on non-finite garbage before they were made
+            finite — a timing probe still has to keep the model's
+            numbers finite, or the trace it leaves is the OLD one and
+            reads as "no change"):
+
+            | us a launch | iq3xxs | iq4nl | varied |
+            |---|---|---|---|
+            | as committed | 778 | 753 | — |
+            | P1 expansion -> one store a lane | 595 | 590 | expansion ALU + 31 stores |
+            | P2 A tiles splatted, LDS gone | 477 | 524 | + the LDS loads |
+            | P3 every mma twice | 944 | 923 | MMA marginal +166 / +170 |
+            | (6.4.6) tiles from one cached block | 640 | 665 | activation traffic |
+
+            So of 778: expansion ~183, LDS A loads ~118, activation
+            loads ~120, the MMA at peak ~247 (14.6 GFLOP effective at
+            59 TFLOPS), and ~110 of barriers, prologue and epilogue.
+            The MMA is a third of the launch and the two phases the
+            barriers serialize around it are half. The expansion's
+            cost is nearly the same for the light iq4nl body (two
+            perms + 32 cvt/mul) as for the heavy iq3xxs one, so it is
+            the phase, not the arithmetic, that costs.
+      - [x] 6.4.7.2 READ llama.cpp's Vulkan `mul_mm` for `mul_mat_id`
+            on this device class (2026-09-17, an Opus read of
+            `ggml-vulkan.cpp` and `mul_mm.comp`, file:line kept in the
+            session). On RADV with KHR coopmat there is NO integer/MMQ
+            GEMM for `mul_mat_id` for any type (every `CREATE_MMQ` sits
+            in the non-coopmat branch) and no `mul_mmq` variant for
+            any IQ type on any device — so their MoE path is the same
+            f16-WMMA-with-dequant-into-LDS shape as ours. Tile choice
+            uses n = total tokens (512), not rows per expert, so the
+            LARGE config runs: BLOCK 256, BM 128, BN 128, BK 32, 4
+            warps of 64x64 (16 accumulators a warp), LDS pitch BK/2+4
+            f16vec2 (the coopmat bank pad), ~26 KB. Per k-block: A
+            dequantized into `buf_a` (16 values a thread), B gathered
+            through `row_ids` and converted f32->f16 at the LDS write,
+            ONE barrier, then 8 A loads + 32 B loads + 32 mma a warp
+            (B re-loaded for every A row; A reuse 4x, B reuse 1x), ONE
+            barrier. Single-buffered, no prefetch. Ragged: a
+            `count_experts` prepass kills whole workgroups past the
+            expert's count, but inside a surviving tile DEAD WORK IS
+            NOT SKIPPED — at 34 rows in a 128-wide tile 73% of the mma
+            is dead and the `warp_c == 1` warps produce nothing; only
+            the store is guarded, through an LDS stage with 32
+            workgroup barriers. Three things theirs does that ours
+            does not: the token gather lands in LDS as one dense tile
+            before the K loop; B is staged in LDS (converted once,
+            read by all warps); and a runtime selection layer (three
+            tiles x aligned x accumulator type, an LDS-budget
+            feasibility pass, a vendor/driver warptile override) — the
+            route-table shape of 9.2.9. What ours does that theirs
+            does not: 6.4.6 E's per-tile dead-work skip, and 64-token
+            chunks against their 128 — which is why we lead them on
+            this model despite the same body family.
+      - [x] 6.4.7.3 DESIGN (2026-09-17). Keep the workgroup (128 rows x
+            64 tokens, 8 waves of 32x32, E's per-tile skip, the guarded
+            tail through `fs`) and change the k-loop's PHASE STRUCTURE:
+            the expansion of k-step i+1 runs in the same phase as the
+            MMA of k-step i, into a second LDS buffer, with ONE barrier
+            a k-step. BK drops from 64 to 32 columns so two A buffers
+            fit: 2 x 128 x 40 halfs (32 + the 8-half coopmat pad) = 20
+            KB, plus `fs` 8 KB and the IQ3 tables 1.5 KB = 29.5 KB ->
+            2 groups/CU, the count the manifest gave the current body.
+            Each lane expands HALF a block a k-step (16 values; the
+            half is `aHalf`, wave-uniform, so the constant-lane stores
+            sit in a uniform branch); per wave per k-step 4 A loads, 4
+            activation loads, 8 mma. B is NOT staged (bounded at 15%
+            by 6.4.6's probe; the LDS it needs is the group we would
+            lose). Barrier count per column is unchanged. Prediction
+            from 6.4.7.1: the expansion's ~170 us hides behind the
+            MMA; the LDS loads and the activation loads stay; iq3xxs
+            778 -> ~600 us, iq4nl 753 -> ~590 us, prefill ~185 -> ~167
+            ms, ~1.32x of llama.cpp (Vulkan).
+      - [x] 6.4.7.4 TDD: `MoeCodebookIdGemmTest` (grouped == per-expert,
+            canary intact) was the bit gate for every variant above,
+            green on all five and on V-d; the test now builds the
+            slab's `halfView()` beside its word view.
+      - [x] 6.4.7.5 CODED AND MEASURED 2026-09-17 — the design is REFUTED
+            on this hardware. Every variant passed the bit gate; none
+            beat E's body:
+
+            | us a launch | iq3xxs | iq4nl | LDS | groups/CU |
+            |---|---|---|---|---|
+            | E (committed) | 778 | 753 | 28160 / 26624 | 2 |
+            | pipelined, BK=32, one barrier | 1170 | 1190 | 30208 / 28672 | 2 |
+            | + second tile's row loop-invariant (V-a) | 1070 | 1010 | same | 2 |
+            | + scales through `halfView` (V-b) | 1070 | 1020 | same | 2 |
+            | pipelined, BK=64, one barrier (V-c) | 844 | 835 | 46592 / 45056 | 1 |
+
+            The ISA of the BK=32 body showed the software half->float
+            (40 instructions, six branches, a subnormal loop) once a
+            lane a step and the second activation tile of each pair
+            split into five loads plus thirteen half-word moves; fixing
+            both (V-a, V-b) recovered 100-180 us and left the body a
+            third slower than E. At BK=64 the same single-barrier
+            pipeline (V-c) runs within 9% of E — from ONE resident
+            group, since two 18 KB buffers plus the 8 KB tail stage
+            exceed the 32 KB that two groups allow. So the phase
+            structure buys about what the lost group costs, and no LDS
+            budget reaches both: with `fs` gone (chunk-major output,
+            a MoeFfn change) the double buffer is still 38 KB.
+            Instruction counts do not explain V-c's 844 either — its
+            issue work sums to ~290 us — so the stall is latency:
+            each k-step still exposes the weight-load wait before the
+            expansion and the activation-load wait before the mma,
+            back to back. Hiding them means loads two steps ahead in
+            registers (+64 VGPRs: iq3xxs's 212 cannot take it) or the
+            token slab in LDS (over budget). The tile route llama.cpp
+            and hipBLASLt take on RDNA3 — bigger per-wave tiles at
+            half the VGPR cost — is wave64, and the amdgpu backend
+            pins wave32 (`oclc_wavefrontsize64_off`): a compiler item,
+            not a kernel one.
+            KEPT: E's bodies with the scales read through the new
+            `KernelBuffer.halfView()` (cajeta stdlib, one load and a
+            hardware convert instead of the branchy decode; measured
+            flat, bit-identical, 125 more call sites can follow).
+            V-d, that final state: 752 / 737 us a launch (-3%), bit
+            gate green, legs in 6.4.7.7.
+      - [x] 6.4.7.6 ROLL OUT: nothing to roll out — 6.4.7.5 did not
+            win. The `halfView` scale read is a separate cleanup across
+            the 125 `halfBitsToF32` kernel call sites, item 9.2.11.
+      - [x] 6.4.7.7 ACCEPTED 2026-09-17 on V-d (E's bodies, scales through
+            the half view):
+
+            | 512x128, ABBA x3 | after E | **V-d** | llama.cpp (Vulkan) | llama.cpp (HIP) |
+            |---|---|---|---|---|
+            | prefill t/s | 2749 | **2769** | 2288 | 1175 |
+            | | 1.194x | **1.210x** | | 2.36x |
+            | decode t/s | 121.8 | 121.5 | 138.4 | 93.0 |
+            | | 0.876x | 0.878x | | 1.31x |
+
+            Decode unmoved. THE ITEM'S RESULT is negative on its
+            question: under a 128x64 / 8-wave workgroup at two groups
+            per CU, the body's phase structure cannot be pipelined
+            within the LDS the group count allows, and the per-step
+            costs that remain (two exposed load latencies a step) need
+            registers the wave32 tile does not have. The ceiling for
+            this body family on gfx1151 is where E sits; the next
+            level is wave64 tiles, a compiler item.
 - [ ] 6.4.5 The precision choice on the down projection. The zero-sync
       row runs down through the integer id kernel on q8_K-packed
       gate*up; the route it replaced ran the f32 wave. Router faithful
@@ -2603,6 +2753,15 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       9.2.9; route-table spec §7.
 
 ### 9.3 Acceptance
+- [ ] 9.2.11 `GgufFile.halfBitsToF32` in kernels -> `KernelBuffer.halfView()`
+      reads. 125 call sites decode an f16 scale by bit manipulation
+      with a subnormal loop (40 instructions, six branches a call);
+      through a float16 view it is one load and `v_cvt_f32_f16`. Done
+      for the two grouped coop bodies in 6.4.7 (bit-identical, -3% a
+      launch); the wave mat-vecs and the dense coop bodies remain.
+      Each kernel gains a `packedH` parameter; each launcher a half
+      view kept beside the word view (`ExpertBank.slabH` is the
+      pattern). Bit gate per kernel, the format's existing test.
 - [~] 9.3.1 Filtered suite green.
       `LinearKernelRouteTest` was never IN the filtered suite, and
       adding it for 9.2.4 found `legacyWidensAreExact` red since
