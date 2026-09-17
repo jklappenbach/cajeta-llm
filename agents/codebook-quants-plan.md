@@ -1958,10 +1958,56 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       Q6_K row largest, which is what the retired 212-byte pad predicts:
       that copy is 2 bytes a block of 6.59 GB, about 63 MB of write and
       read that no longer happens.
-      OWED: the iq4_nl file and a Q4_0 8B, neither of which exists in
-      the tree yet — both need `llama-quantize`. They are the only two
-      files that would exercise Q4_0's and IQ4_NL's WIDEN route, which
-      is the coverage gap 9.2.1 records.
+      THE OTHER THREE, 2026-09-17. The iq4_nl file DID already exist —
+      `tmp/q1fix/llama8b-iq4_nl.gguf` from the IQ1 work, 189 iq4_nl
+      tensors + 36 q5_K + the q6_K head. `llama8b-q4_0.gguf` (225 q4_0)
+      and `llama8b-q5_0.gguf` (225 q5_0) were quantized from the Q8_0 8B
+      with the same recipe. Q5_0 is here because 9.2.1 records its widen
+      route as unverified with no file either, and it is the same
+      commit as Q4_0.
+      PRE IS b0bd58a — the parent of fa11822 (IQ4_NL), itself the parent
+      of e160e69 (Q4_0/Q5_0) — so one control sits before all three. The
+      Q6_K leg's binary could not serve: it was built at 353087e, which
+      already carries them. 9.2.3's fix is patched into BOTH arms, so
+      the iq4_nl file runs on the control and the arms differ only by
+      the migration.
+
+      THE BIT GATE IS EXACT on all three: iq4_nl e79402903475603a,
+      q4_0 03a9ff9be0b1cb5c, q5_0 a5ce1a7a3dc4f2a8, identical pre and
+      post. The q4_0/q5_0 hashes also match the run taken BEFORE 9.2.3
+      existed, which is a free control on that fix.
+
+      | file | pre | post | delta | post GB/s |
+      |---|---|---|---|---|
+      | iq4_nl 8B | 28.60 | 26.39 | -7.7% | 124 |
+      | q4_0 8B | 46.01 | 45.78 | -0.5% | 213 |
+      | q5_0 8B | 38.05 | 38.16 | +0.3% | 213 |
+
+      Q4_0 AND Q5_0 COST NOTHING and are AT THE MACHINE WALL — 213
+      weight-GB/s each, which is where Q4_K sits. Their widen route is
+      now exercised by a file, closing half of 9.2.1's coverage gap.
+      IQ4_NL REGRESSED 7.7% ON DECODE (and 2.4% on prefill), and the
+      cause is not the layout but WHAT KERNEL READS IT. IQ4_NL sets no
+      wave flag at all on a 4096-wide model: `waveIq` covers
+      IQ2_XXS/IQ2_XS/IQ3_XXS/IQ2_S/IQ3_S and not IQ4_NL, and `wavef` —
+      which would serve it, since `hasF32WaveKernel(IQ4_NL)` is true —
+      is gated on `!q8kDims`, false whenever inDim % 256 == 0. So it
+      decodes on the ITEM-PER-ROW f32 kernel, and the measurement says
+      so: 124 GB/s against Q4_0's 213 on a file of the same size and
+      the same bit width. The split costs 7.7% there because that
+      kernel is latency-exposed, not bandwidth-bound; on the two
+      formats at the wall it costs nothing.
+      THE FIFTH UNREACHABLE FAST PATH OF THIS UNIT. `wavef`'s guard
+      means "the integer wave route did not engage", and `!q8kDims` is
+      the wrong way to ask it — a type with no integer route and a
+      256-aligned width answers no to both. Fixing it is a routing
+      change with its own bit-gate baseline (an f32 reduction reorder),
+      so it is NOT folded in here. NOT DONE, and worth more than the
+      regression it would erase.
+      THE TRADE IS JULIAN'S: the IQ4_NL migration bought the Qwen MoE
+      prefill 657 -> 895 t/s by deleting 1420 repack launches a step. A
+      dense 8B has no repack to delete and pays 7.7% of a decode that is
+      already 42% below the wall.
 - [~] 9.3.3 Resident bytes equal file bytes for every file above and the
       30B Q8_0 re-checked; the repack code gone.
       EXACT ON THE PURE Q6_K 8B, which is the file this unit most had to
