@@ -1827,9 +1827,36 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       and slow. It is one-time work per tensor that a fresh process per
       leg rep pays every time; llama.cpp charges the equivalent to load.
       Worth its own look once Q3_K and Q6_K land.
-      REMAINING: Q3_K (5 kernels) and Q6_K (22 — the widen, Mw4/Mw8, the
-      id kernels, the scale image, `q6kPadKernel` and `ensureQ6Pad`),
-      then the predicate removals and 9.2.2's `deqFor(Q8_0)` twin.
+      Q3_K FOLLOWED, and it is cheaper than the byte count suggests
+      because of where its scale lives. Q3_K is `hmask, qs, scales, d`
+      and Q6_K is `ql, qh, scales, d` — the f16 is at the END of the
+      block, like the ternary pair — so `Quant.scaleOffset` returns
+      `blockBytes - 2` for both and THE PAYLOAD OFFSETS INSIDE A BLOCK
+      DO NOT MOVE. Only the row stride and the scale read change, which
+      is three lines a kernel instead of a re-offset of every field.
+      `splitInto` and `splitKernel` were already general over
+      `scaleOffset`, so neither needed a line.
+      FOUR OF FIVE MIGRATED. `coopNeedsRepack` is Q6_K alone.
+      THREE GATES FIRED ON Q3_K and each was right to:
+      `deviceBlockStridesAgreeWithGgmls` caught that Q3_K was still in
+      `coopNeedsRepack` while its `coopBlockWords` had already become
+      the payload stride; `ResidentLayoutTest` asserted every type keeps
+      its scale at offset 0, which Q3_K and Q6_K break — it now asserts
+      the invariant the split actually needs, that the scale sits at ONE
+      END so the payload either side stays contiguous; and the Q3_K Mw8
+      probe was still uploading file blocks.
+      ONE ERROR WORTH RECORDING, because it is the failure mode of a
+      long mechanical pass: the first attempt at that probe fix matched
+      `wDev #= heap ... rawW.count()` by SHAPE and landed in
+      `compareInto`, a Q4_K probe 3000 lines away, which the filtered
+      suite does not exercise — so it would have shipped silently. Match
+      by enclosing FUNCTION NAME, never by a line shape that repeats.
+      Reverted and re-applied by name; `compareInto` is absent from the
+      diff.
+      REMAINING: Q6_K (22 kernels — the widen, Mw4/Mw8, the id kernels,
+      the scale image, `q6kPadKernel` and `ensureQ6Pad`), then the
+      predicate removals and 9.2.2's `deqFor(Q8_0)` twin. Q6_K's
+      payload offsets do not move either, so it is 22 x three lines.
 - [ ] 9.2.2 The int8 widen twin of a Q8_0 weight — `deqFor(Q8_0)` builds
       a tile-major `deqDev` (and `ensureWidenSlab` a `deqSlabDev`) that
       the Mw8 GEMM and the sym id-kernels read — is a second copy of
