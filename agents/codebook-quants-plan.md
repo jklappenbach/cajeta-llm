@@ -1060,6 +1060,41 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       would be 225), so it can only be FUSED into the kernel that
       produces each vector — the norm, the attention output, the GLU.
       That is ~2.8% on every format, not just IQ2.
+      IQ2 RE-PROFILE, 2026-09-16, quiet box, on llama8b-iq2_xs after
+      both changes. Decode is 14.62 ms/token of device work (was
+      16.01): iq2xs wave 9.69 (66.3%), the Q5_K head 1.58 (10.8%),
+      q4k+q2k 0.80, everything else 2.55 (17.4%) — still 82.6%
+      mat-vec. −0.75 ms/token clears the bar, which is +7.7% on the
+      iq2xs kernel, 189 → 204 GB/s.
+      WHAT BINDS IT IS THE GATHER WIDTH, and the ISA sorts the whole
+      set on one column:
+
+      | kernel | `global_load_b64` per body | GB/s |
+      |---|---|---|
+      | iq2xs | 10 | 189 |
+      | iq2xxs | 10 | 185 |
+      | iq2s | 8 | 189 |
+      | iq3xxs | 1 | 200 |
+      | iq3s | 1 | 203 |
+      | q4k | 0 | 207 |
+
+      The three formats below the ceiling are exactly the three whose
+      codebook entry is EIGHT bytes, so every lookup is a divergent
+      `global_load_b64` with 32 unrelated lane addresses. IQ3's entry
+      is four bytes and gathers as `b32`; Q4_K's weights are contiguous
+      `b128`. Nothing else binds: DRAM is at 74% of peak, load ISSUE at
+      2.3% of the ceiling, VALU at 47%. Loads per value REFUTES itself
+      as the explanation — iq3s has the most at 0.50 and sits at the
+      ceiling, iq2xs has 0.266 and does not.
+      SIXTH VARIABLE, ready to build: `IqGrid.iq2xxs2b()`,
+      `iq2xs2b()` and `iq2s2b()` already hold one `int32` per grid
+      entry — eight 2-bit codes over the magnitude set {8, 25, 43}
+      (verified against the int64 tables). Gathering those makes every
+      IQ2 lookup a `b32`, halves the codebook's footprint, and turns
+      the expansion into a 4-entry LUT, which is the `Vector.lut4`
+      pattern that beat llama.cpp on MXFP4. PREDICTED: `b64` per body
+      10 → 0, `b32` up by the same count, byte rate toward 204, and
+      IQ3/Q4_K/TQ flat.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
