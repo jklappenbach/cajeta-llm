@@ -1089,7 +1089,7 @@ every timing leg and wait for the go; filtered suite only
             (exact, gate and up from different fixture offsets). LANDED
             2026-09-17: bit gate exact; decode 7.97 -> 7.76 ms a token,
             128.9 t/s (ABBA x3, pre binary 8.25).
-      - [ ] 6.4.3.5 The shared expert: gate + up + GLU in one IQ2_S wave
+      - [x] 6.4.3.5 The shared expert: gate + up + GLU in one IQ2_S wave
             launch (`Linear.gateUpGluPacked`, two rows a wave as the IQ2_S
             kernel takes them); the IQ3_S down accumulating into the
             residual scaled by sigmoid(z) in its epilogue (`accum` mode
@@ -1098,8 +1098,16 @@ every timing leg and wait for the go; filtered suite only
             mode 3). The gate logit's own mat-vec and the pack stay. -3.
             TDD: `MoeCodebookIdMatVecTest.iq2sWaveGateUpGluMatchesTheChain`
             (63 rows, so the odd-row tail is covered) and
-            `iq3sWaveAccumGatedMatchesTheChain`, both exact.
-      - [ ] 6.4.3.6 Fused QKV for the IQ wave family. -2.
+            `iq3sWaveAccumGatedMatchesTheChain`, both exact. LANDED
+            2026-09-17: bit gate exact; decode 7.76 -> 7.66 ms a token,
+            130.5 t/s (ABBA x3, pre binary 8.24).
+      - [ ] 6.4.3.6 Fused QKV for IQ3_XXS: `iq3xxsQkvWaveMatVecKernel`,
+            one body per weight parameter (the lowering knows buffer
+            parameters only), the biases in the epilogue as 6.4.3.2
+            folds them; `Linear.matvecQkvStagedKeep` takes the arm when
+            all three are IQ3_XXS wave routes. -2. TDD:
+            `MoeCodebookIdMatVecTest.iq3xxsQkvLaunchMatchesThreeBiasedLaunches`
+            (exact).
       - [ ] 6.4.3.7 The token tail (~0.3 ms): argmax on device, the token
             id to a host-visible word; the embed gather from that id on
             device.
