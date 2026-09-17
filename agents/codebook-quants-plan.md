@@ -1100,14 +1100,38 @@ every timing leg and wait for the go; filtered suite only
             (63 rows, so the odd-row tail is covered) and
             `iq3sWaveAccumGatedMatchesTheChain`, both exact. LANDED
             2026-09-17: bit gate exact; decode 7.76 -> 7.66 ms a token,
-            130.5 t/s (ABBA x3, pre binary 8.24).
-      - [ ] 6.4.3.6 Fused QKV for IQ3_XXS: `iq3xxsQkvWaveMatVecKernel`,
+            130.5 t/s (ABBA x3, pre binary 8.24). CORRECTED the same
+            evening by a census of the new binary: only the gated down
+            had taken. THIS FILE'S RECIPE (printed from the gates): attn
+            q, k IQ2_S; attn v, o IQ3_XXS; shared gate, up IQ3_XXS;
+            shared down IQ3_S; expert gate, up IQ3_XXS; expert down
+            IQ4_NL; output Q5_K — the census had q/k and the shared
+            gate/up swapped. Added `iq3xxsQ8WaveGateUpGluKernel` and a
+            by-type dispatch in `gateUpGluPacked` (the IQ2_S kernel stays,
+            tested, for recipes that quantize a shared expert so). TDD:
+            `iq3xxsWaveGateUpGluMatchesTheChain`. A route that is not in
+            the census did not take: the census, not the gate's code, is
+            the proof.
+      - [x] 6.4.3.6 Fused QKV for IQ3_XXS: `iq3xxsQkvWaveMatVecKernel`,
             one body per weight parameter (the lowering knows buffer
             parameters only), the biases in the epilogue as 6.4.3.2
             folds them; `Linear.matvecQkvStagedKeep` takes the arm when
             all three are IQ3_XXS wave routes. -2. TDD:
             `MoeCodebookIdMatVecTest.iq3xxsQkvLaunchMatchesThreeBiasedLaunches`
-            (exact).
+            (exact). First cut measured FLAT (7.66 -> 7.69) because this
+            file's q and k are IQ2_S and the arm never took; the census
+            said so. Added `iq2sIq3xxsQkvWaveMatVecKernel` for the
+            recipe: IQ2_S row pairs for q and k, IQ3_XXS rows for v, the
+            per-type wave bodies verbatim, dispatched by the type triple.
+            TDD: `iq2sIq3xxsQkvLaunchMatchesThreeBiasedLaunches` (odd row
+            counts, so both pair tails are covered). LANDED 2026-09-17
+            with 6.4.3.5's correction in the same cycle: bit gate exact;
+            decode 7.69 -> 7.38 ms a token, 135.5 t/s (ABBA x3, pre
+            binary 8.22). The census of the new binary: one fused QKV and
+            one fused shared gate-up-GLU launch a layer, the plain
+            IQ3_XXS wave kernel down to the o-projection; ~340 launches a
+            token (was ~600), decode idle 13.4% of the window (was
+            18.7%). 0.979x of llama.cpp (Vulkan)'s 138.4 from here.
       - [ ] 6.4.3.7 The token tail (~0.3 ms): argmax on device, the token
             id to a host-visible word; the embed gather from that id on
             device.
