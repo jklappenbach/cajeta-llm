@@ -1059,9 +1059,26 @@ every timing leg and wait for the go; filtered suite only
             are re-costed at 2.4 us a launch: 11 launches a layer =
             ~0.63 ms, plus the tail's ~0.25 = 7.16 ms a token = ~140 t/s
             against 138.4 — parity by a hair if every item lands.
-      - [ ] 6.4.3.3 IQ4_NL down + combine + next-layer norm tail: an
+      - [x] 6.4.3.3 IQ4_NL down + combine + next-layer norm tail: an
             IQ4_NL arm of `idDownCombineTailLaunchNoSync`. -2 (combine,
-            next rmsnormPack).
+            next rmsnormPack). The combine keeps `moeCombineAddKernel`'s
+            order (each expert's total reduced as the id mat-vec reduces
+            it, then hs += sum_k w_k tot_k) so the fused launch is
+            bit-identical to the chain; the Q4_K twin walks (expert,
+            block) pairs and its test carries a tolerance. TDD:
+            `MoeCodebookIdMatVecTest.iq4nlDownCombineTailMatchesTheChain`
+            (hs, normed output and packed bytes exact; counter reset).
+            LANDED 2026-09-17. Two lowering lessons on the way: the tail
+            copied from the Q4_K twin declares `i`, and a same-named
+            int64 in the dot loop had the whole kernel SKIPPED silently
+            (`rebuild-tests.sh` filters the note; the cycle script now
+            greps it back); and the Q4_K tail sums squares by wave
+            reduce + eight partials where `rmsnormPackRowF32` uses a
+            256-lane tree, a last-bit difference in `scale` — this tail
+            takes the tree so the normed row is bit-identical to the
+            launch it replaces. Bit gate exact; decode 8.04 -> 7.97 ms a
+            token, 125.4 t/s, against the pre binary's 8.25 in the same
+            session (ABBA x3).
       - [ ] 6.4.3.4 IQ3_XXS gate + up + GLU in one id launch, the q8_K
             pack of the GLU output in its epilogue. -3.
       - [ ] 6.4.3.5 The shared expert: gate + up + GLU + pack in one wave
