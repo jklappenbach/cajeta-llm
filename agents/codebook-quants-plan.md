@@ -2161,7 +2161,7 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       the same defect and is corrected there.
 
 
-- [ ] 9.2.7 `splitScaleKernel`'s lane mapping, which 9.2.6 left behind on
+- [x] 9.2.7 `splitScaleKernel`'s lane mapping, which 9.2.6 left behind on
       the half it did not touch. The 6.4.3 census reads splitPayload
       64.23 ms and splitScale 45.70 ms: 42% of the split's cost to move
       TWO BYTES a block, about 1% of its bytes. It is one work item per
@@ -2170,6 +2170,55 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       destination by construction, so a wave can take a row's whole
       scale prefix as dwords. Gated by the device-vs-host split tests
       that 9.2.6 added.
+      DONE 2026-09-17, AND THE STATED MECHANISM IS REFUTED. The gain is
+      real but small, and the reason it is small is the finding.
+
+      | arm | launches | self | per launch |
+      |---|---|---|---|
+      | pre, `splitScaleKernel` | 336 | 45.70 ms | 136.01 us |
+      | post, `splitScaleWordKernel` | 264 | 26.15 ms | 99.04 us |
+      | post, `splitScaleKernel` (mid-row chunks) | 72 | 17.55 ms | 243.69 us |
+
+      43.70 ms against 45.70, -4.4% overall and about -7% on the 264
+      chunks that actually changed kernel. The load A/B is FLAT on all
+      three shapes (iq4_nl ~2600 both arms, MoE 2105 -> 2087, Q6_K 3336
+      -> 3333), which is the right answer rather than a disappointing
+      one: 45.70 ms inside a 2.1-3.3 s load is 1-2%, under a +/-3%
+      spread. A flat A/B here means "smaller than the noise floor", never
+      "no change" — 9.2.6's 175 ms was four times larger and DID resolve.
+      WHY THE MAPPING BOUGHT SO LITTLE: the scale split is not store
+      bound or item bound, it is READ AMPLIFICATION bound, and the new
+      mapping does not change the reads. Block scales sit `blockBytes`
+      apart, so a wave pulls one cache line per block to take two bytes:
+      64 lanes over 128 blocks of iq3_xxs span 12544 bytes, 196 lines,
+      to use 256 bytes — 49x. At 99.04 us a 32 MB chunk that is 21.9 MB
+      of lines at ~221 GB/s, which is AT this device's ceiling. Both
+      arms were already there; the dword store bought the 7% left over.
+      There is no lane mapping that improves this further.
+      WHAT WOULD: fold the scale into the payload pass, which already
+      reads those exact lines. Opened as 9.2.8 — and it would retire
+      `splitScaleWordKernel` rather than build on it.
+      THE GATE FALLS BACK MORE THAN EXPECTED: 72 of 336 chunks end
+      mid-row and take the per-block kernel, and they are the expensive
+      ones (243.69 us against 99.04) because they are the 32 MB chunks of
+      the big tensors. 21% of launches, 40% of the remaining cost.
+
+- [ ] 9.2.8 Fold the scale into the payload pass. 9.2.7 measured the
+      scale split at ~221 GB/s of CACHE LINES for 2 useful bytes a
+      block — at the device ceiling for an access pattern that is 49x
+      amplified, so no mapping of a separate pass can improve it. The
+      payload kernel already reads those same lines: for a head-scale
+      format the scale is the two bytes before the payload, for a
+      tail-scale one the two after. A merged pass makes the scale
+      approximately free and retires both `splitScaleWordKernel` and
+      `splitScaleKernel`, worth the whole 43.70 ms on the MoE.
+      THE OBSTACLE IS THE WRITE, not the read: the payload kernel stores
+      through `outW` (`KernelBuffer<int32>`) and a scale is two bytes, so
+      either the kernel takes a second int8 view of the same buffer — two
+      descriptors onto one allocation, which is what 9.2.6 split the
+      kernels to avoid — or a lane assembles a prefix dword from two
+      blocks whose lines it does not both hold. Settle which by probe
+      before writing the kernel.
 
 ### 9.3 Acceptance
 - [~] 9.3.1 Filtered suite green.
