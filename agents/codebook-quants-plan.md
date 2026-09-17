@@ -1014,6 +1014,30 @@ every timing leg and wait for the go; filtered suite only
       STILL OPEN on prefill (cause 5) and on that choice.
 
 
+- [ ] 6.4.4 Cause 5: the grouped prefill id-GEMM for the codebook
+      banks. `ExpertBank.idGemmReady()` admits Q4_K and Q6_K (and the
+      widened symmetric slab); the codebook banks fall to one coop
+      launch per expert — sixteen workgroups, 8.9 GB/s, 3810 in series
+      — and prefill sits at 0.393x of llama.cpp (Vulkan). The existing
+      id-GEMMs are WMMA kernels driven by an expert map
+      (`q4kWmmaIdMw`, `q6kWmmaIdMw`, `symWmmaDeqIdMw8`); the codebook
+      coop bodies clear the IQ4 bar and have no map. SPIKE FIRST: an id
+      variant of the coop family reading `mapE / mapT0 / mapM1`, IQ3_XXS
+      only, measured against the per-expert launches on the MoE before
+      the second format is written. Bit gate: the grouped GEMM equals
+      the per-expert GEMMs over the same slab. ISA read is done (89
+      VGPRs, no spill, 3 groups/CU) — the launch shape is the whole
+      cause. Admission is a route-table row, not a fifth list (9.2.9).
+- [ ] 6.4.5 The precision choice on the down projection. The zero-sync
+      row runs down through the integer id kernel on q8_K-packed
+      gate*up; the route it replaced ran the f32 wave. Router faithful
+      to 5e-6; perplexity +0.41% (5.50046 against 5.4781), inside the
+      floor, mechanism named. Either: KEEP, and record the trade beside
+      llama.cpp's own q8_1 activations; or an f32-activation id kernel
+      for IQ4_NL down, measured for the bandwidth it costs. Julian's
+      call; the arbiter (`bench/MoeRowArbiter`, `MoeFfn.setRouterTap`)
+      is the instrument either way.
+
 ## Unit 7 — The decode bandwidth gap (spec §6, §8.5, 12.1; folds 4.3.5 and 6.4.1)
 
 Every ternary and codebook decode wave mat-vec runs below llama.cpp's
@@ -2357,7 +2381,15 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       blocks whose lines it does not both hold. Settle which by probe
       before writing the kernel.
 
-- [ ] 9.2.9 THE ROUTE TABLE, and the test that audits it — not a sweep.
+- [ ] 9.2.9 THE ROUTE TABLE — this package's registration. Specified
+      as the xpu layer's selection contract at
+      `cajeta/specs/route-table-spec.md` (draft 2026-09-17, no plan
+      yet; architecture note `docs/specification/xpu/CajetaXPU-Routing.md`,
+      guide `docs/guide/25-xpu-kernels.md`). This item is the llm half:
+      every predicate below becomes a row, every dispatcher gets
+      explicit arms and a terminal refusal, and `theFourPartInvariant`
+      becomes the audit's walker. Blocked on the spec's approval and
+      its `Route` / `RouteTable` unit in the runtime. Not a sweep.
       This class of defect has now been solved eight times and each
       time from scratch, because the knowledge of which format may take
       which route lives in prose and in whoever last hit the refusal,
@@ -2393,6 +2425,14 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       into xpu, measured selection from the Autotune store). That is
       the arc this table sits under, and it is a spec. This item is the
       part that stops the bleeding now.
+
+- [ ] 9.2.10 `Linear.backendIsVulkan()`'s ~14 sites (and `MoeFfn`'s
+      two) become `Device.supports(Capability)` queries, with the
+      `Capability` values they need added in the runtime — WMMA
+      present, `dotSum` usable, the RADV context-loss quirk. Three
+      questions under one name today: capability, driver quirk, route
+      policy. The first two move; the third is a row's `needs`. After
+      9.2.9; route-table spec §7.
 
 ### 9.3 Acceptance
 - [~] 9.3.1 Filtered suite green.
