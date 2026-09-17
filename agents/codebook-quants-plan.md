@@ -873,6 +873,82 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       count the IQ2 family reaches Q4_K's 205 GB/s, which is 764 G
       values/s and would clear 7.3.1 for every file. Loads, `vmcnt(0)`
       and `v_dot4` must not move. Q4_K and TQ2_0 stay flat.
+      FOURTH VARIABLE — from READING llama.cpp rather than our own ISA,
+      at Julian's direction, and it displaces the third as the next
+      edit. Their Vulkan IQ2_XS mat-vec, decode path on RDNA:
+
+      | | cajeta | llama.cpp |
+      |---|---|---|
+      | lanes per row | 32 | 16 |
+      | rows per workgroup | 1 | 4, sharing one activation load |
+      | sign bits | `ksigns[q>>9]`, an L1 gather | `q>>9` + `bitCount` |
+      | codebook | L1 | LDS, staged per workgroup |
+      | activations | packed to q8_K | read as f32 |
+      | arithmetic | int8 `v_dot4` | f32/f16 `fma` |
+
+      `ggml_vk_create_pipeline` passes `rm_iq = 2 * rm_kq = 4` rows and
+      `wg_size_subgroup16` threads; `init_iq_shmem` stages the grid.
+      THE ONE THAT MATTERS FIRST: **ksigns is not a table, it is
+      arithmetic.** Checked against all 128 entries of `IqGrid.ksigns()`
+      — `ksigns[s] == s | ((popcount(s) & 1) << 7)`, no exceptions. We
+      gather it four times per body from L1; they compute it. Our body
+      issues 14 loads per 32 values where Q4_K issues 26 per 320, and
+      the kernel saturates neither the VALU ceiling (45%) nor DRAM
+      (63%), so LOAD ISSUE is the limiter and four of the fourteen
+      loads are arithmetic.
+      Their decode is 13.69 ms/token against our 16.01. Holding
+      everything outside this kernel equal, their IQ2_XS mat-vec runs
+      8.54 ms against our 10.86 — 27% faster, where 16.7% clears the
+      bar.
+      CHANGE: `iqSign7(s) = s | ((Bits.count(s) & 1) << 7)`, replacing
+      `ks[...]` in the IQ2_XXS, IQ2_XS and IQ3_XXS wave mat-vecs.
+      PREDICTED: `global_load_b32` down by 4 per body, `vmcnt(0)`
+      unchanged at 1 (the gathers were already in one drain), VALU
+      roughly flat (a popcount, an and, a shift and an or replace the
+      index scaling the gather needed), and 10–20% on those three
+      kernels if load issue is really the limiter.
+      THE CONTROL IS INTERNAL AND BETTER THAN Q4_K: IQ2_S and IQ3_S
+      read raw sign bytes and never touch ksigns. They share `iqDot16`,
+      the split layout, the lane mapping and the launch path, and
+      differ only in this. They must not move. Q4_K and TQ2_0 as the
+      outer controls.
+      DONE 2026-09-16. ISA exactly as predicted: `global_load_b32`
+      down by 4 on each of the three, `vmcnt(0)` still 1, `v_dot4`
+      still 8, VALU up by exactly 8 with 4 `v_bcnt`. The two internal
+      controls came back BYTE-IDENTICAL (iq2s 181 VALU, iq3s 206).
+
+      | kernel | loads/body | G values/s |
+      |---|---|---|
+      | iq2xs | 14 -> 10 | 604 -> 666 (+10.3%) |
+      | iq2xxs | 13 -> 9 | 669 -> 696 (+4.0%) |
+      | iq3xxs | 18 -> 14 | 547 -> 555 (+1.5%) |
+      | iq2s (internal control) | 12 | 613 -> 614 (+0.2%) |
+      | iq3s (internal control) | 16 | 505 -> 507 (+0.4%) |
+      | q4_k / tq2_0 / tq1_0 | - | +0.9 / -0.5 / +1.3% |
+
+      Four loads traded for eight VALU ops bought 10.3%, which settles
+      that LOAD ISSUE binds this kernel, not arithmetic. Exactness gate
+      229/229 — the table identity holds for all 128 entries, so the
+      kernels are bit-identical.
+      The two small movers say where the rest is. IQ3_XXS is at 198
+      GB/s against Q4_K's 207, so it is nearly at the bandwidth wall
+      and has little left. IQ2_XXS at 167 GB/s is not, and it is one of
+      the two kernels the FIRST variable never touched — it and
+      IQ3_XXS still carry the old `while (pp < 2)` body with gathers
+      inside the loop. Giving them variable 1's treatment is the cheap
+      follow-on.
+      REMAINING FROM THE llama.cpp READ, in order of expected size:
+      (a) FOUR ROWS PER WORKGROUP. We run one row per 32-lane wave and
+      re-read the whole activation row for every output row; they run
+      four rows per workgroup and load it once. Activations are 4x our
+      weight traffic at IQ2 rates, so this is the largest structural
+      difference left.
+      (b) The grid in LDS. Spec 12.1 decided against it at 32 lanes
+      serving ONE row. At four rows per workgroup the amortization is
+      4x better, and with ksigns gone the grid is the only table left,
+      so 12.1 must be RE-DECIDED after (a), not before.
+      (c) The 64-bit address arithmetic of the old third variable,
+      still 38–41 instructions per body and untouched by this change.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
