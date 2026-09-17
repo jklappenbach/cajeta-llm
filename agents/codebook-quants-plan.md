@@ -1016,6 +1016,66 @@ every timing leg and wait for the go; filtered suite only
       kernel-rate residues — the grouped coop bodies at ~50-60 GB/s on
       prefill, and decode's last 12% — both under 7.2.1's method, and
       neither a launch count any more.
+      RE-OPENED 2026-09-17 (Julian: "Let's get back to 6.4.3. Get it
+      done"; then "Idle."): prefill 1.21x, decode 0.878x. The residue is
+      decode, and the decode residue is measured below before any kernel
+      is touched.
+      - [x] 6.4.3.1 MEASURED 2026-09-17: the idle anatomy of a decode
+            token. Device busy 228 of 280 ms over 32 tokens (81%). The
+            host issues a token's ~600 launches in 1.31 ms and waits 6.83
+            ms in the stream sync (`MoeBenchProbe`'s dec-tail timers); the
+            ROCm wait-policy knobs (`HSA_ENABLE_INTERRUPT=0`,
+            `ROC_ACTIVE_WAIT_TIMEOUT`) move nothing, ABBA. A new
+            `cajeta profile summary --gaps` (the idle between consecutive
+            slices, histogram + largest, cajeta repo) partitions the
+            52.6 ms: 16134 gaps of 2.54 us between consecutive launches =
+            40.9 ms, and 29 gaps of ~336 us at the token tail (head kernel
+            -> next token's first norm: logits fetch 0.10, argmax, embed
+            0.07, first launch) = 9.7 ms. `LaunchFloorProbe` puts the
+            floor at 2.0-2.4 us a launch, host submit and device gap
+            alike. So decode's idle IS launch count. THE TALLY, per layer
+            (24 layers, 25 launches): rmsnormPack 1, q k v 3, bias adds
+            3, qkPrep 1, flash 1, reducePack 1, o 1 (accumulate form),
+            rmsnormRouterTopK 1, gate 1, up 1, glu 1, pack 1, down 1,
+            combine 1, shared gate 1, up 1, glu 1, pack 1, down 1, gate z
+            1, sigmoid-add 1. Thirteen of these are epilogue work of a
+            neighbour; each fused one saves its ~2.5 us gap plus the tiny
+            kernel's own 2-5 us. The fusions exist for Q4_K/Q6_K
+            (`idGateUpGlu`, `idDownCombineTail`, `qkvWaveMatVecKernel`)
+            and refuse the IQ family, which is why this file pays 25.
+      - [x] 6.4.3.2 Bias in the IQ wave mat-vec epilogue (q, k, v carry
+            biases on this model): `accum` mode 2 stores `tot + bias[row]`
+            on the five IQ wave kernels and the IQ4_NL wave kernel;
+            `Linear.launchOne` folds when the staged launch has no output
+            scale. -3 launches a layer. TDD: `MoeCodebookIdMatVecTest.
+            iq3xxsWaveLaunchAddsItsBias` / `iq4nlWaveLaunchAddsItsBias`
+            (fused == plain launch + `addBiasRowsDevice`, exact).
+            PREDICTION to check before going on: 72 launches x ~4.5 us =
+            ~0.33 ms a token (4%). MEASURED 2026-09-17: bit gate exact
+            (greedy stream md5 56a6a744f993ddc2 both binaries); decode
+            8.21 -> 8.04 ms a token, 121.9 -> 124.4 t/s (ABBA x3), so
+            2.4 us a removed launch, not 4.5: the gap goes, the tiny
+            kernel's own time was partly hidden. The remaining fusions
+            are re-costed at 2.4 us a launch: 11 launches a layer =
+            ~0.63 ms, plus the tail's ~0.25 = 7.16 ms a token = ~140 t/s
+            against 138.4 — parity by a hair if every item lands.
+      - [ ] 6.4.3.3 IQ4_NL down + combine + next-layer norm tail: an
+            IQ4_NL arm of `idDownCombineTailLaunchNoSync`. -2 (combine,
+            next rmsnormPack).
+      - [ ] 6.4.3.4 IQ3_XXS gate + up + GLU in one id launch, the q8_K
+            pack of the GLU output in its epilogue. -3.
+      - [ ] 6.4.3.5 The shared expert: gate + up + GLU + pack in one wave
+            launch (IQ2_S); the gate logit `z` folded into the sigmoid-add;
+            down in accumulate form. -3 or -4.
+      - [ ] 6.4.3.6 Fused QKV for the IQ wave family. -2.
+      - [ ] 6.4.3.7 The token tail (~0.3 ms): argmax on device, the token
+            id to a host-visible word; the embed gather from that id on
+            device.
+      - [ ] 6.4.3.8 Bit gate after each item: the greedy stream of
+            `schedthroughput qwen15moe prompt=512 gen=128` hashes
+            identically to `tmp/cbq/st-pre643` (the V-d binary); the
+            legs ABBA x3 at the end; the item closes at decode >= 1.0x of
+            llama.cpp (Vulkan) or with the residue named.
 
 
 - [x] 6.4.4 Cause 5: the grouped prefill id-GEMM for the codebook

@@ -119,6 +119,7 @@ public final class Linear extends InfModule {
     boolean waveH;
     boolean waveIq;
     boolean packedAct;
+    boolean biasFolded;
     boolean qAct;
     float32[] yScratch;
 
@@ -1068,7 +1069,7 @@ public final class Linear extends InfModule {
                     rep = rep + 1;
                 }
             }
-            this.launchRows();
+            this.launchRows(false);
             if (!Linear.skipTransfers) {
                 int32 rep2 = 0;
                 while (rep2 <= Linear.xferReps) {
@@ -1098,7 +1099,7 @@ public final class Linear extends InfModule {
         int64 c1 = Clock.nanoTime();
         this.sendActivations(so);
         int64 c2 = Clock.nanoTime();
-        this.launchRows();
+        this.launchRows(false);
         int64 c3 = Clock.nanoTime();
         this.fetchResult();
         int64 c4 = Clock.nanoTime();
@@ -2953,7 +2954,7 @@ public final class Linear extends InfModule {
             i = i + 1;
         }
         this.sendActivations(so);
-        this.launchRows();
+        this.launchRows(false);
         return;
     }
 
@@ -3095,11 +3096,11 @@ public final class Linear extends InfModule {
             throw heap LlmException("matvecStagedKeep: no staged "
                 + "device activation for packed type " + this.packedTy);
         }
-        this.launchRows();
+        this.launchRows(this.outScale == 1.0f);
         if (this.outScale != 1.0f) {
             Prim.scaleDevice(this.yDev, this.outScale, (int64) this.outDim);
         }
-        if (this.bias != null) {
+        if (this.bias != null && !this.biasFolded) {
             Prim.addBiasRowsDevice(this.yDev, this.biasDev, 1L,
                 (int64) this.outDim);
         }
@@ -3275,7 +3276,7 @@ public final class Linear extends InfModule {
             // every format; that is units C/D's shape, not this seam's.
             QuantKernel.f32CopyLaunchNoSync(Linear.stX, xDev, n);
         }
-        this.launchRows();
+        this.launchRows(false);
         this.fetchResult();
         float32[] db = dst.hostBuffer();
         int64 doff = dst.hostBase() + dstOff;
@@ -3660,7 +3661,10 @@ public final class Linear extends InfModule {
         return this.winLen;
     }
 
-    void launchRows() {
+    /** `foldBias`: a wave route that can add the bias in its epilogue
+     *  does, and reports it through `biasFolded`. */
+    void launchRows(boolean foldBias) {
+        this.biasFolded = false;
         int64 rows = (int64) this.outDim;
         int64 rowBytes = Linear.residentBytesOf(this.packedTy,
             this.packedBytesTotal(), this.blocksPerRow()) / rows;
@@ -3681,7 +3685,7 @@ public final class Linear extends InfModule {
         }
         if (chunk >= rows) {
             Linear.nLaunches = Linear.nLaunches + 1L;
-            this.launchOne(this.payloadDev, rows, 0L);
+            this.launchOne(this.payloadDev, rows, 0L, foldBias);
             return;
         }
         int64 r0 = 0L;
@@ -3691,7 +3695,7 @@ public final class Linear extends InfModule {
             Linear.nLaunches = Linear.nLaunches + 1L;
             KernelBuffer<int8> sub #= this.payloadDev.slice(
                 (uint64) (r0 * rowBytes), (uint64) (nr * rowBytes));
-            this.launchOne(sub, nr, r0);
+            this.launchOne(sub, nr, r0, foldBias);
             r0 = r0 + nr;
         }
         return;
@@ -3699,7 +3703,8 @@ public final class Linear extends InfModule {
 
     /** One dispatch over `nr` rows of `w` starting at output row `r0`.
      *  Whether it waits is `oneSync`'s business, not this method's. */
-    void launchOne(KernelBuffer<int8> w, int64 nr, int64 r0) {
+    void launchOne(KernelBuffer<int8> w, int64 nr, int64 r0,
+            boolean foldBias) {
         if (this.q8) {
             if (this.wave) {
                 if (Linear.oneSync) {
@@ -3773,7 +3778,12 @@ public final class Linear extends InfModule {
                     Linear.stXp, nr, (int64) this.inDim, r0);
             }
         } else if (this.wave4nl) {
-            if (Linear.oneSync) {
+            if (foldBias && this.bias != null) {
+                QuantKernel.iq4nlQ8WaveMatVecBiasLaunchNoSync(this.yDev, w,
+                    Linear.stXp, nr, (int64) this.inDim, r0, this.biasDev);
+                this.biasFolded = true;
+                if (!Linear.oneSync) { QuantKernel.stream().sync(); }
+            } else if (Linear.oneSync) {
                 QuantKernel.iq4nlQ8WaveMatVecLaunchNoSync(this.yDev, w,
                     Linear.stXp, nr, (int64) this.inDim, r0);
             } else {
@@ -3805,7 +3815,13 @@ public final class Linear extends InfModule {
                     Linear.stXp, nr, (int64) this.inDim, r0);
             }
         } else if (this.waveIq) {
-            if (Linear.oneSync) {
+            if (foldBias && this.bias != null) {
+                QuantKernel.iqQ8WaveMatVecBiasLaunchNoSync(this.packedTy,
+                    this.yDev, w, Linear.stXp, nr, (int64) this.inDim, r0,
+                    this.biasDev);
+                this.biasFolded = true;
+                if (!Linear.oneSync) { QuantKernel.stream().sync(); }
+            } else if (Linear.oneSync) {
                 QuantKernel.iqQ8WaveMatVecLaunchNoSync(this.packedTy,
                     this.yDev, w, Linear.stXp, nr, (int64) this.inDim, r0);
             } else {
