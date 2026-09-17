@@ -825,12 +825,56 @@ every timing leg and wait for the go; filtered suite only
       unit is worth nothing HERE and everything to the files that do. Decode is unmoved at
       0.262, which the census predicts: its 384 launches a token are
       cause 3, the grouped id-GEMM, untouched.
-      BLOCKED ON UNIT 9 for the rest. Causes 2 and 4 are Unit 9's items
-      by definition — the repack machinery and the IQ4_NL migration —
-      and cause 3 needs a grouped id-GEMM over the expert dimension that
-      the codebook formats do not have. Re-open this item when Unit 9
-      lands; nothing else here is worth doing before it, because a third
-      of the prefill is work Unit 9 deletes outright.
+      RE-OPENED AND RE-MEASURED 2026-09-17, Unit 9 having landed. THREE
+      OF FOUR CAUSES ARE COLLECTED and ONE remains, which is now the
+      whole gap.
+
+      | leg | opened | after migration | now | Vulkan |
+      |---|---|---|---|---|
+      | prefill t/s | 615.3 | 902.1 | 908.5 | 2306.9 |
+      | | 0.268x | 0.396x | 0.394x | |
+      | decode t/s | 36.75 | ~36.4 | 39.86 | 139.60 |
+      | | 0.266x | 0.262x | 0.285x | |
+
+      CAUSE 4 IS COLLECTED BY 9.2.4, not 9.2.5, and the distinction is
+      worth keeping: `iq4nlMatVecKernel` is gone from the profile — 3072
+      launches and 94.5 ms became `iq4nlF32WaveMatVecKernel` at 2957 and
+      35.4 ms, -62%. I predicted the INTEGER wave on the ground that
+      gate/up carry inDim 2048 and clear `q8kDims`. Wrong: this file's
+      IQ4_NL tensors are all `ffn_down_exps` at inDim 1408, four a
+      layer, which fails `% 256` and takes the f32 wave 9.2.4 built.
+      9.2.5's integer route does not reach this model at all.
+      CAUSE 2 IS GONE FROM PREFILL ENTIRELY. The corrected census (see
+      below on how it had to be windowed) reads:
+
+      | phase | device self | top items |
+      |---|---|---|
+      | load/bind [0,1650ms) | 260.9 ms | splitPayload 64.2 + splitScale 45.7 = 109.9 (42%) |
+      | prefill [1650,2230ms) | 522.4 ms | iq4nlF16CoopN64 231.9 (44%), iq3xxsF16CoopN64 126.2 (24%) |
+      | decode [2230ms,end) | 231.4 ms | iq3xxsQ8Wave 109.1, iq4nlF32Wave 35.4 |
+
+      No layout conversion appears in prefill at any count. The split's
+      291 ms is 109.9 ms after 9.2.6, which is the number 9.2.6's A/B
+      implied and could not see directly.
+      CAUSE 3 IS THE WHOLE REMAINING GAP, and the census states it
+      without inference: decode spends 231.4 ms of DEVICE time inside
+      944.4 ms of wall. Three quarters of decode is not GPU work. That
+      is the 384 launches a token against llama.cpp's ~72, and it needs
+      the grouped id-GEMM over the expert dimension that the codebook
+      formats do not have. Nothing else in the decode column is worth
+      touching before it: the two mat-vec kernels that dominate the
+      device time together are 145 ms of a 944 ms token stream.
+      HOW THE CENSUS HAD TO BE WINDOWED, because the first cut was
+      wrong: anchoring the load window on the `LlmEngine.load` HOST
+      frame put all 1270 expert-GEMM launches inside load, which is
+      impossible. The two tiers have different origins and the offset is
+      not recoverable from the footers. Re-cut on kernel populations
+      instead — the split's last launch, the first N64 GEMM — the
+      windows self-evidence: prefill wall 574.81 ms against the
+      harness's 574.933, decode 944.39 against 950.59. This is finding 5
+      under 2.2.5, and it is the second attribution this profiler
+      ergonomic has cost this unit.
+      STILL BLOCKED, on cause 3 alone.
 
 
 ## Unit 7 — The decode bandwidth gap (spec §6, §8.5, 12.1; folds 4.3.5 and 6.4.1)
@@ -2116,6 +2160,16 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       bytes over time against a known ceiling. The 6.4.3 census carries
       the same defect and is corrected there.
 
+
+- [ ] 9.2.7 `splitScaleKernel`'s lane mapping, which 9.2.6 left behind on
+      the half it did not touch. The 6.4.3 census reads splitPayload
+      64.23 ms and splitScale 45.70 ms: 42% of the split's cost to move
+      TWO BYTES a block, about 1% of its bytes. It is one work item per
+      block issuing two byte-writes — the same shape 9.2.6 replaced on
+      the payload half, and the scales of a row are contiguous in the
+      destination by construction, so a wave can take a row's whole
+      scale prefix as dwords. Gated by the device-vs-host split tests
+      that 9.2.6 added.
 
 ### 9.3 Acceptance
 - [~] 9.3.1 Filtered suite green.
