@@ -954,8 +954,9 @@ every timing leg and wait for the go; filtered suite only
       variant is a new kernel family, or an id variant of the coop
       family that reads the same map. THE ISA READ (7.2.1's method,
       `bench/KernelIsa`): `iq4nlF16CoopN64Kernel` 89 VGPRs / 18 SGPRs,
-      `iq3xxsF16CoopN64Kernel` 89 / 19 — "spillBytes": 0; "spillBytes": 0. No spill, and 89
-      VGPRs leaves occupancy for five waves a SIMD. The kernels are not
+      `iq3xxsF16CoopN64Kernel` 89 / 19 — "spillBytes": 0; "spillBytes": 0. Spill 0 bytes on both,
+      18432 B static LDS, and the manifest's own occupancy figure is 3
+      resident groups a CU — 24 waves, six a SIMD. The kernels are not
       the problem; the sixteen-workgroup grid is. Nothing in either
       body needs touching for cause 5 — the fix is the launch shape.
       THE ARBITER RAN (`bench/MoeRowArbiter`, `pplprobe ... norowmoe`):
