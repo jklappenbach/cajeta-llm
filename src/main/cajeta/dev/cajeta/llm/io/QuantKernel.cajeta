@@ -14716,6 +14716,74 @@ public final class QuantKernel {
     }
 
     /**
+     * WAVE-COOPERATIVE IQ4_NL x q8_K. Q4_0's twin — one LANE per
+     * 32-element block, the same 16-byte payload and f16 scale — with
+     * the nibble through a codebook instead of `q - 8`.
+     *
+     * `dotSum` takes a SIGNED receiver, so the codebook feeds it
+     * directly — no bias term, where Q4_0 rides its -8 on the
+     * activation sum to keep its quants unsigned.
+     */
+    @Kernel
+    public static void iq4nlQ8WaveMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff) {
+        uint32 lane = KernelThread.x();
+        uint32 row = KernelThread.globalIdX() / 32;
+        int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+        int64 rowBytes = prefix + blocksPerRow * 16L;
+        Vector<int8,16> kv = QuantKernel.iq4Kv();
+        float32 acc = 0.0f;
+        if (row < rows) {
+            int64 i = (int64) row;
+            int64 wb = (int64) lane;
+            while (wb < blocksPerRow) {
+                int64 ro = i * rowBytes + prefix + wb * 16L;
+                float32 d = QuantKernel.scaleAtDev(packed,
+                    i * rowBytes / 2L + wb);
+                Vector<int8,16> qs = packed.vload<16>(ro);
+                Vector<int8,16> dl = (qs & 15).lut4(kv);
+                Vector<int8,16> dh = ((qs >> 4) & 15).lut4(kv);
+                int64 ab = wb / 8L;
+                int64 xb = ab * 320L + (wb % 8L) * 32L;
+                Vector<int8,16> a0 = xp.vload<16>(xb);
+                Vector<int8,16> a1 = xp.vload<16>(xb + 16L);
+                int32 dot = dl.dotSum(a0, 0) + dh.dotSum(a1, 0);
+                Vector<int8,4> dv = xp.vload<4>(ab * 320L + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+                acc = acc + d * xs * (float32) dot;
+                wb = wb + 32L;
+            }
+        }
+        float32 tot = Wave.reduceSumF32(acc);
+        if (lane == 0 && row < rows) {
+            y[yOff + (int64) row] = tot;
+        }
+    }
+
+    public static void iq4nlQ8WaveMatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        KernelStream s = QuantKernel.stream();
+        iq4nlQ8WaveMatVecKernel.launch(s, grid: [(uint32) rows], block: [32])
+            (y, packed, xp, (uint32) rows, cols / 32L, yOff);
+        return;
+    }
+
+    public static void iq4nlQ8WaveMatVecLaunch(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.iq4nlQ8WaveMatVecLaunchNoSync(y, packed, xp, rows, cols,
+            yOff);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        return;
+    }
+
+    /**
      * WAVE-COOPERATIVE Q4_0 x q8_K. One LANE per 32-element weight block,
      * like the Q8_0 twin — Q4_0's block is 18 bytes so the row stride is
      * not dword-aligned, which costs nothing here because the wave

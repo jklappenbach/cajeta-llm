@@ -1981,6 +1981,26 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       exactness budget, which is a unit and not a line.
 
 
+- [x] 9.2.5 IQ4_NL's INTEGER wave route. Q4_0's twin — one lane per
+      32-element block, the same 16-byte payload and f16 scale — with
+      the nibble through `iq4Kv` and lut4 instead of `q - 8`.
+      `dotSum` TAKES A SIGNED RECEIVER, which the codebook family
+      (`iqDot16`) already relied on and I did not check first: the first
+      cut carried a +128 bias in the table so the codebook would be the
+      unsigned operand of a mixed dp4a, and paid it back off the q8_K
+      block's stored sub-block sum. Wrong by up to 140% — the shifted
+      values above 127 read back as negative. The signed table feeds it
+      directly: no bias, no sum load, and cheaper than the Q4_0 twin,
+      which needs its -8 only because its quants are naturally unsigned.
+      Read the proven idiom in the same family BEFORE inventing one.
+      `packedAct` turns true for IQ4_NL as a consequence, so the
+      o-projection reads the packed stage and 9.2.3's lazy f32 reduce
+      stops firing on this format — a launch a layer a token.
+      NOT ADDED: the accum form. `matvecStagedAccum` has branches for
+      waveIq, Q4_K and Q6_K, and none for Q4_0/Q5_0, so IQ4_NL keeps
+      their behaviour rather than growing a sixth.
+
+
 ### 9.3 Acceptance
 - [~] 9.3.1 Filtered suite green.
       `LinearKernelRouteTest` was never IN the filtered suite, and
