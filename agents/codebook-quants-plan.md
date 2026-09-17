@@ -1932,8 +1932,62 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       takes. 270/270.
 
 
+- [x] 9.2.4 `wavef`'s guard asks the real question. It read `!q8kDims`,
+      which stands in for "the integer wave route did not engage" and
+      gets it wrong for a type that has NO integer route: IQ4_NL
+      answers no to both, so at a 256-aligned width it decoded
+      item-per-row. It is now `!(wave || wave6 || ... || waveIq)`,
+      computed after `waveIq` for that reason.
+      THE GUARD ALONE WOULD HAVE BEEN INERT, and this is the part worth
+      remembering. `launchOne`'s `wavef` arm dispatches Q8_0, Q5_0 and
+      Q4_0 only — IQ4_NL fell through to `matVecLaunch`, the same
+      item-per-row kernel — while `hasF32WaveKernel` answered TRUE for
+      IQ4_NL, IQ4_XS, Q4_1 and Q5_1, none of which had one. A lying
+      predicate over a dispatch that silently falls through is how a
+      routing fix measures as "no change".
+      So: `iq4nlF32WaveMatVecKernel` written (Q4_0's wave geometry with
+      the nibble through `iq4Kv` and lut4, exactly as the one-item
+      kernel decodes it), the dispatch arm added, and
+      `hasF32WaveKernel` cut to the four that exist.
+      LATENT CONSEQUENCE, unmeasured: at a NON-256-aligned width
+      IQ4_XS/Q4_1/Q5_1 now get the item kernel's row chunking back,
+      like every other item-per-row type. No file in the tree has that
+      shape.
+      NOT DONE, and worth more: IQ4_NL has no INTEGER wave route either.
+      Q4_0 runs at 213 GB/s on that route against this one's ceiling.
+      IQ4_NL is a 16-entry 4-bit codebook — the MXFP4 shape, lut4 then
+      dotSum over per-32 Q8 — so the kernel is a known quantity. It
+      changes the answer, so it belongs behind `q8Route` with its own
+      exactness budget, which is a unit and not a line.
+
+
 ### 9.3 Acceptance
-- [ ] 9.3.1 Filtered suite green.
+- [~] 9.3.1 Filtered suite green.
+      `LinearKernelRouteTest` was never IN the filtered suite, and
+      adding it for 9.2.4 found `legacyWidensAreExact` red since
+      e160e69 — it staged FILE blocks into a kernel that reads the
+      split layout, the same miss the Q6_K pass hit seven times. With
+      the staging fixed, Q4_0 and Q5_0 widen EXACT over 16384 bytes, so
+      9.2.1's unverified widen route is now verified and correct.
+      IT ALSO COST AN HOUR TO A USE-AFTER-FREE IN THE TEST ITSELF, and
+      the shape is worth naming: `int8[] dev #= raw;` then, inside an
+      `if`, `int8[] sp #= heap int8[...]; dev #= sp;` — `#=` records a
+      BORROW, `sp` keeps title and frees at the end of the block, and
+      the upload after it read reused memory. The tell was that the
+      mismatch count MOVED between two runs that differed only in a
+      print statement (32 then 31), with the first bytes wrong and
+      everything after exact: allocator bookkeeping in the freed block's
+      head. Hoisting the allocation to the enclosing scope made it
+      exact. THREE MORE SITES had the same shape in
+      `LegacyWaveMatVecTest` — the gates for every migrated format —
+      passing on luck; all three hoisted.
+      ONE FAILURE LEFT, and it is not this unit's:
+      `tunesThePartitionWidthOnThisDevice` submits sixteen 512-token
+      prefills to an engine with ctx 1024 and maxSeqs 1, and the
+      sequence slot is never released between requests, so the third
+      runs off the end. `e.cancel(id)` does not release it. It is an
+      autotune TIMING test in a correctness suite and it wants the
+      scheduler's request lifecycle, which is a different unit.
 - [~] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
       Q5_0 tensors), Q3_K_M, Q6_K, the iq4_nl file, a Q4_0 8B from
       `llama-quantize`; bit gate then A/B, no decode regression.
