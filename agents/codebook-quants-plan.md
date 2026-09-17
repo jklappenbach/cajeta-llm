@@ -394,7 +394,7 @@ every timing leg and wait for the go; filtered suite only
       | tq2_0 | llama.cpp CPU | 1450 / 1539 | 175 / 163 | 1360 / 1311 | 107 / 86 |
       | q4_k_m (same model, llama-quantize from our f16) | cajeta | 5747 | 222.3 | | |
       | q4_k_m | llama.cpp CPU | 3088 / 5608 | 131 / 127 | | |
-      | q4_k_m | llama.cpp HIP | 6745 / 7166 | 169 / 196 | | |
+      | q4_k_m | llama.cpp (HIP) | 6745 / 7166 | 169 / 196 | | |
       | q4_k_m | llama.cpp Vulkan | 7544 / 9680 | 202 / 268 | | |
       | Llama-3.1-8B q4_k_m | cajeta | 1546 | 41.9 | | |
 
@@ -502,7 +502,7 @@ every timing leg and wait for the go; filtered suite only
 
 ### 5.3 Acceptance
 - [x] 5.3.1 IQ2_XXS, IQ2_XS, IQ3_XXS 8B files: `batched`, no
-      `batch-refused`; legs against llama.cpp HIP and Vulkan (pp ≥ 1.0×,
+      `batch-refused`; legs against llama.cpp (HIP) and Vulkan (pp ≥ 1.0×,
       tg ≥ 0.95×); greedy agreement; perplexity within the floor;
       resident bytes equal file bytes.
       PART DONE 2026-09-16 on the two loadable files (`tmp/cbq/iq-accept*.sh`,
@@ -529,7 +529,7 @@ every timing leg and wait for the go; filtered suite only
 ### 6.1 TDD
       DECODE HALF NOW CLEARS, 2026-09-16 night after Unit 7 (which
       carries 6.4.1, this item's blocker): iq2_xxs 0.952, iq2_xs 0.954,
-      iq3_xxs 0.997 of Vulkan against the 0.95 bar, and iq3_xxs — the
+      iq3_xxs 0.997 of llama.cpp (Vulkan) against the 0.95 bar, and iq3_xxs — the
       file Unit 5 could not open — is measured for the first time.
       Prefill: iq2_xxs 1.071 and iq2_xs 1.053 clear 1.0x; iq3_xxs is
       0.992, and its coop kernel is the IQ3 family of 6.4.2. CLOSED
@@ -676,7 +676,7 @@ every timing leg and wait for the go; filtered suite only
       before Units 5 and 6.
 - [x] 6.4.1 The IQ codebook decode gap — promoted to Unit 7, which
       folds in 4.3.5's ternary gap as the same shape.
-- [x] 6.4.2 The IQ3_S coop GEMM prefill gap: 0.83–0.90× of Vulkan where
+- [x] 6.4.2 The IQ3_S coop GEMM prefill gap: 0.83–0.90× of llama.cpp (Vulkan) where
       the IQ2 family clears 1.0×. The three files that miss are exactly
       the IQ3_S-heavy ones (193 / 157 / 81 tensors).
       MET 2026-09-17, and the cause was weight REUSE, not the kernel's
@@ -759,7 +759,7 @@ every timing leg and wait for the go; filtered suite only
       expert set, so the bank now admits essentially everything and
       residency is not the cause. Re-measured baseline 2026-09-17 after
       Unit 7 and 6.4.2, which reached this file not at all: prefill
-      615.3 against Vulkan's 2297.5 (0.268x), decode 36.75 against
+      615.3 against llama.cpp (Vulkan)'s 2297.5 (0.268x), decode 36.75 against
       138.11 (0.266x).
       WHAT THE CENSUS SAYS (512 tokens, device time). CORRECTED
       2026-09-17 under 9.2.6: these shares are of the WHOLE RUN's device
@@ -818,7 +818,7 @@ every timing leg and wait for the go; filtered suite only
       with the tile, so that kernel is not padding-bound.
       UNIT 9 PULLED FORWARD 2026-09-17, and its first format paid: with
       IQ4_NL migrated the runtime repack is gone and MoE prefill is
-      902.1 against Vulkan's 2277.8 — 0.396, from 0.268 when this item
+      902.1 against llama.cpp (Vulkan)'s 2277.8 — 0.396, from 0.268 when this item
       opened and 0.286 after the halved tile alone. Completing the other
       four formats leaves it there (896 t/s in the profile): this model
       carries no Q6_K, Q3_K, Q4_0 or Q5_0 tensors, so the rest of the
@@ -829,7 +829,7 @@ every timing leg and wait for the go; filtered suite only
       OF FOUR CAUSES ARE COLLECTED and ONE remains, which is now the
       whole gap.
 
-      | leg | opened | after migration | now | Vulkan |
+      | leg | opened | after migration | now | llama.cpp (Vulkan) |
       |---|---|---|---|---|
       | prefill t/s | 615.3 | 902.1 | 908.5 | 2306.9 |
       | | 0.268x | 0.396x | 0.394x | |
@@ -877,7 +877,7 @@ every timing leg and wait for the go; filtered suite only
       CAUSE 3 COLLECTED 2026-09-17. The grouped id mat-vec existed for
       Q4_K and Q6_K; the codebook formats were not admitted to it.
 
-      | leg | before | after | Vulkan |
+      | leg | before | after | llama.cpp (Vulkan) |
       |---|---|---|---|
       | decode t/s | 39.86 | **122.1** | 140.1 |
       | | 0.285x | **0.871x** | |
@@ -936,7 +936,31 @@ every timing leg and wait for the go; filtered suite only
       is ~91% device-busy. Prefill is GEMM-bound, not dispatch-bound.
       That is a fifth cause, and it is the coop kernels' rate on ragged
       expert batches, not anything this item's four causes covered.
-      STILL OPEN on that and on the perplexity arbiter.
+      THE ARBITER RAN (`bench/MoeRowArbiter`, `pplprobe ... norowmoe`):
+      both routes from ONE binary, `setSharedRow(false)` reproducing
+      the old refusal at the same clause. WHAT IT SETTLED: arm B reads
+      5.47719 — the old build's figure to five places — so the +0.41%
+      is the route, not the build. Eight decode steps on a FIXED token
+      sequence (identical inputs to both arms whatever they predict):
+      argmax identical on 8 of 8; expert selections differ on 8 of 8,
+      by 1-3 experts of 96 a step (2/4/4/2/4/6/2/2 cells of 1440);
+      max|A-B| logit 0.61-0.87 every step, which is one swapped
+      expert's contribution, not reassociation noise.
+      WHAT IT DID NOT SETTLE, stated plainly: no flip-free step
+      occurred, so the numerics of the three changed paths are NOT
+      isolated — the logit delta at every step carries a flip. And the
+      flip RATE is the open question: 1-3% of selections a token is
+      more than "near-tied top-k" intuition, and the fused device router
+      (`rmsnormRouterTopKKernel`, new to this file's decode) is the
+      suspect for a router-logit-level difference rather than a tie.
+      THE DECISIVE PROBE, owed: the router logits of both arms BEFORE
+      top-k, same layer, same step. ~1e-6 apart means the flips are
+      genuine ties and the route is faithful; ~1e-3 or worse means the
+      fused router computes something different and that is a finding
+      against it, floor or no floor. Not done here — it needs an
+      accessor the engine does not expose, and it is a decision whether
+      it precedes 9.2.9.
+      STILL OPEN on prefill (cause 5) and on that probe.
 
 
 ## Unit 7 — The decode bandwidth gap (spec §6, §8.5, 12.1; folds 4.3.5 and 6.4.1)
@@ -2282,19 +2306,42 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       blocks whose lines it does not both hold. Settle which by probe
       before writing the kernel.
 
-- [ ] 9.2.9 Sweep the format-list predicates. Three times today a
-      predicate named two formats where it meant "this weight is on an
-      integer wave route", and each cost a whole route: `wavef`'s guard
-      (9.2.4, IQ4_NL decoded item-per-row), `ExpertBank.idReady()` and
-      `Linear.packedWaveReady()` (6.4.3 cause 3, the MoE refused the
-      zero-sync row on every layer). `Linear` already carries the
-      predicate that answers the question — `qAct`, the union of every
-      integer wave flag — and `intWaveRouted()`. Find every remaining
-      `(q8 && wave) || wave6` and `== 12 || == 14`, ask whether it
-      means "Q4_K or Q6_K specifically" or "on an integer route", and
-      replace the latter. Each replacement takes a does-fire test and a
-      does-not-fire test, because the dispatcher beside each one is
-      where 9.2.4's fallthrough lives.
+- [ ] 9.2.9 THE ROUTE TABLE, and the test that audits it — not a sweep.
+      This class of defect has now been solved eight times and each
+      time from scratch, because the knowledge of which format may take
+      which route lives in prose and in whoever last hit the refusal,
+      not in the code. Today alone: `wavef`'s guard (9.2.4),
+      `ExpertBank.idReady()`, `Linear.packedWaveReady()` — each a
+      predicate naming formats where it meant "on an integer wave
+      route", each costing a whole route, and then `codebookId()` was
+      added as one more list of the same shape.
+      THE HALF THAT EXISTS: `theFourPartInvariant` (3.1.5) already
+      asserts, over every `supported()` type, that `packedSupported`,
+      `coopSupports`, `hasKernel` and the host chain agree. It has held
+      since Unit 3. It covers four parts; the routes have grown to a
+      dozen predicates outside it — `idReady`, `idRowReady`, `symId`,
+      `packedWaveReady`, `coopRoutedHere`, the `wavef` guard, the
+      `zeroSyncReady` clauses — so it stays green while a route it does
+      not know refuses.
+      THE TABLE: one row per route — name, the regime it serves (decode
+      row / prefill batch / bind), the predicate that admits a format,
+      the dispatcher that owns it. Every predicate above becomes a row
+      or a derivation from `qAct` / `intWaveRouted()`; `codebookId()`
+      and every `== 12 || == 14` goes. `backendIsVulkan()`'s ~14 sites
+      are NOT this item (they are capability, and belong in xpu); they
+      are listed so the table does not absorb them by accident.
+      THE TEST: walk every `supported()` format against every row and
+      assert each is admitted or refused BY NAME, and that an admitted
+      format has an ARM in the row's dispatcher — a bare `else` fails
+      on day one. Adding a format is then: write its kernels, add it to
+      the rows that apply, and the test names the rows you forgot.
+      Adding a route is: add a row, and the test audits it against
+      every format that exists. A does-fire and a does-not-fire test
+      per row, as 9.2.7 did.
+      NOT IN SCOPE: the capability / cost / policy split (capability
+      into xpu, measured selection from the Autotune store). That is
+      the arc this table sits under, and it is a spec. This item is the
+      part that stops the bleeding now.
 
 ### 9.3 Acceptance
 - [~] 9.3.1 Filtered suite green.

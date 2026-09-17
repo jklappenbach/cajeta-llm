@@ -1,0 +1,123 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.model.MoeFfn;
+
+/**
+ * 6.4.3 cause 3's arbiter. The zero-sync row route against the
+ * per-expert route it replaced: one decode step each on identical KV
+ * state, one binary. If that step's expert selections agree, the logit
+ * delta is numerics alone and its size is the verdict; if they differ,
+ * the perplexity move is a routing flip.
+ */
+public class MoeRowArbiter {
+
+    public static void run(String[] args) {
+        RouteTrace tr #= heap RouteTrace();
+        Diag.register(tr);
+        ExpertBank.setResidencyBudget(Device.memoryBytes() / 2L);
+        int32 n = 12;
+        int32 steps = 8;
+        int32[] p #= heap int32[n];
+        int32 i = 0;
+        while (i < n) {
+            p[i] = 2 * i + 3;
+            i = i + 1;
+        }
+        Checkpoint ck0 #= Checkpoint.open(args[0]);
+        ModelConfig c0 #= ModelConfig.fromGguf(ck0.gguf());
+        int32 vocab = c0.vocabSize;
+        int64 cells = (int64) c0.numLayers * (int64) c0.expertCount;
+        ck0.close();
+        int64[] ha #= heap int64[(int64) steps * cells];
+        int64[] hb #= heap int64[(int64) steps * cells];
+        float32[] la #= MoeRowArbiter.arm(args[0], p, n, steps, vocab, ha,
+            cells, "A zero-sync row");
+        MoeFfn.setSharedRow(false);
+        float32[] lb #= MoeRowArbiter.arm(args[0], p, n, steps, vocab, hb,
+            cells, "B per-expert");
+        int32 g = 0;
+        while (g < steps) {
+            int64 base = (int64) g * (int64) vocab;
+            float32 maxd = 0.0f;
+            int32 amA = 0;
+            int32 amB = 0;
+            int64 j = 0;
+            while (j < (int64) vocab) {
+                float32 d = la[base + j] - lb[base + j];
+                if (d < 0.0f) { d = 0.0f - d; }
+                if (d > maxd) { maxd = d; }
+                if (la[base + j] > la[base + (int64) amA]) { amA = (int32) j; }
+                if (lb[base + j] > lb[base + (int64) amB]) { amB = (int32) j; }
+                j = j + 1;
+            }
+            int64 hbase = (int64) g * cells;
+            int64 hdiff = 0L;
+            j = 0;
+            while (j < cells) {
+                if (ha[hbase + j] != hb[hbase + j]) { hdiff = hdiff + 1L; }
+                j = j + 1;
+            }
+            System.stdout.println("ARBITER step " + g + ": cells differ "
+                + hdiff + " of " + cells + "; max|A-B| " + maxd
+                + "; argmax A " + amA + " B " + amB);
+            g = g + 1;
+        }
+        return;
+    }
+
+    /** One model, one prefill, `steps` observed decode steps on a FIXED
+     *  token sequence, so both arms see identical inputs whatever they
+     *  predict. Logits step-major, owned; each step's histogram into
+     *  `hist` at `g * cells`. */
+    static #float32[] arm(String path, int32[] p, int32 n, int32 steps,
+            int32 vocab, int64[] hist, int64 cells, String label) {
+        Checkpoint ck #= Checkpoint.open(path);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        int32 layers = cfg.numLayers;
+        int32 experts = cfg.expertCount;
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        int32 t = m.prefill(p, n);
+        MoeFfn.armRouteObservation(0, layers, experts, 1, true);
+        float32[] out #= heap float32[(int64) steps * (int64) vocab];
+        int32[] one #= heap int32[1];
+        int32 g = 0;
+        while (g < steps) {
+            MoeFfn.clearRouteHistogram(0);
+            one[0] = 2 * (n + g) + 3;
+            int32 t2 = m.stepSeq(0, one, 0, 1);
+            Tensor<float32> lt = m.logits();
+            float32[] lbuf = lt.hostBuffer();
+            int64 lo = lt.hostBase();
+            int64 base = (int64) g * (int64) vocab;
+            int64 j = 0;
+            while (j < (int64) vocab) {
+                out[base + j] = lbuf[lo + j];
+                j = j + 1;
+            }
+            int64[] h #= MoeFfn.routeHistogram(0);
+            int64 hbase = (int64) g * cells;
+            j = 0;
+            while (j < cells) {
+                hist[hbase + j] = h[j];
+                j = j + 1;
+            }
+            if (g == 0) {
+                System.stdout.println(label + ": prefill argmax " + t
+                    + ", first step argmax " + t2);
+            }
+            g = g + 1;
+        }
+        return #out;
+    }
+}
