@@ -1079,11 +1079,26 @@ every timing leg and wait for the go; filtered suite only
             launch it replaces. Bit gate exact; decode 8.04 -> 7.97 ms a
             token, 125.4 t/s, against the pre binary's 8.25 in the same
             session (ABBA x3).
-      - [ ] 6.4.3.4 IQ3_XXS gate + up + GLU in one id launch, the q8_K
-            pack of the GLU output in its epilogue. -3.
-      - [ ] 6.4.3.5 The shared expert: gate + up + GLU + pack in one wave
-            launch (IQ2_S); the gate logit `z` folded into the sigmoid-add;
-            down in accumulate form. -3 or -4.
+      - [x] 6.4.3.4 IQ3_XXS gate + up + GLU in one id launch: an IQ3_XXS
+            arm of `ExpertBank.idGateUpGlu`, both dots exactly as the id
+            mat-vec takes them, `gluF32`'s activation in the epilogue.
+            -2 (the q8_K pack of the GLU output stays a launch; folding
+            it needs a 256-row block per workgroup or a last-arriving
+            counter, a later item if the tail leaves room). TDD:
+            `MoeCodebookIdMatVecTest.iq3xxsGateUpGluMatchesTheChain`
+            (exact, gate and up from different fixture offsets). LANDED
+            2026-09-17: bit gate exact; decode 7.97 -> 7.76 ms a token,
+            128.9 t/s (ABBA x3, pre binary 8.25).
+      - [ ] 6.4.3.5 The shared expert: gate + up + GLU in one IQ2_S wave
+            launch (`Linear.gateUpGluPacked`, two rows a wave as the IQ2_S
+            kernel takes them); the IQ3_S down accumulating into the
+            residual scaled by sigmoid(z) in its epilogue (`accum` mode
+            3, `Linear.matvecPackedAccumGated`; the wave kernels' extra
+            buffer is now `aux`: a bias in mode 2, the gate logit in
+            mode 3). The gate logit's own mat-vec and the pack stay. -3.
+            TDD: `MoeCodebookIdMatVecTest.iq2sWaveGateUpGluMatchesTheChain`
+            (63 rows, so the odd-row tail is covered) and
+            `iq3sWaveAccumGatedMatchesTheChain`, both exact.
       - [ ] 6.4.3.6 Fused QKV for the IQ wave family. -2.
       - [ ] 6.4.3.7 The token tail (~0.3 ms): argmax on device, the token
             id to a host-visible word; the embed gather from that id on
