@@ -1124,8 +1124,54 @@ every timing leg and wait for the go; filtered suite only
       groups/CU, and the layout that removes the tail entirely is a
       chunk-major batch (every chunk owns its 64 rows, so the coop store
       never crosses into a neighbour and `fs` and the copy loops go).
-      Ceiling probe before the refactor: the kernels with the guard
-      removed, timing only.
+      B REFUTED BY THE CEILING PROBE: both kernels with `fs` and the
+      guarded tail removed (timing only, wrong output) manifest at
+      19968 / 18432 bytes of LDS, 3 groups/CU, and run at 995 / 913 us
+      a launch against 978 / 904 — no change. Occupancy is not the
+      binding constraint; the chunk-major layout is not worth a
+      refactor for it. Reverted.
+      THE ISA READ NAMES THE CAUSE: per k-step the body pays SIX
+      serialized global round trips — the scale word (wait), the weight
+      words (wait), then a `while (ks < 4)` loop the compiler does not
+      unroll, each pass loading two activation tiles and waiting
+      `vmcnt(0)` before its four `v_wmma`. Weight bytes in flight per
+      lane per step: 16. The kernel is a latency chain, which is why a
+      third resident group bought nothing and why it reads 60 GB/s.
+      C: the eight activation tile loads issued at the top of the
+      k-step, before the expansion, and the four sub-steps written out
+      (t00..t31 / u00..u31) so the loads overlap the expansion and the
+      barrier. MEASURED FLAT: the ISA shows the loads hoisted and the
+      waits spread (`vmcnt(16)`, `vmcnt(3)`), 88 -> 189 VGPRs, no
+      spill, and the launch times do not move (962 / 975 us). So the
+      global round trips were not the chain either. What the ISA
+      proved instead: the 96 / 48 launch counts are the bench's warm-up
+      prefill plus the measured one, so a launch covers the whole
+      512-token batch, ~70 chunks x 11 row tiles, 25.8 GFLOP in 978 us
+      = 26 TFLOPS against a 59 TFLOPS dense-WMMA ceiling — 44% of
+      peak, half of it spent on rows past each group's end (34 rows a
+      group on average, computed 64 at a time). Not a bandwidth
+      kernel; the "60 GB/s" was the wrong lens.
+      E LANDED 2026-09-17, on C's unrolled body: per wave, the two
+      16-token tiles are live only while `cbw < mEnd` / `cbw + 16 <
+      mEnd` (wave-uniform), and a dead tile skips its activation loads
+      and its two `mma`s. The expansion and the barriers stay
+      workgroup-wide. Bit gate unchanged. 962 -> 778 us (iq3xxs), 975
+      -> 753 us (iq4nl); 211 / 139 VGPRs, no spill.
+
+      | 512x128, ABBA x3 | after A | **after E** | llama.cpp (Vulkan) | llama.cpp (HIP) |
+      |---|---|---|---|---|
+      | prefill t/s | 2424 | **2749** | 2303 | 1179 |
+      | | 1.053x | **1.194x** | | 2.33x |
+      | decode t/s | 122.1 | 121.8 | 139.0 | 93.0 |
+      | | 0.877x | 0.876x | | 1.31x |
+
+      D (weight words one k-step ahead) is dropped: C proved the
+      round trips are hidden already. What the census leaves, per
+      prefill: the grouped bodies 55 ms, the shared expert's dense
+      N256 bodies 47 ms (same expansion, 16-19 TFLOPS, no ragged
+      waste), the f32 router GEMM 10 ms (203 us a launch for 126
+      MFLOP), and ~50 ms the device is idle — the host-anchored
+      routing (sync, download, top-k, map build, upload) once a layer.
 - [ ] 6.4.5 The precision choice on the down projection. The zero-sync
       row runs down through the integer id kernel on q8_K-packed
       gate*up; the route it replaced ran the f32 wave. Router faithful
