@@ -242,8 +242,11 @@ every timing leg and wait for the go; filtered suite only
       `fpext(fptrunc x)` to x; and, found here, a static field with an
       array-literal initializer refused as "int32[] not assignable to
       int32[]" (the literal compiles as a local, so `IqGrid` wraps every
-      table in a method). Drafted at `tmp/cbq/compiler-findings.md`;
-      placement per Julian.
+      table in a method); and `cajeta profile summary` windowing only by
+      relative duration, with no way to scope the device tier to a named
+      HOST frame — the gap that let 9.2.1 state a whole-run share as a
+      prefill share and hold it for a day. Drafted at
+      `tmp/cbq/compiler-findings.md`; placement per Julian.
 
 ### 2.3 Acceptance
 - [x] 2.3.1 Fixtures, manifest and `IqGrid.cajeta` committed with their
