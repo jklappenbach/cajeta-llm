@@ -960,7 +960,35 @@ every timing leg and wait for the go; filtered suite only
       against it, floor or no floor. Not done here — it needs an
       accessor the engine does not expose, and it is a decision whether
       it precedes 9.2.9.
-      STILL OPEN on prefill (cause 5) and on that probe.
+      THE PROBE RAN, with a router tap (`MoeFfn.setRouterTap`, null
+      guarded, fired at both arms' router sites) and the arbiter
+      printing each layer's router-logit delta per step. VERDICT: the
+      fused norm+router is FAITHFUL. Layer 0 — no MoE block upstream,
+      attention identical in both arms — differs by 5.2e-6 / 6.7e-6 /
+      8.6e-6 at steps 0 / 3 / 7: f32 reassociation. Layer 1 is already
+      0.014 / 0.027 / 0.031, three to four orders up after exactly ONE
+      MoE block, and the profile sits at 0.03-0.13 through the depth.
+      Every flip's margin is under its layer's delta.
+      SO THE DIVERGENCE IS INJECTED INSIDE THE MoE BLOCK, and there is
+      one place in it where the route changes precision by
+      construction: the DOWN projection. Arm B ran it through the f32
+      wave (1408 is not a multiple of 256, so 9.2.4's dense path took
+      `iq4nlF32WaveMatVec`); arm A runs it through the integer id
+      kernel on the caller's q8_K-packed gate*up. The gate/up id kernels
+      are bit-identical to the wave kernels they replaced (the test),
+      and the shared expert takes the same wave kernels either way, so
+      the int8 rounding of the down activation is the change. That is
+      inherent to the integer route and it is what llama.cpp's
+      `mul_mat_vec_q` does too (q8_1 activations), so it is a precision
+      CHOICE, not a fault. Not pinned to the last decimal — pinning it
+      means an f32-activation id kernel for down, which is also the
+      other arm of the choice.
+      THE CHOICE, Julian's: keep 3.06x and +0.41% (inside the floor,
+      mechanism named), or an f32-activation id kernel for IQ4_NL down
+      that pays the delta back in bandwidth. The tap stays: null
+      guarded, two short methods, and it is the instrument that turned
+      "inside the floor" into a named cause in one afternoon.
+      STILL OPEN on prefill (cause 5) and on that choice.
 
 
 ## Unit 7 — The decode bandwidth gap (spec §6, §8.5, 12.1; folds 4.3.5 and 6.4.1)

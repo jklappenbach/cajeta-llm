@@ -39,11 +39,16 @@ public class MoeRowArbiter {
         ck0.close();
         int64[] ha #= heap int64[(int64) steps * cells];
         int64[] hb #= heap int64[(int64) steps * cells];
+        float32[] ra #= heap float32[(int64) steps * cells];
+        float32[] rb #= heap float32[(int64) steps * cells];
+        int32 layers = c0.numLayers;
+        int32 experts = c0.expertCount;
         float32[] la #= MoeRowArbiter.arm(args[0], p, n, steps, vocab, ha,
-            cells, "A zero-sync row");
+            ra, cells, "A zero-sync row");
         MoeFfn.setSharedRow(false);
         float32[] lb #= MoeRowArbiter.arm(args[0], p, n, steps, vocab, hb,
-            cells, "B per-expert");
+            rb, cells, "B per-expert");
+        int32 used = MoeRowArbiter.usedN;
         int32 g = 0;
         while (g < steps) {
             int64 base = (int64) g * (int64) vocab;
@@ -69,9 +74,96 @@ public class MoeRowArbiter {
             System.stdout.println("ARBITER step " + g + ": cells differ "
                 + hdiff + " of " + cells + "; max|A-B| " + maxd
                 + "; argmax A " + amA + " B " + amB);
+            MoeRowArbiter.routerReport(ra, rb, g, layers, experts, used);
             g = g + 1;
         }
         return;
+    }
+
+    static int32 usedN;
+
+    /** Per layer: the router-logit delta between the arms, and whether
+     *  the top-`used` SET differs — with the 4th-to-5th margin in each
+     *  arm, which says whether a flip was a near-tie or not. */
+    static void routerReport(float32[] ra, float32[] rb, int32 g,
+            int32 layers, int32 experts, int32 used) {
+        int64 e = (int64) experts;
+        float32 maxAll = 0.0f;
+        int32 flipped = 0;
+        int32[] ta #= heap int32[used];
+        int32[] tb #= heap int32[used];
+        int32 l = 0;
+        while (l < layers) {
+            int64 base = ((int64) g * (int64) layers + (int64) l) * e;
+            float32 maxl = 0.0f;
+            int64 i = 0;
+            while (i < e) {
+                float32 d = ra[base + i] - rb[base + i];
+                if (d < 0.0f) { d = 0.0f - d; }
+                if (d > maxl) { maxl = d; }
+                i = i + 1;
+            }
+            if (maxl > maxAll) { maxAll = maxl; }
+            System.stdout.println("PROFILE step " + g + " layer " + l
+                + " max|A-B| " + maxl);
+            float32 mA = MoeRowArbiter.topk(ra, base, e, used, ta);
+            float32 mB = MoeRowArbiter.topk(rb, base, e, used, tb);
+            boolean same = true;
+            int32 a = 0;
+            while (a < used) {
+                boolean found = false;
+                int32 b = 0;
+                while (b < used) {
+                    if (ta[a] == tb[b]) { found = true; }
+                    b = b + 1;
+                }
+                if (!found) { same = false; }
+                a = a + 1;
+            }
+            if (!same) {
+                flipped = flipped + 1;
+                System.stdout.println("   step " + g + " layer " + l
+                    + ": top-" + used + " differs; router max|A-B| "
+                    + maxl + "; margin(4th-5th) A " + mA + " B " + mB);
+            }
+            l = l + 1;
+        }
+        System.stdout.println("ROUTER step " + g + ": max|A-B| logit "
+            + maxAll + " over " + layers + " layers; " + flipped
+            + " layer(s) flipped");
+        return;
+    }
+
+    /** Top-`k` indices of `v[base..base+e)` by value, ties to the lower
+     *  index, into `out`; returns the k-th minus (k+1)-th value. */
+    static float32 topk(float32[] v, int64 base, int64 e, int32 k,
+            int32[] out) {
+        boolean[] taken #= heap boolean[e];
+        float32 kth = 0.0f;
+        int32 r = 0;
+        while (r < k) {
+            int64 best = 0 - 1L;
+            int64 i = 0;
+            while (i < e) {
+                if (!taken[i]) {
+                    if (best < 0L || v[base + i] > v[base + best]) { best = i; }
+                }
+                i = i + 1;
+            }
+            taken[best] = true;
+            out[r] = (int32) best;
+            kth = v[base + best];
+            r = r + 1;
+        }
+        int64 nxt = 0 - 1L;
+        int64 i2 = 0;
+        while (i2 < e) {
+            if (!taken[i2]) {
+                if (nxt < 0L || v[base + i2] > v[base + nxt]) { nxt = i2; }
+            }
+            i2 = i2 + 1;
+        }
+        return kth - v[base + nxt];
     }
 
     /** One model, one prefill, `steps` observed decode steps on a FIXED
@@ -79,7 +171,8 @@ public class MoeRowArbiter {
      *  predict. Logits step-major, owned; each step's histogram into
      *  `hist` at `g * cells`. */
     static #float32[] arm(String path, int32[] p, int32 n, int32 steps,
-            int32 vocab, int64[] hist, int64 cells, String label) {
+            int32 vocab, int64[] hist, float32[] rt, int64 cells,
+            String label) {
         Checkpoint ck #= Checkpoint.open(path);
         ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
         int32 layers = cfg.numLayers;
@@ -88,7 +181,10 @@ public class MoeRowArbiter {
         m.bind(ck, false);
         ck.close();
         int32 t = m.prefill(p, n);
+        MoeRowArbiter.usedN = m.moeAt(0).used();
         MoeFfn.armRouteObservation(0, layers, experts, 1, true);
+        float32[] tap #= heap float32[cells];
+        MoeFfn.setRouterTap(tap);
         float32[] out #= heap float32[(int64) steps * (int64) vocab];
         int32[] one #= heap int32[1];
         int32 g = 0;
@@ -110,6 +206,7 @@ public class MoeRowArbiter {
             j = 0;
             while (j < cells) {
                 hist[hbase + j] = h[j];
+                rt[hbase + j] = tap[j];
                 j = j + 1;
             }
             if (g == 0) {
@@ -118,6 +215,7 @@ public class MoeRowArbiter {
             }
             g = g + 1;
         }
+        MoeFfn.setRouterTap(null);
         return #out;
     }
 }
