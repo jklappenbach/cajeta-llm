@@ -874,7 +874,69 @@ every timing leg and wait for the go; filtered suite only
       harness's 574.933, decode 944.39 against 950.59. This is finding 5
       under 2.2.5, and it is the second attribution this profiler
       ergonomic has cost this unit.
-      STILL BLOCKED, on cause 3 alone.
+      CAUSE 3 COLLECTED 2026-09-17. The grouped id mat-vec existed for
+      Q4_K and Q6_K; the codebook formats were not admitted to it.
+
+      | leg | before | after | Vulkan |
+      |---|---|---|---|
+      | decode t/s | 39.86 | **122.1** | 140.1 |
+      | | 0.285x | **0.871x** | |
+      | prefill t/s | 908.5 | 908.3 | 2309 |
+      | | 0.394x | 0.393x | |
+
+      Two kernels, `iq3xxsQ8IdMatVecKernel` and `iq4nlQ8IdMatVecKernel`
+      — the dense wave kernels with the slab row through `sel[kk]`, the
+      activation base through `xRowBlocks` and the output row changed,
+      the dot loop untouched. Bit-identical to the per-expert wave
+      launches over 192 rows on both (`MoeCodebookIdMatVecTest`), each
+      expert a distinct block rotation so a kernel ignoring `sel`
+      could not agree by accident. The IQ4_NL one reads the INTEGER
+      route on the caller's padded q8_K activation, where 9.2.4's dense
+      path took the f32 wave because 1408 is not a multiple of 256.
+      TWO GATES REFUSED, AND I FOUND ONLY ONE BY READING. `idReady()`
+      listed 12 and 14; widened, the census was UNCHANGED — the id
+      kernels absent, decode 33.65 as before. I had written that the
+      kernels "flip `zeroSyncReady()`"; that was the format clause
+      assumed to be the only clause. `DenseRouteProbe`, given two
+      decode steps, named the real one: "shared expert not row-routed",
+      all 24 layers, clause ONE of seven. `Linear.packedWaveReady()`
+      ended `(q8 && wave) || wave6` — the same two-format list, one file
+      over — and its dispatcher fell through a bare `else` into the
+      Q6_K decoder, which would have fed codebook bytes through it the
+      moment the predicate widened: wrong logits, no crash. Explicit
+      arms now and a terminal `return false`. THIRD INSTANCE TODAY of a
+      predicate naming formats where it means "on an integer wave
+      route": `wavef`'s guard (9.2.4), `idReady`, `packedWaveReady`.
+      Sweep opened as 9.2.9.
+      THE CENSUS, decode window (the boundary is the `LlmEngine.load`
+      frame's span, which on this trace lands after the prefill; the
+      window's 267.96 ms wall against the harness's 279.87 decode ms
+      says it is the decode window and nothing else): device self
+      214.67 ms in 267.96 ms of wall, 80% busy, from 231 in 944 (24%).
+      `iq3xxsQ8IdMatVecKernel` 1424 launches (2 a layer: gate, up),
+      `iq4nlQ8IdMatVecKernel` 712 (1: down), `rmsnormRouterTopKKernel`
+      712 (the fused device router, new to this file). Per-token
+      mat-vec launches ~438 -> ~222; the shared expert (72) and the
+      attention projections (~90) stay dense, which is correct.
+      PERPLEXITY MOVED AND IS NOT WAVED THROUGH: 5.50046 against
+      llama.cpp's 5.4781, +0.41%, from -0.02% on the previous build.
+      Inside the ~0.5% MoE routing-flip floor 7.3.2 records, and the
+      id kernels are bit-identical to what they replace, so the
+      movement is the route's OTHER changes — the fused device router,
+      the shared-expert arms, the down+combine. Greedy agrees with
+      llama.cpp on the shared prefix and ends at eos where the old
+      route continued. OWED before this is called settled: the
+      `[diag] route` record diff between the two routes (7.3.2's
+      arbiter), so the +0.41% is shown to be top-k flips and not a
+      numeric fault in one of the three changed paths.
+      WHAT REMAINS IS PREFILL, and the census names it without
+      inference: 0.393x with the expert coop GEMMs dominating device
+      time — `iq4nlF16CoopN64` 1270 launches / 231 ms at 182 us each,
+      `iq3xxsF16CoopN64` 2540 / 127 ms — inside a prefill window that
+      is ~91% device-busy. Prefill is GEMM-bound, not dispatch-bound.
+      That is a fifth cause, and it is the coop kernels' rate on ragged
+      expert batches, not anything this item's four causes covered.
+      STILL OPEN on that and on the perplexity arbiter.
 
 
 ## Unit 7 — The decode bandwidth gap (spec §6, §8.5, 12.1; folds 4.3.5 and 6.4.1)
@@ -2219,6 +2281,20 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       kernels to avoid — or a lane assembles a prefix dword from two
       blocks whose lines it does not both hold. Settle which by probe
       before writing the kernel.
+
+- [ ] 9.2.9 Sweep the format-list predicates. Three times today a
+      predicate named two formats where it meant "this weight is on an
+      integer wave route", and each cost a whole route: `wavef`'s guard
+      (9.2.4, IQ4_NL decoded item-per-row), `ExpertBank.idReady()` and
+      `Linear.packedWaveReady()` (6.4.3 cause 3, the MoE refused the
+      zero-sync row on every layer). `Linear` already carries the
+      predicate that answers the question — `qAct`, the union of every
+      integer wave flag — and `intWaveRouted()`. Find every remaining
+      `(q8 && wave) || wave6` and `== 12 || == 14`, ask whether it
+      means "Q4_K or Q6_K specifically" or "on an integer route", and
+      replace the latter. Each replacement takes a does-fire test and a
+      does-not-fire test, because the dispatcher beside each one is
+      where 9.2.4's fallthrough lives.
 
 ### 9.3 Acceptance
 - [~] 9.3.1 Filtered suite green.
