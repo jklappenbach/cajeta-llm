@@ -1038,8 +1038,9 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       | iq2_xxs | 70.68 | 78.22 | 0.904 |
       | iq2_xs | 65.96 | 73.06 | 0.903 |
 
-      Unit 7 has taken iq2_xs from 48.7 t/s and 0.66 to 65.96 and
-      0.903, +35%.
+      (Superseded by the pack-fusion rows below: iq2_xs reaches 68.08
+      and 0.931.) Unit 7 has taken iq2_xs from 48.7 t/s and 0.66 to
+      68.08 and 0.931, +40%.
       WHAT REMAINS IS THE IQ2 FAMILY, and the target is exact. Every
       kernel on this box tops out near 206 GB/s — q4_k 207, iq3s 203,
       tq2_0 193 — against a ~256 GB/s LPDDR5X peak, so ~206 is the
@@ -1095,6 +1096,65 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       pattern that beat llama.cpp on MXFP4. PREDICTED: `b64` per body
       10 → 0, `b32` up by the same count, byte rate toward 204, and
       IQ3/Q4_K/TQ flat.
+      PACK FUSION, 2026-09-16, at Julian's direction after the
+      re-profile. THE FINDING IS NOT THAT FUSION WAS MISSING — it was
+      built and unreachable. Three fused fast paths exist and none ran
+      on llama-3-8B:
+      - `Prim.rmsnormPackDevice` (Unit 48) declined `dim > 2048`; the
+        model is 4096 wide. The cap was structural — one workgroup of
+        256 threads, eight waves, ONE 256-element pack block per wave.
+        A wave now takes block `wid`, then `wid + 8`.
+      - the dense route's post-attention norm only tried the fused path
+        when a model had EXPERTS; it now takes it like the
+        attention-input norm.
+      - `attendDecodePartialsLaunchNoSync` (Unit 50, reduce + pack in
+        one launch) allow-lists `nH == nKv` and `nH == 8 * nKv`.
+        Llama-3-8B is GQA-4. STILL UNREACHED — the remaining item.
+      Extending the norm kernel forced a numerics decision: its Unit 54
+      per-wave reduction cannot match `rmsnormRowF32`'s 256-element LDS
+      tree bit for bit, because the tree's first three levels pair
+      lanes 128, 64 and 32 apart, which cross waves. Since the fused
+      kernel REPLACES the pair whenever the width allows, a last-bit
+      difference would make the normed row depend on which path the
+      width selected — the 4096 test caught exactly that, at 2048 and
+      512 it had matched by luck. The tree is back; eight barriers
+      instead of three, and the kernel is still half the cost of the
+      pair it replaces.
+      Per token: `rmsnormRowF32` 65 calls → 1, `q8kPackKernel` 129 →
+      65.5, `rmsnormPackRowF32` 64 at 5.58 us where the pair cost
+      12.20 — it beats even the norm alone, because it keeps the
+      normed values in registers instead of re-reading the row twice.
+      Decode 14.62 → 14.21 ms/token. End to end, five reps, arms
+      alternating:
+
+      | file | before | after | ratio | was |
+      |---|---|---|---|---|
+      | iq3_s | 52.20 | 52.97 | 0.970 MEETS | 0.951 |
+      | iq3_xxs | 56.96 | 57.92 | 0.968 MEETS | 0.947 |
+      | iq2_s | 64.24 | 65.77 | 0.944 | 0.926 |
+      | iq2_xxs | 70.68 | 72.58 | 0.925 | 0.904 |
+      | iq2_xs | 65.96 | 67.70 | 0.925 | 0.903 |
+
+      BOTH IQ3 FILES NOW CLEAR THE BAR. `gluPackF32` then took the last
+      of the four packs a dense layer pays; unlike the norm it needs no
+      cross-block reduction, only the per-block max, so it keeps the
+      many-workgroup shape.
+      With the GLU fused too:
+
+      | file | before | after | ratio | was |
+      |---|---|---|---|---|
+      | iq3_s | 52.97 | 53.68 | 0.980 MEETS | 0.970 |
+      | iq3_xxs | 57.92 | 58.66 | 0.973 MEETS | 0.968 |
+      | iq2_s | 65.77 | 66.56 | 0.956 MEETS | 0.944 |
+      | iq2_xxs | 72.58 | 73.47 | 0.940 | 0.925 |
+      | iq2_xs | 67.70 | 68.08 | 0.931 | 0.925 |
+
+      THREE OF FIVE NOW MEET 7.3.1. Only the two thinnest IQ2 formats
+      remain, at 0.931 and 0.940, and the sixth variable (the `b32`
+      codebook gather) is aimed exactly at them.
+      A dense layer now pays TWO packs, not four: the attention output
+      and — on the sub-norm shapes only — the GLU. Fusing the
+      attention one needs GQA-4 in Unit 50's reduce+pack allow-list.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
