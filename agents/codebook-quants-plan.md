@@ -746,6 +746,65 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       null result twice.
       SECOND VARIABLE: `iqDot16`'s vector build, then TQ1_0's 64
       half-word loads per body.
+      PREDICTION for the second variable, written before the edit:
+      `iqDot16` applies the sign one value at a time — per value a
+      shift, a mask, a negate, an xor and an add, then a truncation and
+      an insert into a 16-lane byte vector, about 130 VALU ops per
+      call. Every grid byte is nonzero and at most 62 (checked across
+      all five tables), so a per-byte two's complement never carries
+      out of its own byte and the whole thing can run a dword at a
+      time: `t = s | s<<7 | s<<14 | s<<21` puts sign bit j at bit 8j,
+      one AND takes the low four and `(t>>4)` the high four, `q = p<<7`
+      then `q | (q-p)` widens 0x01 to 0xFF per byte, and
+      `(g ^ m) + p` negates four values at once. Four dwords then
+      bitcast into the dot through `asBytes`, and `dotSum` replaces
+      `dotAccum` plus its four extracts and three adds. About 38 VALU
+      ops for the same 16 values.
+      Expected: `global_load` and `vmcnt(0)` UNCHANGED (the memory
+      shape is untouched), `v_dot4` unchanged, total VALU down roughly
+      threefold, VGPRs down. The discriminating observation is
+      IQ2_XXS: it was flat for the first variable because it already
+      had the descriptor read, but it pays this cost in full, so if the
+      cause is named right it moves this time. Q4_K stays flat either
+      way.
+      DONE 2026-09-16. Both halves landed. The ISA half exactly as
+      written — `v_dot4` 8, `vmcnt(0)` 1 and every load count
+      unchanged on all five, VALU down about 40% and VGPRs halved:
+
+      | kernel | VALU before → after | VGPR before → after |
+      |---|---|---|
+      | iq2xxs | 288 → 168 | 100 → 48 |
+      | iq2xs | 297 → 176 | 104 → 52 |
+      | iq2s | 298 → 181 | 104 → 52 |
+      | iq3xxs | 299 → 179 | 103 → 50 |
+      | iq3s | 322 → 206 | 117 → 54 |
+
+      And the throughput half, at 14336×4096:
+
+      | kernel | GB/s before → after | G values/s before → after |
+      |---|---|---|
+      | iq2s | 149 → 183 | 498 → 613 (+22.9%) |
+      | iq2xs | 141 → 162 | 524 → 604 (+15.2%) |
+      | iq3xxs | 171 → 195 | 478 → 547 (+14.4%) |
+      | iq3s | 181 → 202 | 451 → 505 (+11.9%) |
+      | iq2xxs | 144 → 161 | 601 → 669 (+11.2%) |
+      | q4_k (control) | 206 → 205 | 394 → 392 (−0.5%) |
+      | tq2_0 (control) | 193 → 193 | 805 → 804 (−0.1%) |
+      | tq1_0 (control) | 96 → 96 | 489 → 488 (−0.4%) |
+
+      IQ2_XXS moved, which is what separates this result from a drift:
+      it was the untouched control for the first variable and stayed
+      flat there, and it pays this cost in full. Three controls flat,
+      five treated kernels up 11–23%. Exactness gate green (229/229).
+      End to end the gain arrives DAMPED, and that is the finding:
+      11–23% in the kernel became 3.6–6.6% in the model, where the
+      first variable's 11–15% became 14–17%. Solving for the share of
+      decode these kernels still hold gives 0.33 on iq2_s and 0.56 on
+      iq2_xxs. After two variables the codebook mat-vec is no longer
+      the dominant term of decode, so a third variable aimed at it
+      would be spending against a shrinking fraction. What the
+      remaining 45–67% is has not been measured yet, and measuring it
+      is the next step rather than guessing a third kernel change.
 - [ ] 7.2.3 `@Occupancy(maxThreads)` wherever a launch block is not a
       literal — an unpinned block is budgeted for 1024 threads and caps
       VGPRs at 192, which is a despill the ISA read will show.
@@ -771,6 +830,25 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       carries 64 IQ2_S and 33 IQ3_S tensors, gains a partial 3.2%.
       NOT MET: 0.77–0.89× against the 0.95 bar, and prefill is
       unchanged. The gap is now ~1.2× rather than ~1.5×.
+      AFTER 7.2.2's second variable (same box, same leg):
+
+      | file | before | after | gain | × vulkan |
+      |---|---|---|---|---|
+      | iq2_xxs | 61.5 | 65.2 | +6.1% | 0.83 |
+      | iq2_xs | 56.8 | 60.3 | +6.2% | 0.82 |
+      | iq2_s | 55.6 | 59.3 | +6.6% | 0.85 |
+      | iq3_xxs | 52.3 | 55.0 | +5.1% | 0.93 |
+      | iq3_s | 48.9 | 50.7 | +3.6% | 0.92 |
+
+      Prefill is untouched by construction (the coop GEMMs never call
+      `iqDot16`) and measured 1.8–7.3% LOWER, alongside load times
+      2–7% higher on the same files — load is host I/O and cannot
+      have been changed by a kernel edit, so the box ran a few percent
+      slow for this run and the decode gains are, if anything,
+      understated.
+      STILL NOT MET: 0.82–0.93× against 0.95. Two files are now
+      within 3 points of the bar and the worst is 0.82, from 0.66 at
+      the start of the unit.
 - [ ] 7.3.2 Perplexity and the Q8 twins unchanged on the files of 5.3.1
       and 6.3.1 — the numbers this unit may not move.
 - [ ] 7.3.3 Legs re-run and recorded (announced).
