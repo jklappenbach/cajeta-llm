@@ -1550,6 +1550,64 @@ every timing leg and wait for the go; filtered suite only
       for IQ4_NL down, measured for the bandwidth it costs. Julian's
       call; the arbiter (`bench/MoeRowArbiter`, `MoeFfn.setRouterTap`)
       is the instrument either way.
+      THE DECIMAL, MEASURED 2026-09-17 (Julian: "I want the decimal";
+      I had predicted rounding alone would come in "well under 0.1%"
+      and that is REFUTED). `MoeFfn.setRoutePin` records one route's
+      expert SELECTIONS and replays them on the other, leaving each
+      route its own logits and its own weights, so a pinned pair
+      differs in arithmetic only; `bench/MoePinnedPpl` runs the four
+      passes over `llama.cpp/README.md`, pre=1025 eval=1023, the same
+      corpus and shape as 7.3.2's figures.
+
+      | route | own routes | pinned to the other's |
+      |---|---|---|
+      | A zero-sync row (integer down) | 5.50046 | 5.48918 |
+      | B per-expert (f32 down) | 5.47719 | 5.48325 |
+
+      THE INSTRUMENT IS VALIDATED BEFORE THE RESULT IS READ: both own-
+      route figures reproduce the published ones to five places (5.50046,
+      5.47719); the pin covered 24552 rows (1023 tokens x 24 layers) with
+      0 overflow; and the weight rule it replays with (`weightsFor`)
+      matched `routeFromLogits`'s own weights on every one of those rows,
+      0 misses, which is what stops a replayed route being weighted
+      differently from the route that recorded it.
+      THE DECOMPOSITION of the +0.425% gap: rounding alone is +0.219%
+      held on B's routes and +0.314% held on A's, so flips are the
+      remaining +0.11 to +0.19%. Rounding is the MAJORITY of the gap,
+      not the minority — "inside the routing-flip floor" was the wrong
+      reading of it. The flip rate is also settled and it is not a
+      handful of near-ties: 4562 and 4703 of 24552 rows carry at least
+      one differing expert, 19% of rows.
+      THE MECHANISM, measured by `MoeFfn.setActErrTap` (the q8_K round
+      trip simulated on the row's real activations, host-side, read-only
+      — the four perplexities are unchanged with it on): the relative
+      RMS error is 1.12% on the layer input, which BOTH routes quantize
+      and which therefore cancels, against 1.70% on the GLU output,
+      which only the integer down quantizes. The cause is block width,
+      not the format: the mean block outlier max|x|/rms is 4.45 on the
+      layer input and 6.82 on the GLU output — a SwiGLU product carries
+      outliers, and q8_K spends one scale on 256 elements. Simulated in
+      32-element blocks the same GLU output costs 0.91%, BELOW what the
+      layer input already costs at 256.
+      AND THE REFERENCE DOES NOT MAKE THIS TRADE. `ggml_vk_should_use_mmvq`
+      (llama.cpp 5306f4b, `ggml-vulkan.cpp`) refuses the integer
+      activation path on AMD when the contraction dimension is under
+      2048; the routed down projection's is 1408 and gate/up's is 2048,
+      so at decode llama.cpp quantizes the gate/up activations on this
+      file and leaves the down's in f16. The plan's earlier note that
+      "llama.cpp's `mul_mat_vec_q` does too (q8_1 activations)" is true
+      of its CUDA/HIP dense path and not of the Vulkan arm this unit
+      benchmarks against, which is why its 5.4781 sits at our f32 arm's
+      5.47719 rather than at our integer arm's 5.50046.
+      SO THE CHOICE IS NOW THREE-WAY, and the middle one is new: keep
+      the integer route at a measured +0.25% and record it; or an
+      f32-activation id kernel for the down, which gives the +0.25% back
+      and costs the fused down+combine+tail launch of 6.4.3.3 and the
+      int8 dot; or quantize the down's activation in 32-element blocks,
+      which the tap says recovers roughly half the error for a new pack
+      in the gate-up-GLU epilogue and a changed inner loop in
+      `iq4nlQ8IdDownCombineKernel`, keeping the fusion and the integer
+      dot. My recommendation has changed with the number: the third.
 
 ## Unit 7 — The decode bandwidth gap (spec §6, §8.5, 12.1; folds 4.3.5 and 6.4.1)
 

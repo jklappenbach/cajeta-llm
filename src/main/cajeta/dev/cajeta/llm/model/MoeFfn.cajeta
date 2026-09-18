@@ -115,6 +115,104 @@ public final class MoeFfn extends InfModule {
     // last row land at [layerIdx * E], from whichever route ran them.
     static float32[] routerTap;
     public static void setRouterTap(float32[] buf) { MoeFfn.routerTap #= buf; }
+
+    // 6.4.5's pin: the expert SELECTION of each (layer, row) recorded on
+    // one route and replayed on another, so two routes can be compared
+    // with their top-k flips removed and their arithmetic intact.
+    static int32[] pinSel;
+    static int32[] pinCalls;      // rows seen so far, per layer
+    static int32 pinMode;         // 0 off, 1 record, 2 replay
+    static int32 pinLayers;
+    static int32 pinUsed;
+    static int32 pinCap;          // rows a layer the buffer holds
+    static int64 pinRows;
+    static int64 pinFlips;        // replayed rows whose own choice differed
+    static int64 pinOverflow;     // rows past `pinCap`, pinned by neither
+    static int64 pinWeightMiss;   // record-mode instrument check
+
+    /** Record (`mode` 1) or replay (2) expert selections in `buf`, laid
+     *  out `[row][layer][used]`; 0 turns the pin off. */
+    public static void setRoutePin(int32 mode, int32[] buf, int32 layers,
+            int32 used, int32 cap) {
+        MoeFfn.pinSel #= buf;
+        MoeFfn.pinMode = mode;
+        MoeFfn.pinLayers = layers;
+        MoeFfn.pinUsed = used;
+        MoeFfn.pinCap = cap;
+        MoeFfn.pinCalls #= heap int32[(int64) layers];
+        MoeFfn.pinRows = 0L;
+        MoeFfn.pinFlips = 0L;
+        MoeFfn.pinOverflow = 0L;
+        MoeFfn.pinWeightMiss = 0L;
+        return;
+    }
+
+    // 6.4.5's mechanism tap: what q8_K's 256-element blocks cost on the
+    // two activations the row quantizes — the layer input, which both
+    // routes quantize, and the GLU output, which only the integer down
+    // projection does.
+    static boolean actErrOn;
+    static float64 actErrGyNum;
+    static float64 actErrGyDen;
+    static float64 actErrGyOut;
+    static float64 actErrXnNum;
+    static float64 actErrXnDen;
+    static float64 actErrXnOut;
+    static int64 actErrBlocks;
+    static int64 actErrRows;
+    static float64 actErr32Num;   // the same tensors in 32-element blocks
+    static float64 actErr32Den;
+
+    public static void setActErrTap(boolean on) {
+        MoeFfn.actErrOn = on;
+        MoeFfn.actErrGyNum = 0.0;
+        MoeFfn.actErrGyDen = 0.0;
+        MoeFfn.actErrGyOut = 0.0;
+        MoeFfn.actErrXnNum = 0.0;
+        MoeFfn.actErrXnDen = 0.0;
+        MoeFfn.actErrXnOut = 0.0;
+        MoeFfn.actErrBlocks = 0L;
+        MoeFfn.actErrRows = 0L;
+        MoeFfn.actErr32Num = 0.0;
+        MoeFfn.actErr32Den = 0.0;
+        return;
+    }
+
+    /** The GLU output's error in 32-element blocks — llama.cpp's q8_1
+     *  granularity — against the 256 of {@link #actErrGlu}. */
+    public static float64 actErrGlu32() {
+        if (MoeFfn.actErr32Den <= 0.0) { return 0.0; }
+        return Math.sqrt(MoeFfn.actErr32Num / MoeFfn.actErr32Den);
+    }
+
+    /** Relative RMS error of the q8_K round trip on the GLU output. */
+    public static float64 actErrGlu() {
+        if (MoeFfn.actErrGyDen <= 0.0) { return 0.0; }
+        return Math.sqrt(MoeFfn.actErrGyNum / MoeFfn.actErrGyDen);
+    }
+
+    /** The same on the layer input, which both routes quantize. */
+    public static float64 actErrInput() {
+        if (MoeFfn.actErrXnDen <= 0.0) { return 0.0; }
+        return Math.sqrt(MoeFfn.actErrXnNum / MoeFfn.actErrXnDen);
+    }
+
+    /** Mean block outlier factor max|x| / rms(x), the quantity a
+     *  256-element block's single scale is spent on. */
+    public static float64 actOutlierGlu() {
+        if (MoeFfn.actErrBlocks <= 0L) { return 0.0; }
+        return MoeFfn.actErrGyOut / (float64) MoeFfn.actErrBlocks;
+    }
+
+    public static float64 actOutlierInput() {
+        if (MoeFfn.actErrRows <= 0L) { return 0.0; }
+        return MoeFfn.actErrXnOut / (float64) MoeFfn.actErrRows;
+    }
+
+    public static int64 routePinRows() { return MoeFfn.pinRows; }
+    public static int64 routePinFlips() { return MoeFfn.pinFlips; }
+    public static int64 routePinOverflow() { return MoeFfn.pinOverflow; }
+    public static int64 routePinWeightMiss() { return MoeFfn.pinWeightMiss; }
     public static void setSharedRow(boolean on) { MoeFfn.sharedRowOn = on; }
     static boolean wideIdOn = true;            // unit 10.2 A/B arm
     static int64 growNs = 0L;                  // 11.1: batch buffer growth
@@ -339,6 +437,8 @@ public final class MoeFfn extends InfModule {
         this.tapRouterHost();
         this.routeFromLogits(this.sc.logits.hostBuffer(),
             this.sc.logits.hostBase(), selOut, wOut);
+        this.pinRoutesHost(selOut, wOut, this.sc.logits.hostBuffer(),
+            this.sc.logits.hostBase());
         this.noteRoutesHost(selOut, 1);
         return;
     }
@@ -346,6 +446,266 @@ public final class MoeFfn extends InfModule {
     /** The selection tail of {@link #routeInto} over one host logits
      *  row — shared by the per-row path and the batched device router
      *  (unit 41), so the two cannot drift. */
+    /**
+     * The combining weights {@link #routeFromLogits} would give a
+     * selection already made: the same softmax, the same order, the same
+     * clamp. Record mode checks it against that function's own output,
+     * so the pin cannot silently weight a replayed route differently.
+     */
+    void weightsFor(float32[] lb, int64 lo, int32[] sel, float32[] wOut) {
+        float32 mx = lb[lo];
+        int32 e = 1;
+        while (e < this.expertsN) {
+            if (lb[lo + (int64) e] > mx) {
+                mx = lb[lo + (int64) e];
+            }
+            e = e + 1;
+        }
+        float32 sum = 0.0f;
+        e = 0;
+        while (e < this.expertsN) {
+            float32 p = Math.exp(lb[lo + (int64) e] - mx);
+            this.sc.probs[e] = p;
+            sum = sum + p;
+            e = e + 1;
+        }
+        e = 0;
+        while (e < this.expertsN) {
+            this.sc.probs[e] = this.sc.probs[e] / sum;
+            e = e + 1;
+        }
+        int32 k = 0;
+        while (k < this.usedN) {
+            wOut[k] = this.sc.probs[sel[k]];
+            k = k + 1;
+        }
+        if (this.normTopk) {
+            float32 ws = 0.0f;
+            k = 0;
+            while (k < this.usedN) {
+                ws = ws + wOut[k];
+                k = k + 1;
+            }
+            if (ws < 0.00006103515625f) {
+                ws = 0.00006103515625f;
+            }
+            k = 0;
+            while (k < this.usedN) {
+                wOut[k] = wOut[k] / ws;
+                k = k + 1;
+            }
+        }
+        return;
+    }
+
+    /** This layer's slot in the pin, or -1 when the pin is off or full.
+     *  Advances the layer's row cursor. */
+    int64 pinSlot() {
+        if (MoeFfn.pinMode == 0 || this.layerIdx < 0) { return -1L; }
+        if (this.usedN != MoeFfn.pinUsed) { return -1L; }
+        int32 row = MoeFfn.pinCalls[(int64) this.layerIdx];
+        if (row >= MoeFfn.pinCap) {
+            MoeFfn.pinOverflow = MoeFfn.pinOverflow + 1L;
+            return -1L;
+        }
+        MoeFfn.pinCalls[(int64) this.layerIdx] = row + 1;
+        MoeFfn.pinRows = MoeFfn.pinRows + 1L;
+        return ((int64) row * (int64) MoeFfn.pinLayers
+            + (int64) this.layerIdx) * (int64) MoeFfn.pinUsed;
+    }
+
+    /** The host route's pin site: `selOut`/`wOut` hold this row's choice
+     *  and `lb`+`lo` its logits. */
+    void pinRoutesHost(int32[] selOut, float32[] wOut, float32[] lb,
+            int64 lo) {
+        int64 at = this.pinSlot();
+        if (at < 0L) { return; }
+        int64 u = (int64) this.usedN;
+        float32[] chk #= heap float32[u];
+        this.weightsFor(lb, lo, selOut, chk);
+        int64 k = 0;
+        while (k < u) {
+            if (chk[k] != wOut[k]) {
+                MoeFfn.pinWeightMiss = MoeFfn.pinWeightMiss + 1L;
+            }
+            k = k + 1;
+        }
+        if (MoeFfn.pinMode == 1) {
+            k = 0;
+            while (k < u) {
+                MoeFfn.pinSel[at + k] = selOut[k];
+                k = k + 1;
+            }
+            return;
+        }
+        boolean same = true;
+        k = 0;
+        while (k < u) {
+            if (selOut[k] != MoeFfn.pinSel[at + k]) { same = false; }
+            k = k + 1;
+        }
+        if (!same) { MoeFfn.pinFlips = MoeFfn.pinFlips + 1L; }
+        k = 0;
+        while (k < u) {
+            selOut[k] = MoeFfn.pinSel[at + k];
+            k = k + 1;
+        }
+        this.weightsFor(lb, lo, selOut, wOut);
+        return;
+    }
+
+    /** The device route's pin site: `selDev`/`wSelDev` hold this row's
+     *  choice and `logitsDev` its logits. Replay recomputes the weights
+     *  from THIS route's own logits, so only the discrete choice is
+     *  held fixed. */
+    void pinRoutesDev() {
+        if (MoeFfn.pinMode == 0) { return; }
+        int64 at = this.pinSlot();
+        if (at < 0L) { return; }
+        int64 u = (int64) this.usedN;
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int32[] sel #= heap int32[u];
+        this.selDev.download(sel, u);
+        int64 k = 0;
+        if (MoeFfn.pinMode == 1) {
+            while (k < u) {
+                MoeFfn.pinSel[at + k] = sel[k];
+                k = k + 1;
+            }
+            return;
+        }
+        boolean same = true;
+        while (k < u) {
+            if (sel[k] != MoeFfn.pinSel[at + k]) { same = false; }
+            k = k + 1;
+        }
+        if (!same) { MoeFfn.pinFlips = MoeFfn.pinFlips + 1L; }
+        int64 e = (int64) this.expertsN;
+        float32[] lg #= heap float32[e];
+        this.logitsDev.download(lg, e);
+        float32[] pw #= heap float32[u];
+        k = 0;
+        while (k < u) {
+            sel[k] = MoeFfn.pinSel[at + k];
+            k = k + 1;
+        }
+        this.weightsFor(lg, 0L, sel, pw);
+        this.selDev.upload(sel, u);
+        this.wSelDev.upload(pw, u);
+        return;
+    }
+
+    /**
+     * One 256-element block's q8_K round trip, host-side and by the pack
+     * kernel's rule: scale max|x|/127, round to nearest. Accumulates the
+     * squared error, the energy and the block's outlier factor.
+     */
+    static void q8kBlockError(float32[] v, int64 off, boolean glu) {
+        float32 bmax = 0.0f;
+        int64 i = 0;
+        float64 sq = 0.0;
+        while (i < 256L) {
+            float32 x = v[off + i];
+            float32 ax = x;
+            if (ax < 0.0f) { ax = 0.0f - ax; }
+            if (ax > bmax) { bmax = ax; }
+            sq = sq + (float64) x * (float64) x;
+            i = i + 1;
+        }
+        float32 inv = 0.0f;
+        float32 dsc = 0.0f;
+        if (bmax > 0.0f) {
+            inv = 127.0f / bmax;
+            dsc = bmax / 127.0f;
+        }
+        float64 err = 0.0;
+        i = 0;
+        while (i < 256L) {
+            float32 x = v[off + i];
+            float32 q = (float32) Math.round(x * inv);
+            float32 d = x - q * dsc;
+            err = err + (float64) d * (float64) d;
+            i = i + 1;
+        }
+        if (glu) {
+            int64 sb = 0;
+            while (sb < 256L) {
+                float32 smax = 0.0f;
+                int64 j = 0;
+                while (j < 32L) {
+                    float32 x = v[off + sb + j];
+                    float32 ax = x;
+                    if (ax < 0.0f) { ax = 0.0f - ax; }
+                    if (ax > smax) { smax = ax; }
+                    j = j + 1;
+                }
+                float32 sinv = 0.0f;
+                float32 ssc = 0.0f;
+                if (smax > 0.0f) {
+                    sinv = 127.0f / smax;
+                    ssc = smax / 127.0f;
+                }
+                j = 0;
+                while (j < 32L) {
+                    float32 x = v[off + sb + j];
+                    float32 qq = (float32) Math.round(x * sinv);
+                    float32 dd = x - qq * ssc;
+                    MoeFfn.actErr32Num = MoeFfn.actErr32Num
+                        + (float64) dd * (float64) dd;
+                    MoeFfn.actErr32Den = MoeFfn.actErr32Den
+                        + (float64) x * (float64) x;
+                    j = j + 1;
+                }
+                sb = sb + 32L;
+            }
+        }
+        float64 rms = Math.sqrt(sq / 256.0);
+        float64 out = 0.0;
+        if (rms > 0.0) { out = (float64) bmax / rms; }
+        if (glu) {
+            MoeFfn.actErrGyNum = MoeFfn.actErrGyNum + err;
+            MoeFfn.actErrGyDen = MoeFfn.actErrGyDen + sq;
+            MoeFfn.actErrGyOut = MoeFfn.actErrGyOut + out;
+            MoeFfn.actErrBlocks = MoeFfn.actErrBlocks + 1L;
+        } else {
+            MoeFfn.actErrXnNum = MoeFfn.actErrXnNum + err;
+            MoeFfn.actErrXnDen = MoeFfn.actErrXnDen + sq;
+            MoeFfn.actErrXnOut = MoeFfn.actErrXnOut + out;
+            MoeFfn.actErrRows = MoeFfn.actErrRows + 1L;
+        }
+        return;
+    }
+
+    /** The tap: this row's layer input and its routed GLU output, both
+     *  through the q8_K rule the row's kernels apply to them. */
+    void tapActErr(KernelBuffer<float32> xDev, int64 hid, int64 wid) {
+        if (!MoeFfn.actErrOn) { return; }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] xh #= heap float32[hid];
+        xDev.download(xh, hid);
+        int64 b = 0;
+        while (b + 256L <= hid) {
+            MoeFfn.q8kBlockError(xh, b, false);
+            b = b + 256L;
+        }
+        int64 gn = (int64) this.usedN * wid;
+        float32[] gh #= heap float32[gn];
+        this.gyDev.download(gh, gn);
+        int64 k = 0;
+        while (k < (int64) this.usedN) {
+            int64 base = k * wid;
+            int64 g = 0;
+            while (g + 256L <= wid) {
+                MoeFfn.q8kBlockError(gh, base + g, true);
+                g = g + 256L;
+            }
+            k = k + 1;
+        }
+        return;
+    }
+
     void routeFromLogits(float32[] lb, int64 lo, int32[] selOut,
             float32[] wOut) {
         // Softmax over all experts (gating 1 — the ctor refused the
@@ -971,6 +1331,7 @@ public final class MoeFfn extends InfModule {
             hid, eps, form, this.selDev, this.wSelDev, this.logitsDev,
             this.routerWDev, this.rtCounter, (int64) this.expertsN,
             (int64) this.usedN, this.normTopk, this.wScale);
+        this.pinRoutesDev();
         this.tapRouterDev();
         this.noteRoutesDev(this.selDev, 1L);
         return true;
@@ -1028,7 +1389,11 @@ public final class MoeFfn extends InfModule {
                 this.logitsDev, this.probsDev, (int64) this.expertsN,
                 (int64) this.usedN, this.normTopk, this.wScale);
         }
-        if (!preRouted) { this.tapRouterDev(); this.noteRoutesDev(this.selDev, 1L); }
+        if (!preRouted) {
+            this.pinRoutesDev();
+            this.tapRouterDev();
+            this.noteRoutesDev(this.selDev, 1L);
+        }
         MoeFfn.phaseSync();
         MoeFfn.mtRouteNs = MoeFfn.mtRouteNs + (Clock.nanoTime() - tr0);
         int64 tg0 = Clock.nanoTime();
@@ -1067,6 +1432,7 @@ public final class MoeFfn extends InfModule {
         }
         MoeFfn.phaseSync();
         MoeFfn.mtGluNs = MoeFfn.mtGluNs + (Clock.nanoTime() - tgl0);
+        this.tapActErr(xDev, hid, wid);
         int64 td0 = Clock.nanoTime();
         int64 widPad = wpad;
         if (fusedGuPk) {

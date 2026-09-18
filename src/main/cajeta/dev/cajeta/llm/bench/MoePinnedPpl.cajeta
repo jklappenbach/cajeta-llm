@@ -1,0 +1,180 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.io.file.File;
+import cajeta.lang.Integer;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.model.MoeFfn;
+import dev.cajeta.llm.tok.Tokenizer;
+
+/**
+ * 6.4.5: the perplexity cost of the integer down projection with the
+ * top-k FLIPS REMOVED. The two routes are `PplProbe`'s arms — A the
+ * zero-sync row (the down projection reads q8_K-packed gate*up), B the
+ * per-expert row the `norowmoe` control restores (its down reads f32) —
+ * and each is run twice, once recording its expert selections and once
+ * replaying the other's. A pinned pair differs only in arithmetic, so
+ * the pinned delta is the rounding and the unpinned delta is rounding
+ * plus flips.
+ */
+public final class MoePinnedPpl {
+
+    public static int32 run(String[] args) {
+        if ((int32) args.count() < 2) {
+            System.stdout.println(
+                "usage: moepinnedppl <model.gguf> <text> [pre=N] [eval=N]");
+            return 2;
+        }
+        int32 pre = 1025;
+        int32 eval = 1023;
+        int32 ai = 2;
+        while (ai < (int32) args.count()) {
+            if (args[ai].startsWith("pre=")) {
+                String pv #= args[ai].substring(4, args[ai].byteLength());
+                pre = Integer.parseInt(pv);
+            }
+            if (args[ai].startsWith("eval=")) {
+                String ev #= args[ai].substring(5, args[ai].byteLength());
+                eval = Integer.parseInt(ev);
+            }
+            ai = ai + 1;
+        }
+
+        int8[] raw #= File.readAllBytes(args[1]);
+        int32 rawN = (int32) raw.count();
+        Checkpoint ck0 #= Checkpoint.open(args[0]);
+        ModelConfig c0 #= ModelConfig.fromGguf(ck0.gguf());
+        Tokenizer tok #= ck0.gguf().tokenizer();
+        int32[] body #= tok.encodeBytes(raw, rawN);
+        int32[] ids #= MoePinnedPpl.prependBos(tok, #body);
+        int32 layers = c0.numLayers;
+        int32 used = c0.expertUsedCount;
+        ck0.close();
+        int32 n = (int32) ids.count();
+        if (n < pre + eval + 1) {
+            System.stdout.println("moepinnedppl: corpus has " + n
+                + " tokens; need " + (pre + eval + 1));
+            return 2;
+        }
+        if (used <= 0) {
+            System.stdout.println("moepinnedppl: not an MoE model");
+            return 2;
+        }
+        System.stdout.println("corpus tokens: " + n + "  (prefill " + pre
+            + ", eval " + eval + ")  layers " + layers + " used " + used);
+
+        int32 cap = eval + 8;
+        int64 cells = (int64) cap * (int64) layers * (int64) used;
+        int32[] selA #= heap int32[cells];
+        int32[] selB #= heap int32[cells];
+
+        MoeFfn.setActErrTap(true);
+        float64 pa = MoePinnedPpl.arm(args[0], ids, pre, eval, true, 1,
+            selA, layers, used, cap, "A  zero-sync row, own routes");
+        System.stdout.println("   q8_K relative RMS error: layer input "
+            + MoeFfn.actErrInput() + "  GLU output " + MoeFfn.actErrGlu()
+            + "  GLU output in 32-element blocks " + MoeFfn.actErrGlu32());
+        System.stdout.println("   mean block outlier max|x|/rms: input "
+            + MoeFfn.actOutlierInput() + "  GLU " + MoeFfn.actOutlierGlu());
+        MoeFfn.setActErrTap(false);
+        float64 pbPinned = MoePinnedPpl.arm(args[0], ids, pre, eval, false,
+            2, selA, layers, used, cap, "B  per-expert, PINNED to A");
+        float64 pb = MoePinnedPpl.arm(args[0], ids, pre, eval, false, 1,
+            selB, layers, used, cap, "B  per-expert, own routes");
+        float64 paPinned = MoePinnedPpl.arm(args[0], ids, pre, eval, true,
+            2, selB, layers, used, cap, "A  zero-sync row, PINNED to B");
+
+        System.stdout.println("");
+        System.stdout.println("=== 6.4.5 ===");
+        System.stdout.println("A own routes             ppl " + pa);
+        System.stdout.println("B own routes             ppl " + pb);
+        System.stdout.println("A pinned to B's routes   ppl " + paPinned);
+        System.stdout.println("B pinned to A's routes   ppl " + pbPinned);
+        System.stdout.println("unpinned A-B (rounding + flips): "
+            + (pa - pb) + "  " + MoePinnedPpl.pct(pa, pb) + "%");
+        System.stdout.println("pinned on B's routes (rounding): "
+            + (paPinned - pb) + "  " + MoePinnedPpl.pct(paPinned, pb) + "%");
+        System.stdout.println("pinned on A's routes (rounding): "
+            + (pa - pbPinned) + "  " + MoePinnedPpl.pct(pa, pbPinned) + "%");
+        return 0;
+    }
+
+    static float64 pct(float64 v, float64 ref) {
+        if (ref <= 0.0) { return 0.0; }
+        return (v - ref) / ref * 100.0;
+    }
+
+    /**
+     * One perplexity pass. `rowRoute` false restores the per-expert row
+     * (the `norowmoe` control); `pinMode` is `MoeFfn.setRoutePin`'s.
+     * The pin is armed AFTER the prefill, which both routes share.
+     */
+    static float64 arm(String model, int32[] ids, int32 pre, int32 eval,
+            boolean rowRoute, int32 pinMode, int32[] pin, int32 layers,
+            int32 used, int32 cap, String label) {
+        MoeFfn.setSharedRow(rowRoute);
+        MoeFfn.setRoutePin(0, pin, layers, used, cap);
+        ExpertBank.setResidencyBudget(Device.memoryBytes() / 2L);
+        Checkpoint ck #= Checkpoint.open(model);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m = heap CausalLM(#cfg, pre + eval + 8, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        m.prewarmPrefillWeights();
+        m.prefill(ids, pre);
+
+        MoeFfn.setRoutePin(pinMode, pin, layers, used, cap);
+        int32 vocab = m.vocabSize();
+        float32[] row #= heap float32[vocab];
+        Perplexity ppl = heap Perplexity();
+        int32[] one #= heap int32[1];
+        int64 t0 = Clock.nanoTime();
+        int32 i = 0;
+        while (i < eval) {
+            Tensor<float32> lg = m.logits();
+            float32[] lb = lg.hostBuffer();
+            int64 lbase = lg.hostBase();
+            int32 c = 0;
+            while (c < vocab) {
+                row[c] = lb[lbase + (int64) c];
+                c = c + 1;
+            }
+            ppl.add(row, vocab, ids[pre + i]);
+            one[0] = ids[pre + i];
+            m.stepSeq(0, one, 0, 1);
+            i = i + 1;
+        }
+        float64 secs = (float64) (Clock.nanoTime() - t0) / 1000000000.0;
+        System.stdout.println(label + "  ppl " + ppl.ppl()
+            + "  positions " + ppl.positions() + "  " + secs + " s");
+        System.stdout.println("   pin rows " + MoeFfn.routePinRows()
+            + "  flips " + MoeFfn.routePinFlips()
+            + "  overflow " + MoeFfn.routePinOverflow()
+            + "  weight-check misses " + MoeFfn.routePinWeightMiss());
+        MoeFfn.setRoutePin(0, pin, layers, used, cap);
+        MoeFfn.setSharedRow(true);
+        return ppl.ppl();
+    }
+
+    static #int32[] prependBos(Tokenizer tok, #int32[] body) {
+        if (!tok.addsBos()) {
+            return #body;
+        }
+        int32 n = (int32) body.count();
+        int32[] out = heap int32[n + 1];
+        out[0] = tok.bosToken();
+        int32 i = 0;
+        while (i < n) {
+            out[i + 1] = body[i];
+            i = i + 1;
+        }
+        return #out;
+    }
+}
