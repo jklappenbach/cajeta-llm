@@ -67,7 +67,7 @@ The five formats that do not meet the floor today are brought to it.
 ### 1.3 Non-goals
 
 - **Which device route serves a format.** That is the route table
-  (codebook-quants 9.2.9). This spec says a format runs; the table says
+  (codebook-quants 9.2.9). This spec says a format runs. The table says
   what runs it fastest.
 - **Kernel performance.** A host mat-vec is a floor, not a target. It
   must be correct, and it must exist.
@@ -129,7 +129,7 @@ exist. That is the whole gate, and it is the same on every device.
 - **5.2** When MXFP4 reaches `matvecInto`, it dispatches to a host
   mat-vec written for it — the one format whose floor is genuinely
   missing rather than unwired. Correctness against the scalar decode is
-  the bar; speed is not.
+  the bar. Speed is not.
 - **5.3** When the five are wired, 4.1 passes without exemptions.
 
 ## 6. Formats ship incrementally
