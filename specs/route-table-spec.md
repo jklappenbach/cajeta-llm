@@ -1,7 +1,8 @@
 # Route table — moved
 
 This spec is the xpu layer's, not this package's. It lives at
-`cajeta/specs/route-table-spec.md`, with the architecture note
+`cajeta/specs/archive/route-table-spec.md` (closed 2026-09-18, plan at
+`cajeta/agents/archive/route-table-plan.md`), with the architecture note
 `cajeta/docs/specification/xpu/CajetaXPU-Routing.md` and the guide
 `cajeta/docs/guide/25-xpu-kernels.md`. cajeta-llm is its first
 registrant; the measured problem statement (four format-list predicates

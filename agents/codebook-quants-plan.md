@@ -2996,13 +2996,19 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
 
 - [ ] 9.2.9 THE ROUTE TABLE — this package's registration. Specified
       as the xpu layer's selection contract at
-      `cajeta/specs/route-table-spec.md` (APPROVED 2026-09-18, plan at
-      `cajeta/agents/route-table-plan.md`; architecture note
-      `docs/specification/xpu/CajetaXPU-Routing.md`, guide
-      `docs/guide/25-xpu-kernels.md`). This item is the llm half:
-      every predicate below becomes a row, every dispatcher gets
-      explicit arms and a terminal refusal, and `theFourPartInvariant`
-      becomes the audit's walker. Blocked on that plan's Units 1-3
+      `cajeta/specs/archive/route-table-spec.md` (**CLOSED 2026-09-18**,
+      plan at `cajeta/agents/archive/route-table-plan.md`; architecture
+      note `docs/specification/xpu/CajetaXPU-Routing.md`, guide
+      `docs/guide/25-xpu-kernels.md` §25.6). The layer half SHIPPED —
+      `Route` is one kernel variant per row with `shapeRefusal` /
+      `readyRefusal` naming their own gates, `RouteTable` resolves at
+      bind (`admissible` / `pick` / `candidates`), `whyNotPicked` names
+      the row that got furthest, and `audit` walks format / regime /
+      shape only, reporting what a row needs rather than ruling on it.
+      This item is the llm half: every predicate below becomes a row,
+      every dispatcher gets explicit arms and a terminal refusal, and
+      `theFourPartInvariant` becomes the audit's walker. NO LONGER
+      BLOCKED — was blocked on that plan's Units 1-3
       (`Route` / `RouteTable` / the audit) in the runtime; it follows
       the spec's §4.2 order and owns the spec's §4.4 acceptance — the
       §3.4.5 grep returning nothing, and flat legs on the recorded
