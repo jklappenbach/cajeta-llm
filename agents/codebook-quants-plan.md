@@ -3069,16 +3069,29 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       landed at the previous request's offsets. The suite had no test
       that submits two requests on a device-routed model, which is how
       it survived.
-      ONE RED REMAINS AND IT IS A DIFFERENT DEFECT, surfaced by pulling
+      A SECOND RED CAME WITH THE HELPER, surfaced by pulling
       `SchedulerTest` (and its `ForwardTest` helper) into the filtered
       suite: `ForwardTest.tiedEmbeddingAndExplicitHeadDim` expects 11
-      parameters from a 1-layer tied llama and the tree reports 12.
-      `lmHead` is null under tie so it is not that; the extra name comes
-      from somewhere in the module walk. Neither file has changed since
-      `e278186`, so the model side gained a parameter while the full
-      suite was blocked. NOT this unit's, and worth a look from 9.3.3's
-      side — an extra parameter in the tree is a resident-bytes question
-      as much as a naming one.
+      parameters from a 1-layer tied llama and the tree reported 12.
+      FIXED 2026-09-17, and it WAS `lmHead` — this item first recorded
+      it as null under tie, which it has not been since `43fbdf1` put
+      the tied head on the device (4.3.3). The head is always a Linear
+      now and a tied checkpoint binds it to the embedding table, so the
+      reflective walk emitted an `lm_head.weight` key that the
+      checkpoint does not have and `parameterTensors` counted the
+      embedding twice. The key list is torch's `state_dict()` contract
+      and torch omits a tied head, so the walk omits it: `InfModule`
+      gains `tiedParameters()`, `Linear.bindTied` sets it, and
+      `CausalLM.bind` uses that spelling for the tied branch. The
+      tied test carries a new assertion that the name and tensor walks
+      agree in length, so guarding only one of them fails loudly, and
+      the untied `parameterNamesMatchTorchStateDictKeys` is the leg
+      that asserts the hook does NOT over-fire.
+      NOT a resident-bytes finding after all: `43fbdf1` measured that
+      cost and took it deliberately ("the resident ledger grows by
+      exactly the head's file bytes") in exchange for 19.4 ms a token
+      of host `rowsDotRow`. Only the key list was wrong.
+      Filtered suite 339/339.
 - [x] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
       Q5_0 tensors), Q3_K_M, Q6_K, the iq4_nl file, a Q4_0 8B from
       `llama-quantize`; bit gate then A/B, no decode regression.
