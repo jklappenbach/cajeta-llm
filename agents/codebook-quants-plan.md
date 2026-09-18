@@ -3036,11 +3036,29 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       passing on luck; all three hoisted.
       ONE FAILURE LEFT, and it is not this unit's:
       `tunesThePartitionWidthOnThisDevice` submits sixteen 512-token
-      prefills to an engine with ctx 1024 and maxSeqs 1, and the
-      sequence slot is never released between requests, so the third
-      runs off the end. `e.cancel(id)` does not release it. It is an
-      autotune TIMING test in a correctness suite and it wants the
-      scheduler's request lifecycle, which is a different unit.
+      prefills to an engine with ctx 1024 and maxSeqs 1, and the third
+      runs off the end.
+      CAUSE READ 2026-09-17, and it is NOT "the slot is never released"
+      as this item first recorded: the slot IS released — the finish
+      path in `Scheduler` calls `cache.release(r.slot)` and clears
+      `slotReq` — but it never resets the DEVICE-RESIDENT KV planes.
+      `DeviceKv` keeps its own `len`/`seq`, `owns()` stays true because
+      the planes are still ahead of the host cache, and
+      `CausalLM.seqLength` asks the planes first by design (a resident
+      generation must not read the deliberately-behind paged length).
+      So the next request admitted to that slot inherits the finished
+      one's position: prefill 1 leaves the planes at 512, prefill 2
+      takes `startPos = 512` and `adopt`s 1024, prefill 3 is refused —
+      which is the message's "512 tokens at position 1024" exactly.
+      THE FIX IS ONE CALL, NOT A REWRITE: `CausalLM.resetSeq(seq)`
+      already does the correct pair (`cache.release` + `DeviceKv.reset`)
+      and is what `LlmEngine`'s load-time warmup uses; the finish path
+      releases only half of it. STILL A DIFFERENT UNIT'S — it is the
+      scheduler's request lifecycle — but it is not a test artefact:
+      the same path serves a second request on a recycled slot, so its
+      RoPE positions and KV writes would land at the previous request's
+      offsets. This test is the only one in the suite that submits more
+      than one request, which is why it is the only red.
 - [x] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
       Q5_0 tensors), Q3_K_M, Q6_K, the iq4_nl file, a Q4_0 8B from
       `llama-quantize`; bit gate then A/B, no decode regression.
