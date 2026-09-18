@@ -3037,17 +3037,132 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       are NOT this item (they are capability, and belong in xpu); they
       are listed so the table does not absorb them by accident.
       THE TEST: walk every `supported()` format against every row and
-      assert each is admitted or refused BY NAME, and that an admitted
-      format has an ARM in the row's dispatcher — a bare `else` fails
-      on day one. Adding a format is then: write its kernels, add it to
-      the rows that apply, and the test names the rows you forgot.
-      Adding a route is: add a row, and the test audits it against
-      every format that exists. A does-fire and a does-not-fire test
-      per row, as 9.2.7 did.
+      assert each is admitted or refused BY NAME. Adding a format is
+      then: write its kernels, add it to the rows that apply, and the
+      test names the rows you forgot. Adding a route is: add a row, and
+      the test audits it against every format that exists. A does-fire
+      and a does-not-fire test per row, as 9.2.7 did. (Drafted with a
+      dispatcher-arm probe too — "an admitted format has an ARM, a bare
+      `else` fails on day one". Route-table spec §3.0 REMOVED that: at
+      one row per kernel variant there is no arm to omit, and no
+      dry-run flag for a dispatcher to forget to honour.)
       NOT IN SCOPE: the capability / cost / policy split (capability
       into xpu, measured selection from the Autotune store). That is
       the arc this table sits under, and it is a spec. This item is the
       part that stops the bleeding now.
+
+      READ FIRST, 2026-09-18 — the call sites, before any code. Three
+      decisions fall out of them and they are settled here rather than
+      discovered halfway.
+
+      **A row class per KERNEL, instantiated once per format.** `waveIq`
+      is ONE flag serving five formats (IQ2_XXS, IQ2_XS, IQ3_XXS,
+      IQ2_S, IQ3_S) and its launcher already takes `packedTy`, so it is
+      five instances of one row class, not five classes and not one row
+      admitting a set. `matVecLaunch`'s eleven arms are eleven
+      instances of another. Rows are data; classes are kernels.
+
+      **What is NOT a row, and the plan must not turn into one.**
+      `oneSync` and `foldBias` are LAUNCH parameters — the same kernel
+      submitted differently — so they ride on the call and a row's
+      `dispatch` may branch on them. It may never branch on the FORMAT.
+      That is the line that keeps "no arms" meaning something.
+      `q8`, `packed1`, `qAct` and `packedAct` are not routes either:
+      they are consequences. `qAct` is "did an integer row win", which
+      after this item is a property of the row that was picked, read
+      once at bind — not an OR of sixteen booleans recomputed in
+      `finishDeviceSetup`. The shared stage (`stageHit`) keys on it, so
+      it has to survive the move as one question with one answer.
+
+      **`wavef`'s negation DISSOLVES, and this is the proof the table
+      is the right shape.** Today it reads `waveMv() && inDim % 32 == 0
+      && !(wave || wave6 || wave2 || wave3 || wave5 || wave8 || wave40
+      || wave50 || waveT1 || waveT2 || waveIq || wave4nl) &&
+      hasF32WaveKernel(ty)` — a twelve-term negation meaning "no
+      integer wave route engaged", and 9.2.4 is what happened when
+      `!q8kDims` stood in for it and IQ4_NL decoded item-per-row at a
+      256-aligned width. Under the table the integer row for a format
+      simply OUTRANKS its f32 wave row by `priority`, and the negation
+      is never written down at all. Nothing to widen, nothing to forget.
+
+- [ ] 9.2.9.1 The sweep that precedes the table (route-table spec
+      §4.2 step 1): every predicate still standing in for another
+      question says what it means, so the rows start from predicates
+      that are true. Small — 9.2.4 already did `wavef` — but do it
+      first and separately, so a row that turns out to admit differently
+      from the flag it replaced is a ROW bug and not an inherited one.
+
+- [ ] 9.2.9.2 Decode-row rows, and `launchOne` retires. The sixteen
+      booleans latched in `finishDeviceSetup` become rows resolved once
+      by `RouteTable.pick` at bind and stored; `launchOne`'s ~16-arm
+      chain becomes one virtual call. Q4_K is THREE rows at DecodeRow
+      (wave, packed, and the three-buffer form) ordered by priority —
+      exactly spec §3.1's worked example, and the code confirms it.
+      `shapeRefusal` carries `inDim % 256` (the q8_K superblock, whose
+      absence walked the pack off its buffer and poisoned a HIP
+      context) and `inDim % 32` for the f32 wave rows. `readyRefusal`
+      carries what `ensureDevice` has or has not done. The terminal
+      `matVecLaunch` arm keeps its throw; it becomes the lowest-priority
+      row per format it serves.
+
+- [ ] 9.2.9.3 MoE decode rows: `ExpertBank.idReady` / `idRowReady` /
+      `symId` / `codebookId`, and `MoeFfn.zeroSyncReady`'s nine gates.
+      The split is already read gate by gate in the xpu guide §25.6.2 —
+      three per-bank format tests become the `format()` of three rows,
+      four shape tests go to `shapeRefusal`, two slab tests to
+      `readyRefusal`, and `widenSlabOn` goes to `readyRefusal` too
+      because it is a mutable A/B arm. Each keeps its own sentence in
+      the `moe-row-route` record: `whyNotPicked().text()` replaces
+      `sayRowRoute`, and 2.3.2's rule is that no refusal gets coarser.
+
+- [ ] 9.2.9.4 Prefill rows: `coopRoutedHere`, `hasBatchKernel`, the
+      widen and Mw8 gates, the coop tile-divisibility refusals.
+      `coopRoutedHere` mixes all three questions in one expression —
+      `coopOn` (a switch), `!backendIsVulkan()` (a capability, 9.2.10's,
+      and it must NOT be absorbed here), `!hasBatchKernel(ty)` (a
+      priority ordering, not a test), `coopColsOk` and `outDim % 128`
+      (shape). Splitting it is most of this item.
+
+- [ ] 9.2.9.5 Bind rows: `Quant.splitOn` and the `deqFor` twin, at
+      `Regime.Bind`. BLOCKED on 9.2.1, which reduces `splitOn` to
+      "nonzero `scaleBytes`" — doing this first would row-ify a list
+      that is about to stop being one.
+
+- [ ] 9.2.9.6 Attention rows: the flash decode / prefill tile gates on
+      `hd == 128` (`AttnKernel.cajeta:2508` and the kernels above it).
+      Not a weight format — the `ty` axis here is HEAD DIMENSION, which
+      is the genericity the route-table plan's 1.1.8 proved on a dtype
+      axis and a bin-count axis. Recorded under 4.3.5 as the reason
+      bitnet-large (hd 96) takes the scalar pair, silently.
+
+- [ ] 9.2.9.7 The audit, and the acceptance. `theFourPartInvariant`
+      (3.1.5) becomes `theRouteTableInvariant`: queries built by walking
+      `ty` 0..63 and filtering `Quant.supported(ty)`, then
+      `RouteTable.audit(queries)` asserting `unservedCount()`,
+      `neverFiringCount()` and the shadowed pairs. Per row a does-fire
+      and a does-not-fire test via `auditRow`. Then spec §4.4: the
+      §3.4.5 grep (`== 12 || == 14`, `codebookId`, `(q8 && wave) ||
+      wave6`) returns nothing outside the rows, the filtered suite is
+      green, and LEGS FLAT on the six recorded files of 9.3.2 and the
+      Qwen1.5-MoE — this is a refactor, and a speed change in either
+      direction is a routing change to explain.
+
+      THE GREP, BASELINE 2026-09-18: the §3.4.5 patterns
+      (`packedTy == 12`, `packedTy == 14`, `codebookId`) match **14
+      lines in one file**, `model/ExpertBank.cajeta`. That is the number
+      9.2.9.7 drives to zero, and it is smaller than the prose suggests
+      — the format lists concentrated in the expert banks while the
+      `Linear` side spread into sixteen named booleans instead. Two
+      shapes of the same defect, and only one of them greps.
+
+      FOUND WHILE READING, both to fix under 9.2.9.7 rather than
+      quietly: `QuantKernel.hasKernel(ty)` omits MXFP4 while
+      `matVecLaunch(ty, ...)` serves it, so the two lists already
+      disagree — and `theFourPartInvariant` exempts MXFP4 by name,
+      which is how it stays green over the disagreement. And
+      `ExpertBank.idGemmReady()` is `idReady`'s defect a second time:
+      `packedTy == 12 || == 14` in the same expression as `deqSlabDev`
+      and `slabDev`, so widening the format list also claims the slab.
 
 - [ ] 9.2.10 `Linear.backendIsVulkan()`'s ~14 sites (and `MoeFfn`'s
       two) become `Device.supports(Capability)` queries, with the
