@@ -129,6 +129,7 @@ public final class MoeFfn extends InfModule {
     static int64 pinFlips;        // replayed rows whose own choice differed
     static int64 pinOverflow;     // rows past `pinCap`, pinned by neither
     static int64 pinWeightMiss;   // record-mode instrument check
+    static boolean pinPaused;
 
     /** Record (`mode` 1) or replay (2) expert selections in `buf`, laid
      *  out `[row][layer][used]`; 0 turns the pin off. */
@@ -140,6 +141,7 @@ public final class MoeFfn extends InfModule {
         MoeFfn.pinUsed = used;
         MoeFfn.pinCap = cap;
         MoeFfn.pinCalls #= heap int32[(int64) layers];
+        MoeFfn.pinPaused = false;
         MoeFfn.pinRows = 0L;
         MoeFfn.pinFlips = 0L;
         MoeFfn.pinOverflow = 0L;
@@ -152,7 +154,6 @@ public final class MoeFfn extends InfModule {
     // routes quantize, and the GLU output, which only the integer down
     // projection does.
     static boolean actErrOn;
-    static float64 actErrGyNum;
     static float64 actErrGyDen;
     static float64 actErrGyOut;
     static float64 actErrXnNum;
@@ -160,12 +161,53 @@ public final class MoeFfn extends InfModule {
     static float64 actErrXnOut;
     static int64 actErrBlocks;
     static int64 actErrRows;
-    static float64 actErr32Num;   // the same tensors in 32-element blocks
-    static float64 actErr32Den;
+    // The GLU output's squared error at five block widths, each against
+    // the one energy `actErrGyDen`.
+    static float64 actErrW256;
+    static float64 actErrW128;
+    static float64 actErrW64;
+    static float64 actErrW32;
+    static float64 actErrW16;
+
+    // 6.4.5's block-width sweep: the width an integer down projection
+    // would quantize its activations at, simulated in the host row
+    // route so the perplexity can be read without a kernel.
+    static int32 actBlockSim;
+    static float64 simNumR;
+    static float64 simDenR;
+    static float64 simNumS;
+    static float64 simDenS;
+
+    /**
+     * Round the down projection's activations to `w`-element int8 blocks
+     * in the per-expert row route, shared expert included; 0 leaves them
+     * f32. Only that route reads it — the zero-sync row's width is its
+     * kernels'.
+     */
+    public static void setActBlockSim(int32 w) {
+        MoeFfn.actBlockSim = w;
+        MoeFfn.simNumR = 0.0;
+        MoeFfn.simDenR = 0.0;
+        MoeFfn.simNumS = 0.0;
+        MoeFfn.simDenS = 0.0;
+        return;
+    }
+
+    /** Relative RMS of the change the simulation actually MADE to the
+     *  activations it rounded — zero means they were already on that
+     *  grid, so the route it feeds had quantized them itself. */
+    public static float64 actSimErrRouted() {
+        if (MoeFfn.simDenR <= 0.0) { return 0.0; }
+        return Math.sqrt(MoeFfn.simNumR / MoeFfn.simDenR);
+    }
+
+    public static float64 actSimErrShared() {
+        if (MoeFfn.simDenS <= 0.0) { return 0.0; }
+        return Math.sqrt(MoeFfn.simNumS / MoeFfn.simDenS);
+    }
 
     public static void setActErrTap(boolean on) {
         MoeFfn.actErrOn = on;
-        MoeFfn.actErrGyNum = 0.0;
         MoeFfn.actErrGyDen = 0.0;
         MoeFfn.actErrGyOut = 0.0;
         MoeFfn.actErrXnNum = 0.0;
@@ -173,22 +215,33 @@ public final class MoeFfn extends InfModule {
         MoeFfn.actErrXnOut = 0.0;
         MoeFfn.actErrBlocks = 0L;
         MoeFfn.actErrRows = 0L;
-        MoeFfn.actErr32Num = 0.0;
-        MoeFfn.actErr32Den = 0.0;
+        MoeFfn.actErrW256 = 0.0;
+        MoeFfn.actErrW128 = 0.0;
+        MoeFfn.actErrW64 = 0.0;
+        MoeFfn.actErrW32 = 0.0;
+        MoeFfn.actErrW16 = 0.0;
         return;
     }
 
-    /** The GLU output's error in 32-element blocks — llama.cpp's q8_1
-     *  granularity — against the 256 of {@link #actErrGlu}. */
+    /** Relative RMS error of the GLU output through the int8 round trip
+     *  in blocks of `w` — 256 is q8_K's, 32 is llama.cpp's q8_1. */
+    public static float64 actErrGluWidth(int32 w) {
+        if (MoeFfn.actErrGyDen <= 0.0) { return 0.0; }
+        float64 num = MoeFfn.actErrW256;
+        if (w == 128) { num = MoeFfn.actErrW128; }
+        if (w == 64) { num = MoeFfn.actErrW64; }
+        if (w == 32) { num = MoeFfn.actErrW32; }
+        if (w == 16) { num = MoeFfn.actErrW16; }
+        return Math.sqrt(num / MoeFfn.actErrGyDen);
+    }
+
     public static float64 actErrGlu32() {
-        if (MoeFfn.actErr32Den <= 0.0) { return 0.0; }
-        return Math.sqrt(MoeFfn.actErr32Num / MoeFfn.actErr32Den);
+        return MoeFfn.actErrGluWidth(32);
     }
 
     /** Relative RMS error of the q8_K round trip on the GLU output. */
     public static float64 actErrGlu() {
-        if (MoeFfn.actErrGyDen <= 0.0) { return 0.0; }
-        return Math.sqrt(MoeFfn.actErrGyNum / MoeFfn.actErrGyDen);
+        return MoeFfn.actErrGluWidth(256);
     }
 
     /** The same on the layer input, which both routes quantize. */
@@ -498,9 +551,20 @@ public final class MoeFfn extends InfModule {
         return;
     }
 
+    /**
+     * Suspend the pin WITHOUT losing the row cursors, which
+     * `setRoutePin` resets: a bench that scores many windows re-prefills
+     * between them, and only the decoded rows are pinned.
+     */
+    public static void setRoutePinPaused(boolean p) {
+        MoeFfn.pinPaused = p;
+        return;
+    }
+
     /** This layer's slot in the pin, or -1 when the pin is off or full.
      *  Advances the layer's row cursor. */
     int64 pinSlot() {
+        if (MoeFfn.pinPaused) { return -1L; }
         if (MoeFfn.pinMode == 0 || this.layerIdx < 0) { return -1L; }
         if (this.usedN != MoeFfn.pinUsed) { return -1L; }
         int32 row = MoeFfn.pinCalls[(int64) this.layerIdx];
@@ -597,9 +661,96 @@ public final class MoeFfn extends InfModule {
     }
 
     /**
-     * One 256-element block's q8_K round trip, host-side and by the pack
-     * kernel's rule: scale max|x|/127, round to nearest. Accumulates the
-     * squared error, the energy and the block's outlier factor.
+     * The squared error of `v[off .. off+n)` through the pack kernel's
+     * int8 round trip in blocks of `w` — scale max|x|/127, round to
+     * nearest, a short last block scaled on the elements it has.
+     */
+    static float64 blockSqErr(float32[] v, int64 off, int64 n, int64 w) {
+        float64 err = 0.0;
+        int64 b = 0;
+        while (b < n) {
+            int64 m = n - b;
+            if (m > w) { m = w; }
+            float32 bmax = 0.0f;
+            int64 i = 0;
+            while (i < m) {
+                float32 ax = v[off + b + i];
+                if (ax < 0.0f) { ax = 0.0f - ax; }
+                if (ax > bmax) { bmax = ax; }
+                i = i + 1;
+            }
+            float32 inv = 0.0f;
+            float32 dsc = 0.0f;
+            if (bmax > 0.0f) {
+                inv = 127.0f / bmax;
+                dsc = bmax / 127.0f;
+            }
+            i = 0;
+            while (i < m) {
+                float32 x = v[off + b + i];
+                float32 d = x - (float32) Math.round(x * inv) * dsc;
+                err = err + (float64) d * (float64) d;
+                i = i + 1;
+            }
+            b = b + w;
+        }
+        return err;
+    }
+
+    /**
+     * `v[off .. off+n)` through that same round trip, WRITTEN BACK: the
+     * rounding an integer down projection at block width `w` would put
+     * on its activations, simulated where the host route can feed it to
+     * an unchanged f32 mat-vec.
+     */
+    static void quantizeInPlace(float32[] v, int64 off, int64 n, int64 w,
+            boolean shared) {
+        float64 num = 0.0;
+        float64 den = 0.0;
+        int64 b = 0;
+        while (b < n) {
+            int64 m = n - b;
+            if (m > w) { m = w; }
+            float32 bmax = 0.0f;
+            int64 i = 0;
+            while (i < m) {
+                float32 ax = v[off + b + i];
+                if (ax < 0.0f) { ax = 0.0f - ax; }
+                if (ax > bmax) { bmax = ax; }
+                i = i + 1;
+            }
+            float32 inv = 0.0f;
+            float32 dsc = 0.0f;
+            if (bmax > 0.0f) {
+                inv = 127.0f / bmax;
+                dsc = bmax / 127.0f;
+            }
+            i = 0;
+            while (i < m) {
+                float32 x = v[off + b + i];
+                float32 q = (float32) Math.round(x * inv) * dsc;
+                float32 d = x - q;
+                num = num + (float64) d * (float64) d;
+                den = den + (float64) x * (float64) x;
+                v[off + b + i] = q;
+                i = i + 1;
+            }
+            b = b + w;
+        }
+        if (shared) {
+            MoeFfn.simNumS = MoeFfn.simNumS + num;
+            MoeFfn.simDenS = MoeFfn.simDenS + den;
+        } else {
+            MoeFfn.simNumR = MoeFfn.simNumR + num;
+            MoeFfn.simDenR = MoeFfn.simDenR + den;
+        }
+        return;
+    }
+
+    /**
+     * One 256-element block of an activation the row quantizes: its
+     * energy, its outlier factor, and — for the GLU output — the error
+     * every candidate block width would leave on it.
      */
     static void q8kBlockError(float32[] v, int64 off, boolean glu) {
         float32 bmax = 0.0f;
@@ -613,63 +764,26 @@ public final class MoeFfn extends InfModule {
             sq = sq + (float64) x * (float64) x;
             i = i + 1;
         }
-        float32 inv = 0.0f;
-        float32 dsc = 0.0f;
-        if (bmax > 0.0f) {
-            inv = 127.0f / bmax;
-            dsc = bmax / 127.0f;
-        }
-        float64 err = 0.0;
-        i = 0;
-        while (i < 256L) {
-            float32 x = v[off + i];
-            float32 q = (float32) Math.round(x * inv);
-            float32 d = x - q * dsc;
-            err = err + (float64) d * (float64) d;
-            i = i + 1;
-        }
-        if (glu) {
-            int64 sb = 0;
-            while (sb < 256L) {
-                float32 smax = 0.0f;
-                int64 j = 0;
-                while (j < 32L) {
-                    float32 x = v[off + sb + j];
-                    float32 ax = x;
-                    if (ax < 0.0f) { ax = 0.0f - ax; }
-                    if (ax > smax) { smax = ax; }
-                    j = j + 1;
-                }
-                float32 sinv = 0.0f;
-                float32 ssc = 0.0f;
-                if (smax > 0.0f) {
-                    sinv = 127.0f / smax;
-                    ssc = smax / 127.0f;
-                }
-                j = 0;
-                while (j < 32L) {
-                    float32 x = v[off + sb + j];
-                    float32 qq = (float32) Math.round(x * sinv);
-                    float32 dd = x - qq * ssc;
-                    MoeFfn.actErr32Num = MoeFfn.actErr32Num
-                        + (float64) dd * (float64) dd;
-                    MoeFfn.actErr32Den = MoeFfn.actErr32Den
-                        + (float64) x * (float64) x;
-                    j = j + 1;
-                }
-                sb = sb + 32L;
-            }
-        }
         float64 rms = Math.sqrt(sq / 256.0);
         float64 out = 0.0;
         if (rms > 0.0) { out = (float64) bmax / rms; }
         if (glu) {
-            MoeFfn.actErrGyNum = MoeFfn.actErrGyNum + err;
+            MoeFfn.actErrW256 = MoeFfn.actErrW256
+                + MoeFfn.blockSqErr(v, off, 256L, 256L);
+            MoeFfn.actErrW128 = MoeFfn.actErrW128
+                + MoeFfn.blockSqErr(v, off, 256L, 128L);
+            MoeFfn.actErrW64 = MoeFfn.actErrW64
+                + MoeFfn.blockSqErr(v, off, 256L, 64L);
+            MoeFfn.actErrW32 = MoeFfn.actErrW32
+                + MoeFfn.blockSqErr(v, off, 256L, 32L);
+            MoeFfn.actErrW16 = MoeFfn.actErrW16
+                + MoeFfn.blockSqErr(v, off, 256L, 16L);
             MoeFfn.actErrGyDen = MoeFfn.actErrGyDen + sq;
             MoeFfn.actErrGyOut = MoeFfn.actErrGyOut + out;
             MoeFfn.actErrBlocks = MoeFfn.actErrBlocks + 1L;
         } else {
-            MoeFfn.actErrXnNum = MoeFfn.actErrXnNum + err;
+            MoeFfn.actErrXnNum = MoeFfn.actErrXnNum
+                + MoeFfn.blockSqErr(v, off, 256L, 256L);
             MoeFfn.actErrXnDen = MoeFfn.actErrXnDen + sq;
             MoeFfn.actErrXnOut = MoeFfn.actErrXnOut + out;
             MoeFfn.actErrRows = MoeFfn.actErrRows + 1L;
@@ -1520,6 +1634,10 @@ public final class MoeFfn extends InfModule {
             MoeFfn.mtGateUpNs = MoeFfn.mtGateUpNs + (tgl0 - tg0);
             Prim.gluRowHost(this.sc.g, 0L, this.sc.u, 0L, this.sc.g, 0L,
                 this.widthN, act);
+            if (MoeFfn.actBlockSim > 0) {
+                MoeFfn.quantizeInPlace(gb, go, (int64) this.widthN,
+                    (int64) MoeFfn.actBlockSim, false);
+            }
             int64 td0 = Clock.nanoTime();
             MoeFfn.mtGluNs = MoeFfn.mtGluNs + (td0 - tgl0);
             if (!this.downB.matvecDeviceAt(e, gb, go, eb, eo)) {
@@ -1561,6 +1679,11 @@ public final class MoeFfn extends InfModule {
         this.sharedUpProj.matvecInto(x, xOff, this.sc.shU, 0L);
         Prim.gluRowHost(this.sc.shG, 0L, this.sc.shU, 0L,
             this.sc.shG, 0L, this.sharedW, act);
+        if (MoeFfn.actBlockSim > 0) {
+            MoeFfn.quantizeInPlace(this.sc.shG.hostBuffer(),
+                this.sc.shG.hostBase(), (int64) this.sharedW,
+                (int64) MoeFfn.actBlockSim, true);
+        }
         this.sharedDownProj.matvecInto(this.sc.shG, 0L,
             this.sc.shOut, 0L);
         float32 gs = 1.0f;

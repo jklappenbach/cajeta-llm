@@ -1,0 +1,253 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.io.file.File;
+import cajeta.lang.Integer;
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.math.Tensor;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.llm.model.MoeFfn;
+import dev.cajeta.llm.tok.Tokenizer;
+
+/**
+ * 6.4.5: what the down projection's activation BLOCK WIDTH costs, in
+ * perplexity, without writing a kernel for each candidate.
+ *
+ * The per-expert route (`PplProbe`'s arm B) feeds its down projection
+ * f32 activations. `MoeFfn.setActBlockSim` rounds them to `w`-element
+ * int8 blocks first, by the pack kernel's own rule, so a pass at 256
+ * carries the rounding q8_K carries and a pass at 32 carries what an
+ * IQ4_NL-aligned pack would. Every pass is pinned to the control's
+ * expert selections, so what is left is the rounding.
+ *
+ * The comparison is PAIRED, position by position. An aggregate
+ * perplexity difference at this corpus length is dominated by where
+ * the perturbed trajectory happens to land — the first cut of this
+ * bench read +0.02% at 256 and +0.54% at 64, against a rounding error
+ * that falls monotonically with the width. The same 1023 positions
+ * carry both arms, so the mean of their per-position differences
+ * measures the effect with a standard error that says whether it is
+ * resolved at all.
+ *
+ * Validated at both ends: width 0 must reproduce the published 5.47719,
+ * and a pinned pass with no rounding at all must come back at exactly
+ * zero difference.
+ */
+public final class MoeBlockWidthPpl {
+
+    public static int32 run(String[] args) {
+        if ((int32) args.count() < 2) {
+            System.stdout.println("usage: moeblockwidthppl <model.gguf> "
+                + "<text> [pre=N] [eval=N] [win=N]");
+            return 2;
+        }
+        int32 pre = 1025;
+        int32 eval = 1023;
+        int32 wantWin = 0;
+        int32 ai = 2;
+        while (ai < (int32) args.count()) {
+            if (args[ai].startsWith("pre=")) {
+                String pv #= args[ai].substring(4, args[ai].byteLength());
+                pre = Integer.parseInt(pv);
+            }
+            if (args[ai].startsWith("eval=")) {
+                String ev #= args[ai].substring(5, args[ai].byteLength());
+                eval = Integer.parseInt(ev);
+            }
+            if (args[ai].startsWith("win=")) {
+                String wv #= args[ai].substring(4, args[ai].byteLength());
+                wantWin = Integer.parseInt(wv);
+            }
+            ai = ai + 1;
+        }
+
+        int8[] raw #= File.readAllBytes(args[1]);
+        int32 rawN = (int32) raw.count();
+        Checkpoint ck0 #= Checkpoint.open(args[0]);
+        ModelConfig c0 #= ModelConfig.fromGguf(ck0.gguf());
+        Tokenizer tok #= ck0.gguf().tokenizer();
+        int32[] body #= tok.encodeBytes(raw, rawN);
+        int32[] ids #= MoeBlockWidthPpl.prependBos(tok, #body);
+        int32 layers = c0.numLayers;
+        int32 used = c0.expertUsedCount;
+        int32 vocab = c0.vocabSize;
+        ck0.close();
+        int32 n = (int32) ids.count();
+        if (used <= 0) {
+            System.stdout.println("moeblockwidthppl: not an MoE model");
+            return 2;
+        }
+        int32 windows = n / (pre + eval);
+        if (wantWin > 0 && wantWin < windows) { windows = wantWin; }
+        if (windows < 1) {
+            System.stdout.println("moeblockwidthppl: corpus has " + n
+                + " tokens; need " + (pre + eval));
+            return 2;
+        }
+        int32 scored = windows * eval;
+        System.stdout.println("corpus tokens: " + n + "  windows " + windows
+            + " x (prefill " + pre + ", eval " + eval + ") = " + scored
+            + " scored positions   layers " + layers + " used " + used);
+
+        int32 cap = scored + 8;
+        int64 cells = (int64) cap * (int64) layers * (int64) used;
+        int32[] sel #= heap int32[cells];
+        int32[] widths #= heap int32[3];
+        widths[0] = 256;
+        widths[1] = 64;
+        widths[2] = 32;
+        float64[] nll0 #= heap float64[scored];
+        float64[] nllW #= heap float64[scored];
+
+        float64 base = MoeBlockWidthPpl.arm(args[0], ids, pre, eval, windows,
+            vocab, 0, 1, sel, layers, used, cap,
+            "f32 down, own routes (control)", nll0);
+
+        System.stdout.println("");
+        System.stdout.println("=== 6.4.5 block width, paired over " + scored
+            + " positions ===");
+        System.stdout.println("control ppl " + base);
+        MoeBlockWidthPpl.arm(args[0], ids, pre, eval, 1, vocab, 0, 2, sel,
+            layers, used, cap, "pinned, no rounding (null control)", nllW);
+        MoeBlockWidthPpl.report("  null control (1 window) ", nll0, nllW,
+            eval);
+        int32 i = 0;
+        while (i < 3) {
+            MoeBlockWidthPpl.arm(args[0], ids, pre, eval, windows, vocab,
+                widths[i], 2, sel, layers, used, cap,
+                "int8 activations, blocks of " + widths[i], nllW);
+            MoeBlockWidthPpl.report("  blocks of " + widths[i] + "          ",
+                nll0, nllW, scored);
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    /**
+     * The mean of the per-position NLL differences and its standard
+     * error, in nats and as the perplexity ratio they imply.
+     */
+    static void report(String label, float64[] a, float64[] b, int32 n) {
+        float64 sum = 0.0;
+        int32 i = 0;
+        while (i < n) {
+            sum = sum + (b[i] - a[i]);
+            i = i + 1;
+        }
+        float64 mean = sum / (float64) n;
+        float64 v = 0.0;
+        i = 0;
+        while (i < n) {
+            float64 d = (b[i] - a[i]) - mean;
+            v = v + d * d;
+            i = i + 1;
+        }
+        float64 se = 0.0;
+        if (n > 1) {
+            se = Math.sqrt(v / (float64) (n - 1) / (float64) n);
+        }
+        float64 pv = (Math.exp(mean) - 1.0) * 100.0;
+        float64 ps = (Math.exp(mean + se) - Math.exp(mean)) * 100.0;
+        System.stdout.println(label + "dNLL " + mean + " +- " + se
+            + "    ppl " + pv + "% +- " + ps + "%");
+        return;
+    }
+
+    /**
+     * One pass over `windows` independent corpus windows, filling
+     * `nllOut` with every scored position's negative log-likelihood.
+     * `simW` 0 leaves the down projection's activations f32; `pinMode`
+     * is `MoeFfn.setRoutePin`'s. Both the pin and the rounding are armed
+     * only for the decode, so every pass shares an unmodified prefill.
+     */
+    static float64 arm(String model, int32[] ids, int32 pre, int32 eval,
+            int32 windows, int32 vocab, int32 simW, int32 pinMode,
+            int32[] pin, int32 layers, int32 used, int32 cap, String label,
+            float64[] nllOut) {
+        MoeFfn.setSharedRow(false);
+        MoeFfn.setRoutePin(pinMode, pin, layers, used, cap);
+        MoeFfn.setRoutePinPaused(true);
+        MoeFfn.setActBlockSim(0);
+        ExpertBank.setResidencyBudget(Device.memoryBytes() / 2L);
+        Perplexity ppl = heap Perplexity();
+        float32[] row #= heap float32[vocab];
+        int32[] win #= heap int32[pre];
+        int32[] one #= heap int32[1];
+        Checkpoint ck #= Checkpoint.open(model);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m = heap CausalLM(#cfg, pre + eval + 8, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        m.prewarmPrefillWeights();
+        int64 t0 = Clock.nanoTime();
+        int32 w = 0;
+        while (w < windows) {
+            int32 off = w * (pre + eval);
+            int32 c = 0;
+            while (c < pre) {
+                win[c] = ids[off + c];
+                c = c + 1;
+            }
+            m.resetSeq(0);
+            MoeFfn.setRoutePinPaused(true);
+            MoeFfn.setActBlockSim(0);
+            m.prefill(win, pre);
+            MoeFfn.setRoutePinPaused(false);
+            MoeFfn.setActBlockSim(simW);
+            int32 i = 0;
+            while (i < eval) {
+                Tensor<float32> lg = m.logits();
+                float32[] lb = lg.hostBuffer();
+                int64 lbase = lg.hostBase();
+                int32 v = 0;
+                while (v < vocab) {
+                    row[v] = lb[lbase + (int64) v];
+                    v = v + 1;
+                }
+                int32 tgt = ids[off + pre + i];
+                nllOut[w * eval + i] =
+                    Metrics.logSumExp(row, vocab) - (float64) row[tgt];
+                ppl.add(row, vocab, tgt);
+                one[0] = tgt;
+                m.stepSeq(0, one, 0, 1);
+                i = i + 1;
+            }
+            MoeFfn.setRoutePinPaused(true);
+            w = w + 1;
+        }
+        float64 secs = (float64) (Clock.nanoTime() - t0) / 1000000000.0;
+        System.stdout.println(label + "  ppl " + ppl.ppl()
+            + "  positions " + ppl.positions() + "  " + secs + " s");
+        System.stdout.println("   pin rows " + MoeFfn.routePinRows()
+            + "  flips " + MoeFfn.routePinFlips()
+            + "  overflow " + MoeFfn.routePinOverflow()
+            + "  misses " + MoeFfn.routePinWeightMiss()
+            + "  rounding made: routed " + MoeFfn.actSimErrRouted()
+            + " shared " + MoeFfn.actSimErrShared());
+        MoeFfn.setRoutePin(0, pin, layers, used, cap);
+        MoeFfn.setActBlockSim(0);
+        MoeFfn.setSharedRow(true);
+        return ppl.ppl();
+    }
+
+    static #int32[] prependBos(Tokenizer tok, #int32[] body) {
+        if (!tok.addsBos()) {
+            return #body;
+        }
+        int32 n = (int32) body.count();
+        int32[] out = heap int32[n + 1];
+        out[0] = tok.bosToken();
+        int32 i = 0;
+        while (i < n) {
+            out[i + 1] = body[i];
+            i = i + 1;
+        }
+        return #out;
+    }
+}

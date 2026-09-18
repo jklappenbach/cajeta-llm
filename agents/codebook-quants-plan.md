@@ -1541,7 +1541,7 @@ every timing leg and wait for the go; filtered suite only
             registers the wave32 tile does not have. The ceiling for
             this body family on gfx1151 is where E sits; the next
             level is wave64 tiles, a compiler item.
-- [ ] 6.4.5 The precision choice on the down projection. The zero-sync
+- [x] 6.4.5 The precision choice on the down projection. The zero-sync
       row runs down through the integer id kernel on q8_K-packed
       gate*up; the route it replaced ran the f32 wave. Router faithful
       to 5e-6; perplexity +0.41% (5.50046 against 5.4781), inside the
@@ -1599,15 +1599,57 @@ every timing leg and wait for the go; filtered suite only
       of its CUDA/HIP dense path and not of the Vulkan arm this unit
       benchmarks against, which is why its 5.4781 sits at our f32 arm's
       5.47719 rather than at our integer arm's 5.50046.
-      SO THE CHOICE IS NOW THREE-WAY, and the middle one is new: keep
-      the integer route at a measured +0.25% and record it; or an
-      f32-activation id kernel for the down, which gives the +0.25% back
-      and costs the fused down+combine+tail launch of 6.4.3.3 and the
-      int8 dot; or quantize the down's activation in 32-element blocks,
-      which the tap says recovers roughly half the error for a new pack
-      in the gate-up-GLU epilogue and a changed inner loop in
-      `iq4nlQ8IdDownCombineKernel`, keeping the fusion and the integer
-      dot. My recommendation has changed with the number: the third.
+      SO THE CHOICE WAS THREE-WAY: keep the integer route and record the
+      trade; an f32-activation id kernel for the down, which costs the
+      fused down+combine+tail launch of 6.4.3.3 and the int8 dot; or
+      quantize the down's activation in 32-element blocks, which the tap
+      said recovers roughly half the error for a new pack in the
+      gate-up-GLU epilogue and a changed inner loop in
+      `iq4nlQ8IdDownCombineKernel`, keeping the fusion and the dot.
+
+      THE COST, MEASURED 2026-09-18 (Julian: "Measure the cost. Explore
+      the block width"), and it settles the item: KEEP.
+      `MoeFfn.setActBlockSim(w)` rounds the down projection's
+      activations to `w`-element int8 blocks by the pack kernel's own
+      rule, inside the per-expert route whose down reads f32 — so a
+      width costs what its kernel would cost, with no kernel written.
+      `bench/MoeBlockWidthPpl` scores 24 independent 2048-token windows
+      of `tmp/cbq/calib.txt`, 24552 positions, each width pinned to the
+      control's expert selections.
+
+      | down activations | rounding RMS | ppl vs f32 |
+      |---|---|---|
+      | q8_K, blocks of 256 (ships) | 1.72% | +0.101% +- 0.054% |
+      | blocks of 64 | 1.15% | +0.106% +- 0.054% |
+      | blocks of 32 | 0.91% | -0.022% +- 0.053% |
+
+      THE COMPARISON IS PAIRED, position by position, and that is the
+      whole reason the table means anything. The first cut compared
+      aggregate perplexities over 1023 positions and read +0.02% at 256,
+      +0.50% at 128 and +0.54% at 64 — non-monotone against a rounding
+      error that falls monotonically, and at one point blocks of 32 came
+      out NEGATIVE. The per-position scatter is +-0.08 nats against an
+      effect of 0.001, so an aggregate difference at that length is
+      trajectory noise. The null control — a pinned pass with no
+      rounding at all — returns dNLL exactly 0 +- 0, which is what says
+      the pairing and the pin are sound before any width is read.
+      WHAT IT SAYS. The shipping route's activation rounding costs
+      +0.10% +- 0.05%, about 1.9 sigma from zero. Blocks of 64 cost the
+      SAME +0.11% on a third less rounding error, so the perplexity is
+      not tracking the error magnitude; blocks of 32 land at zero, but
+      256 - 32 is 1.6 sigma and NOT resolved. Nothing here buys the
+      f32 kernel, and a 32-wide kernel would chase at most 0.12% on 1.6
+      sigma of evidence for no throughput gain — the activation is 1760
+      bytes against the expert's whole IQ4_NL weight read, so width
+      cannot move decode.
+      AND THE +0.25% DECIMAL WAS OVER-READ. The pinned A-vs-B figures
+      (+0.219%, +0.314%) are differences of the same 0.003-nat size and
+      carry the same +-0.26% at 1023 positions, which nobody quoted. The
+      down's activation rounding is +0.10% of the +0.425% gap; the rest
+      is flips plus every other arithmetic difference between two
+      different implementations, not the activation quantization the
+      mechanism note attributed it to. My recommendation reversed twice
+      and lands where Julian started: KEEP.
 
 ## Unit 7 — The decode bandwidth gap (spec §6, §8.5, 12.1; folds 4.3.5 and 6.4.1)
 
