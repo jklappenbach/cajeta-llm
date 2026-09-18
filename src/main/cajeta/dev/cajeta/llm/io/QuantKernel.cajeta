@@ -7309,8 +7309,16 @@ public final class QuantKernel {
     public static void iq3xxsQ8WaveGateUpGluKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packedG, KernelBuffer<int8> packedU,
             KernelBuffer<int8> xp, KernelBuffer<int32> grid, uint32 rows,
-            int64 blocksPerRow, int32 act) {
-        uint32 lane = KernelThread.x();
+            int64 blocksPerRow, int32 act, KernelBuffer<int8> pk,
+            KernelBuffer<int32> counters, uint32 packOn,
+            KernelBuffer<float32> z, KernelBuffer<float32> gw,
+            KernelBuffer<float32> xf, uint32 gateOn) {
+        Shared<int32> ppsum = shared int32[32];
+        Shared<int32> ptk = shared int32[1];
+        Shared<float32> zsh = shared float32[256];
+        uint32 lane = KernelThread.x() % 32;
+        uint32 tid = KernelThread.x();
+        uint32 wgi = KernelThread.globalIdX() / 256;
         uint32 row = KernelThread.globalIdX() / 32;
         int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
         int64 rowBytes = prefix + blocksPerRow * 96L;
@@ -7348,6 +7356,111 @@ public final class QuantKernel {
             }
             y[(int64) row] = a * totU;
         }
+        if (wgi >= rows / 8) {
+            if (gateOn != 0 && wgi == rows / 8) {
+                uint32 zcols = (uint32) blocksPerRow * 256;
+                float32 zacc = 0.0f;
+                uint32 zj = tid;
+                while (zj < zcols) {
+                    zacc = zacc + gw[(int64) zj] * xf[(int64) zj];
+                    zj = zj + 256;
+                }
+                zsh[tid] = zacc;
+                Barrier.workgroup();
+                uint32 zrs = 128;
+                while (zrs > 0) {
+                    if (tid < zrs) { zsh[tid] = zsh[tid] + zsh[tid + zrs]; }
+                    Barrier.workgroup();
+                    zrs = zrs / 2;
+                }
+                if (tid == 0) { z[0L] = zsh[0]; }
+            }
+            return;
+        }
+        if (packOn == 0) { return; }
+        Barrier.workgroup();
+        uint32 pblk = row / 256;
+        uint32 pstart = pblk * 256;
+        uint32 pcount = rows - pstart;
+        if (pcount > 256) { pcount = 256; }
+        int64 pci = (int64) pblk;
+        if (tid == 0) {
+            Barrier.deviceMemory(MemoryOrder.Release);
+            int32 pold = counters.atomicAdd(pci, 1, MemoryOrder.AcqRel);
+            ptk[0] = pold;
+        }
+        Barrier.workgroup();
+        if ((uint32) ptk[0] != (pcount + 7) / 8 - 1) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        if (tid == 0) { counters[pci] = 0; }
+        int64 pxb = 0L;
+        int64 pob = pci * 320L;
+        int64 pe0 = (int64) (pstart + lane * 8);
+        float32 pamax = 0.0f;
+        if (tid < 32) {
+            int32 pt = 0;
+            while (pt < 8) {
+                int64 pea = pe0 + (int64) pt;
+                float32 pv = 0.0f;
+                if (pea < (int64) rows) { pv = y[pxb + pea]; }
+                float32 pav = pv;
+                if (pv < 0.0f) { pav = 0.0f - pv; }
+                if (pav > pamax) { pamax = pav; }
+                pt = pt + 1;
+            }
+        }
+        float32 pbmax = Wave.reduceMaxF32(pamax);
+        if (tid < 32) {
+            float32 pinv = 0.0f;
+            if (pbmax > 0.0f) { pinv = 127.0f / pbmax; }
+            int32 psm = 0;
+            int32 pkk = 0;
+            while (pkk < 8) {
+                int64 peb = pe0 + (int64) pkk;
+                float32 pfv = 0.0f;
+                if (peb < (int64) rows) { pfv = y[pxb + peb] * pinv; }
+                int32 pqi = (int32) Math.round(pfv);
+                pk[pob + (int64) (lane * 8) + (int64) pkk] = (int8) pqi;
+                psm = psm + pqi;
+                pkk = pkk + 1;
+            }
+            ppsum[lane] = psm;
+        }
+        Barrier.workgroup();
+        if (tid < 8) {
+            uint32 pbase = lane * 4;
+            int32 ptot = ppsum[pbase] + ppsum[pbase + 1]
+                       + ppsum[pbase + 2] + ppsum[pbase + 3];
+            int64 pso = pob + 256L + (int64) (lane * 4);
+            int32 pb0 = ptot & 255;
+            int32 pb1 = (ptot >> 8) & 255;
+            int32 pb2 = (ptot >> 16) & 255;
+            int32 pb3 = (ptot >> 24) & 255;
+            if (pb0 > 127) { pb0 = pb0 - 256; }
+            if (pb1 > 127) { pb1 = pb1 - 256; }
+            if (pb2 > 127) { pb2 = pb2 - 256; }
+            if (pb3 > 127) { pb3 = pb3 - 256; }
+            pk[pso] = (int8) pb0;
+            pk[pso + 1L] = (int8) pb1;
+            pk[pso + 2L] = (int8) pb2;
+            pk[pso + 3L] = (int8) pb3;
+        }
+        if (tid == 0) {
+            float32 pdsc = pbmax / 127.0f;
+            int32 pdb = Cajeta.f32ToBits(pdsc);
+            int32 pe1 = pdb & 255;
+            int32 pe2 = (pdb >> 8) & 255;
+            int32 pe3 = (pdb >> 16) & 255;
+            int32 pe4 = (pdb >> 24) & 255;
+            if (pe1 > 127) { pe1 = pe1 - 256; }
+            if (pe2 > 127) { pe2 = pe2 - 256; }
+            if (pe3 > 127) { pe3 = pe3 - 256; }
+            if (pe4 > 127) { pe4 = pe4 - 256; }
+            pk[pob + 288L] = (int8) pe1;
+            pk[pob + 289L] = (int8) pe2;
+            pk[pob + 290L] = (int8) pe3;
+            pk[pob + 291L] = (int8) pe4;
+        }
     }
 
     public static void iq3xxsWaveGateUpGluLaunchNoSync(KernelBuffer<float32> y,
@@ -7355,9 +7468,30 @@ public final class QuantKernel {
             KernelBuffer<int8> xp, int64 rows, int64 cols, int32 act) {
         QuantKernel.ensureIqTables();
         KernelStream s = QuantKernel.stream();
-        iq3xxsQ8WaveGateUpGluKernel.launch(s, grid: [(uint32) rows], block: [32])
+        iq3xxsQ8WaveGateUpGluKernel.launch(s, grid: [(uint32) ((rows + 7L) / 8L)],
+            block: [256])
             (y, packedG, packedU, xp, QuantKernel.iq3xxsDev, (uint32) rows,
-             cols / 256L, act);
+             cols / 256L, act, xp, QuantKernel.iq3xxsDev, 0, y, y, y, 0);
+        return;
+    }
+
+    /** {@link #iq3xxsWaveGateUpGluLaunchNoSync} with the q8_K pack of the
+     *  GLU row by the last wave to finish each 256-row block (`counters`
+     *  one zeroed word a block) and, in one extra wave, the gate logit
+     *  `z[0] = gw . xf` summed exactly as `routerF32MatVecKernel` sums it.
+     *  `rows` is a multiple of 8: a workgroup is eight rows. */
+    public static void iq3xxsWaveGateUpGluPackGateLaunchNoSync(
+            KernelBuffer<float32> y, KernelBuffer<int8> packedG,
+            KernelBuffer<int8> packedU, KernelBuffer<int8> xp, int64 rows,
+            int64 cols, int32 act, KernelBuffer<int8> pk,
+            KernelBuffer<int32> counters, KernelBuffer<float32> z,
+            KernelBuffer<float32> gw, KernelBuffer<float32> xf) {
+        QuantKernel.ensureIqTables();
+        KernelStream s = QuantKernel.stream();
+        iq3xxsQ8WaveGateUpGluKernel.launch(s, grid: [(uint32) (rows / 8L + 1L)],
+            block: [256])
+            (y, packedG, packedU, xp, QuantKernel.iq3xxsDev, (uint32) rows,
+             cols / 256L, act, pk, counters, 1, z, gw, xf, 1);
         return;
     }
 
@@ -14259,8 +14393,13 @@ public final class QuantKernel {
             KernelBuffer<int8> slabG, KernelBuffer<int8> slabU,
             KernelBuffer<int8> xp, KernelBuffer<int32> grid,
             KernelBuffer<int32> sel, uint32 rowsPerExpert,
-            int64 blocksPerRow, int64 xRowBlocks, int32 act) {
-        uint32 lane = KernelThread.x();
+            int64 blocksPerRow, int64 xRowBlocks, int32 act,
+            KernelBuffer<int8> pk, KernelBuffer<int32> counters,
+            uint32 nbRow, uint32 packOn) {
+        Shared<int32> ppsum = shared int32[32];
+        Shared<int32> ptk = shared int32[1];
+        uint32 lane = KernelThread.x() % 32;
+        uint32 tid = KernelThread.x();
         uint32 wave = KernelThread.globalIdX() / 32;
         uint32 kk = wave / rowsPerExpert;
         uint32 row = wave - kk * rowsPerExpert;
@@ -14302,6 +14441,90 @@ public final class QuantKernel {
             }
             y[(int64) kk * (int64) rowsPerExpert + (int64) row] = a * totU;
         }
+        if (packOn == 0) { return; }
+        Barrier.workgroup();
+        uint32 pblk = row / 256;
+        uint32 pstart = pblk * 256;
+        uint32 pcount = rowsPerExpert - pstart;
+        if (pcount > 256) { pcount = 256; }
+        int64 pci = (int64) kk * (int64) nbRow + (int64) pblk;
+        if (tid == 0) {
+            Barrier.deviceMemory(MemoryOrder.Release);
+            int32 pold = counters.atomicAdd(pci, 1, MemoryOrder.AcqRel);
+            ptk[0] = pold;
+        }
+        Barrier.workgroup();
+        if ((uint32) ptk[0] != (pcount + 7) / 8 - 1) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        if (tid == 0) { counters[pci] = 0; }
+        int64 pxb = (int64) kk * (int64) rowsPerExpert;
+        int64 pob = pci * 320L;
+        int64 pe0 = (int64) (pstart + lane * 8);
+        float32 pamax = 0.0f;
+        if (tid < 32) {
+            int32 pt = 0;
+            while (pt < 8) {
+                int64 pea = pe0 + (int64) pt;
+                float32 pv = 0.0f;
+                if (pea < (int64) rowsPerExpert) { pv = y[pxb + pea]; }
+                float32 pav = pv;
+                if (pv < 0.0f) { pav = 0.0f - pv; }
+                if (pav > pamax) { pamax = pav; }
+                pt = pt + 1;
+            }
+        }
+        float32 pbmax = Wave.reduceMaxF32(pamax);
+        if (tid < 32) {
+            float32 pinv = 0.0f;
+            if (pbmax > 0.0f) { pinv = 127.0f / pbmax; }
+            int32 psm = 0;
+            int32 pkk = 0;
+            while (pkk < 8) {
+                int64 peb = pe0 + (int64) pkk;
+                float32 pfv = 0.0f;
+                if (peb < (int64) rowsPerExpert) { pfv = y[pxb + peb] * pinv; }
+                int32 pqi = (int32) Math.round(pfv);
+                pk[pob + (int64) (lane * 8) + (int64) pkk] = (int8) pqi;
+                psm = psm + pqi;
+                pkk = pkk + 1;
+            }
+            ppsum[lane] = psm;
+        }
+        Barrier.workgroup();
+        if (tid < 8) {
+            uint32 pbase = lane * 4;
+            int32 ptot = ppsum[pbase] + ppsum[pbase + 1]
+                       + ppsum[pbase + 2] + ppsum[pbase + 3];
+            int64 pso = pob + 256L + (int64) (lane * 4);
+            int32 pb0 = ptot & 255;
+            int32 pb1 = (ptot >> 8) & 255;
+            int32 pb2 = (ptot >> 16) & 255;
+            int32 pb3 = (ptot >> 24) & 255;
+            if (pb0 > 127) { pb0 = pb0 - 256; }
+            if (pb1 > 127) { pb1 = pb1 - 256; }
+            if (pb2 > 127) { pb2 = pb2 - 256; }
+            if (pb3 > 127) { pb3 = pb3 - 256; }
+            pk[pso] = (int8) pb0;
+            pk[pso + 1L] = (int8) pb1;
+            pk[pso + 2L] = (int8) pb2;
+            pk[pso + 3L] = (int8) pb3;
+        }
+        if (tid == 0) {
+            float32 pdsc = pbmax / 127.0f;
+            int32 pdb = Cajeta.f32ToBits(pdsc);
+            int32 pe1 = pdb & 255;
+            int32 pe2 = (pdb >> 8) & 255;
+            int32 pe3 = (pdb >> 16) & 255;
+            int32 pe4 = (pdb >> 24) & 255;
+            if (pe1 > 127) { pe1 = pe1 - 256; }
+            if (pe2 > 127) { pe2 = pe2 - 256; }
+            if (pe3 > 127) { pe3 = pe3 - 256; }
+            if (pe4 > 127) { pe4 = pe4 - 256; }
+            pk[pob + 288L] = (int8) pe1;
+            pk[pob + 289L] = (int8) pe2;
+            pk[pob + 290L] = (int8) pe3;
+            pk[pob + 291L] = (int8) pe4;
+        }
     }
 
     public static void iq3xxsIdGateUpGluLaunchNoSync(KernelBuffer<float32> y,
@@ -14313,9 +14536,32 @@ public final class QuantKernel {
         QuantKernel.ensureIqTables();
         KernelStream s = QuantKernel.stream();
         iq3xxsQ8IdGateUpGluKernel.launch(s,
-            grid: [(uint32) (rowsPerExpert * (int64) used)], block: [32])
+            grid: [(uint32) ((rowsPerExpert * (int64) used + 7L) / 8L)],
+            block: [256])
             (y, slabG, slabU, xp, QuantKernel.iq3xxsDev, sel,
-             (uint32) rowsPerExpert, cols / 256L, 0L, act);
+             (uint32) rowsPerExpert, cols / 256L, 0L, act, xp, sel, 0, 0);
+        return;
+    }
+
+    /** {@link #iq3xxsIdGateUpGluLaunchNoSync} with the q8_K pack of each
+     *  expert's GLU row (`nbRow` padded blocks a row, as
+     *  `q8kPackRowsLaunchNoSync` lays them) done by the last wave to
+     *  finish a 256-row block; `counters` is one zeroed word a block. */
+    public static void iq3xxsIdGateUpGluPackLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> slabG, KernelBuffer<int8> slabU,
+            KernelBuffer<int8> xp, KernelBuffer<int32> sel, int32 used,
+            int64 rowsPerExpert, int64 cols, int32 act, KernelBuffer<int8> pk,
+            KernelBuffer<int32> counters, int64 nbRow) {
+        QuantKernel.requireOffsets32(slabG, "iq3xxsIdGateUpGlu");
+        QuantKernel.requireOffsets32(slabU, "iq3xxsIdGateUpGlu");
+        QuantKernel.ensureIqTables();
+        KernelStream s = QuantKernel.stream();
+        iq3xxsQ8IdGateUpGluKernel.launch(s,
+            grid: [(uint32) ((rowsPerExpert * (int64) used + 7L) / 8L)],
+            block: [256])
+            (y, slabG, slabU, xp, QuantKernel.iq3xxsDev, sel,
+             (uint32) rowsPerExpert, cols / 256L, 0L, act, pk, counters,
+             (uint32) nbRow, 1);
         return;
     }
 

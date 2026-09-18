@@ -49,6 +49,8 @@ public final class MoeFfn extends InfModule {
     KernelBuffer<int8> xpXnDev;        // staged activation, per token
     KernelBuffer<int32> rtCounter;     // unit 50: the router's ticket counter
     KernelBuffer<int8> xpGyDev;        // staged GLU'd middle, [used rows]
+    KernelBuffer<int32> gyPackCounters; // one zeroed word a q8_K block of it
+    KernelBuffer<int32> shPackCounters; // the shared expert's, [sharedW/256]
     KernelBuffer<float32> routerWDev;  // router weight, f32 [in x E]
     boolean routerWUp;
     KernelBuffer<float32> lgBatchDev;  // unit 41: [rows x E] logits
@@ -749,9 +751,17 @@ public final class MoeFfn extends InfModule {
             (uint64) ((hid / 256L) * 320L));
         this.xpGyDev #= heap KernelBuffer<int8>(
             (uint64) ((u * (Quant.q8kPadCols(wid) / 256L)) * 320L));
+        int64 gyBlocks = u * (Quant.q8kPadCols(wid) / 256L);
+        this.gyPackCounters #= heap KernelBuffer<int32>((uint64) gyBlocks);
+        int32[] zc #= heap int32[gyBlocks];
+        this.gyPackCounters.upload(zc, gyBlocks);
         if (this.sharedW != 0) {
             this.shXpDev #= heap KernelBuffer<int8>(
                 (uint64) (((int64) this.sharedW / 256L) * 320L));
+            int64 shBlocks = (int64) this.sharedW / 256L;
+            this.shPackCounters #= heap KernelBuffer<int32>((uint64) shBlocks);
+            int32[] zs #= heap int32[shBlocks];
+            this.shPackCounters.upload(zs, shBlocks);
         }
         return;
     }
@@ -840,20 +850,27 @@ public final class MoeFfn extends InfModule {
             KernelBuffer<float32> acc, int32 act) {
         int64 h = (int64) this.hidden;
         int64 sw = (int64) this.sharedW;
-        if (!Linear.gateUpGluPacked(this.sharedGateProj, this.sharedUpProj,
-                this.xpXnDev, act)) {
-            this.sharedGateProj.matvecPackedKeep(this.xpXnDev);
-            this.sharedUpProj.matvecPackedKeep(this.xpXnDev);
-            Prim.gluDevice(this.sharedGateProj.out(), this.sharedUpProj.out(),
-                sw, act);
-        }
-        QuantKernel.q8kPackLaunchNoSync(this.shXpDev,
-            this.sharedGateProj.out(), sw);
         boolean gated = this.sharedGate != null;
         this.ensureSharedGateDev(1);
+        boolean fusedAll = gated && Linear.gateUpGluPackGate(this.sharedGateProj,
+            this.sharedUpProj, this.xpXnDev, act, this.shXpDev,
+            this.shPackCounters, this.shZDev, this.shGateWDev, xDev);
+        if (!fusedAll) {
+            if (!Linear.gateUpGluPacked(this.sharedGateProj, this.sharedUpProj,
+                    this.xpXnDev, act)) {
+                this.sharedGateProj.matvecPackedKeep(this.xpXnDev);
+                this.sharedUpProj.matvecPackedKeep(this.xpXnDev);
+                Prim.gluDevice(this.sharedGateProj.out(),
+                    this.sharedUpProj.out(), sw, act);
+            }
+            QuantKernel.q8kPackLaunchNoSync(this.shXpDev,
+                this.sharedGateProj.out(), sw);
+            if (gated) {
+                QuantKernel.routerF32MatVecLaunchNoSync(this.shZDev,
+                    this.shGateWDev, xDev, 1L, h);
+            }
+        }
         if (gated) {
-            QuantKernel.routerF32MatVecLaunchNoSync(this.shZDev,
-                this.shGateWDev, xDev, 1L, h);
             if (this.sharedDownProj.matvecPackedAccumGated(acc, this.shXpDev,
                     this.shZDev)) {
                 return;
@@ -1029,8 +1046,12 @@ public final class MoeFfn extends InfModule {
         // a workgroup per 256-row pack block leaves 192 waves for the
         // launch and the streaming rate collapses — +1.9 ms/tok,
         // alternated arms. The pack stays a launch of its own.)
-        boolean fusedGu = ExpertBank.idGateUpGlu(this.gateB, this.upB,
-            this.gyDev, this.xpXnDev, this.selDev, this.usedN, act);
+        int64 wpad = Quant.q8kPadCols(wid);
+        boolean fusedGuPk = ExpertBank.idGateUpGluPack(this.gateB, this.upB,
+            this.gyDev, this.xpXnDev, this.selDev, this.usedN, act,
+            this.xpGyDev, this.gyPackCounters, wpad / 256L);
+        boolean fusedGu = fusedGuPk || ExpertBank.idGateUpGlu(this.gateB,
+            this.upB, this.gyDev, this.xpXnDev, this.selDev, this.usedN, act);
         if (!fusedGu) {
             this.gateB.idLaunch(this.gyDev, this.xpXnDev, this.selDev,
                 this.usedN, 0L);
@@ -1047,8 +1068,9 @@ public final class MoeFfn extends InfModule {
         MoeFfn.phaseSync();
         MoeFfn.mtGluNs = MoeFfn.mtGluNs + (Clock.nanoTime() - tgl0);
         int64 td0 = Clock.nanoTime();
-        int64 widPad = Quant.q8kPadCols(wid);
-        if (widPad == wid) {
+        int64 widPad = wpad;
+        if (fusedGuPk) {
+        } else if (widPad == wid) {
             QuantKernel.q8kPackLaunchNoSync(this.xpGyDev, this.gyDev,
                 (int64) this.usedN * wid);
         } else {

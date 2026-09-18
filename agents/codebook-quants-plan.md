@@ -1168,14 +1168,49 @@ every timing leg and wait for the go; filtered suite only
             Decode 0.878x -> 1.017x in one evening, every step
             bit-exact; the residue of 6.4.3.1's tally is three launches a
             layer (6.4.3.9), not taken.
-      - [ ] 6.4.3.9 HELD, not started: the last three fusable launches a
+      - [x] 6.4.3.9 TAKEN (Julian, 2026-09-17: ".2ms x 1M tokens is 3
+            minutes. Go for it."): the last three fusable launches a
             layer — the shared expert's gate logit into its gate-up-GLU
             launch (one extra 256-lane workgroup running
             `routerF32MatVecKernel`'s tree), and the two q8_K packs of
             the GLU outputs by a last-arriving-wave counter per 256-row
             block (`q8kPackKernel`'s arithmetic verbatim; the routed pack
             pads 1408 to 1536). ~72 launches x 2.5 us = ~0.2 ms a token,
-            ~1.04x. Julian's call whether the item is worth its counters.
+            ~1.04x. The gate logit's 256-lane tree is reproduced by ONE
+            32-lane wave (eight virtual lanes a lane, the 128/64/32
+            levels folded in registers, the last five through LDS) so
+            the logit is bit-identical to `routerF32MatVecKernel`'s; the
+            pack tails are `q8kPackKernel`'s arithmetic verbatim under a
+            release/acquire counter a block. TDD:
+            `MoeCodebookIdMatVecTest.iq3xxsGateUpGluPackMatchesTheChain`
+            (1408 rows, so the padded sixth block is covered) and
+            `iq3xxsWaveGateUpGluPackGateMatchesTheChain` (packed bytes,
+            GLU rows and the logit exact; counters reset; two passes).
+            FIRST CUT MEASURED SLOWER (7.11 -> 7.27, gate exact): with one
+            row a workgroup, every one of ~11,000 waves a layer paid a
+            device-scope fence and a counter atomic, and 256 atomics on
+            one word serialize. Second cut: eight rows a workgroup, the
+            fence and the atomic once a workgroup, wave 0 packing with
+            the same 32-lane arithmetic. STILL 7.30: the census put the
+            shared launch at 62 us (was 43) — the logit's one-wave
+            2048-term loop, dispatched LAST, extended the launch's tail.
+            Third cut: the logit on all 256 threads of its workgroup
+            with `routerF32MatVecKernel`'s own lane mapping and tree,
+            exact by construction and simpler than the eight-virtual-lane
+            emulation it replaces. LANDED 2026-09-17: bit gate exact;
+            decode 7.11 -> 6.94 ms a token, 144.2 t/s (ABBA x3, pre
+            binary 8.21). Census: the packs and the logit launch gone
+            from decode, the two fused kernels at 47.9 / 46.6 us where the
+            four launches they absorbed cost 61 us of kernel time plus
+            three gaps; ~270 launches a token; decode idle 10.3% of the
+            window. CLOSING LEGS again (`tmp/cbq/u6439-close.log`):
+
+            | 512x128 | cajeta | llama.cpp (Vulkan) | llama.cpp (HIP) |
+            |---|---|---|---|
+            | prefill t/s | 2752 | 2286 | 1174 |
+            | | 1.20x | | 2.34x |
+            | decode t/s | 144.2 | 138.7 | 92.9 |
+            | | 1.039x | | 1.55x |
 
 
 - [x] 6.4.4 Cause 5: the grouped prefill id-GEMM for the codebook
