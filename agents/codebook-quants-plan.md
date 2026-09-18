@@ -3050,15 +3050,35 @@ at. Nothing in this unit changes a kernel before 7.2.1 records why.
       one's position: prefill 1 leaves the planes at 512, prefill 2
       takes `startPos = 512` and `adopt`s 1024, prefill 3 is refused —
       which is the message's "512 tokens at position 1024" exactly.
-      THE FIX IS ONE CALL, NOT A REWRITE: `CausalLM.resetSeq(seq)`
-      already does the correct pair (`cache.release` + `DeviceKv.reset`)
-      and is what `LlmEngine`'s load-time warmup uses; the finish path
-      releases only half of it. STILL A DIFFERENT UNIT'S — it is the
-      scheduler's request lifecycle — but it is not a test artefact:
-      the same path serves a second request on a recycled slot, so its
-      RoPE positions and KV writes would land at the previous request's
-      offsets. This test is the only one in the suite that submits more
-      than one request, which is why it is the only red.
+      FIXED 2026-09-17 (Julian: "Fix it"), and it was three sites, not
+      one: `CausalLM.releaseSeq(seq)` now releases the blocks AND the
+      planes together — `resetSeq` is it plus `pos = 0` — and the
+      scheduler's FINISH, CANCEL and PREEMPT paths all go through it
+      where each had reached past the model for `kvCache().release`.
+      TDD: `SchedulerTest.aRecycledSlotStartsTheNextRequestAtZero` runs
+      two 64-token requests through one slot of a 128-position context
+      on the routable fixture, so a leaked position runs off the end.
+      IT WAS RED FIRST, with the predicted message ("64 tokens at
+      position 65 exceeds maxSeq 128"), and the fix turns it AND
+      `tunesThePartitionWidthOnThisDevice` green. The suite's other
+      eight scheduler tests — cancel, preemption, resume, admission,
+      all paths this touches — stay green. Decode 144.3 t/s and the
+      greedy stream hash unchanged.
+      IT WAS NOT A TEST ARTEFACT: the same path serves a second request
+      on a recycled slot, so its RoPE positions and KV writes would have
+      landed at the previous request's offsets. The suite had no test
+      that submits two requests on a device-routed model, which is how
+      it survived.
+      ONE RED REMAINS AND IT IS A DIFFERENT DEFECT, surfaced by pulling
+      `SchedulerTest` (and its `ForwardTest` helper) into the filtered
+      suite: `ForwardTest.tiedEmbeddingAndExplicitHeadDim` expects 11
+      parameters from a 1-layer tied llama and the tree reports 12.
+      `lmHead` is null under tie so it is not that; the extra name comes
+      from somewhere in the module walk. Neither file has changed since
+      `e278186`, so the model side gained a parameter while the full
+      suite was blocked. NOT this unit's, and worth a look from 9.3.3's
+      side — an extra parameter in the tree is a resident-bytes question
+      as much as a naming one.
 - [x] 9.3.2 Legs per format (announced): Q4_K_M 8B (carries Q6_K and
       Q5_0 tensors), Q3_K_M, Q6_K, the iq4_nl file, a Q4_0 8B from
       `llama-quantize`; bit gate then A/B, no decode regression.
