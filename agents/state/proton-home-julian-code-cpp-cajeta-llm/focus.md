@@ -1,3 +1,4 @@
+wave-row-geometry:1.1.1
 codebook-quants:9.2.9
 codebook-quants:9
 codebook-quants:8.1.3
