@@ -1,0 +1,123 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * What does the FROZEN launch chunk cost on a part it was not measured on?
+ *
+ * This is the harness behind `xpu-kernel-adaptor-plan` 1.7. The numbers
+ * that plan section records -- the 3.0x cost of the frozen constant, and
+ * the finding that the DERIVED value is 3.07x better but still 2.5x short
+ * of measured -- came from this sweep. It is committed so those numbers
+ * can be rechecked rather than believed.
+ *
+ * `CoalesceProbe.CHUNK = 5120` is commented "the measured launch optimum".
+ * With GROUP=64 that is 80 workgroups, and 80 is exactly what the dispatch
+ * law yields for gfx1151 -- so the constant is one part's answer, frozen.
+ * On sm_89 the same law gives 256, so the frozen value under-dispatches
+ * 3.2x. That is the adaptor spec's whole claim, and it is testable: sweep
+ * the chunk on the BEST arm (interleaved, which CoalesceProbe measured at
+ * 1.92x over plain) and see where the frozen value sits on the curve.
+ *
+ * `Device.dispatchBlocks(2)` is the derived answer -- 2 waves per block at
+ * block=64 and a 32-lane wave. It is printed beside the sweep so the
+ * question is not "which constant is best" but "does the DERIVED value
+ * land on the measured optimum", which is the only result that
+ * generalizes to a part nobody has run yet.
+ *
+ * 144 MB, deliberately past both this part's 72 MB L2 and gfx1151's 32 MB
+ * MALL -- a decode reads 96 different cold weights per token, so the
+ * cache-resident case answers a question nobody asked.
+ */
+public class DispatchProbe {
+
+    static final int32 ROWS = 131072;
+    static final int32 COLS = 4096;
+    static final int32 GROUP = 64;
+
+    static void pass(KernelBuffer<float32> y, KernelBuffer<int8> p,
+            KernelBuffer<float32> x, int64 rows, int64 bpr, int64 chunk) {
+        int64 rowBytes = bpr * 144L;
+        int64 r0 = 0L;
+        while (r0 < rows) {
+            int64 nr = chunk;
+            if (r0 + nr > rows) { nr = rows - r0; }
+            KernelBuffer<int8> sub #= p.slice((uint64) (r0 * rowBytes),
+                (uint64) (nr * rowBytes));
+            QuantKernel.q4kILMatVecLaunch(y, sub, x, nr,
+                (int64) DispatchProbe.COLS, 0L, r0);
+            r0 = r0 + nr;
+        }
+        return;
+    }
+
+    static void arm(String tag, KernelBuffer<float32> y, KernelBuffer<int8> p,
+            KernelBuffer<float32> x, int64 rows, int64 bpr, int64 chunk,
+            int64 nbytes) {
+        DispatchProbe.pass(y, p, x, rows, bpr, chunk);      // warm
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 4) {
+            DispatchProbe.pass(y, p, x, rows, bpr, chunk);
+            k = k + 1;
+        }
+        float64 ms = (float64) (Clock.nanoTime() - t0) / 1000000.0 / 4.0;
+        float64 gbs = (float64) nbytes / (ms * 1000000.0);
+        int64 wg = chunk / (int64) DispatchProbe.GROUP;
+        System.stdout.println("  chunk " + chunk + "  (" + wg
+            + " workgroups)  " + ms + " ms  " + gbs + " GB/s   " + tag);
+        return;
+    }
+
+    public static int32 run() {
+        int64 bpr = (int64) (DispatchProbe.COLS / 256);
+        int64 rowBytes = bpr * 144L;
+        int64 rows = (int64) DispatchProbe.ROWS;
+        int64 nbytes = rows * rowBytes;
+
+        int32 derived = Device.dispatchBlocks(2);
+        System.stdout.println("backend " + Device.activeBackend()
+            + "   Device.dispatchBlocks(2) = " + derived
+            + "   => derived chunk " + (derived * DispatchProbe.GROUP));
+        System.stdout.println("Q4_K [" + rows + " x " + DispatchProbe.COLS
+            + "]  " + ((float64) nbytes / 1048576.0) + " MB  interleaved arm");
+
+        int8[] packed #= heap int8[nbytes];
+        ScalingProbe.fillBlocks(packed, Quant.GG_Q4_K, 3);
+        int64 ilBytes = Quant.interleavedBytes(rows, rowBytes,
+            (int64) DispatchProbe.GROUP);
+        int8[] il #= heap int8[ilBytes];
+        Quant.interleaveRows16(packed, il, rows, rowBytes,
+            (int64) DispatchProbe.GROUP);
+
+        float32[] hx #= heap float32[(int64) DispatchProbe.COLS];
+        int64 i = 0;
+        while (i < (int64) DispatchProbe.COLS) {
+            hx[i] = 0.02f * (float32) ((i % 11L) - 5L);
+            i = i + 1;
+        }
+        KernelBuffer<float32> xb #= heap KernelBuffer<float32>(
+            (uint64) DispatchProbe.COLS);
+        xb.upload(hx);
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> ib #= heap KernelBuffer<int8>((uint64) ilBytes);
+        ib.upload(il);
+
+        DispatchProbe.arm("<- FROZEN (gfx1151's answer)", yb, ib, xb, rows,
+            bpr, 5120L, nbytes);
+        if (derived > 0) {
+            DispatchProbe.arm("<- DERIVED from the driver", yb, ib, xb, rows,
+                bpr, (int64) derived * (int64) DispatchProbe.GROUP, nbytes);
+        }
+        DispatchProbe.arm("", yb, ib, xb, rows, bpr, 32768L, nbytes);
+        DispatchProbe.arm("", yb, ib, xb, rows, bpr, 65536L, nbytes);
+        DispatchProbe.arm("", yb, ib, xb, rows, bpr, 131072L, nbytes);
+        return 0;
+    }
+}

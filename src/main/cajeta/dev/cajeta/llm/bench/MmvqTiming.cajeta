@@ -1,0 +1,145 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * Head-to-head against llama.cpp on the SHAPE IT WAS MEASURED ON, so the
+ * numbers are comparable rather than merely adjacent.
+ *
+ * This is the harness behind `xpu-kernel-adaptor-plan` 1.8, and the reason
+ * it is committed rather than discarded: an earlier 49x claim from this
+ * comparison was WRONG and had to be retracted in 1.7.3. It was cache-hot,
+ * under-dispatched and uncoalesced all at once. A measurement cited in a
+ * plan with no runnable harness behind it is exactly how that error
+ * survived as long as it did.
+ *
+ * llama.cpp test-backend-ops, RTX 4090, q4_K x f32, m=4096, k=14336:
+ *
+ *     n=1     13.33 us     8.81 TFLOPS      (MMVQ, mat-vec path)
+ *     n=5     36.61 us    16.04 TFLOPS
+ *     n=512  282.84 us   212.59 TFLOPS      (MMQ, tensor cores)
+ *
+ * FLOPs are counted llama.cpp's way, 2*m*n*k, so 117.44 MFLOP at n=1 and
+ * 60.13 GFLOP at n=512.
+ *
+ * TWO CAVEATS, both of which apply equally to both sides:
+ *  - The weight is ~31.5 MB and the 4090's L2 is 72 MB, so a repeated
+ *    timing loop runs L2-HOT. That is how test-backend-ops measures too,
+ *    so the comparison is fair, but neither number is what streaming a
+ *    real multi-GB model from HBM would give.
+ *  - Output is checked NON-ZERO per arm. A kernel that fails to lower or
+ *    to launch does not raise -- the registry finds nothing and y reads
+ *    back zeros -- so an absent kernel would otherwise look infinitely
+ *    fast. This is the same guard CoopTiming uses.
+ */
+public class MmvqTiming {
+
+    static final int32 WARMUP = 5;
+    static final int32 ITERS = 50;
+
+    static boolean nonZero(KernelBuffer<float32> yb, float32[] scratch) {
+        yb.download(scratch);
+        int64 i = 0;
+        int64 n = (int64) scratch.count();
+        if (n > 4096L) { n = 4096L; }
+        while (i < n) {
+            if (scratch[i] != 0.0f) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static void report(String name, boolean ran, float64 us,
+            int64 m, int64 n, int64 k) {
+        float64 flop = 2.0 * (float64) m * (float64) n * (float64) k;
+        float64 tflops = flop / (us * 1000000.0);
+        if (ran) {
+            System.stdout.println("  " + name + "   " + us + " us   "
+                + tflops + " TFLOPS");
+        } else {
+            System.stdout.println("  " + name + "   NO-OUTPUT (kernel absent"
+                + " or refused) -- " + us + " us is meaningless");
+        }
+        return;
+    }
+
+    /** n=1, the MMVQ shape: y[4096] = W[4096 x 14336] . x[14336]. */
+    static void matVec(int64 m, int64 k) {
+        int64 bpr = k / 256L;
+        int64 wbytes = m * bpr * 144L;
+        System.stdout.println("== n=1 MAT-VEC  m=" + m + " k=" + k
+            + "  weight=" + (wbytes / 1048576L) + " MB");
+
+        int8[] wh #= heap int8[wbytes];
+        int64 i = 0;
+        while (i < wbytes) {
+            wh[i] = (int8) ((i * 7L + 13L) & 255L);
+            i = i + 1;
+        }
+        int64 b = 0;
+        int64 nb = m * bpr;
+        while (b < nb) {
+            wh[b * 144L] = (int8) 0;
+            wh[b * 144L + 1L] = (int8) 60;      // f16 ~1.0
+            wh[b * 144L + 2L] = (int8) 0;
+            wh[b * 144L + 3L] = (int8) 56;      // f16 ~0.5
+            b = b + 1;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) wbytes);
+        wD.upload(wh);
+
+        float32[] xh #= heap float32[k];
+        int64 c = 0;
+        while (c < k) {
+            xh[c] = 0.02f * (float32) ((c % 7L) - 3L);
+            c = c + 1;
+        }
+        KernelBuffer<float32> xb #= heap KernelBuffer<float32>((uint64) k);
+        xb.upload(xh);
+
+        float32[] scratch #= heap float32[m];
+        int64 z = 0;
+        while (z < m) { scratch[z] = 0.0f; z = z + 1; }
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) m);
+        yb.upload(scratch);
+
+        KernelStream s = QuantKernel.stream();
+        int32 w = 0;
+        while (w < MmvqTiming.WARMUP) {
+            QuantKernel.q4kMatVecLaunchNoSync(yb, wD, xb, m, k, 0L, 0L);
+            w = w + 1;
+        }
+        s.sync();
+        boolean ran = MmvqTiming.nonZero(yb, scratch);
+
+        int64 t0 = Clock.nanoTime();
+        int32 it = 0;
+        while (it < MmvqTiming.ITERS) {
+            QuantKernel.q4kMatVecLaunchNoSync(yb, wD, xb, m, k, 0L, 0L);
+            it = it + 1;
+        }
+        s.sync();
+        float64 us = (float64) (Clock.nanoTime() - t0) / 1000.0
+            / (float64) MmvqTiming.ITERS;
+        MmvqTiming.report("q4kMatVec     ", ran, us, m, 1L, k);
+        return;
+    }
+
+    public static int32 run() {
+        System.stdout.println("backend: " + Device.activeBackend());
+        // The exact llama.cpp test-backend-ops shape.
+        MmvqTiming.matVec(4096L, 14336L);
+        // CONTROLLED PAIR: the same 31.5 MB of weight and the same FLOP
+        // count, with m and k swapped. Only the output-row count -- and so
+        // the workgroup count -- differs, so a large gap here is dispatch
+        // and not the kernel body.
+        MmvqTiming.matVec(14336L, 4096L);
+        return 0;
+    }
+}

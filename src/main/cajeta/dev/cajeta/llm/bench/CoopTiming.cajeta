@@ -1,0 +1,164 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * Times the Q4_K coop/tile GEMM variants at prefill shapes, on whatever
+ * backend is active.
+ *
+ * Q4_K is the subject because it is not a `splitOn` format, so the weight
+ * is the plain 144-byte block layout with no resident scale prefix, and
+ * because it carries the hand-tuned partition router (X1 below K=8192,
+ * X3 above) and the 55296-byte N256 tile.
+ *
+ * Every arm reports whether the output came back NON-ZERO. A kernel that
+ * fails to lower or fails to launch does not raise -- the registry finds
+ * nothing and `y` reads back zeros -- which is the guard CoopQuantGemmTest
+ * uses and the only way to tell a fast kernel from an absent one.
+ */
+public class CoopTiming {
+
+    static final int32 WARMUP = 3;
+    static final int32 ITERS = 20;
+
+    static boolean nonZero(KernelBuffer<float32> yb, float32[] scratch) {
+        yb.download(scratch);
+        int64 i = 0;
+        int64 n = (int64) scratch.count();
+        if (n > 4096L) { n = 4096L; }
+        while (i < n) {
+            if (scratch[i] != 0.0f) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    static void arm(String name, int32 which, KernelBuffer<float32> yb,
+            KernelBuffer<int32> pw, KernelBuffer<float16> xh,
+            int64 rows, int64 outDim, int64 cols, float32[] scratch) {
+        // zero the output so a non-launch is visible as zeros
+        int64 z = 0;
+        int64 zn = (int64) scratch.count();
+        while (z < zn) { scratch[z] = 0.0f; z = z + 1; }
+        yb.upload(scratch);
+
+        KernelStream s = QuantKernel.stream();
+        int32 w = 0;
+        while (w < CoopTiming.WARMUP) {
+            CoopTiming.launch(which, yb, pw, xh, rows, outDim, cols);
+            w = w + 1;
+        }
+        s.sync();
+
+        boolean ran = CoopTiming.nonZero(yb, scratch);
+
+        int64 t0 = Clock.nanoTime();
+        int32 it = 0;
+        while (it < CoopTiming.ITERS) {
+            CoopTiming.launch(which, yb, pw, xh, rows, outDim, cols);
+            it = it + 1;
+        }
+        s.sync();
+        float64 us = (float64) (Clock.nanoTime() - t0) / 1000.0
+            / (float64) CoopTiming.ITERS;
+
+        if (ran) {
+            System.stdout.println("  " + name + "  ok         " + us + " us/launch");
+        } else {
+            System.stdout.println("  " + name + "  NO-OUTPUT  " + us + " us/launch");
+        }
+        return;
+    }
+
+    static void launch(int32 which, KernelBuffer<float32> yb,
+            KernelBuffer<int32> pw, KernelBuffer<float16> xh,
+            int64 rows, int64 outDim, int64 cols) {
+        if (which == 0) {
+            QuantKernel.q4kF16CoopAutoLaunchNoSync(yb, pw, xh, rows, outDim, cols);
+        } else if (which == 1) {
+            QuantKernel.q4kF16CoopX1Launch(yb, pw, xh, rows, outDim, cols);
+        } else if (which == 2) {
+            QuantKernel.q4kF16CoopX3Launch(yb, pw, xh, rows, outDim, cols);
+        } else if (which == 3) {
+            QuantKernel.q4kF16CoopLaunchNoSync(yb, pw, xh, rows, outDim, cols);
+        } else if (which == 4) {
+            QuantKernel.q4kF16CoopN256Launch(yb, pw, xh, rows, outDim, cols);
+        } else {
+            QuantKernel.q4kF16CoopN256GLaunch(yb, pw, xh, rows, outDim, cols);
+        }
+        return;
+    }
+
+    static void shape(int64 rows, int64 outDim, int64 cols) {
+        int64 bpr = cols / 256L;
+        int64 wbytes = outDim * bpr * 144L;
+        System.stdout.println("== tokens=" + rows + " outDim=" + outDim
+            + " K=" + cols + "  weight=" + (wbytes / 1048576L) + " MB"
+            + "  tiles=" + ((outDim / 128L) * (rows / 128L)));
+
+        int8[] wh #= heap int8[wbytes];
+        int64 i = 0;
+        while (i < wbytes) {
+            wh[i] = (int8) ((i * 7L + 13L) & 255L);
+            i = i + 1;
+        }
+        // Per-block f16 scale/min pinned to a normal near 1.0 so nothing
+        // in the timing takes a denormal path.
+        int64 b = 0;
+        int64 nb = outDim * bpr;
+        while (b < nb) {
+            wh[b * 144L] = (int8) 0;
+            wh[b * 144L + 1L] = (int8) 60;      // f16 ~1.0
+            wh[b * 144L + 2L] = (int8) 0;
+            wh[b * 144L + 3L] = (int8) 56;      // f16 ~0.5
+            b = b + 1;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) wbytes);
+        wD.upload(wh);
+        KernelBuffer<int32> pw #= wD.wordView();
+
+        int64 xn = rows * cols;
+        float16[] xhh #= heap float16[xn];
+        int64 c = 0;
+        while (c < xn) {
+            xhh[c] = (float16) (0.02f * (float32) ((c % 7L) - 3L));
+            c = c + 1;
+        }
+        KernelBuffer<float16> xh #= heap KernelBuffer<float16>((uint64) xn);
+        xh.upload(xhh);
+
+        int64 yn = rows * outDim;
+        float32[] scratch #= heap float32[yn];
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) yn);
+
+        CoopTiming.arm("Auto (router) ", 0, yb, pw, xh, rows, outDim, cols, scratch);
+        CoopTiming.arm("X1            ", 1, yb, pw, xh, rows, outDim, cols, scratch);
+        CoopTiming.arm("X3            ", 2, yb, pw, xh, rows, outDim, cols, scratch);
+        CoopTiming.arm("Coop (blk 128)", 3, yb, pw, xh, rows, outDim, cols, scratch);
+        if (rows % 256L == 0L) {
+            CoopTiming.arm("N256 (55296 B)", 4, yb, pw, xh, rows, outDim, cols, scratch);
+            CoopTiming.arm("N256G (@Occ)  ", 5, yb, pw, xh, rows, outDim, cols, scratch);
+        }
+        return;
+    }
+
+    public static int32 run() {
+        System.stdout.println("backend: " + Device.activeBackend()
+            + "  ldsPerBlock=" + Device.sharedBytesPerBlock()
+            + "  optIn=" + Device.sharedBytesPerBlockOptIn());
+        System.stdout.println("q4kF16CoopN256Kernel registered: "
+            + Device.kernelAvailable("q4kF16CoopN256Kernel"));
+        // Llama-3.1-8B FFN gate/up: K=4096 -> outDim=14336
+        CoopTiming.shape(256L, 14336L, 4096L);
+        // the down projection: K=14336 -> outDim=4096
+        CoopTiming.shape(256L, 4096L, 14336L);
+        return 0;
+    }
+}
