@@ -99,7 +99,14 @@ run_suite() {
     local rc=${PIPESTATUS[0]}
     set -e
     local nocoop skipped
-    nocoop=$(grep -c "has no coop kernel" "$log" || true)
+    # Count the MARKER, not one suite's phrasing. This grepped for the
+    # literal "has no coop kernel" and therefore saw 1 of the 17 distinct
+    # device-skip messages in the tree — "has no batched device prefill",
+    # "no wave mat-vec on ...", "no device widen" and a dozen more were
+    # invisible to it, so a run could skip a dozen device paths and report
+    # one. Measured 2026-09-20. Every such message now carries
+    # [device-skip]; add the marker to a new one and it counts itself.
+    nocoop=$(grep -c "\[device-skip\]" "$log" || true)
     skipped=$(grep -c "xpu-kernel-skipped" "$log" || true)
     echo ">> ${label}: in-test device skips: ${nocoop} 'no coop kernel', ${skipped} 'xpu-kernel-skipped'"
     if [ "${nocoop}" != "0" ] || [ "${skipped}" != "0" ]; then
