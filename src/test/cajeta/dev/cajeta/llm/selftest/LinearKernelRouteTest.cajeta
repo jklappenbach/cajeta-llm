@@ -1210,6 +1210,109 @@ public class LinearKernelRouteTest {
         return;
     }
 
+    /** The Q6_K deqMw4 GEMM against dequantize-then-multiply on the HOST, on
+     *  whatever backend runs the suite. multiWaveQ6kDeqMw8AgreesWithDeqMw4
+     *  compares two device kernels with each other; this pins one of them to
+     *  ground truth, which is what caught the CPU software tile running every
+     *  wave shuffle as the width-1 identity (2026-09-23: each output column
+     *  read the activation at k == its own lane, a 30% error with sign flips
+     *  that two agreeing-but-wrong kernels could never expose). The bar is 3%
+     *  relative plus an absolute floor: the kernel multiplies q8-QUANTIZED
+     *  activations while the oracle uses the f32 ramp, which is a ~1% effect,
+     *  and the failure this guards is order-100%. */
+    @Test
+    public void deqMw4MatchesHostDequant() {
+        if (!Device.kernelAvailable("q6kWmmaDeqMw4Kernel")) {
+            System.stdout.println("  [device-skip] (skipped: q6 deqMw4 not "
+                + "available on " + Device.activeBackend() + ")");
+            return;
+        }
+        int32 rows = 256;
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        int32 ty = Quant.GG_Q6_K;
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be = (int64) Quant.blockElems(ty);
+        int64 bpr = ci / be;
+        int64 nBlocks = co * bpr;
+
+        int8[] fix #= File.readAllBytes(LinearKernelRouteTest.KQ + "q6_k.bin");
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 bi = 0;
+        while (bi < nBlocks) {
+            int64 src = (bi % fixBlocks) * bb;
+            int64 dst = bi * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            bi = bi + 1;
+        }
+        // Host dequant BEFORE raw is moved into the Linear.
+        float32[] w #= heap float32[nBlocks * be];
+        Quant.dequantize(ty, raw, 0L, nBlocks, w, 0L);
+
+        Linear lin = heap Linear(LinearKernelRouteTest.CI,
+            LinearKernelRouteTest.CO);
+        lin.bindPacked(#raw, ty);
+
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ci, 0L);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L,
+            (int64) rows * co);
+        QuantKernel.setRoutingEnabled(true);
+        Linear.setDeqPrefill(true);
+        Linear.setQ6Mw8(false);
+        Linear.setQ6Mw4(true);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap tap = heap PrefillTap();
+        Diag.register(tap);
+        lin.matmulInto(rows, got, 0L);
+        Diag.register(null);
+        Linear.setDeqPrefill(false);
+        if (!tap.sawContaining("batch-route", "q6 deqMw4")) {
+            Assert.fail("did not take deqMw4 route, saw "
+                + tap.namesOf("batch-route"));
+        }
+
+        // got[t*co+o] vs sum_k w[o*ci+k] * x[t*ci+k], every cell.
+        float32 worst = 0.0f;
+        int64 worstAt = -1L;
+        float32 worstGot = 0.0f;
+        float32 worstWant = 0.0f;
+        int64 t = 0;
+        while (t < (int64) rows) {
+            int64 o = 0;
+            while (o < co) {
+                float32 acc = 0.0f;
+                int64 k = 0;
+                while (k < ci) {
+                    acc = acc + w[o * ci + k] * x.flatGet(t * ci + k);
+                    k = k + 1;
+                }
+                float32 g = got.flatGet(t * co + o);
+                float32 diff = g - acc;
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = acc < 0.0f ? 0.0f - acc : acc;
+                float32 rel = diff / (mag * 0.03f + 0.01f);
+                if (rel > worst) {
+                    worst = rel; worstAt = t * co + o;
+                    worstGot = g; worstWant = acc;
+                }
+                o = o + 1;
+            }
+            t = t + 1;
+        }
+        if (worst > 1.0f) {
+            Assert.fail("q6 deqMw4 vs host dequant at [" + (worstAt / co)
+                + "," + (worstAt % co) + "]: kernel " + worstGot
+                + " vs host " + worstWant + " (" + Device.activeBackend()
+                + ")");
+        }
+        System.stdout.println("   q6 deqMw4 matches host dequant on "
+            + Device.activeBackend() + " (worst " + worst + " of the 3% bar)");
+        return;
+    }
+
     /** A fingerprint of one format's batched deq route: an order-sensitive
      *  fold of the output bits plus samples from both ends, so a re-tiling
      *  that permutes stores is caught as surely as one that changes values.
