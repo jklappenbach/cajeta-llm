@@ -10,6 +10,7 @@ import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
 
 /**
  * The batched (prefill) coop GEMM, for EVERY quantization the engine
@@ -408,6 +409,117 @@ public class CoopQuantGemmTest {
     @Test
     public void coopGemmQ6KMatchesHost() {
         CoopQuantGemmTest.checkFormat(Quant.GG_Q6_K, "q6_k.bin");
+    }
+
+    /**
+     * 7.4.X — the shared int8 widen in ISOLATION. Both Q6_K deq GEMMs
+     * (Mw4 and Mw8) read the buffer q6kWiden produces; the coop GEMM
+     * decodes the packed weights directly and does not. So a widen that
+     * lowers wrong on a backend makes BOTH deq GEMMs wrong while the coop
+     * GEMM stays right — exactly the shape of the deqMw4/deqMw8 CPU
+     * divergence. This pins the widen against a host oracle over the SAME
+     * split bytes, so a mismatch localizes the fault to the widen
+     * lowering itself rather than to a downstream reader.
+     */
+    @Test
+    public void q6kWidenMatchesHost() {
+        if (!Device.kernelAvailable("q6kWidenKernel")) {
+            System.stdout.println("  [device-skip] (skipped: backend "
+                + Device.activeBackend() + " has no q6kWidenKernel)");
+            return;
+        }
+        int32 ty = Quant.GG_Q6_K;
+        int64 cols = CoopQuantGemmTest.COLS;
+        int64 outDim = CoopQuantGemmTest.OUT;
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be = (int64) Quant.blockElems(ty);
+        int64 bpr = cols / be;
+        int64 nBlocks = outDim * bpr;
+
+        int8[] fix #= File.readAllBytes(CoopQuantGemmTest.DIR + "q6_k.bin");
+        int64 fixBlocks = (int64) fix.count() / bb;
+        Assert.isTrue(fixBlocks > 0L);
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+
+        int64 rowRes = Quant.rowResidentBytes(ty, bpr);
+        int8[] resH #= heap int8[outDim * rowRes];
+        Quant.splitInto(ty, raw, 0L, outDim, bpr, resH, 0L);
+
+        KernelBuffer<int8> packed #= heap KernelBuffer<int8>(
+            (uint64) (outDim * rowRes));
+        packed.upload(resH);
+        KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>(
+            (uint64) (outDim * cols));
+        WmmaKernel.q6kWidenLaunch(deqDev, packed, outDim, cols);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int8[] deq #= heap int8[outDim * cols];
+        deqDev.download(deq, outDim * cols);
+
+        // Host oracle: the exact q6kWidenKernel decode and tile-major
+        // placement, over the SAME resH bytes the kernel read.
+        int8[] ref #= heap int8[outDim * cols];
+        int64 pfx = ((bpr * 2L + 3L) / 4L) * 4L;
+        int64 tilesK = bpr * 16L;
+        int64 ii = 0;
+        while (ii < outDim) {
+            int64 rowBase = ii * (pfx + bpr * 208L) + pfx;
+            int64 tI = ii / 16L;
+            int64 iIn = ii % 16L;
+            int64 bl = 0;
+            while (bl < bpr) {
+                int64 base = rowBase + bl * 208L;
+                int64 byteIdx = 0;
+                while (byteIdx < 128L) {
+                    int32 qlb = (int32) resH[base + byteIdx] & 255;
+                    int64 h = byteIdx / 64L;
+                    int64 l64 = byteIdx % 64L;
+                    int32 qhb = (int32) resH[base + 128L + 32L * h
+                        + (l64 % 32L)] & 255;
+                    int32 sh = (int32) (2L * (l64 / 32L));
+                    int32 vLo = ((qlb & 15) | (((qhb >> sh) & 3) << 4)) - 32;
+                    int32 vHi = (((qlb >> 4) & 15)
+                        | (((qhb >> (sh + 4)) & 3) << 4)) - 32;
+                    int64 kLo = bl * 256L + (128L * h + l64);
+                    int64 kHi = kLo + 64L;
+                    ref[(tI * tilesK + kLo / 16L) * 256L
+                        + iIn * 16L + (kLo % 16L)] = (int8) vLo;
+                    ref[(tI * tilesK + kHi / 16L) * 256L
+                        + iIn * 16L + (kHi % 16L)] = (int8) vHi;
+                    byteIdx = byteIdx + 1L;
+                }
+                bl = bl + 1L;
+            }
+            ii = ii + 1L;
+        }
+
+        int64 bad = 0L;
+        int64 firstAt = -1L;
+        int64 i = 0;
+        while (i < outDim * cols) {
+            if (deq[i] != ref[i]) {
+                if (firstAt < 0L) { firstAt = i; }
+                bad = bad + 1L;
+            }
+            i = i + 1L;
+        }
+        if (bad != 0L) {
+            Assert.fail("q6kWiden ty=q6_k: " + bad + " of "
+                + (outDim * cols) + " widened bytes differ from host oracle;"
+                + " first at " + firstAt + " kernel="
+                + (int64) deq[firstAt] + " host=" + (int64) ref[firstAt]);
+        }
+        System.stdout.println("   q6kWiden matches host oracle on "
+            + Device.activeBackend() + " (" + (outDim * cols) + " bytes)");
+        return;
     }
 
     @Test
