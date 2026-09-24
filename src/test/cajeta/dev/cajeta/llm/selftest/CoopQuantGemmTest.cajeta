@@ -1,6 +1,7 @@
 package dev.cajeta.llm.selftest;
 
 import cajeta.io.file.File;
+import cajeta.error.RecoverableException;
 import cajeta.lang.String;
 import cajeta.lang.System;
 import cajeta.xpu.Device;
@@ -73,7 +74,20 @@ public class CoopQuantGemmTest {
      * needs only cols % 64 == 0), which is the width class Qwen-72B's
      * ffn_down lives in (29568 % 256 == 128). 1152 has the same residue.
      */
-    static void checkFormatAt(int32 ty, String fixture, int64 cols) {
+    /**
+     * The general shape: `rows` tokens against `out` output rows over `cols`.
+     * The Auto router picks a kernel from this shape, so the shape IS the
+     * choice of kernel: cols above 8192 is the X1 tile, rows below 128 the
+     * M64 tile, an `out` that is not a multiple of 128 the block-128 tile.
+     */
+    static void checkShape(int32 ty, String fixture, int64 rows, int64 out,
+            int64 cols) {
+        CoopQuantGemmTest.checkShapeVia(ty, fixture, rows, out, cols, false);
+    }
+
+    /** `direct128`: launch the block-128 tile by name instead of the router. */
+    static void checkShapeVia(int32 ty, String fixture, int64 rows, int64 out,
+            int64 cols, boolean direct128) {
         if (!CoopQuantGemmTest.coopHere()) {
             System.stdout.println("  [device-skip] (skipped: backend "
                 + Device.activeBackend() + " has no coop kernel)");
@@ -82,7 +96,7 @@ public class CoopQuantGemmTest {
         int64 bb = (int64) Quant.blockBytes(ty);
         int64 be = (int64) Quant.blockElems(ty);
         int64 blocksPerRow = cols / be;
-        int64 nBlocks = CoopQuantGemmTest.OUT * blocksPerRow;
+        int64 nBlocks = out * blocksPerRow;
 
         int8[] fix #= File.readAllBytes(CoopQuantGemmTest.DIR + fixture);
         int64 fixBlocks = (int64) fix.count() / bb;
@@ -99,10 +113,10 @@ public class CoopQuantGemmTest {
 
         // Mixed signs and magnitudes: an all-positive x hides sign
         // handling in the widen, a constant x hides lane misordering.
-        float32[] x #= heap float32[CoopQuantGemmTest.ROWS
+        float32[] x #= heap float32[rows
             * cols];
         int64 i = 0;
-        while (i < CoopQuantGemmTest.ROWS * cols) {
+        while (i < rows * cols) {
             x[i] = (float32) ((i * 31L + 7L) % 61L - 30L) * 0.0625f;
             i = i + 1;
         }
@@ -111,14 +125,14 @@ public class CoopQuantGemmTest {
             (uint64) (nBlocks * bb));
         wD.upload(raw);
         KernelBuffer<float32> xfD #= heap KernelBuffer<float32>(
-            (uint64) (CoopQuantGemmTest.ROWS * cols));
+            (uint64) (rows * cols));
         xfD.upload(x);
         KernelBuffer<float16> xhD #= heap KernelBuffer<float16>(
-            (uint64) (CoopQuantGemmTest.ROWS * cols));
+            (uint64) (rows * cols));
         QuantKernel.f32ToF16LaunchNoSync(xhD, xfD,
-            CoopQuantGemmTest.ROWS * cols);
+            rows * cols);
         KernelBuffer<float32> yD #= heap KernelBuffer<float32>(
-            (uint64) (CoopQuantGemmTest.ROWS * CoopQuantGemmTest.OUT));
+            (uint64) (rows * out));
         KernelStream s = QuantKernel.stream();
         s.sync();
 
@@ -128,7 +142,7 @@ public class CoopQuantGemmTest {
         int64 dw = (int64) QuantKernel.coopBlockWords(ty);
         int64 padBytes = nBlocks * dw * 4L;
         if (Quant.splitOn(ty)) {
-            padBytes = CoopQuantGemmTest.OUT
+            padBytes = out
                 * Quant.rowResidentBytes(ty, blocksPerRow);
         }
         KernelBuffer<int8> padD #= heap KernelBuffer<int8>((uint64) padBytes);
@@ -145,12 +159,18 @@ public class CoopQuantGemmTest {
         }
         KernelBuffer<int32> wW #= CoopQuantGemmTest.coopView(ty, wD, padD);
 
-        QuantKernel.coopBatchLaunchNoSync(ty, yD, wW, xhD,
-            CoopQuantGemmTest.ROWS, CoopQuantGemmTest.OUT,
-            cols);
+        if (direct128 && ty == Quant.GG_Q4_K) {
+            QuantKernel.q4kF16CoopLaunchNoSync(yD, wW, xhD, rows, out, cols);
+        } else if (direct128 && ty == Quant.GG_Q6_K) {
+            QuantKernel.q6kF16CoopLaunchNoSync(yD, wW, xhD, rows, out, cols);
+        } else {
+            QuantKernel.coopBatchLaunchNoSync(ty, yD, wW, xhD,
+                rows, out,
+                cols);
+        }
         s.sync();
-        float32[] got #= heap float32[CoopQuantGemmTest.ROWS
-            * CoopQuantGemmTest.OUT];
+        float32[] got #= heap float32[rows
+            * out];
         yD.download(got);
 
         float32[] w #= heap float32[nBlocks * be];
@@ -162,9 +182,9 @@ public class CoopQuantGemmTest {
         float32 worstGot = 0.0f;
         float32 worstWant = 0.0f;
         int64 t = 0;
-        while (t < CoopQuantGemmTest.ROWS) {
+        while (t < rows) {
             int64 o = 0;
-            while (o < CoopQuantGemmTest.OUT) {
+            while (o < out) {
                 float32 acc = 0.0f;
                 int64 k = 0;
                 while (k < cols) {
@@ -172,7 +192,7 @@ public class CoopQuantGemmTest {
                         * x[t * cols + k];
                     k = k + 1;
                 }
-                float32 g = got[t * CoopQuantGemmTest.OUT + o];
+                float32 g = got[t * out + o];
                 if (g != 0.0f) { live = true; }
                 float32 diff = acc - g;
                 if (diff < 0.0f) { diff = 0.0f - diff; }
@@ -181,7 +201,7 @@ public class CoopQuantGemmTest {
                     / ((float64) mag * 0.01 + 0.01);
                 if (rel > worst) {
                     worst = rel;
-                    worstAt = t * CoopQuantGemmTest.OUT + o;
+                    worstAt = t * out + o;
                     worstGot = g;
                     worstWant = acc;
                 }
@@ -194,14 +214,41 @@ public class CoopQuantGemmTest {
         // rounding and three below any indexing slip.
         if (worst > 1.0) {
             Assert.fail("coop GEMM ty=" + ty + " at ["
-                + (worstAt / CoopQuantGemmTest.OUT) + ","
-                + (worstAt % CoopQuantGemmTest.OUT) + "]: kernel "
+                + (worstAt / out) + ","
+                + (worstAt % out) + "]: kernel "
                 + worstGot + " vs host dequant-and-multiply " + worstWant);
         }
         if (!live) {
             Assert.fail("coop GEMM ty=" + ty + ": every output is zero, "
                 + "which is what a kernel that never ran produces");
         }
+    }
+
+    static void checkFormatAt(int32 ty, String fixture, int64 cols) {
+        CoopQuantGemmTest.checkShape(ty, fixture, CoopQuantGemmTest.ROWS,
+            CoopQuantGemmTest.OUT, cols);
+    }
+
+    /**
+     * Unit 6 of the xpu-kernel-adaptor plan: a test that claims to reach a
+     * kernel proves it from the runtime's launch census, so a route that
+     * quietly picked another variant cannot pass as coverage.
+     */
+    static void expectReached(String kernel, int64 before) {
+        if (!CoopQuantGemmTest.coopHere()) { return; }
+        int64 now = Device.kernelLaunchCount(kernel);
+        if (now <= before) {
+            Assert.fail("the route did not reach " + kernel + " (launch count "
+                + before + " -> " + now + ")");
+        }
+    }
+
+    /** K above 8192 routes to the X1 tile on every format's Auto launcher. */
+    static void checkX1(int32 ty, String fixture, String kernel) {
+        int64 before = Device.kernelLaunchCount(kernel);
+        CoopQuantGemmTest.checkShape(ty, fixture, CoopQuantGemmTest.ROWS,
+            CoopQuantGemmTest.OUT, 8448L);
+        CoopQuantGemmTest.expectReached(kernel, before);
     }
 
     /**
@@ -703,5 +750,141 @@ public class CoopQuantGemmTest {
             Assert.isTrue(m.contains("5"));
         }
         Assert.isTrue(threw);
+    }
+
+    // ── Unit 6: the shapes the engine dispatches that no test used to ─────
+    //
+    // The 8B model's ffn_down has K=14336, and every Auto router sends
+    // K > 8192 to its X1 tile; the suite only ever used K=256 and K=1152, so
+    // every X1 kernel was registered and never launched. 8448 is the
+    // smallest K above the switch that every block size divides.
+
+    @Test
+    public void coopGemmQ4KAtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q4_K, "q4_k.bin", "q4kF16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmQ6KAtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q6_K, "q6_k.bin", "q6kF16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmQ5KAtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q5_K, "q5_k.bin", "q5kF16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmQ3KAtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q3_K, "q3_k.bin", "q3kF16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmQ2KAtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q2_K, "q2_k.bin", "q2kF16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmQ80AtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q8_0, "q8_0.bin", "q80F16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmQ50AtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q5_0, "q5_0.bin", "q50F16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmQ40AtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q4_0, "q4_0.bin", "q40F16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmQ41AtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q4_1, "q4_1.bin", "q41F16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmQ51AtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_Q5_1, "q5_1.bin", "q51F16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmIq4nlAtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_IQ4_NL, "iq4_nl.bin", "iq4nlF16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmIq4xsAtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_IQ4_XS, "iq4_xs.bin", "iq4xsF16CoopX1Kernel");
+    }
+
+    // Fewer than 128 tokens: wgL is 0 and the router takes the M64 tile.
+    @Test
+    public void coopGemmQ4KAt64RowsTakesM64AndMatchesHost() {
+        int64 before = Device.kernelLaunchCount("q4kF16CoopM64Kernel");
+        CoopQuantGemmTest.checkShape(Quant.GG_Q4_K, "q4_k.bin", 64L,
+            CoopQuantGemmTest.OUT, CoopQuantGemmTest.COLS);
+        CoopQuantGemmTest.expectReached("q4kF16CoopM64Kernel", before);
+    }
+    @Test
+    public void coopGemmQ6KAt64RowsTakesM64AndMatchesHost() {
+        int64 before = Device.kernelLaunchCount("q6kF16CoopM64Kernel");
+        CoopQuantGemmTest.checkShape(Quant.GG_Q6_K, "q6_k.bin", 64L,
+            CoopQuantGemmTest.OUT, CoopQuantGemmTest.COLS);
+        CoopQuantGemmTest.expectReached("q6kF16CoopM64Kernel", before);
+    }
+
+    // An output width that is not a multiple of 128 but is one of 64: the
+    // router takes the 64-row tile whatever the tile count. It used to take
+    // the block-128 tile past 64 tiles, which computes whole tiles only and
+    // left rows 8192..8255 of this very shape ZERO (measured 2026-09-24).
+    @Test
+    public void coopGemmQ4KAtOut8256TakesM64AndMatchesEveryRow() {
+        int64 before = Device.kernelLaunchCount("q4kF16CoopM64Kernel");
+        CoopQuantGemmTest.checkShape(Quant.GG_Q4_K, "q4_k.bin",
+            CoopQuantGemmTest.ROWS, 8256L, CoopQuantGemmTest.COLS);
+        CoopQuantGemmTest.expectReached("q4kF16CoopM64Kernel", before);
+    }
+    @Test
+    public void coopGemmQ6KAtOut8256TakesM64AndMatchesEveryRow() {
+        int64 before = Device.kernelLaunchCount("q6kF16CoopM64Kernel");
+        CoopQuantGemmTest.checkShape(Quant.GG_Q6_K, "q6_k.bin",
+            CoopQuantGemmTest.ROWS, 8256L, CoopQuantGemmTest.COLS);
+        CoopQuantGemmTest.expectReached("q6kF16CoopM64Kernel", before);
+    }
+
+    // The block-128 tile itself, launched by name at the one shape it
+    // computes whole, against the host.
+    @Test
+    public void coopBlock128Q4KLaunchedDirectlyMatchesHost() {
+        int64 before = Device.kernelLaunchCount("q4kF16CoopKernel");
+        CoopQuantGemmTest.checkShapeVia(Quant.GG_Q4_K, "q4_k.bin",
+            CoopQuantGemmTest.ROWS, CoopQuantGemmTest.OUT, CoopQuantGemmTest.COLS, true);
+        CoopQuantGemmTest.expectReached("q4kF16CoopKernel", before);
+    }
+    @Test
+    public void coopBlock128Q6KLaunchedDirectlyMatchesHost() {
+        int64 before = Device.kernelLaunchCount("q6kF16CoopKernel");
+        CoopQuantGemmTest.checkShapeVia(Quant.GG_Q6_K, "q6_k.bin",
+            CoopQuantGemmTest.ROWS, CoopQuantGemmTest.OUT, CoopQuantGemmTest.COLS, true);
+        CoopQuantGemmTest.expectReached("q6kF16CoopKernel", before);
+    }
+
+    // A shape no tile computes whole is REFUSED, never answered in part.
+    @Test
+    public void theCoopRouterRefusesAnOutputWidthNoTileComputesWhole() {
+        if (!CoopQuantGemmTest.coopHere()) {
+            System.stdout.println("  [device-skip] (skipped: backend "
+                + Device.activeBackend() + " has no coop kernel)");
+            return;
+        }
+        boolean refused = false;
+        try {
+            CoopQuantGemmTest.checkShape(Quant.GG_Q4_K, "q4_k.bin",
+                CoopQuantGemmTest.ROWS, 8200L, CoopQuantGemmTest.COLS);
+        } catch (RecoverableException e) {
+            refused = true;
+        }
+        Assert.isTrue(refused);
+    }
+
+    // The ternary formats' X1 tiles, through the same router switch.
+    @Test
+    public void coopGemmTq20AtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_TQ2_0, "tq2_0.bin", "tq20F16CoopX1Kernel");
+    }
+    @Test
+    public void coopGemmTq10AtK8448TakesX1AndMatchesHost() {
+        CoopQuantGemmTest.checkX1(Quant.GG_TQ1_0, "tq1_0.bin", "tq10F16CoopX1Kernel");
     }
 }

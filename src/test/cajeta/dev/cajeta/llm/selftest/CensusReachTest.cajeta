@@ -1,0 +1,582 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.io.file.File;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+import dev.cajeta.llm.model.Prim;
+
+/**
+ * Unit 6 of the xpu-kernel-adaptor plan: the kernels the census found
+ * registered and never launched under a test, each against a host
+ * reference. Exact where the arithmetic is a copy or a fixed-order float
+ * sum; the coop GEMM's one-percent bar where activations are quantized
+ * (the MMQ and int8 batch kernels), stated at the assertion.
+ *
+ * Every kernel here is SHIPPED code: either the engine launches it on some
+ * backend or route (the int8 MMQ tiles on Vulkan, the block pad on a
+ * format that needs a repack, the fused GLU and the QKV split in the batched
+ * prefill), or nothing launches it at all and the plan's 6.4.1 asks whether
+ * it should exist. A kernel that is correct on one vendor and wrong on
+ * another is a failure, so each is tested wherever the suite runs.
+ */
+public class CensusReachTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+
+    public CensusReachTest() { return; }
+
+    static boolean deviceHere() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) {
+            System.stdout.println("  [device-skip] (skipped: no XPU backend)");
+            return false;
+        }
+        return true;
+    }
+
+    /** `nBlocks` blocks of the fixture, tiled. */
+    static #int8[] tiled(int32 ty, String fixture, int64 nBlocks) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int8[] fix #= File.readAllBytes(CensusReachTest.DIR + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        Assert.isTrue(fixBlocks > 0L);
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        return #raw;
+    }
+
+    static #float32[] ramp(int64 n) {
+        float32[] x #= heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            x[i] = (float32) ((i * 31L + 7L) % 61L - 30L) * 0.0625f;
+            i = i + 1;
+        }
+        return #x;
+    }
+
+    /** The coop GEMM's bar: 1% relative plus a 0.01 absolute floor. */
+    static void nearOnePercent(float32[] want, float32[] got, int64 n, String what) {
+        boolean live = false;
+        int64 i = 0;
+        while (i < n) {
+            float32 g = got[i];
+            if (g != 0.0f) { live = true; }
+            float32 diff = want[i] - g;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = want[i] < 0.0f ? 0.0f - want[i] : want[i];
+            float64 rel = (float64) diff / ((float64) mag * 0.01 + 0.01);
+            if (rel > 1.0) {
+                Assert.fail(what + " at [" + i + "]: kernel " + g
+                    + " vs host " + want[i]);
+            }
+            i = i + 1;
+        }
+        if (!live) {
+            Assert.fail(what + ": every output is zero, which is what a "
+                + "kernel that never ran produces");
+        }
+    }
+
+    static void exactBytes(int8[] want, int8[] got, int64 n, String what) {
+        int64 i = 0;
+        while (i < n) {
+            if (want[i] != got[i]) {
+                Assert.fail(what + ": byte " + i + " is " + (int32) got[i]
+                    + ", host says " + (int32) want[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── the block pad and repack (Linear.ensureCoopW's one-time repacks) ──
+
+    @Test
+    public void blockPadCopiesEachBlockToItsPaddedStride() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int64 nBlocks = 37L;
+        int32 sb = 110;   // Q3_K
+        int32 db = 112;
+        int8[] src #= heap int8[nBlocks * (int64) sb];
+        int64 i = 0;
+        while (i < nBlocks * (int64) sb) { src[i] = (int8) ((i * 7L + 3L) & 255L); i = i + 1; }
+        int8[] want #= heap int8[nBlocks * (int64) db];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 j = 0;
+            while (j < (int64) sb) { want[b * (int64) db + j] = src[b * (int64) sb + j]; j = j + 1; }
+            b = b + 1;
+        }
+        KernelBuffer<int8> sD #= heap KernelBuffer<int8>((uint64) (nBlocks * (int64) sb));
+        sD.upload(src);
+        KernelBuffer<int8> dD #= heap KernelBuffer<int8>((uint64) (nBlocks * (int64) db));
+        int8[] zero #= heap int8[nBlocks * (int64) db];
+        dD.upload(zero);
+        QuantKernel.blockPadLaunch(dD, sD, nBlocks, sb, db);
+        int8[] got #= heap int8[nBlocks * (int64) db];
+        dD.download(got);
+        // The two pad bytes per block are not written; compare the copied ones.
+        b = 0;
+        while (b < nBlocks) {
+            int64 j = 0;
+            while (j < (int64) sb) {
+                int64 k = b * (int64) db + j;
+                if (want[k] != got[k]) {
+                    Assert.fail("blockPad block " + b + " byte " + j + ": " + (int32) got[k]
+                        + " vs " + (int32) want[k]);
+                }
+                j = j + 1;
+            }
+            b = b + 1;
+        }
+    }
+
+    @Test
+    public void blockRepack2MovesThePayloadToOffsetFour() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int64 nBlocks = 41L;
+        int32 sb = 18;    // Q4_0: f16 d + 16 payload bytes
+        int32 db = 20;
+        int8[] src #= heap int8[nBlocks * (int64) sb];
+        int64 i = 0;
+        while (i < nBlocks * (int64) sb) { src[i] = (int8) ((i * 11L + 5L) & 255L); i = i + 1; }
+        KernelBuffer<int8> sD #= heap KernelBuffer<int8>((uint64) (nBlocks * (int64) sb));
+        sD.upload(src);
+        KernelBuffer<int8> dD #= heap KernelBuffer<int8>((uint64) (nBlocks * (int64) db));
+        int8[] fill #= heap int8[nBlocks * (int64) db];
+        i = 0;
+        while (i < nBlocks * (int64) db) { fill[i] = (int8) 77; i = i + 1; }
+        dD.upload(fill);
+        QuantKernel.blockRepack2Launch(dD, sD, nBlocks, sb, db);
+        int8[] got #= heap int8[nBlocks * (int64) db];
+        dD.download(got);
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 so = b * (int64) sb;
+            int64 dof = b * (int64) db;
+            Assert.equals((int64) src[so], (int64) got[dof]);
+            Assert.equals((int64) src[so + 1L], (int64) got[dof + 1L]);
+            Assert.equals(0L, (int64) got[dof + 2L]);
+            Assert.equals(0L, (int64) got[dof + 3L]);
+            int64 j = 0;
+            while (j < (int64) sb - 2L) {
+                if (src[so + 2L + j] != got[dof + 4L + j]) {
+                    Assert.fail("blockRepack2 block " + b + " payload byte " + j);
+                }
+                j = j + 1;
+            }
+            b = b + 1;
+        }
+    }
+
+    // ── the int8 concat and slice (fused gate/up packing, resident slices) ─
+
+    @Test
+    public void concatI8ThenSliceI8RoundTrips() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int64 an = 1000L;
+        int64 bn = 300L;
+        int8[] a #= heap int8[an];
+        int8[] b #= heap int8[bn];
+        int64 i = 0;
+        while (i < an) { a[i] = (int8) ((i * 3L) & 255L); i = i + 1; }
+        i = 0;
+        while (i < bn) { b[i] = (int8) ((i * 5L + 1L) & 255L); i = i + 1; }
+        KernelBuffer<int8> aD #= heap KernelBuffer<int8>((uint64) an);
+        aD.upload(a);
+        KernelBuffer<int8> bD #= heap KernelBuffer<int8>((uint64) bn);
+        bD.upload(b);
+        KernelBuffer<int8> cat #= heap KernelBuffer<int8>((uint64) (an + bn));
+        WmmaKernel.concatI8Launch(cat, aD, an, 0L);
+        WmmaKernel.concatI8Launch(cat, bD, bn, an);
+        KernelBuffer<int8> back #= heap KernelBuffer<int8>((uint64) bn);
+        WmmaKernel.sliceI8Launch(back, cat, bn, an);
+        QuantKernel.stream().sync();
+        int8[] gotCat #= heap int8[an + bn];
+        cat.download(gotCat);
+        int8[] wantCat #= heap int8[an + bn];
+        i = 0;
+        while (i < an) { wantCat[i] = a[i]; i = i + 1; }
+        i = 0;
+        while (i < bn) { wantCat[an + i] = b[i]; i = i + 1; }
+        CensusReachTest.exactBytes(wantCat, gotCat, an + bn, "concatI8");
+        int8[] gotBack #= heap int8[bn];
+        back.download(gotBack);
+        CensusReachTest.exactBytes(b, gotBack, bn, "sliceI8");
+    }
+
+    // ── the MoE weighted combine (unit 40's epilogue) ────────────────────
+
+    @Test
+    public void moeCombineIsTheWeightedSumOfExpertRows() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int64 used = 4L;
+        int64 n = 1000L;
+        float32[] rows #= CensusReachTest.ramp(used * n);
+        float32[] w #= heap float32[used];
+        w[0] = 0.5f; w[1] = 0.25f; w[2] = 0.125f; w[3] = 0.125f;
+        float32[] want #= heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            float32 acc = 0.0f;
+            int64 k = 0;
+            while (k < used) { acc = acc + w[k] * rows[k * n + i]; k = k + 1; }
+            want[i] = acc;
+            i = i + 1;
+        }
+        KernelBuffer<float32> rD #= heap KernelBuffer<float32>((uint64) (used * n));
+        rD.upload(rows);
+        KernelBuffer<float32> wD #= heap KernelBuffer<float32>((uint64) used);
+        wD.upload(w);
+        KernelBuffer<float32> oD #= heap KernelBuffer<float32>((uint64) n);
+        QuantKernel.moeCombineLaunchNoSync(oD, rD, wD, used, n);
+        QuantKernel.stream().sync();
+        float32[] got #= heap float32[n];
+        oD.download(got);
+        // Same operands in the same order: the f32 sums are identical.
+        i = 0;
+        while (i < n) {
+            if (got[i] != want[i]) {
+                Assert.fail("moeCombine[" + i + "]: " + got[i] + " vs " + want[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    // ── the batched-prefill elementwise kernels (Prim) ───────────────────
+
+    @Test
+    public void scaleF32ScalesEveryElement() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int64 n = 777L;
+        float32[] x #= CensusReachTest.ramp(n);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) n);
+        yD.upload(x);
+        Prim.scaleDevice(yD, 0.375f, n);
+        QuantKernel.stream().sync();
+        float32[] got #= heap float32[n];
+        yD.download(got);
+        int64 i = 0;
+        while (i < n) {
+            if (got[i] != x[i] * 0.375f) {
+                Assert.fail("scaleF32[" + i + "]: " + got[i] + " vs " + (x[i] * 0.375f));
+            }
+            i = i + 1;
+        }
+    }
+
+    /** The fused gate/up GLU against the host, for both activations. */
+    static void gluFused(int32 act) {
+        int64 rows = 3L;
+        int64 inter = 40L;
+        float32[] src #= CensusReachTest.ramp(rows * 2L * inter);
+        float32[] want #= heap float32[rows * inter];
+        int64 r = 0;
+        while (r < rows) {
+            int64 c = 0;
+            while (c < inter) {
+                float32 x = src[r * (2L * inter) + c];
+                float32 a = 0.0f;
+                if (act == 1) {
+                    float32 t = 0.7978845608f * (x + 0.044715f * x * x * x);
+                    float32 th = 1.0f - 2.0f / (Math.exp(2.0f * t) + 1.0f);
+                    a = 0.5f * x * (1.0f + th);
+                } else {
+                    a = x / (1.0f + Math.exp(0.0f - x));
+                }
+                want[r * inter + c] = a * src[r * (2L * inter) + inter + c];
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+        KernelBuffer<float32> sD #= heap KernelBuffer<float32>((uint64) (rows * 2L * inter));
+        sD.upload(src);
+        KernelBuffer<float32> oD #= heap KernelBuffer<float32>((uint64) (rows * inter));
+        Prim.gluFusedDevice(oD, sD, rows, inter, act);
+        QuantKernel.stream().sync();
+        float32[] got #= heap float32[rows * inter];
+        oD.download(got);
+        // exp() differs in the last bits between host and device libm, so
+        // the bar is 1e-5 relative, far under any indexing slip.
+        int64 i = 0;
+        while (i < rows * inter) {
+            float32 d = got[i] - want[i];
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 m = want[i] < 0.0f ? 0.0f - want[i] : want[i];
+            if (d > m * 1.0e-5f + 1.0e-6f) {
+                Assert.fail("gluFusedF32 act=" + act + " [" + i + "]: " + got[i] + " vs " + want[i]);
+            }
+            i = i + 1;
+        }
+    }
+
+    @Test
+    public void gluFusedF32MatchesTheHostForSiluAndGelu() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        CensusReachTest.gluFused(0);
+        CensusReachTest.gluFused(1);
+    }
+
+    @Test
+    public void splitRows3F32SplitsTheFusedQkvRows() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int64 rows = 5L;
+        int64 aW = 64L;
+        int64 bW = 16L;
+        int64 cW = 16L;
+        int64 tot = aW + bW + cW;
+        float32[] src #= CensusReachTest.ramp(rows * tot);
+        KernelBuffer<float32> sD #= heap KernelBuffer<float32>((uint64) (rows * tot));
+        sD.upload(src);
+        KernelBuffer<float32> aD #= heap KernelBuffer<float32>((uint64) (rows * aW));
+        KernelBuffer<float32> bD #= heap KernelBuffer<float32>((uint64) (rows * bW));
+        KernelBuffer<float32> cD #= heap KernelBuffer<float32>((uint64) (rows * cW));
+        Prim.splitRows3Device(aD, bD, cD, sD, rows, aW, bW, cW);
+        QuantKernel.stream().sync();
+        float32[] a #= heap float32[rows * aW];
+        float32[] b #= heap float32[rows * bW];
+        float32[] c #= heap float32[rows * cW];
+        aD.download(a);
+        bD.download(b);
+        cD.download(c);
+        int64 r = 0;
+        while (r < rows) {
+            int64 j = 0;
+            while (j < tot) {
+                float32 v = src[r * tot + j];
+                float32 g = 0.0f;
+                if (j < aW) { g = a[r * aW + j]; }
+                else if (j < aW + bW) { g = b[r * bW + (j - aW)]; }
+                else { g = c[r * cW + (j - aW - bW)]; }
+                if (g != v) {
+                    Assert.fail("splitRows3 row " + r + " col " + j + ": " + g + " vs " + v);
+                }
+                j = j + 1;
+            }
+            r = r + 1;
+        }
+    }
+
+    // ── the interleaved Q4_K mat-vec: BIT-IDENTICAL to the plain one ─────
+
+    @Test
+    public void q4kInterleavedMatVecIsBitIdenticalToThePlainOne() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int32 ty = Quant.GG_Q4_K;
+        // The interleave GROUP equals the launch block (ROWS_PER_BLOCK = 64):
+        // the kernel receives it as `grp` and walks 16-byte chunks 16*grp apart.
+        int64 grp = 64L;
+        int64 rows = 128L;
+        int64 cols = 512L;
+        int64 bpr = cols / 256L;
+        int64 rowBytes = bpr * (int64) Quant.blockBytes(ty);
+        int8[] raw #= CensusReachTest.tiled(ty, "q4_k.bin", rows * bpr);
+        int64 ilBytes = Quant.interleavedBytes(rows, rowBytes, grp);
+        int8[] il #= heap int8[ilBytes];
+        Quant.interleaveRows16(raw, il, rows, rowBytes, grp);
+        float32[] x #= CensusReachTest.ramp(cols);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) (rows * rowBytes));
+        wD.upload(raw);
+        KernelBuffer<int8> ilD #= heap KernelBuffer<int8>((uint64) ilBytes);
+        ilD.upload(il);
+        KernelBuffer<float32> xD #= heap KernelBuffer<float32>((uint64) cols);
+        xD.upload(x);
+        KernelBuffer<float32> yPlain #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<float32> yIl #= heap KernelBuffer<float32>((uint64) rows);
+        QuantKernel.q4kMatVecLaunch(yPlain, wD, xD, rows, cols, 0L, 0L);
+        QuantKernel.q4kILMatVecLaunch(yIl, ilD, xD, rows, cols, 0L, 0L);
+        float32[] a #= heap float32[rows];
+        float32[] b #= heap float32[rows];
+        yPlain.download(a);
+        yIl.download(b);
+        boolean live = false;
+        int64 r = 0;
+        while (r < rows) {
+            if (a[r] != 0.0f) { live = true; }
+            if (a[r] != b[r]) {
+                Assert.fail("q4kMatVecKernelIL row " + r + ": " + b[r]
+                    + " vs plain " + a[r] + " — the same arithmetic must give the same bits");
+            }
+            r = r + 1;
+        }
+        Assert.isTrue(live);
+    }
+
+    // ── the int8 MMQ tiles (Linear's Vulkan route) and the int8 batch-4 ──
+
+    /** Host reference for a [rows x cols] activation against `out` weight rows. */
+    static #float32[] hostGemm(int32 ty, int8[] raw, int64 nBlocks, float32[] x,
+            int64 rows, int64 out, int64 cols) {
+        int64 be = (int64) Quant.blockElems(ty);
+        float32[] w #= heap float32[nBlocks * be];
+        Quant.dequantize(ty, raw, 0L, nBlocks, w, 0L);
+        float32[] want #= heap float32[rows * out];
+        int64 t = 0;
+        while (t < rows) {
+            int64 o = 0;
+            while (o < out) {
+                float32 acc = 0.0f;
+                int64 k = 0;
+                while (k < cols) { acc = acc + w[o * cols + k] * x[t * cols + k]; k = k + 1; }
+                want[t * out + o] = acc;
+                o = o + 1;
+            }
+            t = t + 1;
+        }
+        return #want;
+    }
+
+    /** Q8_K-packed activations for `rows` tokens, as Linear stages them. */
+    static #KernelBuffer<int8> packedActivations(float32[] x, int64 rows, int64 cols) {
+        KernelBuffer<float32> xD #= heap KernelBuffer<float32>((uint64) (rows * cols));
+        xD.upload(x);
+        int64 pb = Quant.q8kPackedBytes(cols);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) (rows * pb));
+        QuantKernel.q8kPackRowsLaunchNoSync(xp, xD, rows, cols, cols);
+        QuantKernel.stream().sync();
+        return #xp;
+    }
+
+    @Test
+    public void q4kQ8MmqMatchesHostDequantToOnePercent() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int32 ty = Quant.GG_Q4_K;
+        int64 rows = 64L;
+        int64 out = 128L;
+        int64 cols = 512L;
+        int64 nBlocks = out * (cols / 256L);
+        int8[] raw #= CensusReachTest.tiled(ty, "q4_k.bin", nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        float32[] want #= CensusReachTest.hostGemm(ty, raw, nBlocks, x, rows, out, cols);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) (nBlocks * (int64) Quant.blockBytes(ty)));
+        wD.upload(raw);
+        KernelBuffer<int32> wW #= wD.wordView();
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<int32> xpW #= xp.wordView();
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        QuantKernel.q4kQ8MmqLaunchNoSync(yD, wW, xpW, rows, out, cols);
+        QuantKernel.stream().sync();
+        float32[] got #= heap float32[rows * out];
+        yD.download(got);
+        CensusReachTest.nearOnePercent(want, got, rows * out, "q4kQ8MmqKernel");
+    }
+
+    @Test
+    public void q6kQ8MmqMatchesHostDequantToOnePercent() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int32 ty = Quant.GG_Q6_K;
+        int64 rows = 64L;
+        int64 out = 128L;
+        int64 cols = 512L;
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int8[] raw #= CensusReachTest.tiled(ty, "q6_k.bin", nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        float32[] want #= CensusReachTest.hostGemm(ty, raw, nBlocks, x, rows, out, cols);
+        // Q6_K is a split format: the kernel reads the resident row layout.
+        int64 resBytes = out * Quant.rowResidentBytes(ty, bpr);
+        int8[] res #= heap int8[resBytes];
+        Quant.splitInto(ty, raw, 0L, out, bpr, res, 0L);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) resBytes);
+        wD.upload(res);
+        KernelBuffer<int32> wW #= wD.wordView();
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<int32> xpW #= xp.wordView();
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        QuantKernel.q6kQ8MmqLaunchNoSync(yD, wW, xpW, rows, out, cols);
+        QuantKernel.stream().sync();
+        float32[] got #= heap float32[rows * out];
+        yD.download(got);
+        CensusReachTest.nearOnePercent(want, got, rows * out, "q6kQ8MmqKernel");
+    }
+
+    @Test
+    public void q4kQ8Batch4MatMulMatchesHostDequantToOnePercent() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int32 ty = Quant.GG_Q4_K;
+        int64 rows = 4L;
+        int64 out = 96L;
+        int64 cols = 512L;
+        int64 nBlocks = out * (cols / 256L);
+        int8[] raw #= CensusReachTest.tiled(ty, "q4_k.bin", nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        float32[] want #= CensusReachTest.hostGemm(ty, raw, nBlocks, x, rows, out, cols);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) (nBlocks * (int64) Quant.blockBytes(ty)));
+        wD.upload(raw);
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        QuantKernel.q4kQ8Batch4MatMulLaunchNoSync(yD, wD, xp, rows, out, cols);
+        QuantKernel.stream().sync();
+        float32[] got #= heap float32[rows * out];
+        yD.download(got);
+        CensusReachTest.nearOnePercent(want, got, rows * out, "q4kQ8Batch4MatMulKernel");
+    }
+
+    // ── the byte-wise split kernel: does any split format still take it? ─
+
+    static void splitOne(int32 ty, String fixture) {
+        int64 nRows = 8L;
+        int64 cols = 256L;
+        int64 be = (int64) Quant.blockElems(ty);
+        int64 bpr = cols / be;
+        int64 nBlocks = nRows * bpr;
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int8[] raw #= CensusReachTest.tiled(ty, fixture, nBlocks);
+        int64 resBytes = nRows * Quant.rowResidentBytes(ty, bpr);
+        int8[] want #= heap int8[resBytes];
+        Quant.splitInto(ty, raw, 0L, nRows, bpr, want, 0L);
+        KernelBuffer<int8> wb #= heap KernelBuffer<int8>((uint64) (nBlocks * bb));
+        wb.upload(raw);
+        KernelBuffer<int8> pd #= heap KernelBuffer<int8>((uint64) resBytes);
+        int8[] zero #= heap int8[resBytes];
+        pd.upload(zero);
+        QuantKernel.splitLaunch(pd, wb, nBlocks, 0L, ty, bpr);
+        int8[] got #= heap int8[resBytes];
+        pd.download(got);
+        CensusReachTest.exactBytes(want, got, resBytes, "split ty=" + ty);
+    }
+
+    @Test
+    public void everySplitFormatMatchesTheHostSplitOnTheDwordKernels() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        int64 before = Device.kernelLaunchCount("splitKernel");
+        CensusReachTest.splitOne(Quant.GG_Q8_0, "q8_0.bin");
+        CensusReachTest.splitOne(Quant.GG_Q4_0, "q4_0.bin");
+        CensusReachTest.splitOne(Quant.GG_Q5_0, "q5_0.bin");
+        CensusReachTest.splitOne(Quant.GG_Q3_K, "q3_k.bin");
+        CensusReachTest.splitOne(Quant.GG_Q6_K, "q6_k.bin");
+        CensusReachTest.splitOne(Quant.GG_IQ4_NL, "iq4_nl.bin");
+        CensusReachTest.splitOne(Quant.GG_IQ2_XXS, "iq2_xxs.bin");
+        CensusReachTest.splitOne(Quant.GG_IQ2_XS, "iq2_xs.bin");
+        CensusReachTest.splitOne(Quant.GG_IQ3_XXS, "iq3_xxs.bin");
+        CensusReachTest.splitOne(Quant.GG_IQ2_S, "iq2_s.bin");
+        CensusReachTest.splitOne(Quant.GG_IQ3_S, "iq3_s.bin");
+        CensusReachTest.splitOne(Quant.GG_TQ1_0, "tq1_0.bin");
+        CensusReachTest.splitOne(Quant.GG_TQ2_0, "tq2_0.bin");
+        int64 after = Device.kernelLaunchCount("splitKernel");
+        // MEASURED 2026-09-24: no split format takes the byte-wise splitKernel;
+        // every one is dword-addressable. The census carries it as a tracked
+        // skip under plan 6.4.1 (remove, or keep as a fallback with a test).
+        // This line is where that entry becomes STALE the day a format needs it.
+        if (after > before) {
+            Assert.fail("a split format took the byte-wise splitKernel; drop its "
+                + "6.4.1 census entry and pin the format here");
+        }
+    }
+}
