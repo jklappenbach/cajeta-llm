@@ -108,10 +108,23 @@ run_suite() {
     # [device-skip]; add the marker to a new one and it counts itself.
     nocoop=$(grep -c "\[device-skip\]" "$log" || true)
     skipped=$(grep -c "xpu-kernel-skipped" "$log" || true)
-    echo ">> ${label}: in-test device skips: ${nocoop} 'no coop kernel', ${skipped} 'xpu-kernel-skipped'"
-    if [ "${nocoop}" != "0" ] || [ "${skipped}" != "0" ]; then
-        echo ">> NOTE: ${nocoop} test(s) reported PASS without running device code."
-        echo ">>       On a backend that claims device support this is a VACUOUS green."
+    # Every device skip is one of two kinds, and says which (plan 1.6.3):
+    #   [cannot]        the backend or the box truly cannot (a fact, stated)
+    #   [tracked: item] a defect or route gap, with the plan line that retires it
+    # A skip with neither is UNTRACKED and fails the run (1.6.5), so the
+    # inventory of 2026-09-19 cannot regrow in silence. Since 1.6.2 a skip is
+    # counted as SKIPPED by the runner, never as a pass.
+    cannot=$(grep -c "\[device-skip\] \[cannot\]" "$log" || true)
+    tracked=$(grep -c "\[device-skip\] \[tracked:" "$log" || true)
+    untracked=$(grep "\[device-skip\]" "$log" | grep -v "\[cannot\]\|\[tracked:" | grep -vc "^\s*$" || true)
+    echo ">> ${label}: device skips: ${cannot} cannot, ${tracked} tracked, ${untracked} UNTRACKED; ${skipped} 'xpu-kernel-skipped'"
+    if [ "${untracked}" != "0" ]; then
+        echo ">> UNTRACKED device skip(s) — each must say [cannot] or [tracked: <plan item>] (1.6.5):"
+        grep "\[device-skip\]" "$log" | grep -v "\[cannot\]\|\[tracked:" | sort -u | sed 's/^/>>   /'
+        rc=1
+    fi
+    if [ "${skipped}" != "0" ]; then
+        echo ">> NOTE: ${skipped} kernel(s) produced no device code on this backend ([xpu-kernel-skipped])."
     fi
     rm -f "$log"
     return $rc
