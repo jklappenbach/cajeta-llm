@@ -6,6 +6,7 @@ import cajeta.time.Clock;
 import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelTimer;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 
@@ -22,11 +23,38 @@ import dev.cajeta.llm.io.QuantKernel;
  * fails to lower or fails to launch does not raise -- the registry finds
  * nothing and `y` reads back zeros -- which is the guard CoopQuantGemmTest
  * uses and the only way to tell a fast kernel from an absent one.
+ *
+ * THE TIMER (cajeta xpu-kernel-adaptor plan, Unit 5). On 2026-09-19 this
+ * probe reported 119.4 us for the one coop arm that ran at tokens=256,
+ * outDim=14336, K=4096: 30.1 GFLOP, which is 252 TFLOPS against the RTX
+ * 4090's ~165 dense f16 peak, impossible. The timed loop was a host clock
+ * around twenty launches and one sync, and the NON-ZERO check ran only after
+ * the WARM-UP: a launch that was refused inside the timed loop (the
+ * `launchFailures` counter, not an exception) left the warm-up's output in
+ * place and the host clock measuring twenty refusals. Now each arm
+ *   - re-zeroes the output before the timed loop, so "ok" is a claim about
+ *     the launches that were timed;
+ *   - counts `Device.launchFailures()` across the timed loop and says so;
+ *   - reads a {@link KernelTimer} bracket on the SAME stream beside the host
+ *     clock, and prints its tier next to the number;
+ *   - passes the device figure through {@link KernelTimer#withinPeak}
+ *     against the driver's theoretical bus bandwidth and the DECLARED compute
+ *     peak below, and prints REJECTED rather than a rate when it fails.
  */
 public class CoopTiming {
 
     static final int32 WARMUP = 3;
     static final int32 ITERS = 20;
+
+    /**
+     * The compute ceiling the peak gate judges against, dense f16 with f32
+     * accumulate, in TFLOPS. The device reports its memory bus, so the
+     * bandwidth ceiling is derived; it reports no tensor rate, so this one is
+     * DECLARED for the part the probe is read on and printed beside every
+     * verdict. RTX 4090: 165. gfx1151 (Strix Halo, 40 CUs): about 60. A
+     * wrong value here weakens the gate; it never strengthens a number.
+     */
+    static final float64 DECLARED_PEAK_TFLOPS = 165.0;
 
     static boolean nonZero(KernelBuffer<float32> yb, float32[] scratch) {
         yb.download(scratch);
@@ -40,14 +68,19 @@ public class CoopTiming {
         return false;
     }
 
-    static void arm(String name, int32 which, KernelBuffer<float32> yb,
-            KernelBuffer<int32> pw, KernelBuffer<float16> xh,
-            int64 rows, int64 outDim, int64 cols, float32[] scratch) {
-        // zero the output so a non-launch is visible as zeros
+    static void zero(KernelBuffer<float32> yb, float32[] scratch) {
         int64 z = 0;
         int64 zn = (int64) scratch.count();
         while (z < zn) { scratch[z] = 0.0f; z = z + 1; }
         yb.upload(scratch);
+        return;
+    }
+
+    static void arm(String name, int32 which, KernelBuffer<float32> yb,
+            KernelBuffer<int32> pw, KernelBuffer<float16> xh,
+            int64 rows, int64 outDim, int64 cols, float32[] scratch) {
+        // zero the output so a non-launch is visible as zeros
+        CoopTiming.zero(yb, scratch);
 
         KernelStream s = QuantKernel.stream();
         int32 w = 0;
@@ -56,24 +89,68 @@ public class CoopTiming {
             w = w + 1;
         }
         s.sync();
+        boolean warmRan = CoopTiming.nonZero(yb, scratch);
 
-        boolean ran = CoopTiming.nonZero(yb, scratch);
+        // Zero AGAIN: the verdict below is about the launches that are timed,
+        // not about the warm-up.
+        CoopTiming.zero(yb, scratch);
+        s.sync();
 
+        int64 failBefore = Device.launchFailures();
+        KernelTimer timer #= KernelTimer.create();
         int64 t0 = Clock.nanoTime();
+        timer.begin(s);
         int32 it = 0;
         while (it < CoopTiming.ITERS) {
             CoopTiming.launch(which, yb, pw, xh, rows, outDim, cols);
             it = it + 1;
         }
+        timer.end(s);
         s.sync();
-        float64 us = (float64) (Clock.nanoTime() - t0) / 1000.0
-            / (float64) CoopTiming.ITERS;
+        int64 hostNs = Clock.nanoTime() - t0;
+        int64 devNs = timer.elapsedNanos();
+        timer.destroy();
+        int64 failures = Device.launchFailures() - failBefore;
+        boolean ran = CoopTiming.nonZero(yb, scratch);
 
-        if (ran) {
-            System.stdout.println("  " + name + "  ok         " + us + " us/launch");
-        } else {
-            System.stdout.println("  " + name + "  NO-OUTPUT  " + us + " us/launch");
+        float64 usHost = (float64) hostNs / 1000.0 / (float64) CoopTiming.ITERS;
+        String tier = KernelTimer.tierName();
+
+        // Work per launch: the weight once, the activations once, the output
+        // once (a coop tile reads x per row tile, so this is a floor), and
+        // 2 FLOP per multiply-add.
+        int64 bytesPerLaunch = outDim * (cols / 256L) * 144L
+            + rows * cols * 2L + rows * outDim * 4L;
+        float64 flopPerLaunch = 2.0 * (float64) rows * (float64) outDim * (float64) cols;
+
+        String status = "ok        ";
+        if (!ran) { status = "NO-OUTPUT "; }
+        if (failures > 0L) { status = "REFUSED x" + failures; }
+        if (!warmRan && ran) { status = "ok (warm-up silent)"; }
+
+        if (devNs < 0L) {
+            System.stdout.println("  " + name + "  " + status
+                + "  device timer: unavailable (" + tier + ")"
+                + "  host " + usHost + " us/launch (submit-to-sync, NOT a kernel time)");
+            return;
         }
+        int64 perLaunchNs = devNs / (int64) CoopTiming.ITERS;
+        float64 usDev = (float64) perLaunchNs / 1000.0;
+        float64 tflops = KernelTimer.impliedOpsPerSecond(perLaunchNs, flopPerLaunch) / 1.0e12;
+        float64 gbps = KernelTimer.impliedGBps(perLaunchNs, bytesPerLaunch);
+        boolean plausible = KernelTimer.withinPeak(perLaunchNs, bytesPerLaunch,
+            Device.peakBandwidthGBps(), flopPerLaunch,
+            CoopTiming.DECLARED_PEAK_TFLOPS * 1.0e12);
+        String verdict = "";
+        if (!plausible || !ran || failures > 0L) {
+            verdict = "  REJECTED: implies more than the part can do, or the kernel did not run";
+        }
+        System.stdout.println("  " + name + "  " + status
+            + "  " + usDev + " us/launch (" + tier + ")"
+            + "  host " + usHost
+            + "  " + tflops + " TFLOPS  " + gbps + " GB/s"
+            + "  ceilings " + CoopTiming.DECLARED_PEAK_TFLOPS + " TFLOPS / "
+            + Device.peakBandwidthGBps() + " GB/s" + verdict);
         return;
     }
 
