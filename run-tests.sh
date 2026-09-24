@@ -138,34 +138,70 @@ run_suite() {
 # [xpu-kernel-spill] once per kernel it lowered, so gating on that warning
 # covers every kernel by construction and cannot narrow.
 #
-# What we own FAILS; what we do not own is REPORTED. A spilling stdlib
-# kernel is a finding for the compiler repo and must not be absorbed into
-# a waiver list here, where nobody would look at it again.
+# OWNERSHIP (plan 1.5.4): every kernel lowered into this binary is ours --
+# dev.cajeta.llm's own and the cajeta stdlib's (cajeta.math.Ewise, which
+# bench/GpuParity calls). What differs is the repo the fix lands in, and a
+# stdlib fix cannot land in the same commit as an llm change. So a spill
+# outside this repo is TRACKED, never waived: it passes only while it names
+# the plan item that retires it, in SPILL_TRACKED below, and fails otherwise
+# -- the no-silent-skip rule of 1.6 applied to spills, so nothing sits in the
+# log forever. A spill in this repo fails outright. (This used to say
+# "kernels OUTSIDE this repo ... not gated here", a namespace test standing
+# in for an ownership test; the four worst spills in the tree hid behind it.)
+#
+# REMEDY: the compiler's own warning says WHY the kernel spills -- a
+# replicated software tile, a construct legalized through memory, or real
+# register pressure -- and it lowered for the attached part, so its numbers
+# are the right ones. This gate repeats the warning rather than second-guess
+# it with one vendor's register cap (1.5.2.4).
+#
+# One "<kernel>|<plan item>" per line. Empty today: the stdlib tiles that
+# spilled on sm_89 (Ewise.matmulF32/F64/Bf16, 1.5.4.1) are distributed across
+# the warp since cajeta's nvptx change of 2026-09-24 and no longer spill.
+SPILL_TRACKED=(
+)
+spill_tracked_item() {
+    local k="$1" e
+    for e in "${SPILL_TRACKED[@]}"; do
+        [ "${e%%|*}" = "$k" ] && { echo "${e#*|}"; return 0; }
+    done
+    return 1
+}
 spill_gate() {
-    local errlog="$1" label="$2" all mine theirs
-    [ -s "$errlog" ] || return 0
-    all=$(sed -n 's/.*\[xpu-kernel-spill\] \([^ ]*\) on \([^:]*\): \([0-9]*\) bytes.*/  \1 on \2: \3 bytes/p' \
+    local errlog="$1" label="$2" all line kernel item rc=0
+    # An empty stderr is the best case, and it says so: a gate that is
+    # silent when there is nothing to report reads the same as one that
+    # never ran.
+    [ -s "$errlog" ] || { echo ">> ${label}: no kernel spills (nothing on stderr)"; return 0; }
+    all=$(sed -n 's/.*\[xpu-kernel-spill\] \([^ ]*\) on \([^:]*\): \([0-9]*\) bytes.*/\1 on \2: \3 bytes/p' \
           "$errlog" | sort -u)
     if [ -z "$all" ]; then
         echo ">> ${label}: no kernel spills"
         return 0
     fi
-    theirs=$(printf '%s\n' "$all" | grep -v ' dev\.cajeta\.llm\.' || true)
-    mine=$(printf '%s\n' "$all" | grep ' dev\.cajeta\.llm\.' || true)
-    if [ -n "$theirs" ]; then
-        echo ">> NOTE (${label}): kernels OUTSIDE this repo spill. A finding for"
-        echo ">>       the compiler repo; not gated here."
-        printf '%s\n' "$theirs"
-    fi
-    if [ -n "$mine" ]; then
-        echo ">> FAIL (${label}): a kernel in this repo spills."
-        printf '%s\n' "$mine"
-        echo ">>       A block the compiler cannot see as constant is budgeted"
-        echo ">>       for 1024 threads, which caps gfx1151 at 192 VGPRs."
-        echo ">>       Declare the structural bound: @Occupancy(maxThreads = N)."
+    while IFS= read -r line; do
+        kernel="${line%% on *}"
+        case "$kernel" in
+            dev.cajeta.llm.*)
+                echo ">> FAIL (${label}): a kernel in this repo spills: ${line}"
+                rc=1 ;;
+            *)
+                if item=$(spill_tracked_item "$kernel"); then
+                    echo ">> ${label}: [spill-tracked: ${item}] ${line} (fix lands in the cajeta repo)"
+                else
+                    echo ">> FAIL (${label}): a stdlib kernel spills and nothing tracks it: ${line}"
+                    echo ">>       Ours to fix (the cajeta repo). Add \"${kernel}|<plan item>\" to"
+                    echo ">>       SPILL_TRACKED in run-tests.sh so the item that retires it is named."
+                    rc=1
+                fi ;;
+        esac
+    done <<< "$all"
+    if [ "$rc" != "0" ]; then
+        echo ">>       The compiler's [xpu-kernel-spill] line above names the cause and the"
+        echo ">>       remedy for the part it lowered for; read that, not a rule of thumb."
         return 1
     fi
-    echo ">> ${label}: no kernel in this repo spills"
+    echo ">> ${label}: no kernel in this repo spills; every stdlib spill is tracked"
     return 0
 }
 
@@ -315,6 +351,21 @@ if [[ ! -f "$logging_cja" ]]; then
     fi
 fi
 echo ">> dev.cajeta.logging: $logging_cja"
+
+# 1.4.5 — the static arity sweep, before the build. The compiler stops at the
+# FIRST call whose argument count disagrees with a library signature, so
+# drift between the test tree and a library is otherwise found one site per
+# build round trip. The sweep reads every static method and constructor in
+# this library and, when the sibling checkout is there, the stdlib, and
+# checks every test-tree call site against them in one pass.
+if command -v python3 >/dev/null 2>&1; then
+    sweep_libs=(--lib "$here/src/main/cajeta")
+    [ -d "$here/../cajeta/runtime/src" ] && sweep_libs+=(--lib "$here/../cajeta/runtime/src")
+    python3 "$here/scripts/arity-sweep.py" "${sweep_libs[@]}" --test "$here/src/test/cajeta" || {
+        echo ">> arity sweep found drift; fix the sites above before building" >&2; exit 1; }
+else
+    echo ">> arity sweep NOT RUN: no python3 on this box (the compiler still catches drift, one site per build)"
+fi
 
 echo ">> building llama library .cja"
 "$CAJETA" --emit=cja -o "$out/llama.cja" \
