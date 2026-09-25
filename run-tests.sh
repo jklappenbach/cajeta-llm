@@ -86,6 +86,50 @@ echo ">> compile backend: ${XPU_BACKEND}"
 # this catches the quieter one -- compiled and dispatched correctly, but the
 # TESTS opted out. Print both skip families so a vacuous green is visible in
 # the log instead of inferred later from a differential.
+# Unit 3 / 4.2.2 — the kernels the COMPILER declined, from its own notes.
+# `[xpu-kernel-skipped] <kernel>: no <backend> device code ...` is emitted
+# once per kernel that produced no device code for the declared backend.
+# It is a NOTE, so a build missing 50 kernels is green; this counts them
+# from the build's stderr (run_suite used to grep the SUITE log for it and
+# printed 0 on a backend with 54, measured 2026-09-24) and groups them by
+# cause, which is the 3.2.3 table in miniature. It does not fail the build
+# yet: whether an unlowered kernel is an error or a warning is 4.2.3's
+# decision with Julian, and 4.2.2 is where it becomes a tracked failure.
+skip_notes() {
+    local errlog="$1" label="$2" n
+    [ -s "$errlog" ] || { echo ">> ${label}: 0 kernels declined by the compiler"; return 0; }
+    n=$(grep -c "\[xpu-kernel-skipped\]" "$errlog" || true)
+    echo ">> ${label}: ${n} kernel(s) declined by the compiler ([xpu-kernel-skipped]; plan 4.2.2 decides whether that fails)"
+    [ "$n" = "0" ] && return 0
+    sed -n 's/.*\[xpu-kernel-skipped\] [A-Za-z0-9_]*: //p' "$errlog" \
+        | sed -E 's/__cajeta_xpu_wave_[a-z_0-9]+/<wave op>/' | cut -c1-120 | sort | uniq -c | sort -rn \
+        | sed 's/^/>>   /'
+    return 0
+}
+
+# 3.2.2 — the census as a table, one row per kernel per backend:
+#   backend  kernel  class  launches  manifest  note
+# RAN/SKIP/PROBE/EXTERNAL/UNCOVERED/STALE-SKIP rows come from the runtime
+# census (KernelCensus prints one `census-row` line per registered kernel);
+# DECLINED rows come from the compiler's [xpu-kernel-skipped] notes, which
+# name the kernels the registry never saw. Written to build/census-<be>.tsv;
+# the checked-in copies under census/ are refreshed by hand from there.
+census_table() {
+    local log="$1" be="$2" tsv errlog
+    mkdir -p "$here/build"
+    tsv="$here/build/census-${be}.tsv"
+    { printf 'backend\tkernel\tclass\tlaunches\tmanifest\tnote\n'
+      grep "^census-row"$'\t' "$log" | cut -f2- | sort -t$'\t' -k2,2
+      for errlog in "$out/lib.err" "$out/test.err"; do
+          [ -s "$errlog" ] || continue
+          sed -n 's/.*\[xpu-kernel-skipped\] \([A-Za-z0-9_]*\): \(.*\)$/\1\t\2/p' "$errlog"
+      done | sort -u | awk -F'\t' -v be="$be" '{ printf "%s\t%s\tDECLINED\t0\tno-manifest\t%s\n", be, $1, $2 }'
+    } > "$tsv"
+    local rows
+    rows=$(( $(wc -l < "$tsv") - 1 ))
+    echo ">> census table: $tsv (${rows} rows; DECLINED rows are the compiler notes)"
+}
+
 run_suite() {
     local bin="$1" label="$2" log
     log="$(mktemp)"
@@ -107,7 +151,9 @@ run_suite() {
     # one. Measured 2026-09-20. Every such message now carries
     # [device-skip]; add the marker to a new one and it counts itself.
     nocoop=$(grep -c "\[device-skip\]" "$log" || true)
-    skipped=$(grep -c "xpu-kernel-skipped" "$log" || true)
+    # Kernels the compiler declined are counted from the BUILD stderr by
+    # skip_notes above, not from this log, which never carries the note.
+    skipped=$( { cat "$out/lib.err" "$out/test.err" 2>/dev/null || true; } | grep -c "\[xpu-kernel-skipped\]" || true)
     # Every device skip is one of two kinds, and says which (plan 1.6.3):
     #   [cannot]        the backend or the box truly cannot (a fact, stated)
     #   [tracked: item] a defect or route gap, with the plan line that retires it
@@ -124,8 +170,9 @@ run_suite() {
         rc=1
     fi
     if [ "${skipped}" != "0" ]; then
-        echo ">> NOTE: ${skipped} kernel(s) produced no device code on this backend ([xpu-kernel-skipped])."
+        echo ">> NOTE: ${skipped} kernel(s) produced no device code on this backend ([xpu-kernel-skipped], listed by cause above)."
     fi
+    census_table "$log" "${XPU_BACKEND%%,*}"
     rm -f "$log"
     return $rc
 }
@@ -374,6 +421,7 @@ echo ">> building llama library .cja"
     >/dev/null 2>"$out/lib.err" || { cat "$out/lib.err" >&2; exit 1; }
 cat "$out/lib.err" >&2
 spill_gate "$out/lib.err" "llama library"
+skip_notes "$out/lib.err" "llama library"
 
 echo ">> building + running the test binary"
 # XPU_BACKEND (default cpu): the engine's device paths (device-resident weight
@@ -397,6 +445,7 @@ echo ">> building + running the test binary"
     >/dev/null 2>"$out/test.err" || { cat "$out/test.err" >&2; exit 1; }
 cat "$out/test.err" >&2
 spill_gate "$out/test.err" "test binary"
+skip_notes "$out/test.err" "test binary"
 
 run_suite "$out/llamatests" "test profile"
 
