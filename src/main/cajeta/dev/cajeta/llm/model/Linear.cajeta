@@ -450,28 +450,29 @@ public final class Linear extends InfModule {
     static boolean packWant;
 
     /**
-     * The WAVE-COOPERATIVE mat-vec (plan 11.1) — one workgroup of 32
-     * threads per output row instead of one work item.
+     * IS THERE A DEVICE MAT-VEC ON THIS BACKEND AT ALL?
      *
-     * Backend-resolved for two reasons, not one. It is a device
-     * optimization: 11.0 measured this machine's read ceiling at ~208 GB/s
-     * for a coalesced pattern against ~162-170 for one-row-per-work-item,
-     * so the whole point is a lane mapping the CPU backend has no analogue
-     * for. And it is presently WRONG on that backend — every row comes back
-     * exactly 0.0 (plan 11.5) — so this is a correctness gate as much as a
-     * performance one.
+     * The engine-wide half of {@link KernelCap#matVecHere}, kept because
+     * a dozen callers hold no weight to ask about. Every route that DOES
+     * hold one asks per format instead: the vectorizer declines kernels
+     * one at a time, so one answer for the whole engine can only be a
+     * lower bound.
+     *
+     * It used to read `Device.activeBackend()` and latch
+     * `!(cpu || none)`, and 78 cpu skips descended from that one line.
+     * Its doc gave two reasons and both had expired. "The CPU backend
+     * has no analogue for a lane mapping" is a PERFORMANCE argument, and
+     * a correctness gate is the wrong place for one. "It is presently
+     * WRONG on that backend, every row comes back exactly 0.0" is now
+     * enforced by the compiler itself: CpuRegistration's left-scalar
+     * gate erases the wrapper of any kernel whose work-item loop did not
+     * vectorize at the wave width, so those kernels never register and a
+     * route that asks the registry cannot reach them. The boolean had
+     * become a stale copy of a rule enforced elsewhere.
      */
     static boolean waveMv() {
-        if (!Linear.waveSet) {
-            String be #= Device.activeBackend();
-            Linear.waveWant = !(be.equals("cpu") || be.equals("none"));
-            Linear.waveSet = true;
-        }
-        return Linear.waveWant;
+        return KernelCap.anyMatVecHere();
     }
-
-    static boolean waveSet;
-    static boolean waveWant;
 
     /**
      * The device-resident decode path (plan 10.2) — the residual stream
@@ -506,18 +507,36 @@ public final class Linear extends InfModule {
     // positions; below it residency costs about 2%.
     static boolean residentOn = true;
 
+    /**
+     * The DEVICE-RESIDENT decode path, as a capability.
+     *
+     * Two kernels, not one, because the resident path is two things: the
+     * per-projection mat-vec (asked per weight by `isDeviceRouted`, which
+     * `CausalLM.deviceResidentReady` checks beside this) and the flash
+     * ATTEND tail that is the whole reason residency pays for itself.
+     * A backend with the GEMMs but no flash kernels must keep the host
+     * attend, which is what the cpu backend does correctly today; asking
+     * only about the mat-vec would open it onto refused launches.
+     */
     public static boolean residentEnabled() {
-        return Linear.residentOn && Linear.waveMv();
+        return Linear.residentOn && KernelCap.attendHere()
+            && KernelCap.anyMatVecHere();
     }
 
     public static void setDeviceResident(boolean on) {
         Linear.residentOn = on;
     }
 
-    /** Arm for 11.1: force the one-item-per-row kernel back on. */
+    /** Arm for 11.1: force the one-item-per-row kernel back on, by
+     *  pinning the registry answer for the wave mat-vec kernels the
+     *  route struct consults. */
     public static void setWaveMatVec(boolean on) {
-        Linear.waveWant = on;
-        Linear.waveSet = true;
+        int32 i = KernelCap.K_WAVE_Q4K;
+        while (i <= KernelCap.K_F32W_IQ4NL) {
+            KernelCap.setOverride(i, on);
+            i = i + 1;
+        }
+        return;
     }
 
     /**
@@ -1014,8 +1033,10 @@ public final class Linear extends InfModule {
             if (QuantKernel.hasKernel(this.packedTy)
                     && QuantKernel.routingEnabled()
                     && ((QuantKernel.hasF32Kernel(this.packedTy)
-                            && (this.packedTy != Quant.GG_F16 || Linear.waveMv()))
-                        || (Linear.waveMv() && Linear.packedActivations()
+                            && (this.packedTy != Quant.GG_F16
+                                || KernelCap.matVecHere(Quant.GG_F16)))
+                        || (KernelCap.matVecHere(this.packedTy)
+                            && Linear.packedActivations()
                             && Linear.q8Route()
                             && this.inDim % 256 == 0))) {
                 // The second clause: Q2_K/Q3_K exist ONLY on the wave
@@ -1300,7 +1321,8 @@ public final class Linear extends InfModule {
      */
     public boolean isDeviceRouted() {
         return this.packedTy >= 0 && QuantKernel.hasKernel(this.packedTy)
-            && QuantKernel.routingEnabled() && Linear.waveMv();
+            && QuantKernel.routingEnabled()
+            && KernelCap.matVecHere(this.packedTy);
     }
 
     /** This Linear's output buffer — a BORROW of interior state, valid
@@ -1861,8 +1883,10 @@ public final class Linear extends InfModule {
             // launchable exactly where a wave mat-vec exists; without one
             // the f16 head is a host linear (cpu, 2026-09-25).
             && ((QuantKernel.hasF32Kernel(this.packedTy)
-                    && (this.packedTy != Quant.GG_F16 || Linear.waveMv()))
-                || (Linear.waveMv() && Linear.packedActivations()
+                    && (this.packedTy != Quant.GG_F16
+                        || KernelCap.matVecHere(Quant.GG_F16)))
+                || (KernelCap.matVecHere(this.packedTy)
+                    && Linear.packedActivations()
                     && Linear.q8Route() && this.inDim % 256 == 0));
     }
 
@@ -1974,7 +1998,8 @@ public final class Linear extends InfModule {
      *  useWmma6 off), which requires that kernel to be registered. */
     boolean isBatchRouted() {
         if (this.packedTy < 0 || !QuantKernel.routingEnabled()
-                || !Linear.waveMv() || !Linear.wmmaBackend()) {
+                || !KernelCap.batchGemmHere(this.packedTy)
+                || !Linear.wmmaBackend()) {
             return false;
         }
         if (Linear.backendIsVulkan()) {
@@ -2023,7 +2048,17 @@ public final class Linear extends InfModule {
     String batchRefusal(int64 rows) {
         if (this.packedTy < 0) { return "not a quantized weight (packedTy < 0)"; }
         if (!QuantKernel.routingEnabled()) { return "kernel routing disabled"; }
-        if (!Linear.waveMv()) { return "no device mat-vec on this backend"; }
+        if (!KernelCap.batchGemmHere(this.packedTy)) {
+            // NAMES the kernel. The reason this replaces said "no device
+            // mat-vec on this backend", which was a statement about a
+            // backend's name and about the wrong capability besides: the
+            // batched prefill launches a GEMM, not a mat-vec. A reason
+            // that names the missing kernel is a measured fact, and the
+            // skip built on it retires itself the day that kernel lands.
+            return "no device batch GEMM: "
+                + KernelCap.batchGemmKernelName(this.packedTy)
+                + " is not registered on this backend";
+        }
         if (!Linear.wmmaBackend()) { return "no batch GEMM kernels on this backend"; }
         if (this.isBatchRouted()) { return null; }
         if (Linear.backendIsVulkan()) {
@@ -3693,7 +3728,8 @@ public final class Linear extends InfModule {
             // weight beside it still dispatches the f32 one — which is
             // chunked, and collapses to 9.6 GB/s if this flag turns
             // chunking off on its behalf.
-            this.wave = Linear.waveMv() && this.packed1 && this.q8;
+            this.wave = KernelCap.here(KernelCap.K_WAVE_Q4K)
+                && this.packed1 && this.q8;
             // Q6_K gets the wave decomposition too (plan 11.2), on its own
             // kernel and WITHOUT the q8 integer route's activation switch —
             // it reads the same packed q8_K block.
@@ -3703,43 +3739,55 @@ public final class Linear extends InfModule {
             // integer route does — measured at 0.028% on a real v_proj —
             // and a caller that pins the switch off must still get the
             // exact path.
-            this.wave6 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.wave6 = KernelCap.here(KernelCap.K_WAVE_Q6K)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_Q6_K;
             // 10.12.45.C: Q2_K/Q3_K have ONLY the wave integer route —
             // no f32 kernel exists for them, so these flags are their
             // whole device story (deviceLaunchable and the matvecInto
             // gate both encode that).
-            this.wave2 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.wave2 = KernelCap.here(KernelCap.K_WAVE_Q2K)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_Q2_K;
-            this.wave3 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.wave3 = KernelCap.here(KernelCap.K_WAVE_Q3K)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_Q3_K;
             // 10.12.39: Q5_K and Q8_0 join the wave integer route. Until
             // now they were the two types still decoding on the
             // one-item-per-row f32 kernels — measured 14 and 10 ms/token
             // above llama.cpp's bandwidth line at 512 context.
-            this.wave5 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.wave5 = KernelCap.here(KernelCap.K_WAVE_Q5K)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_Q5_K;
-            this.wave8 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.wave8 = KernelCap.here(KernelCap.K_WAVE_Q80)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_Q8_0;
-            this.waveT1 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.waveT1 = KernelCap.here(KernelCap.K_WAVE_TQ10)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_TQ1_0;
-            this.waveT2 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.waveT2 = KernelCap.here(KernelCap.K_WAVE_TQ20)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_TQ2_0;
             // 2026-08-26: Q4_0 and Q5_0 were the last two formats with no
             // DEVICE mat-vec at all — they ingested, prefilled and then
             // decoded on the host per-row path. Qwen2.5-VL-72B carries
             // Q5_0 on half its ffn_down layers, so this is what stood
             // between that file and generating on a device.
-            this.wave40 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.wave40 = KernelCap.here(KernelCap.K_WAVE_Q40)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_Q4_0;
-            this.wave50 = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.wave50 = KernelCap.here(KernelCap.K_WAVE_Q50)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_Q5_0;
             // 9.2.5: IQ4_NL joins them. Its codebook is 16 signed int8
             // values, so the nibble is one lut4 and the dp4a is Q4_0's.
-            this.wave4nl = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.wave4nl = KernelCap.here(KernelCap.K_WAVE_IQ4NL)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && this.packedTy == Quant.GG_IQ4_NL;
-            this.waveH = Linear.waveMv() && this.packedTy == Quant.GG_F16;
-            this.waveIq = Linear.waveMv() && this.packed1 && Linear.q8Route()
+            this.waveH = KernelCap.here(KernelCap.K_WAVE_F16)
+                && this.packedTy == Quant.GG_F16;
+            this.waveIq = KernelCap.waveIntHere(this.packedTy)
+                && this.packed1 && Linear.q8Route()
                 && q8kDims && (this.packedTy == Quant.GG_IQ2_XXS
                     || this.packedTy == Quant.GG_IQ2_XS
                     || this.packedTy == Quant.GG_IQ3_XXS
@@ -3752,7 +3800,8 @@ public final class Linear extends InfModule {
             // first clause: a type with no integer route at all answers
             // no to both, so IQ4_NL decoded item-per-row at a 256-aligned
             // width.
-            this.wavef = Linear.waveMv() && this.inDim % 32 == 0
+            this.wavef = KernelCap.f32WaveHere(this.packedTy)
+                && this.inDim % 32 == 0
                 && !(this.wave || this.wave6 || this.wave2 || this.wave3
                     || this.wave5 || this.wave8 || this.wave40
                     || this.wave50 || this.waveT1 || this.waveT2
