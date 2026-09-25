@@ -1,0 +1,322 @@
+package dev.cajeta.llm.model;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.io.Quant;
+
+/**
+ * WHICH DEVICE KERNELS THIS BACKEND ACTUALLY HAS, asked of the registry.
+ *
+ * Every route gate in this engine used to descend from one boolean,
+ * `Linear.waveMv()`, which read `Device.activeBackend()` and latched
+ * `!(cpu || none)`. That boolean answered a capability question with a
+ * NAME, and it answered for three unrelated capabilities at once: the
+ * per-format wave mat-vec the decode launches, the batched GEMM the
+ * prefill launches, and the flash attend the resident tail launches. One
+ * name standing in for three capabilities is wrong in both directions.
+ * It was too strict, because the batched GEMM kernels ARE registered on
+ * the cpu backend and the name closed that route anyway; and it would be
+ * too loose if simply lifted, because the flash attend kernels are NOT
+ * registered there and the route would have launched them.
+ *
+ * The honest question is the registry's: has this kernel's device code
+ * been registered for the backend in use? `Device.kernelAvailable` is
+ * that question, and it is MEASURED to answer per backend rather than
+ * per name. A kernel the compiler declined (the cpu vectorizer's
+ * left-scalar gate refuses a work-item loop that did not vectorize at
+ * the wave width, so the wrapper is erased and never registers) answers
+ * false; one that lowered answers true; on nvptx, where the compiler
+ * declines nothing, every kernel here answers true, which is why moving
+ * these gates onto the registry cannot change that backend's behaviour.
+ *
+ * It also makes the gates SELF-OPENING. When xpu-kernel-adaptor 4.2.1
+ * lands and the cpu vectorizer takes those loops, the kernels register,
+ * these predicates start answering true, and the routes open with no
+ * edit here. Nothing in this file names a backend.
+ *
+ * LATCHED, one registry call per kernel for the life of the process.
+ * `Device.kernelAvailable` allocates a byte array and scans the registry,
+ * so a per-projection or per-launch call would show up in ms/token; the
+ * state array below is what keeps it off that path. Tests reach the same
+ * array through {@link #setOverride}, which is how the does-not-fire twin
+ * of each gate is written.
+ */
+public final class KernelCap {
+
+    public KernelCap() { return; }
+
+    // ── kernel ids ──────────────────────────────────────────────────
+    // A dense id per gated kernel, so the latch is an array index and no
+    // String is ever stored. `nameOf` is the one place a name is written.
+    public static final int32 K_WAVE_Q4K = 0;
+    public static final int32 K_WAVE_Q6K = 1;
+    public static final int32 K_WAVE_Q2K = 2;
+    public static final int32 K_WAVE_Q3K = 3;
+    public static final int32 K_WAVE_Q5K = 4;
+    public static final int32 K_WAVE_Q80 = 5;
+    public static final int32 K_WAVE_TQ10 = 6;
+    public static final int32 K_WAVE_TQ20 = 7;
+    public static final int32 K_WAVE_Q40 = 8;
+    public static final int32 K_WAVE_Q50 = 9;
+    public static final int32 K_WAVE_IQ4NL = 10;
+    public static final int32 K_WAVE_IQ2XXS = 11;
+    public static final int32 K_WAVE_IQ2XS = 12;
+    public static final int32 K_WAVE_IQ3XXS = 13;
+    public static final int32 K_WAVE_IQ2S = 14;
+    public static final int32 K_WAVE_IQ3S = 15;
+    public static final int32 K_WAVE_F16 = 16;
+    public static final int32 K_F32W_Q80 = 17;
+    public static final int32 K_F32W_Q50 = 18;
+    public static final int32 K_F32W_Q40 = 19;
+    public static final int32 K_F32W_IQ4NL = 20;
+    public static final int32 K_BATCH_Q4K = 21;
+    public static final int32 K_BATCH_Q6K = 22;
+    public static final int32 K_FLASH_PREFILL = 23;
+    public static final int32 K_FLASH_DECODE = 24;
+    public static final int32 K_ROUTER_TOPK = 25;
+    /** The coop f16 GEMM WITNESS. The coop kernels' compute half is
+     *  format blind — each format is a staging body over the same tile —
+     *  so the family lowers or is declined together, and one of them
+     *  answers for all. Named rather than inferred: if that ever stops
+     *  being true, this is the line to split. */
+    public static final int32 K_COOP_X3 = 26;
+    public static final int32 N_ID = 27;
+
+    /** The kernel `id` names. One place, so a gate and the skip reason
+     *  it prints cannot drift apart. */
+    public static String nameOf(int32 id) {
+        if (id == KernelCap.K_WAVE_Q4K) { return "q4kQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_Q6K) { return "q6kQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_Q2K) { return "q2kQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_Q3K) { return "q3kQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_Q5K) { return "q5kQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_Q80) { return "q80Q8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_TQ10) { return "tq10Q8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_TQ20) { return "tq20Q8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_Q40) { return "q40Q8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_Q50) { return "q50Q8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_IQ4NL) { return "iq4nlQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_IQ2XXS) { return "iq2xxsQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_IQ2XS) { return "iq2xsQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_IQ3XXS) { return "iq3xxsQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_IQ2S) { return "iq2sQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_IQ3S) { return "iq3sQ8WaveMatVecKernel"; }
+        if (id == KernelCap.K_WAVE_F16) { return "f16F32WaveMatVecKernel"; }
+        if (id == KernelCap.K_F32W_Q80) { return "q80F32WaveMatVecKernel"; }
+        if (id == KernelCap.K_F32W_Q50) { return "q50F32WaveMatVecKernel"; }
+        if (id == KernelCap.K_F32W_Q40) { return "q40F32WaveMatVecKernel"; }
+        if (id == KernelCap.K_F32W_IQ4NL) { return "iq4nlF32WaveMatVecKernel"; }
+        if (id == KernelCap.K_BATCH_Q4K) { return "q4kQ8BatchMatMulKernel"; }
+        if (id == KernelCap.K_BATCH_Q6K) { return "q6kQ8BatchMatMulKernel"; }
+        if (id == KernelCap.K_FLASH_PREFILL) { return "attnFlashPrefillKernel"; }
+        if (id == KernelCap.K_FLASH_DECODE) { return "attnFlashDecodeGqa1Kernel"; }
+        if (id == KernelCap.K_ROUTER_TOPK) { return "routerTopKKernel"; }
+        if (id == KernelCap.K_COOP_X3) { return "q4kF16CoopX3Kernel"; }
+        return "";
+    }
+
+    // ── the latch ───────────────────────────────────────────────────
+    // 0 = not asked yet, 1 = registered, 2 = absent.
+    static int32[] state;
+
+    /** Is kernel `id` registered on the backend in use? */
+    public static boolean here(int32 id) {
+        if (KernelCap.state == null) {
+            KernelCap.state #= heap int32[(int64) KernelCap.N_ID];
+        }
+        int32 s = KernelCap.state[(int64) id];
+        if (s != 0) { return s == 1; }
+        boolean v = Device.kernelAvailable(KernelCap.nameOf(id));
+        if (v) {
+            KernelCap.state[(int64) id] = 1;
+        } else {
+            KernelCap.state[(int64) id] = 2;
+        }
+        return v;
+    }
+
+    /**
+     * Pin `id`'s answer, for the arm that proves a gate FIRES.
+     *
+     * A check needs a test that asserts it fires and one that asserts it
+     * does not (CLAUDE.md §5); without an override the absent arm is only
+     * reachable on a backend that happens to lack the kernel, which is no
+     * test at all on the backend where it matters.
+     */
+    public static void setOverride(int32 id, boolean on) {
+        if (KernelCap.state == null) {
+            KernelCap.state #= heap int32[(int64) KernelCap.N_ID];
+        }
+        if (on) {
+            KernelCap.state[(int64) id] = 1;
+        } else {
+            KernelCap.state[(int64) id] = 2;
+        }
+        return;
+    }
+
+    /** Drop every override AND every latched answer, so the next ask
+     *  goes back to the registry. */
+    public static void clearOverrides() {
+        KernelCap.state = null;
+        return;
+    }
+
+    // ── per-format kernel ids ───────────────────────────────────────
+
+    /** The id of the INTEGER wave mat-vec for `ty`, or -1 when the
+     *  format has none. This is the kernel the q8 decode route
+     *  launches for that weight. */
+    public static int32 waveMatVecId(int32 ty) {
+        if (ty == Quant.GG_Q4_K) { return KernelCap.K_WAVE_Q4K; }
+        if (ty == Quant.GG_Q6_K) { return KernelCap.K_WAVE_Q6K; }
+        if (ty == Quant.GG_Q2_K) { return KernelCap.K_WAVE_Q2K; }
+        if (ty == Quant.GG_Q3_K) { return KernelCap.K_WAVE_Q3K; }
+        if (ty == Quant.GG_Q5_K) { return KernelCap.K_WAVE_Q5K; }
+        if (ty == Quant.GG_Q8_0) { return KernelCap.K_WAVE_Q80; }
+        if (ty == Quant.GG_TQ1_0) { return KernelCap.K_WAVE_TQ10; }
+        if (ty == Quant.GG_TQ2_0) { return KernelCap.K_WAVE_TQ20; }
+        if (ty == Quant.GG_Q4_0) { return KernelCap.K_WAVE_Q40; }
+        if (ty == Quant.GG_Q5_0) { return KernelCap.K_WAVE_Q50; }
+        if (ty == Quant.GG_IQ4_NL) { return KernelCap.K_WAVE_IQ4NL; }
+        if (ty == Quant.GG_IQ2_XXS) { return KernelCap.K_WAVE_IQ2XXS; }
+        if (ty == Quant.GG_IQ2_XS) { return KernelCap.K_WAVE_IQ2XS; }
+        if (ty == Quant.GG_IQ3_XXS) { return KernelCap.K_WAVE_IQ3XXS; }
+        if (ty == Quant.GG_IQ2_S) { return KernelCap.K_WAVE_IQ2S; }
+        if (ty == Quant.GG_IQ3_S) { return KernelCap.K_WAVE_IQ3S; }
+        if (ty == Quant.GG_F16) { return KernelCap.K_WAVE_F16; }
+        return 0 - 1;
+    }
+
+    /** The id of the f32-activation wave mat-vec for `ty` (Linear.wavef),
+     *  or -1. Mirrors `QuantKernel.hasF32WaveKernel`. */
+    public static int32 f32WaveId(int32 ty) {
+        if (ty == Quant.GG_Q8_0) { return KernelCap.K_F32W_Q80; }
+        if (ty == Quant.GG_Q5_0) { return KernelCap.K_F32W_Q50; }
+        if (ty == Quant.GG_Q4_0) { return KernelCap.K_F32W_Q40; }
+        if (ty == Quant.GG_IQ4_NL) { return KernelCap.K_F32W_IQ4NL; }
+        return 0 - 1;
+    }
+
+    /** The id of the dp4a batched GEMM for `ty`, or -1. Mirrors
+     *  `QuantKernel.hasBatchKernel`, which is the TYPE half of the same
+     *  question; this is the BACKEND half the type check cannot know. */
+    public static int32 batchGemmId(int32 ty) {
+        if (ty == Quant.GG_Q4_K) { return KernelCap.K_BATCH_Q4K; }
+        if (ty == Quant.GG_Q6_K) { return KernelCap.K_BATCH_Q6K; }
+        return 0 - 1;
+    }
+
+    // ── the capabilities the routes ask for ─────────────────────────
+
+    /**
+     * Does a DEVICE MAT-VEC exist here for `ty`? Either the integer wave
+     * kernel or the f32 wave kernel will do: the decode route takes the
+     * integer one where the format and the dimensions allow and the f32
+     * one otherwise, and a weight whose format has neither registered has
+     * no device decode at all.
+     */
+    public static boolean matVecHere(int32 ty) {
+        int32 w = KernelCap.waveMatVecId(ty);
+        int32 f = KernelCap.f32WaveId(ty);
+        if (w < 0 && f < 0) {
+            // No wave mat-vec is TABULATED for this format, which is not
+            // the same as none existing. The honest answer is then the
+            // engine-wide one below rather than a false that would close
+            // a route this file simply does not know the name of — and
+            // that is the direction that matters, because a wrong false
+            // here silently demotes a format to the host.
+            return KernelCap.anyMatVecHere();
+        }
+        if (w >= 0 && KernelCap.here(w)) { return true; }
+        return f >= 0 && KernelCap.here(f);
+    }
+
+    /** The INTEGER wave mat-vec for `ty` is registered. False when the
+     *  format has none, so a caller may ask about any format. */
+    public static boolean waveIntHere(int32 ty) {
+        int32 w = KernelCap.waveMatVecId(ty);
+        return w >= 0 && KernelCap.here(w);
+    }
+
+    /** The f32-activation wave mat-vec for `ty` is registered. */
+    public static boolean f32WaveHere(int32 ty) {
+        int32 f = KernelCap.f32WaveId(ty);
+        return f >= 0 && KernelCap.here(f);
+    }
+
+    /**
+     * The BATCHED GEMM this weight's format would launch is registered.
+     *
+     * Two routes, asked in the order `matmulBatchKeep` takes them: the
+     * dp4a batch kernel where the format has one (Q4_K and Q6_K), and
+     * the coop f16 GEMM otherwise. The WMMA deq variants above both are
+     * already latched per name by `Linear.ensureKernelAvail`, which is
+     * the same idea this file generalizes.
+     */
+    public static boolean batchGemmHere(int32 ty) {
+        int32 id = KernelCap.batchGemmId(ty);
+        if (id >= 0) { return KernelCap.here(id); }
+        return KernelCap.here(KernelCap.K_COOP_X3);
+    }
+
+    /** The kernel {@link #batchGemmHere} asked about, for a refusal to
+     *  name. */
+    public static String batchGemmKernelName(int32 ty) {
+        int32 id = KernelCap.batchGemmId(ty);
+        if (id >= 0) { return KernelCap.nameOf(id); }
+        return KernelCap.nameOf(KernelCap.K_COOP_X3);
+    }
+
+    /** The kernel a caller should NAME when {@link #matVecHere} says no:
+     *  the integer wave kernel where the format has one, else the f32
+     *  wave kernel, else the empty string. */
+    public static String matVecKernelName(int32 ty) {
+        int32 w = KernelCap.waveMatVecId(ty);
+        if (w >= 0) { return KernelCap.nameOf(w); }
+        int32 f = KernelCap.f32WaveId(ty);
+        if (f >= 0) { return KernelCap.nameOf(f); }
+        return "";
+    }
+
+    /**
+     * Does ANY device mat-vec exist here?
+     *
+     * The generic half of {@link #matVecHere}, for the two gates that
+     * hold no weight to ask about: the resident decode switch and the
+     * whole-engine "is there a device decode on this backend". Q4_K is
+     * the witness because every backend that has a wave mat-vec at all
+     * has that one; the f16 head kernel is the second chance, for a
+     * backend that carries only the f32 wave family.
+     */
+    public static boolean anyMatVecHere() {
+        return KernelCap.here(KernelCap.K_WAVE_Q4K)
+            || KernelCap.here(KernelCap.K_WAVE_F16)
+            || KernelCap.here(KernelCap.K_WAVE_Q80)
+            || KernelCap.here(KernelCap.K_F32W_Q80);
+    }
+
+    /**
+     * Does the DEVICE FLASH ATTEND exist here?
+     *
+     * The hazard this closes is specific and measured. `CausalLM`'s
+     * batched prefill opens the device KV planes off the batch route
+     * alone, and `AttnKernel` then launches `attnFlashPrefillKernel` and
+     * the `attnFlashDecodeGqa*` family unconditionally. Those are
+     * DECLINED on the cpu backend. A launch of an unregistered kernel is
+     * a refused launch: one line on stderr, the output buffer unchanged,
+     * a plausible looking answer. So the attend has to be its own
+     * capability, asked beside the GEMM rather than implied by it.
+     */
+    public static boolean attendHere() {
+        return KernelCap.here(KernelCap.K_FLASH_PREFILL)
+            && KernelCap.here(KernelCap.K_FLASH_DECODE);
+    }
+
+    /** Does the DEVICE MoE ROUTER exist here? `QuantKernel` launches
+     *  `routerTopKKernel` and its siblings with no gate of their own, so
+     *  the grouped MoE route asks this before it opens. */
+    public static boolean routerHere() {
+        return KernelCap.here(KernelCap.K_ROUTER_TOPK);
+    }
+}

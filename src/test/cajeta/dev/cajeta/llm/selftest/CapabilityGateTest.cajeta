@@ -1,0 +1,263 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+
+/**
+ * THE ROUTE GATES ARE CAPABILITIES, NOT BACKEND NAMES.
+ *
+ * Every test here runs on every backend and skips on none. That is the
+ * point: a suite of skips cannot catch the defect this file exists to
+ * catch, which is a gate that answers a capability question by reading
+ * `Device.activeBackend()` and comparing it to a string.
+ *
+ * The defect was real and it was one boolean. `Linear.waveMv()` latched
+ * `!(backend == "cpu" || backend == "none")` and 78 cpu skips descended
+ * from it. It stood for three unrelated capabilities at once, so it was
+ * simultaneously too strict (the batched GEMM kernels ARE registered on
+ * the cpu backend and the name closed that route anyway) and, if simply
+ * lifted, too loose (the flash attend kernels are NOT registered there
+ * and the route would have launched them). Its own doc gave two reasons
+ * and both had expired: one was a performance argument in a correctness
+ * gate, the other a rule the compiler now enforces itself, by erasing
+ * the wrapper of a kernel whose work-item loop did not vectorize at the
+ * wave width so that it never registers at all.
+ *
+ * So the gates ask the registry, through {@link KernelCap}. Three
+ * consequences this file pins:
+ *
+ *   1. a gate agrees with `Device.kernelAvailable` for the kernel its
+ *      route would launch, on every backend, so it cannot drift;
+ *   2. a route never launches a kernel the registry does not have;
+ *   3. a refusal NAMES the missing kernel, so the skip that follows it
+ *      is a measured fact and retires itself when the kernel lands.
+ *
+ * Consequence 3 is what makes the remaining cpu skips honest. They are
+ * tracked at xpu-kernel-adaptor 4.2.1 — the cpu vectorizer taking the
+ * wave-op work-item loops — and nothing here has to be edited when it
+ * lands: the registry starts saying yes and the routes open by
+ * themselves.
+ */
+public class CapabilityGateTest {
+
+    static final String FIX = "src/test/fixtures/gguf/toy-routable.gguf";
+    static final String KQ = "src/test/fixtures/gguf/kquant/";
+    static final int32 CO = 128;     // outDim: one Mw8 / coop row tile
+    static final int32 CI = 256;     // inDim: one k-quant super-block
+
+    public CapabilityGateTest() { return; }
+
+    static #CausalLM mk() {
+        Checkpoint ck #= Checkpoint.open(CapabilityGateTest.FIX);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    /** A Q4_K weight at one coop/Mw8 tile, built from the checked-in
+     *  block fixture the route tests use. */
+    static #Linear tiled(int32 ty, String fixture) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be = (int64) Quant.blockElems(ty);
+        int64 nBlocks = (int64) CapabilityGateTest.CO
+            * ((int64) CapabilityGateTest.CI / be);
+        int8[] fix #= File.readAllBytes(CapabilityGateTest.KQ + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 src = (b % fixBlocks) * bb;
+            int64 dst = b * bb;
+            int64 j = 0;
+            while (j < bb) { raw[dst + j] = fix[src + j]; j = j + 1; }
+            b = b + 1;
+        }
+        Linear lin = heap Linear(CapabilityGateTest.CI,
+            CapabilityGateTest.CO);
+        lin.bindPacked(#raw, ty);
+        return #lin;
+    }
+
+    static #int32[] promptOf(int32 len, int32 seed) {
+        int32[] p #= heap int32[len];
+        int32 i = 0;
+        while (i < len) {
+            p[i] = (i * 7 + seed) % 200;
+            i = i + 1;
+        }
+        return #p;
+    }
+
+    /**
+     * 1 — the BATCHED GEMM gate equals the registry.
+     *
+     * The routable fixture is Q4_K throughout, so the kernel the batched
+     * prefill would launch for it is `q4kQ8BatchMatMulKernel`, and the
+     * engine's own predicate must be open exactly where that kernel is
+     * registered. Asserted against `Device.kernelAvailable` rather than
+     * against a backend name on purpose: the assertion is then the same
+     * sentence on cpu, nvptx and vulkan, and it is the sentence that
+     * fails when a gate goes back to reading a name.
+     */
+    @Test
+    public void theBatchGateIsOpenExactlyWhereItsKernelIsRegistered() {
+        CausalLM m #= CapabilityGateTest.mk();
+        Assert.isTrue(m.deviceRoutable());
+        boolean kernelHere = Device.kernelAvailable("q4kQ8BatchMatMulKernel");
+        if (kernelHere != m.batchRoutedFor(8)) {
+            Assert.fail("the batch route and the registry disagree:"
+                + " q4kQ8BatchMatMulKernel registered=" + kernelHere
+                + " batchRoutedFor(8)=" + m.batchRoutedFor(8)
+                + " on backend " + Device.activeBackend());
+        }
+    }
+
+    /**
+     * 2 — the DECODE gate equals the registry, per format.
+     *
+     * `matVecHere` is the replacement for the decode half of `waveMv`,
+     * and there is one of these per format rather than one for the
+     * engine, because the vectorizer declines kernels one at a time.
+     */
+    @Test
+    public void theDecodeGateIsOpenExactlyWhereItsKernelIsRegistered() {
+        int32[] tys #= heap int32[6];
+        tys[0] = Quant.GG_Q4_K;
+        tys[1] = Quant.GG_Q6_K;
+        tys[2] = Quant.GG_Q5_K;
+        tys[3] = Quant.GG_Q8_0;
+        tys[4] = Quant.GG_Q2_K;
+        tys[5] = Quant.GG_F16;
+        int32 i = 0;
+        while (i < 6) {
+            int32 ty = tys[i];
+            String want #= KernelCap.matVecKernelName(ty);
+            boolean reg = Device.kernelAvailable(want);
+            boolean gate = KernelCap.matVecHere(ty);
+            if (ty != Quant.GG_Q8_0 && reg != gate) {
+                // Q8_0 is the one format with BOTH an integer and an f32
+                // wave kernel, so its gate is a disjunction of two
+                // registry answers rather than one; the others are 1:1.
+                Assert.fail("decode gate disagrees with the registry for"
+                    + " ggml type " + ty + ": " + want + " registered="
+                    + reg + " matVecHere=" + gate);
+            }
+            i = i + 1;
+        }
+    }
+
+    /**
+     * 3 — A ROUTE NEVER LAUNCHES AN UNREGISTERED KERNEL.
+     *
+     * The anti-regression for the hazard that opening the batch route
+     * on cpu creates. `CausalLM` opens the device KV planes off the
+     * batch route, and `AttnKernel` then launches the flash prefill and
+     * decode kernels with no gate of their own. Those are declined on
+     * the cpu backend, and a launch of an unregistered kernel is a
+     * REFUSED launch: one line on stderr, the output buffer unchanged,
+     * an answer that looks plausible. A red test is the only thing that
+     * separates it from a correct run, and a delta on the process-wide
+     * failure counter is that test.
+     *
+     * TestMain gates the whole suite on the same counter (25.4). This is
+     * the focused twin, so a failure says WHICH forward pass did it.
+     */
+    @Test
+    public void aFullForwardPassRefusesNoLaunch() {
+        int64 before = Device.launchFailures();
+        CausalLM m #= CapabilityGateTest.mk();
+        int32[] p #= CapabilityGateTest.promptOf(8, 3);
+        int32 tok = m.prefill(p, 8);
+        Assert.isTrue(tok >= 0);
+        // A decode step after the prefill: the resident tail and the
+        // flash DECODE kernels are a different set from the prefill's.
+        int32[] one #= heap int32[1];
+        one[0] = tok;
+        int32 next = m.stepSeq(0, one, 0, 1);
+        Assert.isTrue(next >= 0);
+        int64 after = Device.launchFailures();
+        if (after != before) {
+            Assert.fail("a forward pass on backend "
+                + Device.activeBackend() + " refused "
+                + (after - before) + " launch(es): a route opened onto a"
+                + " kernel the registry does not have");
+        }
+    }
+
+    /**
+     * 4 — THE REFUSAL NAMES THE MISSING KERNEL, and the gate FIRES.
+     *
+     * The does-not-fire twin of the three above. Without the override
+     * the absent arm is only reachable on a backend that happens to
+     * lack the kernel, which is no test at all on the backend where it
+     * matters; CLAUDE.md §5 records an hour lost to a predicate that
+     * silently disabled a whole check and read as a clean run.
+     */
+    @Test
+    public void theBatchRefusalNamesTheKernelTheRegistryIsMissing() {
+        Linear lin #= CapabilityGateTest.tiled(Quant.GG_Q4_K, "q4_k.bin");
+        // Absent: the refusal must say so, and say WHICH.
+        KernelCap.setOverride(KernelCap.K_BATCH_Q4K, false);
+        String why = lin.batchRefusal(128L);
+        KernelCap.clearOverrides();
+        if (why == null) {
+            Assert.fail("the batch route stayed open with"
+                + " q4kQ8BatchMatMulKernel forced absent");
+        }
+        if (!why.contains("q4kQ8BatchMatMulKernel")) {
+            Assert.fail("the refusal does not name the missing kernel: "
+                + why);
+        }
+        // Present: no refusal for the same weight and row count. The
+        // twin that proves the gate is not simply always closed.
+        KernelCap.setOverride(KernelCap.K_BATCH_Q4K, true);
+        String ok = lin.batchRefusal(128L);
+        KernelCap.clearOverrides();
+        if (ok != null) {
+            Assert.fail("the batch route refused with"
+                + " q4kQ8BatchMatMulKernel forced present: " + ok);
+        }
+    }
+
+    /**
+     * 5 — the ATTEND is its own capability, separate from the GEMM.
+     *
+     * One boolean for three capabilities is what made the old gate
+     * wrong in both directions at once. This asserts they are actually
+     * separable now: forcing the flash kernels absent must not close
+     * the batched GEMM, and the engine must still refuse to open the
+     * device KV planes.
+     */
+    @Test
+    public void theAttendGateIsSeparateFromTheBatchGate() {
+        KernelCap.clearOverrides();
+        boolean gemm = Device.kernelAvailable("q4kQ8BatchMatMulKernel");
+        KernelCap.setOverride(KernelCap.K_FLASH_PREFILL, false);
+        KernelCap.setOverride(KernelCap.K_FLASH_DECODE, false);
+        Assert.isFalse(KernelCap.attendHere());
+        CausalLM m #= CapabilityGateTest.mk();
+        boolean stillBatched = m.batchRoutedFor(8);
+        int32[] p #= CapabilityGateTest.promptOf(8, 3);
+        m.prefill(p, 8);
+        int32 slots = m.deviceKvSlotsActive();
+        KernelCap.clearOverrides();
+        if (gemm != stillBatched) {
+            Assert.fail("forcing the flash kernels absent changed the"
+                + " GEMM gate: registered=" + gemm + " batched="
+                + stillBatched);
+        }
+        Assert.equals((int64) 0, (int64) slots);
+    }
+}
