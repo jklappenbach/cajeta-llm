@@ -1,0 +1,252 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelTimer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.bench.LegRow;
+import dev.cajeta.llm.bench.ParityLeg;
+import dev.cajeta.llm.bench.ParityTable;
+import dev.cajeta.llm.bench.ParityVerdict;
+
+/**
+ * xpu-kernel-adaptor plan Unit 8 TDD (8.1.1, 8.2.2, 8.2.3, 8.3.1): the
+ * parity harness refuses every comparison the spec's §7.1 says is not
+ * one, and judges the rest with the four fields beside the number.
+ *
+ * Every row here is a hand-written `leg-row` line, so the arithmetic is
+ * pinned in-test; the real numbers live in `census/parity-nvptx.tsv` and
+ * are produced by `tools/parity/run-parity-legs.sh`, never asserted here.
+ * The one test that touches a kernel runs the cajeta leg on whatever
+ * backend is active and accepts either a row or a refusal BY NAME: a leg
+ * whose kernel does not lower here must say so, not print a number.
+ */
+public class ParityTableTest {
+
+    public ParityTableTest() { return; }
+
+    static boolean near(float64 a, float64 b, float64 eps) {
+        float64 d = a - b;
+        if (d < 0.0) { d = 0.0 - d; }
+        return d < eps;
+    }
+
+    /** A leg-row with every field, in the column order ParityTable reads. */
+    static #String row(String leg, String backend, String build,
+            String residency, String tier, int64 ns, int64 bytes,
+            float64 flops) {
+        String s #= "leg-row\t" + leg + "\t" + backend + "\t" + build
+            + "\tmul_mat\tq4_K\t4096\t14336\t1\t50\t201326592\t75497472\t"
+            + residency + "\t" + tier + "\t" + ns + "\t" + bytes + "\t"
+            + flops + "\t1.0456";
+        return #s;
+    }
+
+    @Test
+    public void parsesALegRowAndRejectsOtherLines() {
+        String line #= ParityTableTest.row("cajeta", "cuda", "9b810777",
+            "cold", "device", 41000L, 29491200L, 117440512.0);
+        LegRow r #= ParityTable.parse(line);
+        Assert.isTrue(r != null);
+        Assert.equals("cajeta", r.leg);
+        Assert.equals("cuda", r.backend);
+        Assert.equals("9b810777", r.build);
+        Assert.equals("mul_mat", r.op);
+        Assert.equals("q4_K", r.type);
+        Assert.isTrue(r.m == 4096L);
+        Assert.isTrue(r.k == 14336L);
+        Assert.isTrue(r.n == 1L);
+        Assert.isTrue(r.launches == 50L);
+        Assert.isTrue(r.poolBytes == 201326592L);
+        Assert.isTrue(r.l2Bytes == 75497472L);
+        Assert.equals("cold", r.residency);
+        Assert.equals("device", r.tier);
+        Assert.isTrue(r.nsPerLaunch == 41000L);
+        Assert.isTrue(r.bytesPerLaunch == 29491200L);
+        // cajeta prints a float64 with six significant digits, so a flop
+        // count round-trips to 1e-5, which is all a fraction needs.
+        Assert.isTrue(ParityTableTest.near(r.flopsPerLaunch, 117440512.0, 2000.0));
+        Assert.isTrue(ParityTableTest.near(r.clockScale, 1.0456, 1e-9));
+        // Anything that is not a leg-row parses to nothing, loudly enough.
+        LegRow none #= ParityTable.parse("census-row\tcuda\tq4kQ8WaveMatVecKernel\tRAN");
+        Assert.isTrue(none == null);
+        LegRow shortRow #= ParityTable.parse("leg-row\tcajeta\tcuda");
+        Assert.isTrue(shortRow == null);
+    }
+
+    @Test
+    public void residencyFollowsThePoolAgainstL2() {
+        // The 4090: 72 MB of L2. A 31.5 MB weight repeated is hot; a 192 MB
+        // pool cycled is cold; a part that reports no L2 cannot be judged.
+        Assert.equals("hot", ParityTable.residency(31457280L, 75497472L));
+        Assert.equals("cold", ParityTable.residency(201326592L, 75497472L));
+        Assert.equals("hot", ParityTable.residency(75497472L, 75497472L));
+        Assert.equals("unknown", ParityTable.residency(201326592L, 0L));
+    }
+
+    @Test
+    public void refusesAResidencyMismatch() {
+        LegRow c #= ParityTable.parse(ParityTableTest.row("cajeta", "cuda",
+            "9b810777", "cold", "device", 41000L, 29491200L, 117440512.0));
+        LegRow l #= ParityTable.parse(ParityTableTest.row("llama.cpp", "CUDA",
+            "67a17c1", "hot", "device", 12940L, 29491200L, 117440512.0));
+        ParityVerdict v #= ParityTable.judge(c, l, 1008.1, 165.0e12);
+        Assert.isTrue(v.refused);
+        Assert.isTrue(v.reason.contains("residency"));
+        // And "unknown" on either side is a refusal, not a pass.
+        LegRow u #= ParityTable.parse(ParityTableTest.row("llama.cpp", "CUDA",
+            "67a17c1", "unknown", "device", 12940L, 29491200L, 117440512.0));
+        ParityVerdict v2 #= ParityTable.judge(c, u, 1008.1, 165.0e12);
+        Assert.isTrue(v2.refused);
+        Assert.isTrue(v2.reason.contains("residency"));
+    }
+
+    @Test
+    public void refusesAHostTierOnEitherLeg() {
+        LegRow c #= ParityTable.parse(ParityTableTest.row("cajeta", "cpu",
+            "9b810777", "cold", "host", 41000L, 29491200L, 117440512.0));
+        LegRow l #= ParityTable.parse(ParityTableTest.row("llama.cpp", "CUDA",
+            "67a17c1", "cold", "device", 12940L, 29491200L, 117440512.0));
+        ParityVerdict v #= ParityTable.judge(c, l, 1008.1, 165.0e12);
+        Assert.isTrue(v.refused);
+        Assert.isTrue(v.reason.contains("tier"));
+        LegRow c2 #= ParityTable.parse(ParityTableTest.row("cajeta", "cuda",
+            "9b810777", "cold", "device", 41000L, 29491200L, 117440512.0));
+        LegRow l2 #= ParityTable.parse(ParityTableTest.row("llama.cpp", "CUDA",
+            "67a17c1", "cold", "host", 12940L, 29491200L, 117440512.0));
+        ParityVerdict v2 #= ParityTable.judge(c2, l2, 1008.1, 165.0e12);
+        Assert.isTrue(v2.refused);
+        Assert.isTrue(v2.reason.contains("tier"));
+    }
+
+    @Test
+    public void refusesABareOrUnbuiltLlamaBackendLabel() {
+        LegRow c #= ParityTable.parse(ParityTableTest.row("cajeta", "cuda",
+            "9b810777", "cold", "device", 41000L, 29491200L, 117440512.0));
+        // 8.2.3: never bare "cuda" — the same op has a different counterpart
+        // per backend, and a build hash says which llama.cpp.
+        LegRow bare #= ParityTable.parse(ParityTableTest.row("llama.cpp", "cuda",
+            "67a17c1", "cold", "device", 12940L, 29491200L, 117440512.0));
+        ParityVerdict v #= ParityTable.judge(c, bare, 1008.1, 165.0e12);
+        Assert.isTrue(v.refused);
+        Assert.isTrue(v.reason.contains("backend"));
+        LegRow unbuilt #= ParityTable.parse(ParityTableTest.row("llama.cpp", "CUDA",
+            "", "cold", "device", 12940L, 29491200L, 117440512.0));
+        ParityVerdict v2 #= ParityTable.judge(c, unbuilt, 1008.1, 165.0e12);
+        Assert.isTrue(v2.refused);
+        Assert.isTrue(v2.reason.contains("build"));
+        // The four labels the spec names are accepted.
+        LegRow hip #= ParityTable.parse(ParityTableTest.row("llama.cpp", "HIP",
+            "67a17c1", "cold", "device", 12940L, 29491200L, 117440512.0));
+        ParityVerdict v3 #= ParityTable.judge(c, hip, 1008.1, 165.0e12);
+        Assert.isFalse(v3.refused);
+    }
+
+    @Test
+    public void judgesAWellFormedPairWithRatioAndPeakFractions() {
+        // cajeta: 8 MB in 10 us = 800 GB/s, 0.8 of a 1000 GB/s peak.
+        // llama.cpp: the same bytes in 12.5 us = 640 GB/s, 0.64 of peak.
+        // Compute: 117.44 MFLOP in 10 us = 11.7 TFLOPS, 0.07 of 165 — the
+        // bandwidth axis binds and the fraction reports the binding one.
+        LegRow c #= ParityTable.parse(ParityTableTest.row("cajeta", "cuda",
+            "9b810777", "cold", "device", 10000L, 8000000L, 117440512.0));
+        LegRow l #= ParityTable.parse(ParityTableTest.row("llama.cpp", "CUDA",
+            "67a17c1", "cold", "device", 12500L, 8000000L, 117440512.0));
+        ParityVerdict v #= ParityTable.judge(c, l, 1000.0, 165.0e12);
+        Assert.isFalse(v.refused);
+        Assert.isTrue(ParityTableTest.near(v.ratio, 0.8, 1e-9));
+        Assert.isTrue(v.par);
+        Assert.isTrue(ParityTableTest.near(v.ofPeakCajeta, 0.8, 1e-9));
+        Assert.isTrue(ParityTableTest.near(v.ofPeakLlama, 0.64, 1e-9));
+        // A cajeta leg at 1.25x llama.cpp's time is not par.
+        LegRow slow #= ParityTable.parse(ParityTableTest.row("cajeta", "cuda",
+            "9b810777", "cold", "device", 15625L, 8000000L, 117440512.0));
+        ParityVerdict w #= ParityTable.judge(slow, l, 1000.0, 165.0e12);
+        Assert.isFalse(w.refused);
+        Assert.isTrue(ParityTableTest.near(w.ratio, 1.25, 1e-9));
+        Assert.isFalse(w.par);
+        // A peak of zero is a refusal: a fraction of nothing is not a number.
+        ParityVerdict z #= ParityTable.judge(c, l, 0.0, 165.0e12);
+        Assert.isTrue(z.refused);
+        Assert.isTrue(z.reason.contains("peak"));
+        // Different shapes are not a pair.
+        String other #= "leg-row\tllama.cpp\tCUDA\t67a17c1\tmul_mat\tq6_K\t4096\t14336\t1"
+            + "\t50\t201326592\t75497472\tcold\tdevice\t12500\t8000000\t117440512.0\t1.0";
+        LegRow o #= ParityTable.parse(other);
+        ParityVerdict s #= ParityTable.judge(c, o, 1000.0, 165.0e12);
+        Assert.isTrue(s.refused);
+        Assert.isTrue(s.reason.contains("shape"));
+    }
+
+    @Test
+    public void nothingIsJudgedBeforeACalibrationRowReproduces() {
+        ParityTable t #= heap ParityTable(1000.0, 165.0e12);
+        LegRow c #= ParityTable.parse(ParityTableTest.row("cajeta", "cuda",
+            "9b810777", "cold", "device", 10000L, 8000000L, 117440512.0));
+        LegRow l #= ParityTable.parse(ParityTableTest.row("llama.cpp", "CUDA",
+            "67a17c1", "cold", "device", 12500L, 8000000L, 117440512.0));
+        // No calibration row yet: the pair is refused, and says why.
+        ParityVerdict v #= t.add(c, l);
+        Assert.isTrue(v.refused);
+        Assert.isTrue(v.reason.contains("calibration"));
+        // A recorded 13330 ns reproduced at 12940 is within 5%: calibrated.
+        LegRow recorded #= ParityTable.parse(ParityTableTest.row("llama.cpp",
+            "CUDA", "67a17c1", "hot", "device", 13330L, 29491200L, 117440512.0));
+        LegRow now #= ParityTable.parse(ParityTableTest.row("llama.cpp",
+            "CUDA", "67a17c1", "hot", "device", 12940L, 29491200L, 117440512.0));
+        Assert.isTrue(t.calibrate(recorded, now, 0.05));
+        ParityVerdict v2 #= t.add(c, l);
+        Assert.isFalse(v2.refused);
+        // A recorded 144 reproduced at 168 is NOT within 5%: not calibrated,
+        // and the table says so rather than judging on a moved floor.
+        ParityTable t2 #= heap ParityTable(1000.0, 165.0e12);
+        LegRow rec2 #= ParityTable.parse(ParityTableTest.row("llama.cpp",
+            "CUDA", "67a17c1", "hot", "device", 144000L, 29491200L, 117440512.0));
+        LegRow now2 #= ParityTable.parse(ParityTableTest.row("llama.cpp",
+            "CUDA", "67a17c1", "hot", "device", 168000L, 29491200L, 117440512.0));
+        Assert.isFalse(t2.calibrate(rec2, now2, 0.05));
+        ParityVerdict v3 #= t2.add(c, l);
+        Assert.isTrue(v3.refused);
+        Assert.isTrue(v3.reason.contains("calibration"));
+        // The rendered table carries every §7.1 field as a column.
+        String text #= t.render();
+        Assert.isTrue(text.contains("residency"));
+        Assert.isTrue(text.contains("tier"));
+        Assert.isTrue(text.contains("of_peak"));
+        Assert.isTrue(text.contains("llama_backend"));
+        Assert.isTrue(text.contains("CUDA 67a17c1"));
+    }
+
+    @Test
+    public void theLegOnThisBackendEmitsARowOrRefusesByName() {
+        String be #= Device.activeBackend();
+        // A 1024x4096 q4_K weight is 2.25 MB; four copies keep the test small.
+        String line #= ParityLeg.row(12, 1024L, 4096L, 4L, 2);
+        System.stdout.println("  [parity-leg " + be + "] " + line);
+        if (!Device.kernelAvailable("q4kQ8WaveMatVecKernel")) {
+            // No number for an absent kernel: the refusal names it.
+            Assert.isTrue(line.startsWith("leg-refused\t"));
+            Assert.isTrue(line.contains("q4kQ8WaveMatVecKernel"));
+            return;
+        }
+        LegRow r #= ParityTable.parse(line);
+        Assert.isTrue(r != null);
+        Assert.equals("cajeta", r.leg);
+        Assert.equals(be, r.backend);
+        Assert.equals("q4_K", r.type);
+        Assert.isTrue(r.m == 1024L);
+        Assert.isTrue(r.k == 4096L);
+        Assert.isTrue(r.launches == 8L);
+        Assert.isTrue(r.poolBytes == 4L * 1024L * 16L * 144L);
+        Assert.isTrue(r.l2Bytes == Device.l2CacheBytes());
+        Assert.equals(ParityTable.residency(r.poolBytes, r.l2Bytes), r.residency);
+        Assert.equals(KernelTimer.tierName(), r.tier);
+        if (KernelTimer.tier() != KernelTimer.TIER_UNAVAILABLE) {
+            Assert.isTrue(r.nsPerLaunch > 0L);
+        }
+        Assert.isTrue(r.bytesPerLaunch == 1024L * 16L * 144L
+            + 4096L * 4L + 1024L * 4L);
+    }
+}

@@ -1,0 +1,161 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+
+/**
+ * Joins the two legs' `leg-row` files into the parity table
+ * (xpu-kernel-adaptor plan 8.2.2): the llama.cpp rows from `ggml-leg`, the
+ * cajeta rows from {@link ParityLeg}, paired by op, type and shape.
+ *
+ * The calibration first (8.1.2): the llama.cpp leg's HOT row at
+ * test-backend-ops' shape (q4_K 4096x14336, one tensor) must reproduce
+ * `--recorded-hot-ns` within `--tolerance`, else every pair is refused
+ * and the table says so. The recorded number is llama.cpp's own
+ * test-backend-ops figure on this part (13.33 us on 2026-09-19, plan 1.8),
+ * which the hot ggml-leg row measures the same op at the same residency
+ * with a device timer instead of the host clock.
+ *
+ * Rows pair at the same shape and residency; the hot control row is
+ * printed as calibration and paired with nothing.
+ *
+ *   ParityJoin.run --llama rows.tsv --cajeta rows.tsv
+ *                  --recorded-hot-ns 13330 --tolerance 0.05
+ */
+public class ParityJoin {
+
+    static #String readText(String path) {
+        int8[] raw #= File.readAllBytes(path);
+        String s #= heap String(#raw, (int32) raw.count());
+        return #s;
+    }
+
+    /** Every leg-row in the file, in order; other lines are printed and kept out. */
+    static int32 rowsOf(String text, LegRow[] into) {
+        int32 n = 0;
+        int64 p = 0;
+        int64 len = text.size();
+        while (p < len) {
+            int64 nl = text.indexOfFrom("\n", p);
+            if (nl < 0L) { nl = len; }
+            String line #= text.substring((int32) p, (int32) nl);
+            p = nl + 1L;
+            if (line.startsWith("leg-refused\t")) {
+                System.stdout.println("# " + line);
+                continue;
+            }
+            LegRow r #= ParityTable.parse(line);
+            if (r == null) { continue; }
+            if (n < (int32) into.count()) {
+                into[n] #= r;
+                n = n + 1;
+            }
+        }
+        return n;
+    }
+
+    /** Index of the row matching `like`'s op, type and shape at `residency`, or -1. */
+    static int32 find(LegRow[] rows, int32 n, LegRow like, String residency) {
+        int32 i = 0;
+        while (i < n) {
+            LegRow r = rows[i];
+            if (r.op.equals(like.op) && r.type.equals(like.type) && r.m == like.m
+                    && r.k == like.k && r.n == like.n
+                    && r.residency.equals(residency)) {
+                return i;
+            }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    public static int32 run(String[] args) {
+        String llamaPath #= "";
+        String cajetaPath #= "";
+        int64 recordedHotNs = 13330;
+        float64 tolerance = 0.05;
+        int32 i = 0;
+        int32 n = (int32) args.count();
+        while (i < n) {
+            if (args[i].equals("--llama") && i + 1 < n) { llamaPath #= "" + args[i + 1]; i = i + 2; }
+            else if (args[i].equals("--cajeta") && i + 1 < n) { cajetaPath #= "" + args[i + 1]; i = i + 2; }
+            else if (args[i].equals("--recorded-hot-ns") && i + 1 < n) { recordedHotNs = Long.parseLong(args[i + 1]); i = i + 2; }
+            else if (args[i].equals("--tolerance") && i + 1 < n) { tolerance = Double.parseDouble(args[i + 1]); i = i + 2; }
+            else { i = i + 1; }
+        }
+        if (llamaPath.size() == 0L || cajetaPath.size() == 0L) {
+            System.stdout.println("usage: ParityJoin.run --llama rows.tsv --cajeta rows.tsv"
+                + " [--recorded-hot-ns 13330] [--tolerance 0.05]");
+            return 2;
+        }
+        LegRow[] llama #= heap LegRow[64];
+        LegRow[] cajeta #= heap LegRow[64];
+        String lt #= ParityJoin.readText(llamaPath);
+        String ct #= ParityJoin.readText(cajetaPath);
+        int32 ln = ParityJoin.rowsOf(lt, llama);
+        int32 cn = ParityJoin.rowsOf(ct, cajeta);
+
+        ParityTable t #= heap ParityTable(Device.peakBandwidthGBps(), 165.0e12);
+
+        // Calibration: the llama.cpp hot row against the recorded number.
+        LegRow probe #= heap LegRow();
+        probe.op = "mul_mat";
+        probe.type = "q4_K";
+        probe.m = 4096;
+        probe.k = 14336;
+        probe.n = 1;
+        int32 hotIdx = ParityJoin.find(llama, ln, probe, "hot");
+        if (hotIdx < 0) {
+            System.stdout.println("# calibration: the llama.cpp leg has no hot q4_K 4096x14336 row");
+        } else {
+            LegRow hotNow = llama[hotIdx];
+            LegRow recorded #= heap LegRow();
+            recorded.leg = "" + hotNow.leg;
+            recorded.op = "mul_mat";
+            recorded.type = "q4_K";
+            recorded.m = 4096;
+            recorded.k = 14336;
+            recorded.n = 1;
+            recorded.residency = "hot";
+            recorded.nsPerLaunch = recordedHotNs;
+            t.calibrate(recorded, hotNow, tolerance);
+        }
+        // The cajeta hot row is reported beside it, as this run's control
+        // for the next run to calibrate against.
+        int32 cajetaHotIdx = ParityJoin.find(cajeta, cn, probe, "hot");
+        if (cajetaHotIdx >= 0) {
+            LegRow cajetaHot = cajeta[cajetaHotIdx];
+            System.stdout.println("# cajeta hot control: " + cajetaHot.type + " "
+                + cajetaHot.shape() + " " + cajetaHot.nsPerLaunch + " ns/launch ("
+                + cajetaHot.tier + ", clock scale " + cajetaHot.clockScale + ")");
+        }
+
+        // Pair every cajeta row but the hot control with the llama.cpp row
+        // at the same shape AND residency: cold is the engine's case, and a
+        // shape whose every tensor in the model fits L2 (the sixteen q6_K
+        // attn_v's are 55 MB) is judged hot on both legs, which the table
+        // says in its residency column.
+        int32 paired = 0;
+        int32 par = 0;
+        int32 refused = 0;
+        i = 0;
+        while (i < cn) {
+            LegRow c = cajeta[i];
+            if (i == cajetaHotIdx) { i = i + 1; continue; }
+            int32 li = ParityJoin.find(llama, ln, c, c.residency);
+            LegRow l = null;
+            if (li >= 0) { l = llama[li]; }
+            ParityVerdict v #= t.add(c, l);
+            paired = paired + 1;
+            if (v.refused) { refused = refused + 1; }
+            else if (v.par) { par = par + 1; }
+            i = i + 1;
+        }
+        System.stdout.print(t.render());
+        System.stdout.println("# pairs " + paired + ", par " + par + ", not par "
+            + (paired - par - refused) + ", refused " + refused);
+        return 0;
+    }
+}

@@ -1,0 +1,310 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+
+/**
+ * The parity table of xpu-kernel-adaptor spec §7.1 (plan 8.1.1, 8.2.2,
+ * 8.2.3, 8.3.1): pairs a cajeta {@link LegRow} with its llama.cpp
+ * counterpart at the same shape and judges par, or REFUSES with the
+ * reason, in this order:
+ *
+ * <ol>
+ * <li>the two rows are not the same op, type and shape;</li>
+ * <li>the llama.cpp leg is not labelled by backend (CUDA, HIP, Vulkan,
+ *     CPU — never bare "cuda") and build (8.2.3);</li>
+ * <li>the residencies differ, or either is unknown (8.1.1);</li>
+ * <li>either timer tier is not `device` — a host number is not par
+ *     evidence on either side;</li>
+ * <li>a time is not positive, or the peak to judge a fraction against
+ *     is zero;</li>
+ * <li>the table has no calibration row that reproduced a recorded
+ *     number within tolerance (8.1.2) — nothing is judged on a floor
+ *     that moved.</li>
+ * </ol>
+ *
+ * The roofline fraction beside each number is the larger of the
+ * bandwidth fraction (bytes moved over time against `peakGBps`) and the
+ * compute fraction (operations over time against `peakOps`): the axis
+ * that binds. `peakGBps` is the part's THEORETICAL bus bandwidth
+ * (`Device.peakBandwidthGBps()`, 1008.1 on the 4090); the measured
+ * achievable is lower (859 to 915 on this part, plan 1.8.1), so a
+ * fraction here is a floor on the true fraction, and the column says
+ * `of_peak`, not `of_achievable`.
+ */
+public final class ParityTable {
+
+    static final int32 FIELDS = 18;
+    static final int32 CAPACITY = 128;
+
+    float64 peakGBps;
+    float64 peakOps;
+    boolean calibrated;
+    String calibrationNote;
+    LegRow[] cajetaRows;
+    LegRow[] llamaRows;
+    ParityVerdict[] verdicts;
+    int32 n;
+
+    public ParityTable(float64 peakGBps, float64 peakOps) {
+        this.peakGBps = peakGBps;
+        this.peakOps = peakOps;
+        this.calibrated = false;
+        this.calibrationNote = "no calibration row";
+        this.cajetaRows #= heap LegRow[ParityTable.CAPACITY];
+        this.llamaRows #= heap LegRow[ParityTable.CAPACITY];
+        this.verdicts #= heap ParityVerdict[ParityTable.CAPACITY];
+        this.n = 0;
+    }
+
+    // ── the line format ────────────────────────────────────────────────
+
+    static int32 fieldCount(String line) {
+        int32 c = 1;
+        int64 pos = 0;
+        while (true) {
+            int64 t = line.indexOfFrom("\t", pos);
+            if (t < 0L) { return c; }
+            c = c + 1;
+            pos = t + 1L;
+        }
+    }
+
+    static #String field(String line, int32 idx) {
+        int32 pos = 0;
+        int32 f = 0;
+        while (f < idx) {
+            int64 t = line.indexOfFrom("\t", (int64) pos);
+            if (t < 0L) { return #""; }
+            pos = (int32) t + 1;
+            f = f + 1;
+        }
+        int64 e = line.indexOfFrom("\t", (int64) pos);
+        if (e < 0L) { e = line.size(); }
+        String out #= line.substring(pos, (int32) e);
+        return #out;
+    }
+
+    /** Parses one `leg-row` line; null for any other line or a short one. */
+    public static #LegRow parse(String line) {
+        if (!line.startsWith("leg-row\t")) { return null; }
+        if (ParityTable.fieldCount(line) != ParityTable.FIELDS) { return null; }
+        LegRow r #= heap LegRow();
+        r.leg #= ParityTable.field(line, 1);
+        r.backend #= ParityTable.field(line, 2);
+        r.build #= ParityTable.field(line, 3);
+        r.op #= ParityTable.field(line, 4);
+        r.type #= ParityTable.field(line, 5);
+        r.m = Long.parseLong(ParityTable.field(line, 6));
+        r.k = Long.parseLong(ParityTable.field(line, 7));
+        r.n = Long.parseLong(ParityTable.field(line, 8));
+        r.launches = Long.parseLong(ParityTable.field(line, 9));
+        r.poolBytes = Long.parseLong(ParityTable.field(line, 10));
+        r.l2Bytes = Long.parseLong(ParityTable.field(line, 11));
+        r.residency #= ParityTable.field(line, 12);
+        r.tier #= ParityTable.field(line, 13);
+        r.nsPerLaunch = Long.parseLong(ParityTable.field(line, 14));
+        r.bytesPerLaunch = Long.parseLong(ParityTable.field(line, 15));
+        r.flopsPerLaunch = Double.parseDouble(ParityTable.field(line, 16));
+        r.clockScale = Double.parseDouble(ParityTable.field(line, 17));
+        return #r;
+    }
+
+    // ── residency ──────────────────────────────────────────────────────
+
+    /**
+     * `cold` when the pool the launches cycle through exceeds the part's
+     * last-level cache, `hot` when it fits, `unknown` when the part reports
+     * no cache size. A decode reads about a hundred different weights a
+     * token and every one is cold, so the engine's case is `cold`.
+     */
+    public static #String residency(int64 poolBytes, int64 l2Bytes) {
+        if (l2Bytes <= 0L) { return #"unknown"; }
+        if (poolBytes > l2Bytes) { return #"cold"; }
+        return #"hot";
+    }
+
+    // ── the judgement ──────────────────────────────────────────────────
+
+    static boolean labelled(String backend) {
+        return backend.equals("CUDA") || backend.equals("HIP")
+            || backend.equals("Vulkan") || backend.equals("CPU");
+    }
+
+    /** The binding roofline axis: bandwidth or compute, whichever is higher. */
+    public static float64 ofPeak(LegRow r, float64 peakGBps, float64 peakOps) {
+        if (r.nsPerLaunch <= 0L || peakGBps <= 0.0) { return 0.0; }
+        float64 bw = ((float64) r.bytesPerLaunch / (float64) r.nsPerLaunch) / peakGBps;
+        float64 comp = 0.0;
+        if (peakOps > 0.0 && r.flopsPerLaunch > 0.0) {
+            comp = (r.flopsPerLaunch / ((float64) r.nsPerLaunch * 1.0e-9)) / peakOps;
+        }
+        if (comp > bw) { return comp; }
+        return bw;
+    }
+
+    public static #ParityVerdict judge(LegRow c, LegRow l, float64 peakGBps,
+            float64 peakOps) {
+        if (c == null || l == null) {
+            return ParityVerdict.refuse("a leg is missing");
+        }
+        if (!c.op.equals(l.op) || !c.type.equals(l.type) || c.m != l.m
+                || c.k != l.k || c.n != l.n) {
+            return ParityVerdict.refuse("not the same shape: " + c.op + " "
+                + c.type + " " + c.shape() + " against " + l.op + " " + l.type
+                + " " + l.shape());
+        }
+        if (!ParityTable.labelled(l.backend)) {
+            return ParityVerdict.refuse("llama.cpp leg is not labelled by backend"
+                + " (CUDA, HIP, Vulkan or CPU): '" + l.backend + "'");
+        }
+        if (l.build.size() == 0L) {
+            return ParityVerdict.refuse("llama.cpp leg names no build");
+        }
+        if (c.residency.equals("unknown") || l.residency.equals("unknown")
+                || !c.residency.equals(l.residency)) {
+            return ParityVerdict.refuse("residency differs or is unknown: cajeta "
+                + c.residency + ", llama.cpp " + l.residency);
+        }
+        if (!c.tier.equals("device") || !l.tier.equals("device")) {
+            return ParityVerdict.refuse("timer tier is not device on both legs:"
+                + " cajeta " + c.tier + ", llama.cpp " + l.tier);
+        }
+        if (c.nsPerLaunch <= 0L || l.nsPerLaunch <= 0L) {
+            return ParityVerdict.refuse("a leg has no time: cajeta "
+                + c.nsPerLaunch + " ns, llama.cpp " + l.nsPerLaunch + " ns");
+        }
+        if (peakGBps <= 0.0) {
+            return ParityVerdict.refuse("no peak bandwidth to judge a fraction against");
+        }
+        ParityVerdict v #= heap ParityVerdict();
+        v.ratio = (float64) c.nsPerLaunch / (float64) l.nsPerLaunch;
+        v.par = v.ratio <= 1.0;
+        v.ofPeakCajeta = ParityTable.ofPeak(c, peakGBps, peakOps);
+        v.ofPeakLlama = ParityTable.ofPeak(l, peakGBps, peakOps);
+        return #v;
+    }
+
+    // ── the table ──────────────────────────────────────────────────────
+
+    /**
+     * The 8.1.2 control: `now` reproduces `recorded` — same leg, op, type,
+     * shape and residency — within `tolerance` of its time. Until one does,
+     * every pair added is refused.
+     */
+    public boolean calibrate(LegRow recorded, LegRow now, float64 tolerance) {
+        if (!recorded.leg.equals(now.leg) || !recorded.op.equals(now.op)
+                || !recorded.type.equals(now.type) || recorded.m != now.m
+                || recorded.k != now.k || recorded.n != now.n
+                || !recorded.residency.equals(now.residency)) {
+            this.calibrationNote = "calibration rows are not the same measurement";
+            this.calibrated = false;
+            return false;
+        }
+        if (recorded.nsPerLaunch <= 0L || now.nsPerLaunch <= 0L) {
+            this.calibrationNote = "calibration row has no time";
+            this.calibrated = false;
+            return false;
+        }
+        float64 d = (float64) now.nsPerLaunch - (float64) recorded.nsPerLaunch;
+        if (d < 0.0) { d = 0.0 - d; }
+        float64 rel = d / (float64) recorded.nsPerLaunch;
+        String note #= now.leg + " " + now.op + " " + now.type + " " + now.shape()
+            + " " + now.residency + ": recorded " + recorded.nsPerLaunch
+            + " ns, now " + now.nsPerLaunch + " ns (" + (rel * 100.0)
+            + "% apart, tolerance " + (tolerance * 100.0) + "%)";
+        if (rel > tolerance) {
+            this.calibrationNote = "NOT REPRODUCED " + note;
+            this.calibrated = false;
+            return false;
+        }
+        this.calibrationNote = "reproduced " + note;
+        this.calibrated = true;
+        return true;
+    }
+
+    /**
+     * Adds a pair; the verdict is stored and a copy returned. The rows are
+     * recorded as the caller lends them (`#=` on a lent source records a
+     * borrow): the table is a view over rows the caller keeps alive.
+     */
+    public #ParityVerdict add(LegRow c, LegRow l) {
+        ParityVerdict v #= heap ParityVerdict();
+        if (!this.calibrated) {
+            v #= ParityVerdict.refuse("no calibration row reproduced: "
+                + this.calibrationNote);
+        } else {
+            v #= ParityTable.judge(c, l, this.peakGBps, this.peakOps);
+        }
+        ParityVerdict out #= heap ParityVerdict();
+        out.refused = v.refused;
+        out.reason = "" + v.reason;
+        out.ratio = v.ratio;
+        out.par = v.par;
+        out.ofPeakCajeta = v.ofPeakCajeta;
+        out.ofPeakLlama = v.ofPeakLlama;
+        if (this.n < ParityTable.CAPACITY) {
+            this.cajetaRows[this.n] #= c;
+            this.llamaRows[this.n] #= l;
+            this.verdicts[this.n] #= v;
+            this.n = this.n + 1;
+        }
+        return #out;
+    }
+
+    public int32 count() { return this.n; }
+
+    public ParityVerdict verdictAt(int32 i) { return this.verdicts[i]; }
+
+    static #String pct(float64 f) {
+        int64 tenths = (int64) (f * 1000.0 + 0.5);
+        String s #= "" + (tenths / 10L) + "." + (tenths % 10L) + "%";
+        return #s;
+    }
+
+    static #String ratioText(float64 r) {
+        int64 hundredths = (int64) (r * 100.0 + 0.5);
+        String frac #= "" + (hundredths % 100L);
+        if (hundredths % 100L < 10L) { frac #= "0" + frac; }
+        String s #= "" + (hundredths / 100L) + "." + frac + "x";
+        return #s;
+    }
+
+    /** The table as TSV: one header, one line per pair, §7.1 fields as columns. */
+    public #String render() {
+        String out #= "# calibration: " + this.calibrationNote + "\n"
+            + "# of_peak: fraction of the theoretical bus bandwidth "
+            + this.peakGBps + " GB/s (or of " + (this.peakOps / 1.0e12)
+            + " TFLOPS where compute binds)\n"
+            + "op\ttype\tshape\tresidency\ttier\tcajeta_ns\tcajeta_of_peak"
+            + "\tllama_ns\tllama_of_peak\tratio\tpar\tllama_backend\tnote\n";
+        int32 i = 0;
+        while (i < this.n) {
+            LegRow c = this.cajetaRows[i];
+            LegRow l = this.llamaRows[i];
+            ParityVerdict v = this.verdicts[i];
+            String llamaLabel #= "-";
+            if (l != null) { llamaLabel #= l.backend + " " + l.build; }
+            String line #= "";
+            if (c != null) {
+                line #= c.op + "\t" + c.type + "\t" + c.shape() + "\t"
+                    + c.residency + "\t" + c.tier + "\t" + c.nsPerLaunch;
+            } else {
+                line #= l.op + "\t" + l.type + "\t" + l.shape() + "\t"
+                    + l.residency + "\t" + l.tier + "\t-";
+            }
+            if (v.refused) {
+                line #= line + "\t-\t";
+                if (l != null) { line #= line + l.nsPerLaunch; } else { line #= line + "-"; }
+                line #= line + "\t-\t-\tREFUSED\t" + llamaLabel + "\t" + v.reason;
+            } else {
+                line #= line + "\t" + ParityTable.pct(v.ofPeakCajeta) + "\t"
+                    + l.nsPerLaunch + "\t" + ParityTable.pct(v.ofPeakLlama)
+                    + "\t" + ParityTable.ratioText(v.ratio) + "\t"
+                    + (v.par ? "par" : "NOT PAR") + "\t" + llamaLabel + "\t";
+            }
+            out #= out + line + "\n";
+            i = i + 1;
+        }
+        return #out;
+    }
+}
