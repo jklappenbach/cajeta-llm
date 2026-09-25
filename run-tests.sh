@@ -89,17 +89,23 @@ echo ">> compile backend: ${XPU_BACKEND}"
 # Unit 3 / 4.2.2 — the kernels the COMPILER declined, from its own notes.
 # `[xpu-kernel-skipped] <kernel>: no <backend> device code ...` is emitted
 # once per kernel that produced no device code for the declared backend.
-# It is a NOTE, so a build missing 50 kernels is green; this counts them
-# from the build's stderr (run_suite used to grep the SUITE log for it and
-# printed 0 on a backend with 54, measured 2026-09-24) and groups them by
-# cause, which is the 3.2.3 table in miniature. It does not fail the build
-# yet: whether an unlowered kernel is an error or a warning is 4.2.3's
-# decision with Julian, and 4.2.2 is where it becomes a tracked failure.
+# Since 2026-09-25 (4.2.3, Julian: "make it an error") it is an ERROR that
+# fails the build unless the kernel holds it by name,
+# `@Unlowered(backend = "cpu", tracked = "<plan item>")`, in which case it
+# is a note carrying `[tracked: <item>]` -- the 1.6.5 shape; a held kernel
+# that lowers is STALE and fails. The same rule covers
+# `[xpu-kernel-unbounded]` (7.0.1) with `@Unbounded(tracked = ...)`. This
+# counts both from the build's stderr (run_suite used to grep the SUITE log
+# for it and printed 0 on a backend with 54, measured 2026-09-24) and groups
+# the declined by cause, which is the 3.2.3 table in miniature. A build
+# that reached this point passed the gate, so every line here is tracked.
 skip_notes() {
-    local errlog="$1" label="$2" n
+    local errlog="$1" label="$2" n tracked unb
     [ -s "$errlog" ] || { echo ">> ${label}: 0 kernels declined by the compiler"; return 0; }
     n=$(grep -c "\[xpu-kernel-skipped\]" "$errlog" || true)
-    echo ">> ${label}: ${n} kernel(s) declined by the compiler ([xpu-kernel-skipped]; plan 4.2.2 decides whether that fails)"
+    tracked=$(grep "\[xpu-kernel-skipped\]" "$errlog" | grep -c "\[tracked:" || true)
+    unb=$(grep -c "\[xpu-kernel-unbounded\]" "$errlog" || true)
+    echo ">> ${label}: ${n} kernel(s) declined by the compiler ([xpu-kernel-skipped], ${tracked} held by @Unlowered), ${unb} unbounded ([xpu-kernel-unbounded], held by @Unbounded; 7.0.5 retires them)"
     [ "$n" = "0" ] && return 0
     sed -n 's/.*\[xpu-kernel-skipped\] [A-Za-z0-9_]*: //p' "$errlog" \
         | sed -E 's/__cajeta_xpu_wave_[a-z_0-9]+/<wave op>/' | cut -c1-120 | sort | uniq -c | sort -rn \
@@ -170,7 +176,7 @@ run_suite() {
         rc=1
     fi
     if [ "${skipped}" != "0" ]; then
-        echo ">> NOTE: ${skipped} kernel(s) produced no device code on this backend ([xpu-kernel-skipped], listed by cause above)."
+        echo ">> NOTE: ${skipped} kernel(s) produced no device code on this backend ([xpu-kernel-skipped], each held by @Unlowered naming its plan item; listed by cause above)."
     fi
     census_table "$log" "${XPU_BACKEND%%,*}"
     rm -f "$log"
