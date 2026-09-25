@@ -16,23 +16,60 @@ import dev.cajeta.llm.model.CausalLM;
  * to the paged cache. On the shexp fixture: after the prewarm the
  * first step streams nothing; the chunks after it grow nothing; a
  * mid-sequence chunk writes no K/V back inside the layer loop.
+ *
+ * The suite gates on the route CAPABILITY, `batchRoutedFor(CHUNK)`, and
+ * carries both arms of it: `theChunkRecordIsEmittedWhereTheBatchedRouteIsTaken`
+ * pins that the record fires where the batched route is taken, and
+ * `aPerRowPrefillEmitsNoChunkRecord` pins that it does NOT fire on the
+ * per row path, so a backend that quietly stopped batching cannot read
+ * as a clean run.
  */
 public class PrefillChunkTest {
 
     public PrefillChunkTest() { return; }
 
-    static boolean skip() {
-        String be #= Device.activeBackend();
-        if (!be.equals("hip")) {
-            DeviceSkip.tracked("backend " + be
-                + " has no batched device prefill", "xpu-kernel-adaptor 7");
-            return true;
+    /** The rows one chunk carries. `steps()` drives three of them. */
+    static final int32 CHUNK = 4;
+
+    /**
+     * The moe fixture bound, or a SKIP that names the projection which
+     * refused.
+     *
+     * This replaced a backend NAME gate, `!be.equals("hip")`, reported
+     * as "backend cuda has no batched device prefill". That claim was
+     * false on cuda: `q4kQ8BatchMatMulKernel` ran 1306 times in the
+     * nvptx census against this very fixture, and
+     * `theChunkRecordIsEmittedWhereTheBatchedRouteIsTaken` measures the
+     * route on whatever backend is present. "hip" was simply the
+     * backend the suite was authored on.
+     *
+     * The gate here is the CAPABILITY the prefill path itself branches
+     * on, `batched = rows > 1 && batchReady(rows)`, asked through the
+     * public `batchRoutedFor`. It is asked BEFORE the prewarm so a
+     * backend that will skip does no device work first.
+     */
+    static #CausalLM bindOrSkip() {
+        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        PrefillTap why = heap PrefillTap();
+        Diag.register(why);
+        boolean routed = m.batchRoutedFor(PrefillChunkTest.CHUNK);
+        Diag.register(null);
+        if (!routed) {
+            // NAMES the refusing projections instead of asserting a
+            // cause it never checked. `CausalLM.refuse` emits one
+            // `batch-refused` record per distinct projection, format and
+            // reason, so on cpu this reads "attn_q Q4_K: no device
+            // mat-vec on this backend" rather than a bare sentence.
+            DeviceSkip.tracked("backend " + Device.activeBackend()
+                + " refuses the batched prefill route for the moe"
+                + " fixture at " + PrefillChunkTest.CHUNK + " rows: "
+                + why.namesOf("batch-refused"), "xpu-kernel-adaptor 7");
         }
-        return false;
+        return #m;
     }
 
     static #PrefillTap steps() {
-        CausalLM m #= MoeForwardTest.bindPath(MoeForwardTest.FIX);
+        CausalLM m #= PrefillChunkTest.bindOrSkip();
         m.prewarmPrefillWeights();
         int32[] toks = heap int32[12];
         int32 i = 0;
@@ -48,7 +85,6 @@ public class PrefillChunkTest {
 
     @Test
     public void thePrewarmedFirstStepStreamsNoWeights() {
-        if (PrefillChunkTest.skip()) { return; }
         PrefillTap tap #= PrefillChunkTest.steps();
         Assert.equals(3L, (int64) tap.countOf("prefill-chunk"));
         Assert.equals(4L, tap.valueOf("prefill-chunk", 0, 0));
@@ -62,7 +98,6 @@ public class PrefillChunkTest {
 
     @Test
     public void theStepsAfterTheFirstGrowNothing() {
-        if (PrefillChunkTest.skip()) { return; }
         PrefillTap tap #= PrefillChunkTest.steps();
         int32 j = 1;
         while (j < 3) {
@@ -79,7 +114,6 @@ public class PrefillChunkTest {
 
     @Test
     public void aMidSequenceChunkWritesNoKvBackInsideTheLayerLoop() {
-        if (PrefillChunkTest.skip()) { return; }
         PrefillTap tap #= PrefillChunkTest.steps();
         Assert.equals(4L, tap.valueOf("prefill-chunk", 1, 1));
         int64 kv = tap.valueOf("prefill-chunk", 1, 4);
@@ -88,9 +122,6 @@ public class PrefillChunkTest {
                 + " us writing K/V back per layer");
         }
     }
-
-    /** The rows one chunk carries. `steps()` drives three of them. */
-    static final int32 CHUNK = 4;
 
     /**
      * The does NOT fire arm, and it runs on every backend including cpu.
