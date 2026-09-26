@@ -1001,6 +1001,100 @@ public class LinearKernelRouteTest {
      * Device-gated; skipped where either kernel is unavailable or the
      * packed WMMA route is not taken (vulkan).
      */
+    /**
+     * The q6 WMMA EPILOGUE route, pinned. `q6kWmmaEpiKernel` is the arm
+     * the batched GEMM takes when the int8-deq route is NOT admitted, and
+     * on a box where WidenBudget admits everything it was never reached:
+     * the census read RAN 123 on a loaded box and UNCOVERED on a quiet
+     * one (2026-09-25), coverage following the box's memory rather than
+     * a test. Here the deq route is switched off outright, so the epi
+     * arm is taken by construction, and it is judged against the plain
+     * WMMA route (the same tiles, the block-scale fold done afterwards)
+     * to float rounding, on every backend whose registry has both.
+     */
+    @Test
+    public void q6EpilogueRouteAgreesWithThePlainWmma() {
+        if (!Device.kernelAvailable("q6kWmmaEpiKernel")
+                || !Device.kernelAvailable("q6kWmmaKernel")) {
+            DeviceSkip.tracked("backend " + Device.activeBackend()
+                + " has no q6 WMMA epilogue pair", "xpu-kernel-adaptor 4.2.1");
+            return;
+        }
+        if (Linear.backendIsVulkan()) {
+            DeviceSkip.cannot("vulkan takes dotAccum for Q6_K (RADV context loss)");
+            return;
+        }
+        int32 rows = 256;
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q6_K, "q6_k.bin");
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ci, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L, (int64) rows * co);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L, (int64) rows * co);
+        QuantKernel.setRoutingEnabled(true);
+        boolean deqWas = Linear.deqPrefillOn();
+        boolean epiWas = Linear.epiEnabled();
+        boolean mw4Was = Linear.q6Mw4Enabled();
+        Linear.setDeqPrefill(false);
+        // The int8-deq arm is keyed on the multi-wave switches, not on
+        // the prefill policy: with them on, the route was "q6 deqMw8Part"
+        // whatever deqPrefill said (measured 2026-09-26). Off, the batch
+        // GEMM falls to the epi / plain pair this test judges.
+        Linear.setQ6Mw4(false);
+        Linear.setQ6Mw8(false);
+
+        // Reference: the plain WMMA route.
+        Linear.setEpi(false);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap refTap = heap PrefillTap();
+        Diag.register(refTap);
+        lin.matmulInto(rows, want, 0L);
+        Diag.register(null);
+        if (!refTap.sawContaining("batch-route", "q6 plain")) {
+            Linear.setEpi(epiWas);
+            Linear.setDeqPrefill(deqWas);
+            Linear.setQ6Mw4(mw4Was);
+            Linear.setQ6Mw8(true);
+            Assert.fail("reference did not take the q6 plain route, saw "
+                + refTap.namesOf("batch-route"));
+        }
+
+        // Under test: the fused-epilogue kernel, same weight, same staging.
+        Linear.setEpi(true);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap epiTap = heap PrefillTap();
+        Diag.register(epiTap);
+        lin.matmulInto(rows, got, 0L);
+        Diag.register(null);
+        Linear.setEpi(epiWas);
+        Linear.setDeqPrefill(deqWas);
+        Linear.setQ6Mw4(mw4Was);
+        Linear.setQ6Mw8(true);
+        if (!epiTap.sawContaining("batch-route", "q6 epi")) {
+            Assert.fail("the q6 epi route was not taken, saw "
+                + epiTap.namesOf("batch-route"));
+        }
+        LinearKernelRouteTest.assertLive(want, (int64) rows * co, "q6 plain");
+        LinearKernelRouteTest.assertLive(got, (int64) rows * co, "q6 epi");
+        int64 i = 0;
+        while (i < (int64) rows * co) {
+            float32 a = want.flatGet(i);
+            float32 b = got.flatGet(i);
+            float32 d = a - b;
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 sc = a;
+            if (sc < 0.0f) { sc = 0.0f - sc; }
+            if (sc < 1.0f) { sc = 1.0f; }
+            if (d / sc > 0.00001f) {
+                Assert.fail("element " + i + ": q6 epi " + b
+                    + " vs q6 plain " + a);
+            }
+            i = i + 1;
+        }
+    }
+
     @Test
     public void multiWavePackedQ4kAgreesWithDeqMw8() {
         if (!Device.kernelAvailable("q4kWmmaMwKernel")
