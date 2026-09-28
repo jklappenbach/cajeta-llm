@@ -138,6 +138,7 @@ census_table() {
 
 run_suite() {
     local bin="$1" label="$2" log
+    phase_end
     log="$(mktemp)"
     set +e
     # Line-buffer stdout: the runtime prints its diagnostics (launch FAILED
@@ -145,8 +146,19 @@ run_suite() {
     # beside the WRONG test in the merged log — Unit 25 triage chased a
     # misattribution that pure buffering created. Line-buffered, adjacency
     # in the log is truth.
-    stdbuf -oL -eL "$bin" 2>&1 | tee "$log"
-    local rc=${PIPESTATUS[0]}
+    # THE HANG WATCHDOG (scripts/run-with-watchdog.sh; its tests are
+    # scripts/test-run-with-watchdog.sh). On 2026-09-27 one test ran for THREE
+    # HOURS pinning all 32 cores and 25 GB while this log did not move, and
+    # nothing noticed: this harness runs one monolithic binary with no per-test
+    # timeout. A log that stops growing IS a stalled test, so after
+    # HANG_MINUTES of silence (default 20) the watchdog records every thread's
+    # backtrace — which names the stalled test — and stops that pid only.
+    "$here/scripts/run-with-watchdog.sh" "$log" "$bin"
+    local rc=$?
+    if [ "$rc" -eq 124 ]; then
+        echo ">> ${label}: the suite HUNG and was stopped — the backtrace above names the test"
+        rc=1
+    fi
     set -e
     local nocoop skipped
     # Count the MARKER, not one suite's phrasing. This grepped for the
@@ -269,7 +281,36 @@ export CAJETA_CAPTURED_BORROW="${CAJETA_CAPTURED_BORROW:-error}"
 UNIT_REPO="${UNIT_REPO:-$here/../cajeta-unit}"
 
 out="$(mktemp -d)"
-trap 'rm -rf "$out"' EXIT
+
+# THE BUILD HEARTBEAT. The compile steps below send their output to /dev/null
+# or to a file, so for many minutes at a time this log said nothing, and a
+# silent log cannot be told from a stuck one (2026-09-27: "this is the last
+# time we run tests with the excuse that the log tells us nothing until the
+# end"). `phase LABEL` names what is running; every PROGRESS seconds (default
+# 60, 0 turns it off) this prints that the phase is still going and which
+# processes under this script are burning CPU. The test phase streams its own
+# per-test output and has the hang watchdog, so run_suite clears the phase.
+phase_file="$out/phase"
+: > "$phase_file"
+phase() { printf '%s\t%s\n' "$1" "$SECONDS" > "$phase_file"; }
+phase_end() { : > "$phase_file"; }
+heartbeat_pid=""
+if [ "${PROGRESS:-60}" != "0" ]; then
+    (
+        top=$$
+        while sleep "${PROGRESS:-60}"; do
+            [ -s "$phase_file" ] || continue
+            IFS=$'\t' read -r label since < "$phase_file" || continue
+            busy=$(ps -eo pid=,ppid=,pcpu=,etime=,comm= 2>/dev/null | awk -v top="$top" '
+                { pid[NR]=$1; par[$1]=$2; cpu[$1]=$3; et[$1]=$4; cm[$1]=$5 }
+                END { for (i in pid) { p=pid[i]; q=par[p]; d=0
+                        while (q != "" && q != 0 && d < 20) { if (q == top) { if (cpu[p]+0 >= 1) printf " %s[%s %s%% %s]", cm[p], p, cpu[p], et[p]; break } q=par[q]; d++ } } }')
+            echo ">> still running: ${label} ($((SECONDS - since))s)${busy:+ busy:${busy}}"
+        done
+    ) &
+    heartbeat_pid=$!
+fi
+trap '[ -n "$heartbeat_pid" ] && kill "$heartbeat_pid" 2>/dev/null; rm -rf "$out"' EXIT
 
 # cajeta-unit resolution (the cajeta-ml pattern), in order:
 #   1. $UNIT_CJA        — explicit archive path, used verbatim
@@ -289,7 +330,9 @@ sha256_of() {
 unit_cja="${UNIT_CJA:-}"
 if [[ -z "$unit_cja" && -d "$UNIT_REPO" ]]; then
     echo ">> building cajeta-unit from checkout ($UNIT_REPO)"
+    phase "building cajeta-unit"
     ( cd "$UNIT_REPO" && "$CAJETA" build >/dev/null )
+    phase_end
     unit_cja="$(cajeta_artifact_path "$UNIT_REPO" dev.cajeta.unit 2>/dev/null)"
 fi
 if [[ -z "$unit_cja" ]]; then
@@ -324,7 +367,9 @@ CODEC_REPO="${CODEC_REPO:-$here/../cajeta-codec}"
 codec_cja=""
 if [[ -d "$CODEC_REPO" ]]; then
     echo ">> building dev.cajeta.codec from checkout ($CODEC_REPO)"
+    phase "building dev.cajeta.codec"
     ( cd "$CODEC_REPO" && "$CAJETA" build >/dev/null )
+    phase_end
     codec_cja="$(cajeta_artifact_path "$CODEC_REPO" dev.cajeta.codec 2>/dev/null)"
 fi
 if [[ -z "$codec_cja" ]]; then
@@ -354,7 +399,9 @@ JINJA_REPO="${JINJA_REPO:-$here/../cajeta-jinja}"
 jinja_cja=""
 if [[ -d "$JINJA_REPO" ]]; then
     echo ">> building dev.cajeta.jinja from checkout ($JINJA_REPO)"
+    phase "building dev.cajeta.jinja"
     ( cd "$JINJA_REPO" && "$CAJETA" build >/dev/null )
+    phase_end
     jinja_cja="$(cajeta_artifact_path "$JINJA_REPO" dev.cajeta.jinja 2>/dev/null)"
 fi
 if [[ -z "$jinja_cja" ]]; then
@@ -384,7 +431,9 @@ LOGGING_REPO="${LOGGING_REPO:-$here/../cajeta-logging}"
 logging_cja=""
 if [[ -d "$LOGGING_REPO" ]]; then
     echo ">> building dev.cajeta.logging from checkout ($LOGGING_REPO)"
+    phase "building dev.cajeta.logging"
     ( cd "$LOGGING_REPO" && "$CAJETA" build >/dev/null )
+    phase_end
     logging_cja="$(cajeta_artifact_path "$LOGGING_REPO" dev.cajeta.logging 2>/dev/null)"
 fi
 if [[ -z "$logging_cja" ]]; then
@@ -421,6 +470,7 @@ else
 fi
 
 echo ">> building llama library .cja"
+phase "building the llama library"
 "$CAJETA" --emit=cja -o "$out/llama.cja" \
     --classpath="$codec_cja,$jinja_cja,$logging_cja" \
     dev.cajeta.llm.Llm.run "$here/src/main/cajeta" "$out" \
@@ -430,6 +480,7 @@ spill_gate "$out/lib.err" "llama library"
 skip_notes "$out/lib.err" "llama library"
 
 echo ">> building + running the test binary"
+phase "building the test binary"
 # XPU_BACKEND (default cpu): the engine's device paths (device-resident weight
 # loads, the decode kernels) are exercised on the portable CPU backend by
 # default — the PlacementDispatchTests discipline, real KernelBuffers, no
@@ -456,6 +507,7 @@ skip_notes "$out/test.err" "test binary"
 run_suite "$out/llamatests" "test profile"
 
 echo ">> building + running the test binary under --release --live-set=bounded"
+phase "building the release test binary"
 # Second pass, plan 6.1.7: the zero-allocation decode invariant (and the
 # rest of the suite) must hold under the SHIPPING configuration — release
 # codegen with the bounded live-set discipline — not only the test profile.
