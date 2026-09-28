@@ -114,8 +114,8 @@ skip_notes() {
 }
 
 # 3.2.2 — the census as a table, one row per kernel per backend:
-#   backend  kernel  class  launches  manifest  note
-# RAN/SKIP/PROBE/EXTERNAL/UNCOVERED/STALE-SKIP rows come from the runtime
+#   backend  kernel  class  launches  checks  manifest  note
+# CHECKED/RAN-UNCHECKED/SKIP/PROBE/EXTERNAL/UNCOVERED/STALE-* rows come from the runtime
 # census (KernelCensus prints one `census-row` line per registered kernel);
 # DECLINED rows come from the compiler's [xpu-kernel-skipped] notes, which
 # name the kernels the registry never saw. Written to build/census-<be>.tsv;
@@ -124,12 +124,12 @@ census_table() {
     local log="$1" be="$2" tsv errlog
     mkdir -p "$here/build"
     tsv="$here/build/census-${be}.tsv"
-    { printf 'backend\tkernel\tclass\tlaunches\tmanifest\tnote\n'
+    { printf 'backend\tkernel\tclass\tlaunches\tchecks\tmanifest\tnote\n'
       grep "^census-row"$'\t' "$log" | cut -f2- | sort -t$'\t' -k2,2
       for errlog in "$out/lib.err" "$out/test.err"; do
           [ -s "$errlog" ] || continue
           sed -n 's/.*\[xpu-kernel-skipped\] \([A-Za-z0-9_]*\): \(.*\)$/\1\t\2/p' "$errlog"
-      done | sort -u | awk -F'\t' -v be="$be" '{ printf "%s\t%s\tDECLINED\t0\tno-manifest\t%s\n", be, $1, $2 }'
+      done | sort -u | awk -F'\t' -v be="$be" '{ printf "%s\t%s\tDECLINED\t0\t0\tno-manifest\t%s\n", be, $1, $2 }'
     } > "$tsv"
     local rows
     rows=$(( $(wc -l < "$tsv") - 1 ))
@@ -506,6 +506,12 @@ skip_notes "$out/test.err" "test binary"
 
 run_suite "$out/llamatests" "test profile"
 
+# RELEASE_PASS=0 skips the second pass while iterating on the suite itself:
+# each pass is an hour of compile on cpu (plan 6.4.12). The default runs it.
+if [ "${RELEASE_PASS:-1}" = "0" ]; then
+    echo ">> release pass skipped (RELEASE_PASS=0)"
+    exit 0
+fi
 echo ">> building + running the test binary under --release --live-set=bounded"
 phase "building the release test binary"
 # Second pass, plan 6.1.7: the zero-allocation decode invariant (and the
