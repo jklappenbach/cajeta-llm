@@ -86,23 +86,41 @@ not convert in one commit. Each stage is bit-gated against the kernel it
 replaces BEFORE any timing.
 
 ### 2.1 TDD
-- [ ] 2.1.1 Per converted kernel, a bit-identical check against the
+- [x] 2.1.1 Per converted kernel, a bit-identical check against the
       pre-conversion output at wave 32, one row per workgroup. `==`, not
       a tolerance: the arithmetic is unchanged.
-- [ ] 2.1.2 The same kernel at rows-per-workgroup 2 and 4 is bit-identical
+      DONE 2026-09-29 (cajeta xpu-kernel-adaptor 9.1.1): `selftest/WaveGolden`
+      and `src/test/fixtures/wave/goldens-wave32.tsv`, the output bits of
+      22 kernels recorded on the pre-conversion tree and compared `==` by
+      every run since; a missing row fails. Not one bit moved.
+- [x] 2.1.2 The same kernel at rows-per-workgroup 2 and 4 is bit-identical
       to rows-per-workgroup 1. This is the property the sweep depends on
       and it is worth asserting before the sweep exists.
-- [ ] 2.1.3 A does-fire check that the converted launcher actually used
+      DONE 2026-09-29: `WaveGeometryTest.*RowsPerWorkgroupTwoAndFourMatchOne`
+      for q2k, q3k, q4k, q5k, q6k, q80 on a 64-row fixture with no two
+      rows alike, `==` on the bits.
+- [x] 2.1.3 A does-fire check that the converted launcher actually used
       the derived geometry, via a counter, not by reading the source.
+      DONE 2026-09-29: `QuantKernel.waveGridDerivations()` and
+      `WaveGeometryTest.everyConvertedLauncherDerivesItsGeometry`.
 
 ### 2.2 Coding
-- [ ] 2.2.1 Stage A, the wave mat-vec family: `q3k`, `q5k`, `q4k`, `q6k`,
+- [x] 2.2.1 Stage A, the wave mat-vec family: `q3k`, `q5k`, `q4k`, `q6k`,
       `q80`, `q40`, `q50`, `tq10`, `tq20`, `iq4nl`, the five `iq*` and
       `f16F32`. Body to `Group.width()`, launcher to `waveRowGrid` /
       `waveRowBlock`.
-- [ ] 2.2.2 Stage A resolves the `rowsPerWave` conflict of §3.2. `q4k`
+      DONE 2026-09-29 as two nvptx-gated stages (one-row and two-row
+      kernels; then the q4k/q6k slot kernels and the three fused qkv
+      kernels), 23 kernels and 25 launch sites, every launcher through
+      `QuantKernel.waveGrid`. On cpu (wave 8, 2026-09-29 leg 07:01-07:30): every converted kernel lowers, runs and is value-checked against its host oracle at width 8 (census 156 ran / 138 value-checked, up from 137 / 116, 0 uncovered); the only cpu reds are the two plan reds 6.4.4 and 6.4.6 plus route tests whose waveMv() guard had meant "a device" and now ask their route (fixed in the same commit). The three fused qkv kernels stay held on cpu (4.2.1.10).
+- [x] 2.2.2 Stage A resolves the `rowsPerWave` conflict of §3.2. `q4k`
       and `q6k` compute a derived value and then discard it for a
       literal 4. One of the two is right and the other goes.
+      DONE 2026-09-29: `slotRowsPerWave` answers segments for short rows
+      and the four slots (`WAVE_ROW_SLOTS`, the kernel's accumulators)
+      for long ones; `rowsPerWave` keeps the segment meaning for the Id
+      launchers and derives from `waveWidth()`; no launcher overwrites
+      anything.
 - [ ] 2.2.3 Stage B, the grouped-id family: the `*Id*` kernels. Their row
       derivation carries an expert index, so the conversion is the same
       idea with a different decomposition.
@@ -113,10 +131,13 @@ replaces BEFORE any timing.
 - [ ] 2.2.5 An audit that no converted family still divides by a literal.
 
 ### 2.3 Acceptance
-- [ ] 2.3.1 Bit gate passes per kernel before any speed number is quoted.
+- [x] 2.3.1 Bit gate passes per kernel before any speed number is quoted.
+      DONE 2026-09-29, see 2.1.1.
 - [ ] 2.3.2 Legs flat on the recorded files. This is a refactor, and a
       change in either direction is a geometry change to explain.
-- [ ] 2.3.3 Filtered suite green at each stage, not only at the end.
+- [x] 2.3.3 Filtered suite green at each stage, not only at the end.
+      DONE 2026-09-29: the whole nvptx suite, not a filter, after each
+      stage (605/0 and 606/0).
 
 ## Unit 3 — the sweep that writes (spec §4)
 
