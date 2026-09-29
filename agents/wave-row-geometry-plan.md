@@ -121,9 +121,20 @@ replaces BEFORE any timing.
       for long ones; `rowsPerWave` keeps the segment meaning for the Id
       launchers and derives from `waveWidth()`; no launcher overwrites
       anything.
-- [ ] 2.2.3 Stage B, the grouped-id family: the `*Id*` kernels. Their row
+- [~] 2.2.3 Stage B, the grouped-id family: the `*Id*` kernels. Their row
       derivation carries an expert index, so the conversion is the same
       idea with a different decomposition.
+      The five grouped-id MAT-VECS are DONE 2026-09-29 (cajeta
+      xpu-kernel-adaptor Unit 9, its Stage C): `q4kQ8IdMatVecKernel`,
+      `q6kQ8IdMatVecKernel`, `symQ8IdMatVecKernel`, `iq3xxsQ8IdMatVecKernel`,
+      `iq4nlQ8IdMatVecKernel` derive lane, wave and the segment packing
+      from `Group.width()`, their launchers take `waveGrid`/`waveRowBlock`,
+      goldens recorded for the three with direct tests and bit-identical
+      after. On cpu (wave 8, legs 11:20-12:20): 520 passed, the two plan reds 6.4.4 and 6.4.6, 88 skipped; census 159 ran / 140 value-checked / 0 stale, the five grouped-id mat-vecs and the two forced-32 Group kernels lowering there for the first time. STILL OPEN here: the grouped-id
+      GLU and combine kernels (`q4kQ8IdGateUpGluKernel`,
+      `q4kQ8IdDownCombineKernel`, `q6kQ8IdDownCombineKernel`,
+      `iq3xxsQ8IdGateUpGluKernel`, `iq4nlQ8IdDownCombineKernel`,
+      `symQ8IdDownCombineKernel`), still on `KernelCap.WAVE32_ONLY`.
 - [ ] 2.2.4 Stage C, the batch and utility kernels: `q4kQ8Batch*`,
       `q6kQ8Batch*`, `q8kPack`, `touchLines`, `moeTopKBatch`,
       `mxfp4QuantAct`. Convert only where the literal is a lane or row
