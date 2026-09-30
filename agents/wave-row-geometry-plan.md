@@ -175,9 +175,28 @@ replaces BEFORE any timing.
 
 ## Unit 4 — the measured table (spec §5.2)
 
-- [ ] 4.1.1 Run the sweep across the formats on gfx1151 and record the
+- [~] 4.1.1 Run the sweep across the formats on gfx1151 and record the
       winners against the hand-found values, including whether four rows
       per wave generalizes past `q4k` and `q6k`.
+      q4_K and q6_K SWEPT on proton 2026-09-30 (`bench/ParityLeg
+      --rows-per-block N`, the 8B Q4_K_M's own tensors, min of three, us):
+
+      | shape | 1 | 2 | 4 | 8 |
+      |---|---|---|---|---|
+      | q4_K 1024x4096 | 16.75 | 16.91 | 16.67 | 16.68 |
+      | q6_K 1024x4096 | 21.56 | 21.50 | 21.15 | 21.64 |
+      | q4_K 4096x4096 | 47.15 | 47.63 | 47.47 | 47.24 |
+      | q4_K 14336x4096 | 148.1 | 148.1 | 148.9 | 149.2 |
+      | q4_K 4096x14336 | 158.4 | 158.9 | 159.3 | 159.7 |
+      | q6_K 4096x14336 | 223.6 | 222.0 | 222.1 | 222.6 |
+      | q6_K head | 1907 | 1908 | 1911 | 1927 |
+
+      Flat within about 1% at every cold engine shape, so one wave per
+      workgroup stays the default, as on sm_89 (9.3.3). The one place four
+      waves pays is a weight that stays in the 32 MB MALL (the q4_K
+      4096x14336 control: 45.5 us at 1, 41.8 at 4), which a decode never
+      is. BLOCKED for the other formats: ParityLeg reads only the Q4_K_M
+      layout and refuses a tensor of another type by name.
 - [ ] 4.1.2 The same on the NVIDIA box, which is a wave-32 part with
       different everything else.
 - [ ] 4.1.3 Record the table in the spec, where the adaptor draft can

@@ -8,7 +8,7 @@ demands on the same line as the number.
 | file | what |
 |---|---|
 | `llama-env.sh` | where llama.cpp is, and the WSL driver-library fix every llama.cpp binary on this box needs (see the file) |
-| `build-ggml-leg.sh` | builds `ggml-leg` and `llama-greedy` against `llama.cpp/build-cuda` |
+| `build-ggml-leg.sh` | builds `ggml-leg` and `llama-greedy` against the llama.cpp build at `$LLAMA_BUILD_DIR`, CUDA or HIP by the backend library it carries |
 | `ggml-leg.cpp` | the llama.cpp leg: one MUL_MAT shape, device-timed on ggml's own stream through its own events, over a pool of real tensors from the reference GGUF, one `leg-row` per run |
 | `llama-greedy.cpp` | llama.cpp's greedy walk with the top-2 logit gap per position, the reference for GreedyVsLlama |
 | `run-parity-legs.sh` | both legs at the reference model's seven decode shapes, joined by `bench/ParityJoin` into `census/parity-<backend>.tsv` |
@@ -40,12 +40,16 @@ bus bandwidth (1008.1 GB/s on the 4090), a floor on the true fraction.
 
 ```sh
 XPU_BACKEND=nvptx tools/parity/run-parity-legs.sh    # census/parity-nvptx.tsv
+LLAMA_BUILD_DIR=~/code/llama.cpp/build ROCM_PATH=~/.local/lib/rocm XPU_BACKEND=amdgpu \
+  RECORDED_HOT_NS=82440 tools/parity/run-parity-legs.sh     # census/parity-amdgpu.tsv
 XPU_BACKEND=nvptx DEVICE=cuda tools/parity/run-greedy.sh
 ```
 
 Both need the reference model at `$MODEL`
 (`~/models/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`)
-and a CUDA build of llama.cpp at `$LLAMA_ROOT/build-cuda`.
+and a CUDA or HIP build of llama.cpp at `$LLAMA_BUILD_DIR` (default
+`$LLAMA_ROOT/build-cuda`). `RECORDED_HOT_NS` is the calibration figure for
+the part: 13330 on the 4090 (the default), 82440 on gfx1151.
 
 ## Three things measured on the way (2026-09-24, RTX 4090, llama.cpp 67a17c1)
 
