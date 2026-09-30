@@ -139,7 +139,7 @@ public final class QuantKernel {
      * it exists to be the bit-identity oracle and nothing else.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q4kMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -280,7 +280,7 @@ public final class QuantKernel {
      * turn into registers and no runtime index into one.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q6kMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -345,7 +345,7 @@ public final class QuantKernel {
      * just one f16 scale per 32 elements.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q8MatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -400,7 +400,7 @@ public final class QuantKernel {
      * `y[yOff + i] = W[i]·x` for one row per work item, W packed Q5_K.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q5kMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -504,13 +504,99 @@ public final class QuantKernel {
         }
     }
 
-    /** Rows per grid block. One work item is a whole row, so this is a
-     *  scheduling width, not a tile size. */
+    /** The interleave group of {@link #q4kMatVecKernelIL} and the block of
+     *  the row-read probe: a LAYOUT constant for those two (the interleaved
+     *  weight is written in groups of this many rows and the launch block is
+     *  that group), and the scalar family's rows per workgroup where no
+     *  device answers. */
     static final int32 ROWS_PER_BLOCK = 64;
 
-    /** Work items per launch block — the divisor turning a target WORKGROUP
-     *  count into a row count (see Linear.effectiveChunkRows). */
-    public static int32 rowsPerBlock() { return QuantKernel.ROWS_PER_BLOCK; }
+    /** The interleave group, which is also the launch block of the two
+     *  kernels whose block is structural (xpu-kernel-adaptor 11.2.1). */
+    public static int32 ilGroup() { return QuantKernel.ROWS_PER_BLOCK; }
+
+    /**
+     * The scalar per-row family's structural ceiling: the
+     * `@Occupancy(maxThreads = 256)` every kernel launched through
+     * {@link #scalarBlock} declares (xpu-kernel-adaptor 7.0.5, 11.2.1). One
+     * work item is one whole row addressed by its global id, so the block
+     * is a scheduling width and the ceiling is only the widest block a
+     * sweep or a tuned value may ask for. 256 keeps the register budget
+     * whole on both parts we own, as {@link #waveRowCeiling} records.
+     */
+    public static int32 scalarRowCeiling() { return 256; }
+
+    /** Forced rows per workgroup for the scalar family; 0 = the derived. */
+    static int32 scalarRpb = 0;
+    /** The block in force, resolved once per setting; 0 = not resolved. */
+    static int32 scalarBlk = 0;
+
+    /** Force rows per workgroup, for a sweep. 0 restores the derived value.
+     *  A forced value is clamped like the derived one (see
+     *  {@link #rowsPerBlock}). */
+    public static void setScalarRowsPerBlock(int32 n) {
+        QuantKernel.scalarRpb = n;
+        QuantKernel.scalarBlk = 0;
+    }
+
+    /**
+     * Rows (work items) per workgroup for the scalar per-row family, and
+     * the divisor turning a target WORKGROUP count into a row count (see
+     * Linear.effectiveChunkRows).
+     *
+     * DERIVED (xpu-kernel-adaptor 11.1.2): a workgroup carries the waves
+     * the device wants resident on one SIMD, `waveSize x
+     * wavesPerSimdTarget`. That is 32 on sm_89, 64 on gfx1151 and 8 on the
+     * cpu backend. The literal 64 this replaces was gfx1151's answer
+     * carried everywhere, and the sweep on the other two parts
+     * (bench/ParityLeg --family scalar, the reference model's seven decode
+     * shapes, min of three, 2026-09-30) says what it cost: on sm_89 the
+     * time per launch rises with the block at every shape under 14336 rows
+     * (q4_K 1024x4096: 93.8, 105.5, 138.3, 224.6 us at 32, 64, 128, 256)
+     * and is flat above; on cpu 8 to 64 are within 3% of each other and
+     * 128 and 256 are slower. gfx1151 keeps the 64 it was measured at.
+     *
+     * A forced value wins. Either is clamped to the family's declared
+     * ceiling and to the device's threads per block, then rounded DOWN to
+     * a whole number of waves and never under one: a block that is not a
+     * whole number of waves leaves lanes idle in its last wave on every
+     * workgroup. With no queryable device the measured 64 stands.
+     */
+    public static int32 rowsPerBlock() {
+        if (QuantKernel.scalarBlk > 0) { return QuantKernel.scalarBlk; }
+        int32 want = QuantKernel.ROWS_PER_BLOCK;
+        if (Device.waveSize() > 0) {
+            want = Device.waveSize() * Device.wavesPerSimdTarget();
+        }
+        if (QuantKernel.scalarRpb > 0) { want = QuantKernel.scalarRpb; }
+        int32 maxT = Device.maxThreadsPerBlock();
+        int32 ceilingT = QuantKernel.scalarRowCeiling();
+        if (maxT <= 0 || maxT > ceilingT) { maxT = ceilingT; }
+        if (want > maxT) { want = maxT; }
+        int32 wave = QuantKernel.waveWidth();
+        want = (want / wave) * wave;
+        if (want < wave) { want = wave; }
+        QuantKernel.scalarBlk = want;
+        return want;
+    }
+
+    /** Workgroup size for the scalar per-row family. */
+    public static uint32 scalarBlock() { return (uint32) QuantKernel.rowsPerBlock(); }
+
+    /** How many times a launcher derived its grid through
+     *  {@link #scalarGrid}: the counter ScalarGeometryTest reads to prove a
+     *  launcher took the derived geometry rather than a literal. */
+    static int64 scalarGridDerived = 0;
+
+    public static int64 scalarGridDerivations() { return QuantKernel.scalarGridDerived; }
+
+    /** Workgroups needed to cover `rows` at {@link #scalarBlock} rows each:
+     *  THE launch strategy of the scalar per-row family. */
+    public static uint32 scalarGrid(int64 rows) {
+        QuantKernel.scalarGridDerived = QuantKernel.scalarGridDerived + 1L;
+        int64 blk = (int64) QuantKernel.rowsPerBlock();
+        return (uint32) ((rows + blk - 1L) / blk);
+    }
 
     /** Work items per block of the mxfp4 cooperative launchers (Coop,
      *  CoopQ8, CoopQ8Surface, QuantAct): the block those four launchers
@@ -531,9 +617,9 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        q4kMatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        q4kMatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 256L, xOff, yOff);
         return;
     }
@@ -570,7 +656,7 @@ public final class QuantKernel {
      * overflow rather than wrapping.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q4kQ8MatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xq,
             KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
@@ -678,9 +764,9 @@ public final class QuantKernel {
             KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
             int64 rows, int64 cols, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        q4kQ8MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        q4kQ8MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, xq, xd, xbsums, ur, cols / 256L, yOff);
         return;
     }
@@ -713,7 +799,7 @@ public final class QuantKernel {
      * beside the vector loads it accompanies.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q4kQ8PackedMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff) {
@@ -11591,10 +11677,10 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             int64 rows, int64 cols, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
         q4kQ8PackedMatVecKernel.launch(s,
-            grid: [(ur + blk - 1) / blk], block: [blk])
+            grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, xp, ur, cols / 256L, yOff);
         return;
     }
@@ -17458,7 +17544,7 @@ public final class QuantKernel {
         KernelStream s = QuantKernel.stream();
         q4kMatVecKernelIL.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
             (y, packed, x, ur, cols / 256L, xOff, yOff,
-             (int64) QuantKernel.ROWS_PER_BLOCK);
+             (int64) QuantKernel.ilGroup());
         s.sync();
         return;
     }
@@ -17514,9 +17600,9 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        q6kMatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        q6kMatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 256L, xOff, yOff);
         return;
     }
@@ -17569,7 +17655,7 @@ public final class QuantKernel {
     }
 
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void mxfp4MatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -17606,9 +17692,9 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        mxfp4MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        mxfp4MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 32L, xOff, yOff);
         return;
     }
@@ -17653,7 +17739,7 @@ public final class QuantKernel {
      * GPU path; matches the scalar reference within the backend tolerance.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void mxfp4MatVecKernelFast3(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -17710,7 +17796,7 @@ public final class QuantKernel {
      * permute, not a per-element arithmetic remap.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void iq4nlMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -17754,10 +17840,10 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
         iq4nlMatVecKernel.launch(s,
-            grid: [(ur + blk - 1) / blk], block: [blk])
+            grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 32L, xOff, yOff);
         return;
     }
@@ -17779,7 +17865,7 @@ public final class QuantKernel {
      * IQ4_NL's table, so the same single lut4 decodes each sub-block.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void iq4xsMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -17834,10 +17920,10 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
         iq4xsMatVecKernel.launch(s,
-            grid: [(ur + blk - 1) / blk], block: [blk])
+            grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 256L, xOff, yOff);
         return;
     }
@@ -17857,10 +17943,10 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
         mxfp4MatVecKernelFast3.launch(s,
-            grid: [(ur + blk - 1) / blk], block: [blk])
+            grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 32L, xOff, yOff);
         return;
     }
@@ -18214,9 +18300,9 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        q5kMatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        q5kMatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 256L, xOff, yOff);
         return;
     }
@@ -18236,9 +18322,9 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        q8MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        q8MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 32L, xOff, yOff);
         return;
     }
@@ -18284,7 +18370,7 @@ public final class QuantKernel {
      * Nibble unpack vectorized 16 wide; -8 folds per lane.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q40MatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -18325,9 +18411,9 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        q40MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        q40MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 32L, xOff, yOff);
         return;
     }
@@ -18353,7 +18439,7 @@ public final class QuantKernel {
      * than branched on (same trick as the wave twin).
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q50MatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -18415,7 +18501,7 @@ public final class QuantKernel {
      * min costs one more accumulator and no extra traffic.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q41MatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -18468,9 +18554,9 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        q41MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        q41MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 32L, xOff, yOff);
         return;
     }
@@ -18492,7 +18578,7 @@ public final class QuantKernel {
      * a scalar fold, +16*x[j] per set bit, as the Q5_0 kernel does.
      */
     @Kernel
-    @Occupancy(maxThreads = 64)
+    @Occupancy(maxThreads = 256)
     public static void q51MatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff) {
@@ -18559,9 +18645,9 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        q51MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        q51MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 32L, xOff, yOff);
         return;
     }
@@ -18580,9 +18666,9 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<float32> x,
             int64 rows, int64 cols, int64 xOff, int64 yOff) {
         uint32 ur = (uint32) rows;
-        uint32 blk = (uint32) QuantKernel.ROWS_PER_BLOCK;
+        uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
-        q50MatVecKernel.launch(s, grid: [(ur + blk - 1) / blk], block: [blk])
+        q50MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, x, ur, cols / 32L, xOff, yOff);
         return;
     }

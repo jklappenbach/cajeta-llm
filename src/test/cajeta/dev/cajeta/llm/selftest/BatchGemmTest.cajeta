@@ -1,0 +1,107 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * The batch GEMMs against a HOST oracle (xpu-kernel-adaptor 11.1.1). The
+ * dp4a batch kernels are the batched-decode route (n in 2..8) and the
+ * prefill fallback, and until Unit 11 the Q6_K one was compared only with
+ * the WMMA kernels on the same bytes: two kernels that read a weight the
+ * same wrong way agree with each other. Here each is held to the host's
+ * dequantized GEMM at the coop GEMM's bar (1% relative, 0.01 absolute: the
+ * activation is quantized to q8_K, so bit identity with an f32 host is
+ * not on offer).
+ *
+ * Two shapes each: the batched-decode shape (4 tokens, so 28 of a
+ * workgroup's 32 lanes are idle, at the reference model's 4096 columns)
+ * and a prefill shape whose second token tile is ragged (40 tokens).
+ */
+public class BatchGemmTest {
+
+    public BatchGemmTest() { return; }
+
+    static void check(String kernel, int32 ty, String fixture, int64 rows,
+            int64 out, int64 cols) {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q8kPackKernel")) {
+            DeviceSkip.noKernel("q8kPackKernel", be);
+            return;
+        }
+        if (!KernelCap.usable(kernel)) { DeviceSkip.noKernel(kernel, be); return; }
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int8[] raw #= CensusReachTest.tiled(ty, fixture, nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        float32[] want #= CensusReachTest.hostGemm(ty, raw, nBlocks, x, rows, out, cols);
+        // Q6_K is a split format: its kernel reads the resident row layout.
+        int8[] dev #= raw;
+        if (Quant.splitOn(ty)) {
+            int8[] res #= heap int8[out * Quant.rowResidentBytes(ty, bpr)];
+            Quant.splitInto(ty, raw, 0L, out, bpr, res, 0L);
+            dev #= res;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) dev.count()));
+        wD.upload(dev);
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        float32[] got #= heap float32[rows * out];
+        yD.upload(got);
+        QuantKernel.setBatch4(false);
+        QuantKernel.batchMatMulLaunch(ty, yD, wD, xp, rows, out, cols);
+        QuantKernel.stream().sync();
+        yD.download(got);
+        // Every token row must be live: a tiling that loses a tile leaves
+        // whole rows at zero, which a tolerance against smooth data forgives.
+        int64 t = 0;
+        while (t < rows) {
+            boolean live = false;
+            int64 i = 0;
+            while (i < out) {
+                if (got[t * out + i] != 0.0f) { live = true; }
+                i = i + 1;
+            }
+            if (!live) {
+                Assert.fail(kernel + " at " + rows + "x" + out + "x" + cols
+                    + ": token row " + t + " is entirely zero");
+                return;
+            }
+            t = t + 1;
+        }
+        CensusReachTest.nearOnePercent(want, got, rows * out,
+            kernel + " at " + rows + "x" + out + "x" + cols);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void q4kBatchMatchesHostDequantAtTheBatchedDecodeShape() {
+        BatchGemmTest.check("q4kQ8BatchMatMulKernel", Quant.GG_Q4_K, "q4_k.bin",
+            4L, 128L, 4096L);
+    }
+
+    @Test
+    public void q4kBatchMatchesHostDequantAcrossARaggedTokenTile() {
+        BatchGemmTest.check("q4kQ8BatchMatMulKernel", Quant.GG_Q4_K, "q4_k.bin",
+            40L, 96L, 512L);
+    }
+
+    @Test
+    public void q6kBatchMatchesHostDequantAtTheBatchedDecodeShape() {
+        BatchGemmTest.check("q6kQ8BatchMatMulKernel", Quant.GG_Q6_K, "q6_k.bin",
+            4L, 128L, 4096L);
+    }
+
+    @Test
+    public void q6kBatchMatchesHostDequantAcrossARaggedTokenTile() {
+        BatchGemmTest.check("q6kQ8BatchMatMulKernel", Quant.GG_Q6_K, "q6_k.bin",
+            40L, 96L, 512L);
+    }
+}

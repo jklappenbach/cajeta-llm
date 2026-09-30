@@ -1,0 +1,457 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * The geometry gate for the scalar mat-vec family (xpu-kernel-adaptor Unit
+ * 11). One work item is one whole row, addressed by its global id, so the
+ * workgroup size is a SCHEDULING width and nothing else: the output must
+ * be the same bits at every block the launcher may pass. That is what lets
+ * the block be derived per device (11.2.1) and swept (11.1.2) without a
+ * correctness question riding on the answer.
+ *
+ * 200 rows, no two alike, which no block of the sweep divides: the last
+ * workgroup is ragged at 32, 64 and 128 and the only workgroup is ragged
+ * at 256.
+ */
+public class ScalarGeometryTest {
+
+    static final String DIR = "src/test/fixtures/gguf/kquant/";
+    static final int64 ROWS = 200L;
+    static final int64 COLS = 512L;
+
+    public ScalarGeometryTest() { return; }
+
+    static boolean sameBits(float32[] a, float32[] b, int64 n, String what) {
+        int64 i = 0;
+        while (i < n) {
+            if (Cajeta.f32ToBits(a[i]) != Cajeta.f32ToBits(b[i])) {
+                Assert.fail(what + ": row " + i + " reads " + b[i] + " against "
+                    + a[i]);
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** Which launcher `run` drives: the by-type f32 family, or one of the
+     *  three with their own buffers. */
+    static final int32 BY_TYPE = 0;
+    static final int32 Q4K_Q8 = 1;
+    static final int32 Q4K_Q8_PACKED = 2;
+    static final int32 MXFP4_PLAIN = 3;
+
+    static void run(int32 how, int32 ty, int8[] raw, float32[] x, float32[] out,
+            int64 rows, int64 cols) {
+        if (how == ScalarGeometryTest.Q4K_Q8) {
+            QuantKernel.q4kQ8MatVecIntoDevice(raw, rows, cols, x, 0L, out, 0L);
+        } else if (how == ScalarGeometryTest.Q4K_Q8_PACKED) {
+            QuantKernel.q4kQ8PackedMatVecIntoDevice(raw, rows, cols, x, 0L, out, 0L);
+        } else if (how == ScalarGeometryTest.MXFP4_PLAIN) {
+            KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+            wD.upload(raw);
+            KernelBuffer<float32> xD #= heap KernelBuffer<float32>((uint64) cols);
+            xD.upload(x);
+            KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) rows);
+            yD.upload(out);
+            QuantKernel.mxfp4MatVecLaunchNoSync(yD, wD, xD, rows, cols, 0L, 0L);
+            QuantKernel.stream().sync();
+            yD.download(out);
+        } else {
+            QuantKernel.matVecIntoDevice(ty, raw, rows, cols, x, 0L, out, 0L);
+        }
+    }
+
+    /**
+     * 11.1.1 + 11.2.1: `kernel` answers the same bits at the derived block
+     * and at every block of the sweep, and each launch took its geometry
+     * from the family's one derivation.
+     */
+    static void acrossBlocks(String kernel, int32 how, int32 ty, String fixture) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable(kernel)) { DeviceSkip.noKernel(kernel, be); return; }
+        int64 rows = ScalarGeometryTest.ROWS;
+        int64 cols = ScalarGeometryTest.COLS;
+        int64 bpr = cols / (int64) Quant.blockElems(ty);
+        int8[] raw #= ty == Quant.GG_MXFP4
+            ? Mxfp4Test.fillPacked(rows, bpr)
+            : WaveGeometryTest.rowsOf(fixture, ty, rows, bpr);
+        float32[] x #= QuantKernelTest.activations(cols);
+        float32[] base #= heap float32[rows];
+        int64[] vc #= ValueCheck.mark();
+        QuantKernel.setScalarRowsPerBlock(0);
+        int64 d0 = QuantKernel.scalarGridDerivations();
+        int64 l0 = Device.kernelLaunchCount(kernel);
+        ScalarGeometryTest.run(how, ty, raw, x, base, rows, cols);
+        if (QuantKernel.scalarGridDerivations() != d0 + 1L) {
+            Assert.fail(kernel + ": its launcher did not take the derived geometry ("
+                + (QuantKernel.scalarGridDerivations() - d0) + " derivations for one "
+                + "launch)");
+            return;
+        }
+        if (Device.kernelLaunchCount(kernel) != l0 + 1L) {
+            Assert.fail(kernel + ": the launch did not reach the kernel");
+            return;
+        }
+        QuantKernelTest.assertLive(base, kernel + " at the derived block");
+        int32[] blocks = [ 32, 64, 128, 256 ];
+        boolean ok = true;
+        int64 b = 0;
+        while (b < 4L) {
+            float32[] got #= heap float32[rows];
+            QuantKernel.setScalarRowsPerBlock(blocks[b]);
+            int32 used = QuantKernel.rowsPerBlock();
+            ScalarGeometryTest.run(how, ty, raw, x, got, rows, cols);
+            QuantKernel.setScalarRowsPerBlock(0);
+            if (!ScalarGeometryTest.sameBits(base, got, rows,
+                    kernel + " at block " + used + " (asked " + blocks[b] + ")")) {
+                ok = false;
+            }
+            b = b + 1;
+        }
+        if (ok) { ValueCheck.credit(vc); }
+    }
+
+    @Test
+    public void q4kIsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q4kMatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_Q4_K, "q4_k.bin");
+    }
+
+    @Test
+    public void q5kIsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q5kMatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_Q5_K, "q5_k.bin");
+    }
+
+    @Test
+    public void q6kIsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q6kMatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_Q6_K, "q6_k.bin");
+    }
+
+    @Test
+    public void q8IsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q8MatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_Q8_0, "q8_0.bin");
+    }
+
+    @Test
+    public void q40IsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q40MatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_Q4_0, "q4_0.bin");
+    }
+
+    @Test
+    public void q41IsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q41MatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_Q4_1, "q4_1.bin");
+    }
+
+    @Test
+    public void q50IsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q50MatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_Q5_0, "q5_0.bin");
+    }
+
+    @Test
+    public void q51IsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q51MatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_Q5_1, "q5_1.bin");
+    }
+
+    @Test
+    public void iq4nlIsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("iq4nlMatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_IQ4_NL, "iq4_nl.bin");
+    }
+
+    @Test
+    public void iq4xsIsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("iq4xsMatVecKernel",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_IQ4_XS, "iq4_xs.bin");
+    }
+
+    @Test
+    public void mxfp4Fast3IsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("mxfp4MatVecKernelFast3",
+            ScalarGeometryTest.BY_TYPE, Quant.GG_MXFP4, "");
+    }
+
+    @Test
+    public void mxfp4IsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("mxfp4MatVecKernel",
+            ScalarGeometryTest.MXFP4_PLAIN, Quant.GG_MXFP4, "");
+    }
+
+    @Test
+    public void q4kQ8IsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q4kQ8MatVecKernel",
+            ScalarGeometryTest.Q4K_Q8, Quant.GG_Q4_K, "q4_k.bin");
+    }
+
+    @Test
+    public void q4kQ8PackedIsTheSameBitsAtEveryBlock() {
+        ScalarGeometryTest.acrossBlocks("q4kQ8PackedMatVecKernel",
+            ScalarGeometryTest.Q4K_Q8_PACKED, Quant.GG_Q4_K, "q4_k.bin");
+    }
+
+    // ── the block itself ─────────────────────────────────────────
+
+    /** A forced block is clamped to the family's declared ceiling and to
+     *  the device, and is a whole number of waves. Asking for more than the
+     *  ceiling must not launch above the declaration (a launch failure,
+     *  not a slowdown). */
+    @Test
+    public void aForcedBlockIsClampedToTheCeilingAndAWholeNumberOfWaves() {
+        int32 ceiling = QuantKernel.scalarRowCeiling();
+        QuantKernel.setScalarRowsPerBlock(4096);
+        int32 high = QuantKernel.rowsPerBlock();
+        QuantKernel.setScalarRowsPerBlock(1);
+        int32 low = QuantKernel.rowsPerBlock();
+        QuantKernel.setScalarRowsPerBlock(0);
+        int32 wave = QuantKernel.waveWidth();
+        if (high > ceiling) {
+            Assert.fail("a forced block of 4096 launched at " + high
+                + ", above the declared ceiling " + ceiling);
+        }
+        int32 maxT = Device.maxThreadsPerBlock();
+        if (maxT > 0 && high > maxT) {
+            Assert.fail("a forced block launched at " + high
+                + ", above the device's " + maxT + " threads per block");
+        }
+        if (high % wave != 0 || low % wave != 0) {
+            Assert.fail("blocks " + low + " and " + high
+                + " are not whole numbers of the " + wave + "-lane wave");
+        }
+        if (low < wave) {
+            Assert.fail("a forced block of 1 launched at " + low
+                + ", under one wave of " + wave);
+        }
+    }
+
+    /** Does NOT fire: with nothing forced the derived block stands, and
+     *  forcing then clearing returns exactly to it. */
+    @Test
+    public void clearingAForcedBlockRestoresTheDerivedOne() {
+        QuantKernel.setScalarRowsPerBlock(0);
+        int32 derived = QuantKernel.rowsPerBlock();
+        QuantKernel.setScalarRowsPerBlock(128);
+        int32 forced = QuantKernel.rowsPerBlock();
+        QuantKernel.setScalarRowsPerBlock(0);
+        Assert.equals((int64) derived, (int64) QuantKernel.rowsPerBlock());
+        Assert.isTrue(derived > 0);
+        Assert.isTrue(derived <= QuantKernel.scalarRowCeiling());
+        if (QuantKernel.scalarRowCeiling() >= 128
+                && 128 % QuantKernel.waveWidth() == 0) {
+            Assert.equals(128L, (int64) forced);
+        }
+        System.stdout.println("   scalar rows per block: derived " + derived
+            + ", ceiling " + QuantKernel.scalarRowCeiling());
+    }
+
+    /**
+     * 11.1.2: the block is DERIVED from the device, stated as an identity
+     * over queried quantities so it pins no part's number: a workgroup
+     * carries the waves the device wants resident on one SIMD. It gives 32
+     * on sm_89, 64 on gfx1151 and 8 on cpu, which is what the sweep of
+     * 2026-09-30 measured best or tied on the two parts it ran on.
+     */
+    @Test
+    public void theDerivedBlockIsTheWavesOneSimdWantsResident() {
+        QuantKernel.setScalarRowsPerBlock(0);
+        int32 wave = Device.waveSize();
+        if (wave <= 0) {
+            // No queryable device: the measured fallback, asserted.
+            Assert.equals(64L, (int64) QuantKernel.rowsPerBlock());
+            return;
+        }
+        int32 want = wave * Device.wavesPerSimdTarget();
+        int32 maxT = Device.maxThreadsPerBlock();
+        int32 ceiling = QuantKernel.scalarRowCeiling();
+        if (maxT <= 0 || maxT > ceiling) { maxT = ceiling; }
+        if (want > maxT) { want = (maxT / wave) * wave; }
+        Assert.equals((int64) want, (int64) QuantKernel.rowsPerBlock());
+    }
+
+    // ── the dispatched shapes ─────────────────────────────────────
+
+    /**
+     * 11.1.1: the kernels the reference model dispatches, held to their
+     * bit-identity host oracles at the shapes it dispatches them at (the
+     * per-format tests hold two rows). The 128256-row head is run at one
+     * block per row: the row count is what reaches the grid, and its 4096
+     * columns are covered by the other shapes.
+     */
+    static void atShape(String kernel, int32 how, int32 ty, String fixture,
+            int64 rows, int64 cols) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable(kernel)) { DeviceSkip.noKernel(kernel, be); return; }
+        int64 bpr = cols / (int64) Quant.blockElems(ty);
+        int8[] raw #= WaveGeometryTest.rowsOf(fixture, ty, rows, bpr);
+        float32[] x #= QuantKernelTest.activationsVaried(cols);
+        float32[] want #= heap float32[rows];
+        float32[] got #= heap float32[rows];
+        boolean bitExact = true;
+        if (how == ScalarGeometryTest.BY_TYPE) {
+            if (ty == Quant.GG_Q4_K) {
+                Quant.q4kMatVecIntoLanes4(raw, rows, cols, x, 0L, want, 0L);
+            } else {
+                Quant.q6kMatVecInto(raw, rows, cols, x, 0L, want, 0L);
+            }
+        } else {
+            int8[] xq #= heap int8[cols];
+            float32[] xd #= heap float32[cols / 256L];
+            int32[] xbs #= heap int32[cols / 16L];
+            Quant.q8kQuantize(x, 0L, cols, xq, xd, xbs);
+            Quant.q4kMatVecIntoQ8(raw, rows, cols, xq, xd, xbs, want, 0L);
+            // The shader tier's driver may contract mul+add differently
+            // (QuantKernelTest.q4kQ8KernelIsBitIdenticalToItsIntegerOracle).
+            bitExact = !be.equals("vulkan");
+        }
+        int64[] vc #= ValueCheck.mark();
+        ScalarGeometryTest.run(how, ty, raw, x, got, rows, cols);
+        QuantKernelTest.assertLive(want, kernel + " host oracle");
+        QuantKernelTest.assertLive(got, kernel + " at " + rows + "x" + cols);
+        int64 r = 0;
+        while (r < rows) {
+            boolean bad = got[r] != want[r];
+            if (bad && !bitExact) {
+                float32 diff = got[r] - want[r];
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = want[r] < 0.0f ? 0.0f - want[r] : want[r];
+                bad = diff > mag * 1.0e-5f + 1.0e-5f;
+            }
+            if (bad) {
+                Assert.fail(kernel + " at " + rows + "x" + cols + ": row " + r
+                    + " reads " + got[r] + " against the host oracle's " + want[r]);
+                return;
+            }
+            r = r + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+
+    static void q4kShapes(String kernel, int32 how) {
+        ScalarGeometryTest.atShape(kernel, how, Quant.GG_Q4_K, "q4_k.bin", 1024L, 4096L);
+        ScalarGeometryTest.atShape(kernel, how, Quant.GG_Q4_K, "q4_k.bin", 4096L, 4096L);
+        ScalarGeometryTest.atShape(kernel, how, Quant.GG_Q4_K, "q4_k.bin", 14336L, 4096L);
+        ScalarGeometryTest.atShape(kernel, how, Quant.GG_Q4_K, "q4_k.bin", 4096L, 14336L);
+    }
+
+    @Test
+    public void q4kAgreesWithItsOracleAtTheDispatchedShapes() {
+        ScalarGeometryTest.q4kShapes("q4kMatVecKernel", ScalarGeometryTest.BY_TYPE);
+    }
+
+    @Test
+    public void q4kQ8AgreesWithItsOracleAtTheDispatchedShapes() {
+        ScalarGeometryTest.q4kShapes("q4kQ8MatVecKernel", ScalarGeometryTest.Q4K_Q8);
+    }
+
+    @Test
+    public void q4kQ8PackedAgreesWithItsOracleAtTheDispatchedShapes() {
+        ScalarGeometryTest.q4kShapes("q4kQ8PackedMatVecKernel",
+            ScalarGeometryTest.Q4K_Q8_PACKED);
+    }
+
+    @Test
+    public void q6kAgreesWithItsOracleAtTheDispatchedShapes() {
+        ScalarGeometryTest.atShape("q6kMatVecKernel", ScalarGeometryTest.BY_TYPE,
+            Quant.GG_Q6_K, "q6_k.bin", 1024L, 4096L);
+        ScalarGeometryTest.atShape("q6kMatVecKernel", ScalarGeometryTest.BY_TYPE,
+            Quant.GG_Q6_K, "q6_k.bin", 4096L, 14336L);
+        ScalarGeometryTest.atShape("q6kMatVecKernel", ScalarGeometryTest.BY_TYPE,
+            Quant.GG_Q6_K, "q6_k.bin", 128256L, 256L);
+    }
+
+    // ── the router mat-vec ─────────────────────────────────────
+
+    /**
+     * 11.1.1: `routerF32MatVecKernel` against the host dot product at the
+     * two router shapes the MoE models dispatch (E experts of H columns).
+     * Its block is STRUCTURAL, a 256-lane tree over a shared array, so
+     * there is no geometry to derive; what it owes is the right number on
+     * every backend, and the lanes reduce in tree order, so the bar is
+     * relative, not bit identity. A column count that is not a multiple of
+     * 256 leaves the last stride ragged.
+     */
+    static void router(int64 experts, int64 cols) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable("routerF32MatVecKernel")) {
+            DeviceSkip.noKernel("routerF32MatVecKernel", be);
+            return;
+        }
+        float32[] w #= heap float32[experts * cols];
+        float32[] x #= heap float32[cols];
+        int64 i = 0;
+        while (i < experts * cols) {
+            w[i] = (float32) ((i * 37L + 11L) % 101L - 50L) * 0.015625f;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < cols) {
+            x[i] = (float32) ((i * 13L + 5L) % 29L - 14L) * 0.0625f;
+            i = i + 1;
+        }
+        float32[] want #= heap float32[experts];
+        int64 e = 0;
+        while (e < experts) {
+            float64 acc = 0.0;
+            int64 j = 0;
+            while (j < cols) {
+                acc = acc + (float64) w[e * cols + j] * (float64) x[j];
+                j = j + 1;
+            }
+            want[e] = (float32) acc;
+            e = e + 1;
+        }
+        KernelBuffer<float32> wD #= heap KernelBuffer<float32>((uint64) (experts * cols));
+        wD.upload(w);
+        KernelBuffer<float32> xD #= heap KernelBuffer<float32>((uint64) cols);
+        xD.upload(x);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) experts);
+        float32[] got #= heap float32[experts];
+        yD.upload(got);
+        int64[] vc #= ValueCheck.mark();
+        QuantKernel.routerF32MatVecLaunchNoSync(yD, wD, xD, experts, cols);
+        QuantKernel.stream().sync();
+        yD.download(got);
+        QuantKernelTest.assertLive(got, "routerF32MatVecKernel at " + experts + "x" + cols);
+        e = 0;
+        while (e < experts) {
+            float32 diff = got[e] - want[e];
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = want[e] < 0.0f ? 0.0f - want[e] : want[e];
+            if (diff > mag * 1.0e-4f + 1.0e-3f) {
+                Assert.fail("routerF32MatVecKernel at " + experts + "x" + cols
+                    + ": expert " + e + " reads " + got[e] + " against the host's "
+                    + want[e]);
+                return;
+            }
+            e = e + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void theRouterMatVecAgreesWithTheHostDot() {
+        ScalarGeometryTest.router(32L, 2880L);
+        ScalarGeometryTest.router(128L, 2048L);
+        ScalarGeometryTest.router(5L, 1000L);
+    }
+}

@@ -10,6 +10,7 @@ import cajeta.xpu.KernelTimer;
 import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
 import dev.cajeta.llm.model.KernelCap;
 
 /**
@@ -47,7 +48,9 @@ import dev.cajeta.llm.model.KernelCap;
  * legs on the same real bytes.
  *
  * Run:  ParityLeg.run --build <cajeta-llm commit> [--gguf model.gguf]
- *                     [--copies-bytes N]
+ *                     [--copies-bytes N] [--rows-per-block N]
+ *                     [--family wave|scalar|scalar-f32|batch|wmma] [--n N]
+ *                     [--scalar-rows-per-block N]
  */
 public class ParityLeg {
 
@@ -56,6 +59,43 @@ public class ParityLeg {
     /** The pool the weights cycle through: past the 4090's 72 MB L2. */
     static int64 poolTarget = 201326592L;
     static String build = "unknown";
+
+    /** Which family the leg measures (xpu-kernel-adaptor 11.2.2): the wave
+     *  mat-vecs the device routes dispatch, or the scalar per-row mat-vecs
+     *  at the same shapes. SCALAR is the integer route where one exists
+     *  (q4_K: the packed q8 kernel, its pack inside the bracket like the
+     *  wave leg) and the f32 kernel elsewhere; SCALAR_F32 is the f32 kernel
+     *  for every type, with no pack to charge. */
+    static final int32 WAVE = 0;
+    static final int32 SCALAR = 1;
+    static final int32 SCALAR_F32 = 2;
+    /** The dp4a batch GEMMs at `batchN` tokens a launch: the batched-decode
+     *  route (llama.cpp keeps mmvq up to MMVQ_MAX_BATCH_SIZE 8). The
+     *  bracket carries the pack of all `batchN` activations. */
+    static final int32 BATCH = 3;
+    /** The plain matrix-core GEMMs at `batchN` tokens (a multiple of 16):
+     *  what a batched chunk takes when its row count tiles, measured beside
+     *  BATCH to say what padding a ragged chunk up to the tile costs
+     *  (xpu-kernel-adaptor 11.2.2). Same buffers and bracket as BATCH. */
+    static final int32 WMMA = 4;
+    static int32 family = 0;
+    static int64 batchN = 1L;
+
+    /** Does this leg's kernel for `ty` read the packed q8 activation? */
+    static boolean packs(int32 ty) {
+        if (ParityLeg.family == ParityLeg.WAVE) { return true; }
+        if (ParityLeg.family == ParityLeg.BATCH) { return true; }
+        if (ParityLeg.family == ParityLeg.WMMA) { return true; }
+        return ParityLeg.family == ParityLeg.SCALAR && ty == Quant.GG_Q4_K;
+    }
+
+    /** Does this leg's kernel for `ty` read the row-split resident layout? */
+    static boolean splits(int32 ty) {
+        if (ParityLeg.family == ParityLeg.BATCH) { return Quant.splitOn(ty); }
+        if (ParityLeg.family == ParityLeg.WMMA) { return Quant.splitOn(ty); }
+        if (ParityLeg.family != ParityLeg.WAVE && ParityLeg.packs(ty)) { return false; }
+        return Quant.splitOn(ty);
+    }
 
     static #String typeName(int32 ty) {
         if (ty == Quant.GG_Q4_K) { return #"q4_K"; }
@@ -68,6 +108,25 @@ public class ParityLeg {
     }
 
     static #String kernelName(int32 ty) {
+        if (ParityLeg.family == ParityLeg.BATCH) {
+            if (ty == Quant.GG_Q4_K) { return #"q4kQ8BatchMatMulKernel"; }
+            return #"q6kQ8BatchMatMulKernel";
+        }
+        if (ParityLeg.family == ParityLeg.WMMA) {
+            if (ty == Quant.GG_Q4_K) { return #"q4kWmmaKernel"; }
+            return #"q6kWmmaKernel";
+        }
+        if (ParityLeg.family != ParityLeg.WAVE) {
+            if (ty == Quant.GG_Q4_K) {
+                if (ParityLeg.family == ParityLeg.SCALAR) {
+                    return #"q4kQ8PackedMatVecKernel";
+                }
+                return #"q4kMatVecKernel";
+            }
+            if (ty == Quant.GG_Q6_K) { return #"q6kMatVecKernel"; }
+            if (ty == Quant.GG_Q5_K) { return #"q5kMatVecKernel"; }
+            return #"q8MatVecKernel";
+        }
         if (ty == Quant.GG_Q4_K) { return #"q4kQ8WaveMatVecKernel"; }
         if (ty == Quant.GG_Q6_K) { return #"q6kQ8WaveMatVecKernel"; }
         if (ty == Quant.GG_Q5_K) { return #"q5kQ8WaveMatVecKernel"; }
@@ -77,7 +136,28 @@ public class ParityLeg {
     }
 
     static void launch(int32 ty, KernelBuffer<float32> y, KernelBuffer<int8> w,
-            KernelBuffer<int8> xp, int64 rows, int64 cols) {
+            KernelBuffer<int8> xp, KernelBuffer<float32> xf, int64 rows,
+            int64 cols) {
+        if (ParityLeg.family == ParityLeg.BATCH) {
+            QuantKernel.batchMatMulLaunch(ty, y, w, xp, ParityLeg.batchN, rows, cols);
+            return;
+        }
+        if (ParityLeg.family == ParityLeg.WMMA) {
+            if (ty == Quant.GG_Q4_K) {
+                WmmaKernel.q4kWmmaLaunch(y, w, xp, ParityLeg.batchN, rows, cols);
+            } else {
+                WmmaKernel.q6kWmmaLaunch(y, w, xp, ParityLeg.batchN, rows, cols);
+            }
+            return;
+        }
+        if (ParityLeg.family != ParityLeg.WAVE) {
+            if (ParityLeg.packs(ty)) {
+                QuantKernel.q4kQ8PackedMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
+            } else {
+                QuantKernel.matVecLaunchNoSync(ty, y, w, xf, rows, cols, 0L, 0L);
+            }
+            return;
+        }
         if (ty == Quant.GG_Q4_K) {
             QuantKernel.q4kQ8WaveMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
         } else if (ty == Quant.GG_Q6_K) {
@@ -90,6 +170,17 @@ public class ParityLeg {
             QuantKernel.q2kQ8WaveMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
         } else {
             QuantKernel.q3kQ8WaveMatVecLaunchNoSync(y, w, xp, rows, cols, 0L);
+        }
+        return;
+    }
+
+    /** The activation pack this leg's bracket carries: one row, or all
+     *  `batchN` rows for the batch family. */
+    static void pack(KernelBuffer<int8> xpb, KernelBuffer<float32> xf, int64 cols) {
+        if (ParityLeg.family == ParityLeg.BATCH || ParityLeg.family == ParityLeg.WMMA) {
+            QuantKernel.q8kPackRowsLaunchNoSync(xpb, xf, ParityLeg.batchN, cols, cols);
+        } else {
+            QuantKernel.q8kPackLaunchNoSync(xpb, xf, cols);
         }
         return;
     }
@@ -164,7 +255,8 @@ public class ParityLeg {
         if (!Device.kernelAvailable(kernel)) {
             return ParityLeg.refused(kernel, "no device code on " + be);
         }
-        if (!Device.kernelAvailable("q8kPackKernel")) {
+        boolean pack = ParityLeg.packs(ty);
+        if (pack && !Device.kernelAvailable("q8kPackKernel")) {
             return ParityLeg.refused("q8kPackKernel", "no device code on " + be);
         }
         // Registered is not correct: a kernel written for a 32-lane wave
@@ -176,7 +268,7 @@ public class ParityLeg {
             return ParityLeg.refused(kernel, "written for a 32-lane wave and "
                 + be + "'s wave is " + Device.waveSize());
         }
-        if (!KernelCap.usable("q8kPackKernel")) {
+        if (pack && !KernelCap.usable("q8kPackKernel")) {
             return ParityLeg.refused("q8kPackKernel", "written for a 32-lane wave and "
                 + be + "'s wave is " + Device.waveSize());
         }
@@ -186,21 +278,25 @@ public class ParityLeg {
         int64 poolBytes = copies * wbytes;
 
         // The activation: f32 on the device, packed inside the bracket.
-        float32[] hx #= heap float32[cols];
+        int64 nTok = 1L;
+        if (ParityLeg.family == ParityLeg.BATCH || ParityLeg.family == ParityLeg.WMMA) {
+            nTok = ParityLeg.batchN;
+        }
+        float32[] hx #= heap float32[nTok * cols];
         int64 i = 0;
-        while (i < cols) {
+        while (i < nTok * cols) {
             hx[i] = 0.02f * (float32) ((i % 11L) - 5L);
             i = i + 1;
         }
-        KernelBuffer<float32> xf #= heap KernelBuffer<float32>((uint64) cols);
+        KernelBuffer<float32> xf #= heap KernelBuffer<float32>((uint64) (nTok * cols));
         xf.upload(hx);
-        int64 xpBytes = Quant.q8kPackedBytes(cols);
+        int64 xpBytes = nTok * Quant.q8kPackedBytes(cols);
         KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xpBytes);
 
         // The pool, past L2.
         KernelBuffer<int8> pool #= heap KernelBuffer<int8>((uint64) poolBytes);
         pool.upload(big);
-        boolean split = Quant.splitOn(ty);
+        boolean split = ParityLeg.splits(ty);
         int64 pBytes = wbytes;
         int64 ppBytes = 4L;
         if (split) {
@@ -221,10 +317,11 @@ public class ParityLeg {
             }
             c = c + 1;
         }
-        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) rows);
-        float32[] scratch #= heap float32[rows];
+        int64 yN = nTok * rows;
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) yN);
+        float32[] scratch #= heap float32[yN];
         int64 z = 0;
-        while (z < rows) { scratch[z] = 0.0f; z = z + 1; }
+        while (z < yN) { scratch[z] = 0.0f; z = z + 1; }
         y.upload(scratch);
         KernelStream s = QuantKernel.stream();
 
@@ -234,19 +331,26 @@ public class ParityLeg {
         while (w < ParityLeg.WARMUP) {
             c = 0;
             while (c < copies) {
-                QuantKernel.q8kPackLaunchNoSync(xpb, xf, cols);
-                ParityLeg.launch(ty, y, arms[c], xpb, rows, cols);
+                if (pack) { ParityLeg.pack(xpb, xf, cols); }
+                ParityLeg.launch(ty, y, arms[c], xpb, xf, rows, cols);
                 c = c + 1;
             }
             w = w + 1;
         }
         s.sync();
         y.download(scratch);
-        boolean live = false;
-        z = 0;
-        while (z < rows) {
-            if (scratch[z] != 0.0f) { live = true; }
-            z = z + 1;
+        // Every token row must be live, not merely some output.
+        boolean live = true;
+        int64 tk = 0;
+        while (tk < nTok) {
+            boolean rowLive = false;
+            z = 0;
+            while (z < rows) {
+                if (scratch[tk * rows + z] != 0.0f) { rowLive = true; }
+                z = z + 1;
+            }
+            if (!rowLive) { live = false; }
+            tk = tk + 1;
         }
         if (!live) {
             return ParityLeg.refused(kernel, "produced zeros at " + rows + "x" + cols);
@@ -267,8 +371,8 @@ public class ParityLeg {
         int64 pass0 = Clock.nanoTime();
         c = 0;
         while (c < copies) {
-            QuantKernel.q8kPackLaunchNoSync(xpb, xf, cols);
-            ParityLeg.launch(ty, y, arms[c], xpb, rows, cols);
+            if (pack) { ParityLeg.pack(xpb, xf, cols); }
+            ParityLeg.launch(ty, y, arms[c], xpb, xf, rows, cols);
             c = c + 1;
         }
         s.sync();
@@ -288,8 +392,8 @@ public class ParityLeg {
             while (it < iters) {
                 c = 0;
                 while (c < copies) {
-                    QuantKernel.q8kPackLaunchNoSync(xpb, xf, cols);
-                    ParityLeg.launch(ty, y, arms[c], xpb, rows, cols);
+                    if (pack) { ParityLeg.pack(xpb, xf, cols); }
+                    ParityLeg.launch(ty, y, arms[c], xpb, xf, rows, cols);
                     c = c + 1;
                 }
                 it = it + 1;
@@ -318,15 +422,15 @@ public class ParityLeg {
         r.type #= ParityLeg.typeName(ty);
         r.m = rows;
         r.k = cols;
-        r.n = 1;
+        r.n = nTok;
         r.launches = launches;
         r.poolBytes = poolBytes;
         r.l2Bytes = Device.l2CacheBytes();
         r.residency #= ParityTable.residency(poolBytes, r.l2Bytes);
         r.tier #= KernelTimer.tierName();
         r.nsPerLaunch = per;
-        r.bytesPerLaunch = pBytes + cols * 4L + rows * 4L;
-        r.flopsPerLaunch = 2.0 * (float64) rows * (float64) cols;
+        r.bytesPerLaunch = pBytes + nTok * cols * 4L + nTok * rows * 4L;
+        r.flopsPerLaunch = 2.0 * (float64) nTok * (float64) rows * (float64) cols;
         r.clockScale = scaleRow;
         String line #= r.line();
         return #line;
@@ -419,13 +523,52 @@ public class ParityLeg {
                 // workgroup for this leg (0 = the derived or tuned value).
                 QuantKernel.setWaveRowsPerBlock((int32) Long.parseLong(args[i + 1]));
                 i = i + 2;
+            } else if (args[i].equals("--family") && i + 1 < n) {
+                // xpu-kernel-adaptor 11.2.2: which family the leg measures.
+                if (args[i + 1].equals("scalar")) {
+                    ParityLeg.family = ParityLeg.SCALAR;
+                } else if (args[i + 1].equals("scalar-f32")) {
+                    ParityLeg.family = ParityLeg.SCALAR_F32;
+                } else if (args[i + 1].equals("batch")) {
+                    ParityLeg.family = ParityLeg.BATCH;
+                    if (ParityLeg.batchN < 2L) { ParityLeg.batchN = 4L; }
+                } else if (args[i + 1].equals("wmma")) {
+                    ParityLeg.family = ParityLeg.WMMA;
+                    if (ParityLeg.batchN < 16L) { ParityLeg.batchN = 16L; }
+                } else {
+                    ParityLeg.family = ParityLeg.WAVE;
+                }
+                i = i + 2;
+            } else if (args[i].equals("--n") && i + 1 < n) {
+                // Tokens per launch for the batch family (default 4).
+                ParityLeg.batchN = Long.parseLong(args[i + 1]);
+                i = i + 2;
+            } else if (args[i].equals("--scalar-rows-per-block") && i + 1 < n) {
+                // xpu-kernel-adaptor 11.1.2: force the scalar family's rows
+                // per workgroup for this leg (0 = the default).
+                QuantKernel.setScalarRowsPerBlock((int32) Long.parseLong(args[i + 1]));
+                i = i + 2;
             } else {
                 i = i + 1;
             }
         }
-        System.stdout.println("# cajeta leg: wave rows per workgroup "
-            + QuantKernel.waveRowsPerBlock() + " (block "
-            + QuantKernel.waveRowBlock() + ")");
+        if (ParityLeg.family == ParityLeg.WAVE) {
+            System.stdout.println("# cajeta leg: wave rows per workgroup "
+                + QuantKernel.waveRowsPerBlock() + " (block "
+                + QuantKernel.waveRowBlock() + ")");
+        } else if (ParityLeg.family == ParityLeg.BATCH || ParityLeg.family == ParityLeg.WMMA) {
+            System.stdout.println("# cajeta leg: "
+                + (ParityLeg.family == ParityLeg.BATCH ? "batch" : "matrix-core")
+                + " family, " + ParityLeg.batchN
+                + " tokens per launch, kernels " + ParityLeg.kernelName(Quant.GG_Q4_K)
+                + " and " + ParityLeg.kernelName(Quant.GG_Q6_K));
+        } else {
+            System.stdout.println("# cajeta leg: scalar family"
+                + (ParityLeg.family == ParityLeg.SCALAR ? "" : " (f32)")
+                + ", rows per workgroup " + QuantKernel.rowsPerBlock()
+                + ", kernels " + ParityLeg.kernelName(Quant.GG_Q4_K) + " and "
+                + ParityLeg.kernelName(Quant.GG_Q6_K));
+        }
         System.stdout.println("# cajeta leg: backend " + Device.activeBackend()
             + ", timer " + KernelTimer.tierName() + " (clock scale "
             + KernelTimer.clockScale() + "), L2 " + Device.l2CacheBytes()

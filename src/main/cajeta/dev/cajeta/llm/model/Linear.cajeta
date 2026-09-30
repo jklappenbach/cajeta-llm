@@ -2183,6 +2183,114 @@ public final class Linear extends InfModule {
             (int64) this.inDim, 0L, 0L, 0L, 0L);
     }
 
+    // ── do the matrix cores pay on this device? ──────────────────
+    // 0 = not measured yet, 1 = they pay, 2 = they do not.
+    static int32 mcPay = 0;
+    static int64 mcProbeWmmaNs = 0L;
+    static int64 mcProbeBatchNs = 0L;
+
+    /** Pin the answer of {@link #matrixCoresPay} (1 = pay, 2 = do not), or
+     *  0 to measure again: the arm that proves the gate fires and the arm
+     *  that proves it does not, on one backend. */
+    public static void setMatrixCoresPay(int32 v) { Linear.mcPay = v; }
+
+    /** The probe's two times, ns per launch (0 before it has run). */
+    public static int64 matrixCoreProbeWmmaNs() { return Linear.mcProbeWmmaNs; }
+    public static int64 matrixCoreProbeBatchNs() { return Linear.mcProbeBatchNs; }
+
+    /**
+     * Is a 16-row matrix-core GEMM cheaper HERE than the dotAccum batch
+     * kernel over the same 16 rows (xpu-kernel-adaptor 11.2.2)? Measured
+     * once per process, the first time a ragged chunk asks, on a synthetic
+     * Q4_K 4096x4096 weight: both kernels are warmed, then the faster of
+     * two synced launches each is compared. No backend is named and no
+     * tier is assumed; the two parts measured so far answer in opposite
+     * directions by a wide margin (sm_89: 0.19 ms against 1.0 ms; cpu: 123
+     * ms against 7.5 ms), which is why the question is asked of the device.
+     *
+     * False where either kernel is not usable here: with no matrix-core
+     * kernel there is nothing to pad to, and with no batch kernel the
+     * caller had no fallback to weigh.
+     */
+    public static boolean matrixCoresPay() {
+        if (Linear.mcPay == 0) {
+            if (Linear.probeMatrixCores()) {
+                Linear.mcPay = 1;
+            } else {
+                Linear.mcPay = 2;
+            }
+        }
+        return Linear.mcPay == 1;
+    }
+
+    static boolean probeMatrixCores() {
+        if (!KernelCap.usable("q4kWmmaKernel")
+                || !KernelCap.usable("q4kQ8BatchMatMulKernel")
+                || !KernelCap.usable("q8kPackKernel")) {
+            return false;
+        }
+        int64 rows = 16L;
+        int64 out = 4096L;
+        int64 cols = 4096L;
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int8[] raw #= heap int8[nBlocks * 144L];
+        int64 z = 0;
+        int64 nb = (int64) raw.count();
+        while (z < nb) {
+            raw[z] = (int8) ((z * 31L + 35L) % 251L);
+            z = z + 1;
+        }
+        // Real scales: arbitrary bytes in the two f16 fields decode to NaN
+        // or Inf, and NaN arithmetic is not the work a GEMM does.
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 o = b * 144L;
+            raw[o] = (int8) (b % 16L);
+            raw[o + 1L] = (int8) 60;
+            raw[o + 2L] = (int8) (b % 16L);
+            raw[o + 3L] = (int8) 56;
+            b = b + 1;
+        }
+        float32[] x #= heap float32[rows * cols];
+        z = 0;
+        while (z < rows * cols) {
+            x[z] = 0.02f * (float32) ((z % 11L) - 5L);
+            z = z + 1;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) nb);
+        wD.upload(raw);
+        KernelBuffer<float32> xD #= heap KernelBuffer<float32>((uint64) (rows * cols));
+        xD.upload(x);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) (rows * Quant.q8kPackedBytes(cols)));
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) (rows * out));
+        KernelStream s = QuantKernel.stream();
+        QuantKernel.q8kPackRowsLaunchNoSync(xp, xD, rows, cols, cols);
+        s.sync();
+        int64 wBest = 0L - 1L;
+        int64 bBest = 0L - 1L;
+        int32 round = 0;
+        while (round < 3) {
+            int64 t0 = Clock.nanoTime();
+            WmmaKernel.q4kWmmaLaunch(y, wD, xp, rows, out, cols);
+            s.sync();
+            int64 t1 = Clock.nanoTime();
+            QuantKernel.q4kQ8BatchMatMulLaunchNoSync(y, wD, xp, rows, out, cols);
+            s.sync();
+            int64 t2 = Clock.nanoTime();
+            // Round 0 is the warm-up and is not read.
+            if (round > 0) {
+                if (wBest < 0L || t1 - t0 < wBest) { wBest = t1 - t0; }
+                if (bBest < 0L || t2 - t1 < bBest) { bBest = t2 - t1; }
+            }
+            round = round + 1;
+        }
+        Linear.mcProbeWmmaNs = wBest;
+        Linear.mcProbeBatchNs = bBest;
+        return wBest < bBest;
+    }
+
     void matmulBatchKeep(int32 rows) {
         Linear.ensureKernelAvail();
         this.ensureDevice();
@@ -2218,22 +2326,52 @@ public final class Linear extends InfModule {
         // "ring gfx_0.0.0 timeout" from the VkTileProbe stage-5 isolation,
         // ring reset, context lost — the defect the whole "Q6 hang" hunt
         // was chasing). The dotAccum batch GEMMs are the vulkan route.
+        // A ROW COUNT THAT DOES NOT TILE PADS UP TO THE TILE (xpu-kernel-
+        // adaptor 11.2.2). The matrix-core GEMMs tile 16 token rows, and a
+        // chunk of any other length used to fall to the dotAccum batch
+        // kernel, which gives each token ONE lane to walk a whole weight
+        // row: measured on sm_89 at the reference model's shapes it costs
+        // 17 to 28 times llama.cpp's time and grows linearly with the row
+        // count (q4_K 4096x14336: 1.0 ms at 4 rows, 7.0 ms at 32, against
+        // 47 us for one wave mat-vec). The stage is sized to a multiple of
+        // 128 rows already (ensureBatchStage), the pad rows hold stale
+        // activations, and only pad OUTPUT rows read them, as on the Mw8
+        // routes below.
+        //
+        // WHERE THE MATRIX CORES PAY, which is measured and not assumed: on
+        // the cpu backend the same 16-row tile is a software tile and costs
+        // 11 to 21 times the dotAccum kernel (q4_K 4096x14336 at 16 rows:
+        // 432 ms against 20.5 ms), so there a ragged chunk keeps the
+        // fallback it always had ({@link #matrixCoresPay}).
+        int64 tRows = (int64) rows;
+        if (tRows % 16L != 0L && Linear.wmmaOn && !Linear.backendIsVulkan()
+                && (this.packedTy == Quant.GG_Q4_K || this.packedTy == Quant.GG_Q6_K)
+                && (int64) this.outDim % 16L == 0L
+                && Linear.matrixCoresPay()) {
+            tRows = ((int64) rows + 15L) / 16L * 16L;
+        }
         boolean useWmma = Linear.wmmaOn
             && this.packedTy == Quant.GG_Q4_K
-            && WmmaKernel.fits((int64) rows, (int64) this.outDim)
+            && WmmaKernel.fits(tRows, (int64) this.outDim)
             && !Linear.backendIsVulkan();
         // Slots NEVER take a deq route: the widened copy is
         // outDim x inDim bytes PER EXPERT, which at bank scale would
         // double the residency budget for a kernel the plain WMMA
         // form serves from the packed slab directly (unit 41c).
+        // A padded launch on the expert WINDOW takes the form the slots
+        // take (no widen): the window and a resident slot must feed the
+        // same kernel the same bytes, which is what keeps a capped budget
+        // bit-identical to a full one (moe-expert-cache 7.1.1), and an
+        // expert's share of a chunk is the row count that does not tile.
+        boolean paddedWindow = tRows != (int64) rows && this.winStage != null;
         boolean useDeq = useWmma && Linear.deqFor(this.packedTy)
-            && !this.slotMode && this.deqAdmitted();
+            && !this.slotMode && !paddedWindow && this.deqAdmitted();
         // Q6_K on the matrix cores too (10.12.23): 10.12.22 measured the
         // dotAccum fallback at 1290 ms of the 2844 ms launch — 32 calls
         // costing ~as much as all 192 WMMA calls.
         boolean useWmma6 = Linear.wmmaOn && Linear.wmma6On
             && this.packedTy == Quant.GG_Q6_K
-            && WmmaKernel.fits((int64) rows, (int64) this.outDim)
+            && WmmaKernel.fits(tRows, (int64) this.outDim)
             && !Linear.backendIsVulkan();   // RADV context-loss: dotAccum instead
         // 10.12.45.D: Q5_K and Q8_0 exist only in deq (int8) mode and
         // only at the Mw8 shape — isBatchRoutedFor gates the batched
@@ -2264,136 +2402,137 @@ public final class Linear extends InfModule {
             && this.packedTy == Quant.GG_Q3_K && Linear.avQ3Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
             && this.deqAdmitted();
+        if (useWmma || useWmma6) { this.ensureBatchOut((int32) tRows); }
         if (useDeq) {
             this.ensureDeq();
             if (Linear.q4Mw8On && Linear.avQ4Mw8
-                    && WmmaKernel.fitsMw8((int64) rows,
+                    && WmmaKernel.fitsMw8(tRows,
                         (int64) this.outDim)) {
                 if (Linear.part32On) {
                     this.sayRoute(1L, "q4 deqMw8Part");
                     WmmaKernel.q4kWmmaDeqMw8PartLaunch(this.yBatch,
                         this.payloadDev, this.deqDev, Linear.btXp,
-                        (int64) rows, (int64) this.outDim,
+                        tRows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else {
                     this.sayRoute(2L, "q4 deqMw8");
                     WmmaKernel.q4kWmmaDeqMw8Launch(this.yBatch,
                         this.payloadDev, this.deqDev, Linear.btXp,
-                        (int64) rows, (int64) this.outDim,
+                        tRows, (int64) this.outDim,
                         (int64) this.inDim);
                 }
             } else if (Linear.q4Mw4On && Linear.avQ4Mw4
-                    && WmmaKernel.fitsMw4((int64) rows,
+                    && WmmaKernel.fitsMw4(tRows,
                         (int64) this.outDim)) {
                 this.sayRoute(4L, "q4 deqMw4");
                 WmmaKernel.q4kWmmaDeqMw4Launch(this.yBatch,
                     this.payloadDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    tRows, (int64) this.outDim,
                     (int64) this.inDim);
             } else if (Linear.q4MwOn
-                    && WmmaKernel.fitsMw((int64) rows,
+                    && WmmaKernel.fitsMw(tRows,
                         (int64) this.outDim)) {
                 this.sayRoute(8L, "q4 deqMw");
                 WmmaKernel.q4kWmmaDeqMwLaunch(this.yBatch,
                     this.payloadDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    tRows, (int64) this.outDim,
                     (int64) this.inDim);
             } else if (Linear.q4N4On
-                    && WmmaKernel.fitsN4((int64) rows,
+                    && WmmaKernel.fitsN4(tRows,
                         (int64) this.outDim)) {
                 this.sayRoute(16L, "q4 deqN4");
                 WmmaKernel.q4kWmmaDeqN4Launch(this.yBatch,
                     this.payloadDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    tRows, (int64) this.outDim,
                     (int64) this.inDim);
             } else if (Linear.q4T2On
-                    && WmmaKernel.fitsT2((int64) rows,
+                    && WmmaKernel.fitsT2(tRows,
                         (int64) this.outDim)) {
                 this.sayRoute(32L, "q4 deqT2");
                 WmmaKernel.q4kWmmaDeqT2Launch(this.yBatch,
                     this.payloadDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    tRows, (int64) this.outDim,
                     (int64) this.inDim);
             } else if (Linear.q4EpiOn) {
                 this.sayRoute(64L, "q4 deqEpi");
                 WmmaKernel.q4kWmmaDeqEpiLaunch(this.yBatch,
                     this.payloadDev, this.deqDev, Linear.btXp,
-                    (int64) rows, (int64) this.outDim,
+                    tRows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
                 this.sayRoute(128L, "q4 deq");
                 WmmaKernel.q4kWmmaDeqLaunch(this.yBatch, this.payloadDev,
-                    this.deqDev, Linear.btXp, (int64) rows,
+                    this.deqDev, Linear.btXp, tRows,
                     (int64) this.outDim, (int64) this.inDim);
             }
         } else if (useWmma) {
             if (Linear.q4MwPackedOn && Linear.avQ4MwPacked
-                    && WmmaKernel.fitsMw8((int64) rows,
+                    && WmmaKernel.fitsMw8(tRows,
                         (int64) this.outDim)) {
                 this.sayRoute(536870912L, "q4 mw");
                 // fromWords reads the nibbles as int32 words off the
                 // packed weight — the same word view the mmq route takes.
                 this.ensurePackedW();
                 WmmaKernel.q4kWmmaMwLaunch(this.yBatch, this.payloadDev,
-                    this.packedW, Linear.btXp, (int64) rows,
+                    this.packedW, Linear.btXp, tRows,
                     (int64) this.outDim, (int64) this.inDim);
             } else if (Linear.q4EpiOn) {
                 this.sayRoute(256L, "q4 epi");
                 WmmaKernel.q4kWmmaEpiLaunch(this.yBatch, this.payloadDev,
-                    Linear.btXp, (int64) rows, (int64) this.outDim,
+                    Linear.btXp, tRows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
                 this.sayRoute(512L, "q4 plain");
                 WmmaKernel.q4kWmmaLaunch(this.yBatch, this.payloadDev,
-                    Linear.btXp, (int64) rows, (int64) this.outDim,
+                    Linear.btXp, tRows, (int64) this.outDim,
                     (int64) this.inDim);
             }
         } else if (useWmma6) {
             if (Linear.deqFor(this.packedTy) && Linear.q6Mw4On && Linear.avQ6Mw4
-                    && !this.slotMode && this.deqAdmitted()
-                    && WmmaKernel.fitsMw4((int64) rows,
+                    && !this.slotMode && !paddedWindow && this.deqAdmitted()
+                    && WmmaKernel.fitsMw4(tRows,
                         (int64) this.outDim)) {
                 this.ensureDeq();
                 // 10.12.39: T=8 twin preferred when the rows fit —
                 // eight token tiles per weight fragment plus the cf
                 // prefold; Mw4 stays the odd-shape fallback.
                 boolean mw8 = Linear.q6Mw8On && Linear.avQ6Mw8
-                    && WmmaKernel.fitsMw8((int64) rows,
+                    && WmmaKernel.fitsMw8(tRows,
                         (int64) this.outDim);
                 if (mw8 && Linear.part32On) {
                     this.sayRoute(33554432L, "q6 deqMw8Part");
                     WmmaKernel.q6kWmmaDeqMw8PartLaunch(this.yBatch,
                         this.payloadDev, this.deqDev, Linear.btXp,
-                        (int64) rows, (int64) this.outDim,
+                        tRows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else if (mw8) {
                     this.sayRoute(33554432L, "q6 deqMw8");
                     WmmaKernel.q6kWmmaDeqMw8Launch(this.yBatch,
                         this.payloadDev, this.deqDev, Linear.btXp,
-                        (int64) rows, (int64) this.outDim,
+                        tRows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else if (Linear.part32On) {
                     this.sayRoute(67108864L, "q6 deqMw4Part");
                     WmmaKernel.q6kWmmaDeqMw4PartLaunch(this.yBatch,
                         this.payloadDev, this.deqDev, Linear.btXp,
-                        (int64) rows, (int64) this.outDim,
+                        tRows, (int64) this.outDim,
                         (int64) this.inDim);
                 } else {
                     this.sayRoute(67108864L, "q6 deqMw4");
                     WmmaKernel.q6kWmmaDeqMw4Launch(this.yBatch,
                         this.payloadDev, this.deqDev, Linear.btXp,
-                        (int64) rows, (int64) this.outDim,
+                        tRows, (int64) this.outDim,
                         (int64) this.inDim);
                 }
             } else if (Linear.epiOn) {
                 this.sayRoute(134217728L, "q6 epi");
                 WmmaKernel.q6kWmmaEpiLaunch(this.yBatch, this.payloadDev,
-                    Linear.btXp, (int64) rows, (int64) this.outDim,
+                    Linear.btXp, tRows, (int64) this.outDim,
                     (int64) this.inDim);
             } else {
                 this.sayRoute(268435456L, "q6 plain");
                 WmmaKernel.q6kWmmaLaunch(this.yBatch, this.payloadDev,
-                    Linear.btXp, (int64) rows, (int64) this.outDim,
+                    Linear.btXp, tRows, (int64) this.outDim,
                     (int64) this.inDim);
             }
         } else if (useDeq5) {

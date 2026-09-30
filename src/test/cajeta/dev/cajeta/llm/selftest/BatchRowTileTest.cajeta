@@ -1,0 +1,123 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * xpu-kernel-adaptor 11.2.2: a batched chunk whose row count does not tile
+ * the matrix-core GEMM keeps the matrix cores, padded to the tile, WHERE
+ * THE MATRIX CORES PAY, instead of falling to the dotAccum batch kernel
+ * (one lane per token, measured 17 to 28 times llama.cpp's time on sm_89
+ * and linear in the row count). Where they do not pay (the cpu backend's
+ * software tile costs 11 to 21 times the dotAccum kernel) the chunk keeps
+ * the fallback. Which it is, is measured on the device by
+ * `Linear.matrixCoresPay()`.
+ *
+ * Both arms run on every backend, by pinning the answer: pinned to PAY,
+ * 37 rows and 5 rows must take the matrix cores and agree with the serial
+ * path row by row, which is what proves the stale pad rows reach no real
+ * output; pinned to NOT PAY, the same chunk must take the fallback, or the
+ * gate is dead. Sixteen rows tile, so whatever route they take is this
+ * backend's tiled route; where that is already the dotAccum kernel there
+ * is no tile to pad to and the test says so.
+ */
+public class BatchRowTileTest {
+
+    public BatchRowTileTest() { return; }
+
+    static void ragged(int32 ty, String fixture, String what) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        Linear lin #= LinearKernelRouteTest.tiled(ty, fixture);
+        if (!lin.isBatchRoutedFor(16L)) {
+            DeviceSkip.cannot(what + " has no batched route on " + be);
+            return;
+        }
+        int64 f0 = Linear.batchFallbackCount();
+        LinearKernelRouteTest.checkBatched(lin, 16, 0.01, what + " at 16 rows");
+        if (Linear.batchFallbackCount() != f0) {
+            DeviceSkip.cannot("the matrix-core GEMM is not " + be
+                + "'s batched route for " + what + ", so there is no tile to pad to");
+            return;
+        }
+        boolean measured = Linear.matrixCoresPay();
+
+        // FIRES: where the cores pay, a ragged chunk keeps them.
+        Linear.setMatrixCoresPay(1);
+        int64 f1 = Linear.batchFallbackCount();
+        LinearKernelRouteTest.checkBatched(lin, 37, 0.01, what + " at 37 rows, padded");
+        LinearKernelRouteTest.checkBatched(lin, 5, 0.01, what + " at 5 rows, padded");
+        int64 fellBack = Linear.batchFallbackCount() - f1;
+
+        // DOES NOT FIRE: where they do not, it keeps the fallback.
+        Linear.setMatrixCoresPay(2);
+        int64 f2 = Linear.batchFallbackCount();
+        LinearKernelRouteTest.checkBatched(lin, 37, 0.01, what + " at 37 rows, fallback");
+        int64 kept = Linear.batchFallbackCount() - f2;
+
+        Linear.setMatrixCoresPay(measured ? 1 : 2);
+        if (fellBack != 0L) {
+            Assert.fail(what + ": with the matrix cores paying, a row count that does "
+                + "not tile still fell back to the dotAccum batch kernel (" + fellBack
+                + " of 2 launches)");
+        }
+        if (kept != 1L) {
+            Assert.fail(what + ": with the matrix cores NOT paying, a row count that "
+                + "does not tile left the dotAccum fallback (" + kept
+                + " fallback launches for one chunk)");
+        }
+    }
+
+    @Test
+    public void q4kKeepsTheMatrixCoresAtARowCountThatDoesNotTile() {
+        BatchRowTileTest.ragged(Quant.GG_Q4_K, "q4_k.bin", "q4_K");
+    }
+
+    @Test
+    public void q6kKeepsTheMatrixCoresAtARowCountThatDoesNotTile() {
+        BatchRowTileTest.ragged(Quant.GG_Q6_K, "q6_k.bin", "q6_K");
+    }
+
+    /**
+     * The answer is MEASURED: both probe times are real, the answer is
+     * their comparison, and asking twice measures once. The direction is
+     * not asserted, because it is the device's to say (sm_89 answers yes,
+     * the cpu backend no).
+     */
+    @Test
+    public void whetherTheMatrixCoresPayIsMeasuredOnce() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable("q4kWmmaKernel")) {
+            DeviceSkip.noKernel("q4kWmmaKernel", be);
+            return;
+        }
+        if (!KernelCap.usable("q4kQ8BatchMatMulKernel")) {
+            DeviceSkip.noKernel("q4kQ8BatchMatMulKernel", be);
+            return;
+        }
+        if (!KernelCap.usable("q8kPackKernel")) {
+            DeviceSkip.noKernel("q8kPackKernel", be);
+            return;
+        }
+        Linear.setMatrixCoresPay(0);
+        boolean pays = Linear.matrixCoresPay();
+        int64 w = Linear.matrixCoreProbeWmmaNs();
+        int64 b = Linear.matrixCoreProbeBatchNs();
+        System.stdout.println("   matrix-core probe on " + be + ": 16 rows of q4_K "
+            + "4096x4096, matrix cores " + w + " ns, dotAccum " + b + " ns, pay = "
+            + pays);
+        Assert.isTrue(w > 0L);
+        Assert.isTrue(b > 0L);
+        Assert.isTrue(pays == (w < b));
+        boolean again = Linear.matrixCoresPay();
+        Assert.isTrue(again == pays);
+        Assert.equals(w, Linear.matrixCoreProbeWmmaNs());
+    }
+}
