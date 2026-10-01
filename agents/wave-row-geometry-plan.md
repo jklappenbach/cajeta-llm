@@ -135,11 +135,42 @@ replaces BEFORE any timing.
       `q4kQ8IdDownCombineKernel`, `q6kQ8IdDownCombineKernel`,
       `iq3xxsQ8IdGateUpGluKernel`, `iq4nlQ8IdDownCombineKernel`,
       `symQ8IdDownCombineKernel`), still on `KernelCap.WAVE32_ONLY`.
-- [ ] 2.2.4 Stage C, the batch and utility kernels: `q4kQ8Batch*`,
+- [x] 2.2.4 Stage C, the batch and utility kernels: `q4kQ8Batch*`,
       `q6kQ8Batch*`, `q8kPack`, `touchLines`, `moeTopKBatch`,
       `mxfp4QuantAct`. Convert only where the literal is a lane or row
       derivation. A stride or payload width that happens to be 32 stays.
-- [ ] 2.2.5 An audit that no converted family still divides by a literal.
+      CLOSED ANOTHER WAY, 2026-09-30. The conversion of the twenty-nine
+      remaining wave-32 kernels (the grouped-id GLU and combine family, the
+      two GateUpGlu wave kernels, iq2sQ8WaveMatVecLds, the routers and
+      top-k, the packs, qkPrep, the flash attend family, the mxfp4 coops,
+      and q8kPack, which had been credited at wave 8 by a test whose maximum
+      happened to fall in the first quarter block) was not done body by
+      body. Each DECLARES its wave, `@Kernel @Wave(width = 32)`, and the
+      compiler honors the declaration on the cpu backend (cajeta a538aa77):
+      the work-item loop is laid out at 32 lanes, Wave.width() folds to 32,
+      the reduces span 32, and the manifest records waveWidth 32 for
+      Group.laneBlockOf. The same source runs unchanged on every backend,
+      which is the whole point of the annotation the spec had carried since
+      the beginning. KernelCap.WAVE32_ONLY, wave32Only and the "written for
+      a 32-lane wave" skip are gone; usable() is registered and not measured
+      wrong. Found on the way and fixed in the compiler: the cpu segmented
+      reduce ignored its segment (right while the host wave was never wider
+      than a segment, wrong at 32 with eight-lane segments: the Gqa1 flash
+      decode), now a select-guarded butterfly (XpuCpuDeclaredWaveTests).
+      Found and fixed in the engine: isDeviceRouted answered for a format
+      that could not be launched (a TQ2_0 body on cpu threw from the f32
+      launch table once the batched route opened there); the Id GEMM arms
+      launched q4kWmmaIdMwKernel without asking; and packed activations were
+      off on cpu BY NAME, closing every packed-only route there (11.2.5
+      measures which form is faster, 6.4.9 says the gate is a capability).
+- [x] 2.2.5 An audit that no converted family still divides by a literal.
+      DONE 2026-09-30 as a script over every @Kernel: a kernel that uses a
+      wave op either derives its lanes from Group.width() / Wave.width() or
+      declares @Wave(width = 32); after q8kPackKernel took the declaration,
+      none is left that does neither. The cpu leg: 601 passed, 0 failed, 43
+      skipped (from 549 / 2 / 88), census 192 ran / 177 value-checked / 0
+      uncovered / 0 stale, 5 cannot and 36 tracked device skips, under
+      CAJETA_XPU_POISON=1, 22:07 to 22:26.
 
 ### 2.3 Acceptance
 - [x] 2.3.1 Bit gate passes per kernel before any speed number is quoted.
