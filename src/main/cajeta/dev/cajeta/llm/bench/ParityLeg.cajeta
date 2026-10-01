@@ -10,6 +10,7 @@ import cajeta.xpu.KernelTimer;
 import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.TcTile;
 import dev.cajeta.llm.io.WmmaKernel;
 import dev.cajeta.llm.model.KernelCap;
 
@@ -83,6 +84,7 @@ public class ParityLeg {
     static final int32 COLS = 5;
     /** The LDS-tiled dp4a MMQ GEMMs at `batchN` tokens, the Vulkan batch route beside the coop GEMM (xpu-kernel-adaptor 11.1.2). */
     static final int32 MMQ = 6;
+    static final int32 TC = 7;       // the tensor-core prefill tile (TcTile)
     static int32 family = 0;
     static int64 batchN = 1L;
     /** Accept the host-bounded bracket where the backend has no device timer (Vulkan), labelled `host`. */
@@ -93,7 +95,8 @@ public class ParityLeg {
     /** Does the family launch `batchN` tokens at once? */
     static boolean batched() {
         return ParityLeg.family == ParityLeg.BATCH || ParityLeg.family == ParityLeg.WMMA
-            || ParityLeg.family == ParityLeg.COLS || ParityLeg.family == ParityLeg.MMQ;
+            || ParityLeg.family == ParityLeg.COLS || ParityLeg.family == ParityLeg.MMQ
+            || ParityLeg.family == ParityLeg.TC;
     }
 
     /** Does this leg's kernel for `ty` read the packed q8 activation? */
@@ -103,6 +106,7 @@ public class ParityLeg {
         if (ParityLeg.family == ParityLeg.COLS) { return true; }
         if (ParityLeg.family == ParityLeg.WMMA) { return true; }
         if (ParityLeg.family == ParityLeg.MMQ) { return true; }
+        if (ParityLeg.family == ParityLeg.TC) { return true; }
         return ParityLeg.family == ParityLeg.SCALAR && ty == Quant.GG_Q4_K;
     }
 
@@ -112,6 +116,8 @@ public class ParityLeg {
         if (ParityLeg.family == ParityLeg.COLS) { return Quant.splitOn(ty); }
         if (ParityLeg.family == ParityLeg.WMMA) { return Quant.splitOn(ty); }
         if (ParityLeg.family == ParityLeg.MMQ) { return Quant.splitOn(ty); }
+        // The Q6_K tile reads the resident (split) payload; Q4_K the file's.
+        if (ParityLeg.family == ParityLeg.TC) { return Quant.splitOn(ty); }
         if (ParityLeg.family != ParityLeg.WAVE && ParityLeg.packs(ty)) { return false; }
         return Quant.splitOn(ty);
     }
@@ -127,6 +133,10 @@ public class ParityLeg {
     }
 
     static #String kernelName(int32 ty) {
+        if (ParityLeg.family == ParityLeg.TC) {
+            if (ty == Quant.GG_Q4_K) { return #"q4kQ8TcTileKernel"; }
+            return #"q6kQ8TcTileKernel";
+        }
         if (ParityLeg.family == ParityLeg.MMQ) {
             if (ty == Quant.GG_Q4_K) { return #"q4kQ8MmqKernel"; }
             return #"q6kQ8MmqKernel";
@@ -165,6 +175,16 @@ public class ParityLeg {
     static void launch(int32 ty, KernelBuffer<float32> y, KernelBuffer<int8> w,
             KernelBuffer<int8> xp, KernelBuffer<float32> xf, int64 rows,
             int64 cols, int64 arm) {
+        if (ParityLeg.family == ParityLeg.TC) {
+            // Q4_K and Q6_K; another format launches nothing and the leg
+            // refuses the zero output by name.
+            if (ty == Quant.GG_Q4_K && TcTile.fits(ParityLeg.batchN, rows, cols)) {
+                TcTile.q4kQ8TcTileLaunchNoSync(y, w, xp, ParityLeg.batchN, rows, cols);
+            } else if (ty == Quant.GG_Q6_K && TcTile.fits6(ParityLeg.batchN, rows, cols)) {
+                TcTile.q6kQ8TcTileLaunchNoSync(y, w, xp, ParityLeg.batchN, rows, cols);
+            }
+            return;
+        }
         if (ParityLeg.family == ParityLeg.MMQ) {
             if (ty == Quant.GG_Q4_K) {
                 QuantKernel.q4kQ8MmqLaunchNoSync(y, ParityLeg.wArms[arm], ParityLeg.xpW,
@@ -658,6 +678,8 @@ public class ParityLeg {
                 } else if (args[i + 1].equals("cols")) {
                     ParityLeg.family = ParityLeg.COLS;
                     if (ParityLeg.batchN < 1L || ParityLeg.batchN > 8L) { ParityLeg.batchN = 4L; }
+                } else if (args[i + 1].equals("tc")) {
+                    ParityLeg.family = ParityLeg.TC;
                 } else if (args[i + 1].equals("mmq")) {
                     ParityLeg.family = ParityLeg.MMQ;
                     if (ParityLeg.batchN < 2L) { ParityLeg.batchN = 512L; }

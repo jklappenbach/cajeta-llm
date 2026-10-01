@@ -1,0 +1,756 @@
+package dev.cajeta.llm.io;
+
+import cajeta.lang.Cajeta;
+import cajeta.xpu.Barrier;
+import cajeta.xpu.CooperativeMatrix;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelThread;
+import cajeta.xpu.Shared;
+import cajeta.xpu.Vector;
+import cajeta.xpu.WaveVector;
+
+/**
+ * The tensor-core prefill tile for Q4_K (xpu-kernel-adaptor 1.8.3): one
+ * workgroup of eight waves computes a 128-token x 128-row output tile
+ * over the whole K, reading the weight ONCE per workgroup into shared
+ * memory as int8 straight from the packed nibbles, and the q8_K
+ * activation stage into shared memory beside it.
+ *
+ * Why this and not the deq multi-wave GEMM it is shaped after
+ * (WmmaKernel.q4kWmmaDeqMw8Kernel): that kernel loads its weight
+ * fragments from a widened int8 copy in global memory, per wave, per
+ * sub-block, so at 512 tokens every weight byte crosses L2 sixteen times
+ * (four wave-rows a workgroup, four workgroups a column tile) and the
+ * GEMM runs at the L2's rate, 100 TFLOPS on sm_89 where llama.cpp's MMQ
+ * runs the same shape at 216 (test-backend-ops, 2026-10-01). Here the
+ * eight waves share one staged tile, the weight bytes are the packed
+ * ones (half the widened), and the widen launch is gone with its copy.
+ * The arithmetic is the deq kernel's, verb for verb: the int8 mma over
+ * each 32-k sub-block, the 6-bit scale folded as an integer
+ * (scaledAccumI32), the min term as a rank-1 float per sub-block, the
+ * block's d and the activation's scale applied once per 256-k block.
+ *
+ * The staging is the kernel's whole cost model, measured 2026-10-01: the
+ * first cut staged the weight half-block with one byte load and two byte
+ * stores per nibble pair (32 global byte loads and 64 bank-conflicted
+ * shared byte stores a thread per half-block) and read its activation
+ * fragments from global inside the mma loop, and it ran at 722 us for
+ * 512x4096x14336 against the deq kernel's 610; dropping the staging
+ * alone (wrong results, timing only) gave 519. So every byte now moves
+ * sixteen at a time: a thread reads its column's 32 packed bytes as two
+ * 16-byte vectors, splits the nibbles on 32-bit words (`w & 0x0F0F0F0F`
+ * and `(w >> 4) & 0x0F0F0F0F`), and stores them as four 16-byte vectors;
+ * the activation half-block is copied as 16-byte chunks the same way.
+ * Both tiles are double-buffered and the next half's global reads are
+ * issued into registers before the current half's mma loop, so the
+ * loads' latency hides behind the tensor work and each half costs one
+ * barrier. The panels (the token scales and sums, the column scales and
+ * mins) are double-buffered too, per block, so a block boundary costs no
+ * extra barrier.
+ *
+ * Shared memory: two 128x128 int8 half-block tiles for the weight and two
+ * for the activation (stride 144 against bank conflicts, 72 KB) plus the
+ * doubled panels (26 KB), 98 KB in all. That is over the 48 KB a launch
+ * may take without opting in; the NVPTX lowering relocates the tiles into
+ * the dynamic block and the runtime opts the function in. One workgroup a
+ * multiprocessor, by shared memory and by the accumulators' registers.
+ */
+public final class TcTile {
+
+    public TcTile() { return; }
+
+    /** Whether the tile covers the shape: tokens and rows on the 128
+     *  grid, columns a whole number of 256-element blocks. */
+    public static boolean fits(int64 rows, int64 outDim, int64 cols) {
+        return rows % 128L == 0L && outDim % 128L == 0L && cols % 256L == 0L
+            && rows > 0L && outDim > 0L && cols > 0L;
+    }
+
+    // The launch is a literal block of 256; the pin lets the register
+    // allocator use the 255 a 256-thread block allows (the accumulators
+    // alone are 160 registers a thread). Held on amdgpu and vulkan, where
+    // the double-buffered tiles' 98 KB of shared memory is over the 64 KB
+    // those parts offer a workgroup, and on cpu, where the cooperative
+    // matrix is the software tile and a 128x128 workgroup tile has not
+    // been measured to pay; the Mw8 deq GEMMs stay those backends' route,
+    // and the kernel's availability is what the batched route asks.
+    @Occupancy(maxThreads = 256)
+    @Kernel @FastMath
+    @Unlowered(backend = {"cpu", "amdgpu", "vulkan"}, tracked = "xpu-kernel-adaptor 1.8.3")
+    public static void q4kQ8TcTileKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp, uint32 rows,
+            uint32 outDim, uint32 tilesN8, int64 blocksPerRow) {
+        // Half-block tiles, [buffer][row][k] at stride 144, two buffers each.
+        Shared<int8> aT = shared int8[36864];
+        Shared<int8> bT = shared int8[36864];
+        // Per-block panels, two buffers each: xsAll[buf*128 + token] is the
+        // token's q8_K scale, dAll[buf*128 + col] the column's d,
+        // rgAll[buf*1024 + (tokenTile*8 + j)*16 + tok] = xs * bsum_j,
+        // scAll[buf*1024 + col*8 + j] = sc_j, cgAll[...] = -dmin * mn_j.
+        Shared<float32> xsAll = shared float32[256];
+        Shared<float32> dAll = shared float32[256];
+        Shared<float32> rgAll = shared float32[2048];
+        Shared<int32> scAll = shared int32[2048];
+        Shared<float32> cgAll = shared float32[2048];
+
+        uint32 tid = KernelThread.x();
+        uint32 lane = tid % 32;
+        uint32 wid = tid / 32;
+        uint32 lane16 = lane % 16;
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 tileT = wg / tilesN8;
+        uint32 tileI8 = wg % tilesN8;
+        uint32 t0 = tileT * 128;
+        uint32 i0 = tileI8 * 128;
+        uint32 wr = wid / 2;
+        uint32 wc = wid % 2;
+        uint32 tw = t0 + 32 * wr;
+        uint32 cw = tileI8 * 128 + 64 * wc;
+        // Staging roles: thread -> (column of the 128, which 32-byte nibble
+        // group of the half-block), and the same pair as (token, panel role).
+        uint32 sCol = tid >> 1;
+        uint32 sH = tid & 1;
+        if (t0 < rows && i0 < outDim) {
+            int64 rowBytes = blocksPerRow * 144L;
+            int64 xRowBytes = blocksPerRow * 320L;
+            int64 sRo = (int64) (i0 + sCol) * rowBytes;
+            int64 sXb = (int64) (t0 + sCol) * xRowBytes;
+            // The activation chunks this thread copies: chunk c = tid + 256i
+            // is token c/8, 16-byte part c%8 of the half's 128 bytes, so
+            // eight consecutive threads read one token's 128 contiguous
+            // bytes (a whole line a group; the contiguous-per-thread
+            // mapping measured 10% slower, 2026-10-01). The three further
+            // tokens are 32 rows on, added per load rather than hoisted as
+            // three more base registers.
+            uint32 aRow0 = tid >> 3;
+            uint32 aPart = tid & 7;
+            int64 aSrc0 = (int64) (t0 + aRow0) * xRowBytes + (int64) (16 * aPart);
+            int64 xr32 = 32L * xRowBytes;
+            uint32 aDst0 = aRow0 * 144 + 16 * aPart;
+
+            CooperativeMatrix<int8,16,16,0> ma;
+            CooperativeMatrix<int8,16,16,0> maB;
+            CooperativeMatrix<int8,16,16,1> mbA;
+            CooperativeMatrix<int8,16,16,1> mbB;
+            CooperativeMatrix<int8,16,16,1> mbC;
+            CooperativeMatrix<int8,16,16,1> mbD;
+            CooperativeMatrix<int32,16,16,2> mc0;
+            CooperativeMatrix<int32,16,16,2> mc1;
+            CooperativeMatrix<int32,16,16,2> mc2;
+            CooperativeMatrix<int32,16,16,2> mc3;
+            CooperativeMatrix<int32,16,16,2> iacc0;
+            CooperativeMatrix<int32,16,16,2> iacc1;
+            CooperativeMatrix<int32,16,16,2> iacc2;
+            CooperativeMatrix<int32,16,16,2> iacc3;
+            CooperativeMatrix<int32,16,16,2> iacc4;
+            CooperativeMatrix<int32,16,16,2> iacc5;
+            CooperativeMatrix<int32,16,16,2> iacc6;
+            CooperativeMatrix<int32,16,16,2> iacc7;
+            CooperativeMatrix<float32,16,16,2> facc0;
+            CooperativeMatrix<float32,16,16,2> facc1;
+            CooperativeMatrix<float32,16,16,2> facc2;
+            CooperativeMatrix<float32,16,16,2> facc3;
+            CooperativeMatrix<float32,16,16,2> facc4;
+            CooperativeMatrix<float32,16,16,2> facc5;
+            CooperativeMatrix<float32,16,16,2> facc6;
+            CooperativeMatrix<float32,16,16,2> facc7;
+            facc0.splat(0.0f);
+            facc1.splat(0.0f);
+            facc2.splat(0.0f);
+            facc3.splat(0.0f);
+            facc4.splat(0.0f);
+            facc5.splat(0.0f);
+            facc6.splat(0.0f);
+            facc7.splat(0.0f);
+
+            // The prefetch registers: the next half's activation chunks,
+            // its weight nibbles, and at a block boundary the column
+            // header (even threads) or the token's sums and scale (odd).
+            Vector<int8,16> pa0 = xp.vload<16>(aSrc0);
+            Vector<int8,16> pa1 = xp.vload<16>(aSrc0 + xr32);
+            Vector<int8,16> pa2 = xp.vload<16>(aSrc0 + xr32 + xr32);
+            Vector<int8,16> pa3 = xp.vload<16>(aSrc0 + xr32 + xr32 + xr32);
+            Vector<int8,16> pb0 = packed.vload<16>(sRo + 16L + (int64) (32 * sH));
+            Vector<int8,16> pb1 = packed.vload<16>(sRo + 32L + (int64) (32 * sH));
+            // pq0 is the column header on an even thread, the first four
+            // token sums on an odd one; the union of the two roles' registers
+            // is what the kernel pays, so the roles share.
+            Vector<int8,16> pq0 = pb0;
+            Vector<int8,16> pq1 = pb0;
+            Vector<int8,4> px = xp.vload<4>(sXb + 288L);
+            if (sH == 0) {
+                pq0 = packed.vload<16>(sRo);
+            } else {
+                pq0 = xp.vload<16>(sXb + 256L);
+                pq1 = xp.vload<16>(sXb + 272L);
+            }
+
+            uint32 nh = (uint32) blocksPerRow * 2;
+            uint32 hh = 0;
+            while (hh < nh) {
+                uint32 H = hh & 1;
+                uint32 buf = H * 18432;
+                uint32 pOff = (hh >> 1) & 1;
+                // Store the prefetched half into its buffer. The buffer
+                // was last read two halves ago, behind a barrier.
+                int64 aDst = (int64) (buf + aDst0);
+                aT.vstore(aDst, pa0);
+                aT.vstore(aDst + 4608L, pa1);
+                aT.vstore(aDst + 9216L, pa2);
+                aT.vstore(aDst + 13824L, pa3);
+                {
+                    // Nibble group sH of the half: low nibbles are k
+                    // 64sH..64sH+31 of the staged half, high ones
+                    // 64sH+32..64sH+63 (Quant.q4kBlock).
+                    int64 dst = (int64) (buf + sCol * 144 + 64 * sH);
+                    Vector<int32,4> w0 = pb0.asWords();
+                    Vector<int32,4> w1 = pb1.asWords();
+                    bT.vstore(dst, (w0 & 252645135).asBytes());
+                    bT.vstore(dst + 16L, (w1 & 252645135).asBytes());
+                    bT.vstore(dst + 32L, ((w0 >> 4) & 252645135).asBytes());
+                    bT.vstore(dst + 48L, ((w1 >> 4) & 252645135).asBytes());
+                }
+                if (H == 0) {
+                    if (sH == 0) {
+                        Vector<int32,4> hw = pq0.asWords();
+                        int32 h0 = hw[0];
+                        int32 h1 = hw[1];
+                        int32 h2 = hw[2];
+                        int32 h3 = hw[3];
+                        float32 dv = GgufFile.halfBitsToF32(h0 & 65535);
+                        float32 dmv = GgufFile.halfBitsToF32((h0 >> 16) & 65535);
+                        int32 d0 = h1 & 255;
+                        int32 d1 = (h1 >> 8) & 255;
+                        int32 d2 = (h1 >> 16) & 255;
+                        int32 d3 = (h1 >> 24) & 255;
+                        int32 m0 = h2 & 255;
+                        int32 m1 = (h2 >> 8) & 255;
+                        int32 m2 = (h2 >> 16) & 255;
+                        int32 m3 = (h2 >> 24) & 255;
+                        int32 k0 = h3 & 255;
+                        int32 k1 = (h3 >> 8) & 255;
+                        int32 k2 = (h3 >> 16) & 255;
+                        int32 k3 = (h3 >> 24) & 255;
+                        uint32 cb = pOff * 1024 + sCol * 8;
+                        dAll[pOff * 128 + sCol] = dv;
+                        scAll[cb] = d0 & 63;
+                        scAll[cb + 1] = d1 & 63;
+                        scAll[cb + 2] = d2 & 63;
+                        scAll[cb + 3] = d3 & 63;
+                        scAll[cb + 4] = (k0 & 15) | ((d0 >> 2) & 48);
+                        scAll[cb + 5] = (k1 & 15) | ((d1 >> 2) & 48);
+                        scAll[cb + 6] = (k2 & 15) | ((d2 >> 2) & 48);
+                        scAll[cb + 7] = (k3 & 15) | ((d3 >> 2) & 48);
+                        cgAll[cb] = 0.0f - dmv * (float32) (m0 & 63);
+                        cgAll[cb + 1] = 0.0f - dmv * (float32) (m1 & 63);
+                        cgAll[cb + 2] = 0.0f - dmv * (float32) (m2 & 63);
+                        cgAll[cb + 3] = 0.0f - dmv * (float32) (m3 & 63);
+                        cgAll[cb + 4] = 0.0f - dmv
+                            * (float32) ((k0 >> 4) | ((m0 >> 2) & 48));
+                        cgAll[cb + 5] = 0.0f - dmv
+                            * (float32) ((k1 >> 4) | ((m1 >> 2) & 48));
+                        cgAll[cb + 6] = 0.0f - dmv
+                            * (float32) ((k2 >> 4) | ((m2 >> 2) & 48));
+                        cgAll[cb + 7] = 0.0f - dmv
+                            * (float32) ((k3 >> 4) | ((m3 >> 2) & 48));
+                    } else {
+                        Vector<int32,4> q0 = pq0.asWords();
+                        Vector<int32,4> q1 = pq1.asWords();
+                        Vector<int32,1> xw = px.asWords();
+                        float32 xv = Cajeta.bitsToF32(xw[0]);
+                        xsAll[pOff * 128 + sCol] = xv;
+                        uint32 rb = pOff * 1024 + (sCol >> 4) * 128 + (sCol & 15);
+                        rgAll[rb] = xv * (float32) q0[0];
+                        rgAll[rb + 16] = xv * (float32) q0[1];
+                        rgAll[rb + 32] = xv * (float32) q0[2];
+                        rgAll[rb + 48] = xv * (float32) q0[3];
+                        rgAll[rb + 64] = xv * (float32) q1[0];
+                        rgAll[rb + 80] = xv * (float32) q1[1];
+                        rgAll[rb + 96] = xv * (float32) q1[2];
+                        rgAll[rb + 112] = xv * (float32) q1[3];
+                    }
+                }
+                // Prefetch the next half while this one computes.
+                if (hh + 1 < nh) {
+                    int64 nb = (int64) ((hh + 1) >> 1);
+                    uint32 nH = (hh + 1) & 1;
+                    int64 aS = aSrc0 + nb * 320L + (int64) (128 * nH);
+                    pa0 = xp.vload<16>(aS);
+                    aS = aS + xr32;
+                    pa1 = xp.vload<16>(aS);
+                    aS = aS + xr32;
+                    pa2 = xp.vload<16>(aS);
+                    aS = aS + xr32;
+                    pa3 = xp.vload<16>(aS);
+                    int64 bS = sRo + nb * 144L + 16L + (int64) (64 * nH + 32 * sH);
+                    pb0 = packed.vload<16>(bS);
+                    pb1 = packed.vload<16>(bS + 16L);
+                    if (nH == 0) {
+                        if (sH == 0) {
+                            pq0 = packed.vload<16>(sRo + nb * 144L);
+                        } else {
+                            int64 xb = sXb + nb * 320L;
+                            pq0 = xp.vload<16>(xb + 256L);
+                            pq1 = xp.vload<16>(xb + 272L);
+                            px = xp.vload<4>(xb + 288L);
+                        }
+                    }
+                }
+                Barrier.workgroup();
+
+                if (H == 0) {
+                    iacc0.splat(0);
+                    iacc1.splat(0);
+                    iacc2.splat(0);
+                    iacc3.splat(0);
+                    iacc4.splat(0);
+                    iacc5.splat(0);
+                    iacc6.splat(0);
+                    iacc7.splat(0);
+                }
+                uint32 pBase = pOff * 1024;
+                uint32 cBase = pBase + (64 * wc) * 8;
+                uint32 aBuf = buf + (32 * wr) * 144;
+                uint32 bBuf = buf + (64 * wc) * 144;
+                uint32 jj = 0;
+                while (jj < 4) {
+                    uint32 j = 4 * H + jj;
+                    WaveVector<int32, 16> scv0 = WaveVector.ofSlice(scAll, cBase + j, 8);
+                    WaveVector<int32, 16> scv1 = WaveVector.ofSlice(scAll, cBase + 128 + j, 8);
+                    WaveVector<int32, 16> scv2 = WaveVector.ofSlice(scAll, cBase + 256 + j, 8);
+                    WaveVector<int32, 16> scv3 = WaveVector.ofSlice(scAll, cBase + 384 + j, 8);
+                    WaveVector<float32, 16> cgv0 = WaveVector.ofSlice(cgAll, cBase + j, 8);
+                    WaveVector<float32, 16> cgv1 = WaveVector.ofSlice(cgAll, cBase + 128 + j, 8);
+                    WaveVector<float32, 16> cgv2 = WaveVector.ofSlice(cgAll, cBase + 256 + j, 8);
+                    WaveVector<float32, 16> cgv3 = WaveVector.ofSlice(cgAll, cBase + 384 + j, 8);
+                    uint32 rbase = pBase + (16 * wr + j) * 16;
+                    uint32 kk = 32 * jj;
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
+                    mbA.load(bT, bBuf + kk, 1, 144);
+                    mbB.load(bT, bBuf + 16 * 144 + kk, 1, 144);
+                    mbC.load(bT, bBuf + 32 * 144 + kk, 1, 144);
+                    mbD.load(bT, bBuf + 48 * 144 + kk, 1, 144);
+                    ma.load(aT, aBuf + kk, 0, 144);
+                    mc0.mma(ma, mbA);
+                    mc1.mma(ma, mbB);
+                    mc2.mma(ma, mbC);
+                    mc3.mma(ma, mbD);
+                    mbA.load(bT, bBuf + kk + 16, 1, 144);
+                    mbB.load(bT, bBuf + 16 * 144 + kk + 16, 1, 144);
+                    mbC.load(bT, bBuf + 32 * 144 + kk + 16, 1, 144);
+                    mbD.load(bT, bBuf + 48 * 144 + kk + 16, 1, 144);
+                    ma.load(aT, aBuf + kk + 16, 0, 144);
+                    mc0.mma(ma, mbA);
+                    mc1.mma(ma, mbB);
+                    mc2.mma(ma, mbC);
+                    mc3.mma(ma, mbD);
+                    mc0.scaledAccumI32(iacc0, scv0);
+                    mc1.scaledAccumI32(iacc1, scv1);
+                    mc2.scaledAccumI32(iacc2, scv2);
+                    mc3.scaledAccumI32(iacc3, scv3);
+                    // The second token tile over the same weights.
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
+                    mbA.load(bT, bBuf + kk, 1, 144);
+                    mbB.load(bT, bBuf + 16 * 144 + kk, 1, 144);
+                    mbC.load(bT, bBuf + 32 * 144 + kk, 1, 144);
+                    mbD.load(bT, bBuf + 48 * 144 + kk, 1, 144);
+                    maB.load(aT, aBuf + 16 * 144 + kk, 0, 144);
+                    mc0.mma(maB, mbA);
+                    mc1.mma(maB, mbB);
+                    mc2.mma(maB, mbC);
+                    mc3.mma(maB, mbD);
+                    mbA.load(bT, bBuf + kk + 16, 1, 144);
+                    mbB.load(bT, bBuf + 16 * 144 + kk + 16, 1, 144);
+                    mbC.load(bT, bBuf + 32 * 144 + kk + 16, 1, 144);
+                    mbD.load(bT, bBuf + 48 * 144 + kk + 16, 1, 144);
+                    maB.load(aT, aBuf + 16 * 144 + kk + 16, 0, 144);
+                    mc0.mma(maB, mbA);
+                    mc1.mma(maB, mbB);
+                    mc2.mma(maB, mbC);
+                    mc3.mma(maB, mbD);
+                    mc0.scaledAccumI32(iacc4, scv0);
+                    mc1.scaledAccumI32(iacc5, scv1);
+                    mc2.scaledAccumI32(iacc6, scv2);
+                    mc3.scaledAccumI32(iacc7, scv3);
+                    facc0.rank1Accum(rgAll[rbase], cgv0);
+                    facc1.rank1Accum(rgAll[rbase], cgv1);
+                    facc2.rank1Accum(rgAll[rbase], cgv2);
+                    facc3.rank1Accum(rgAll[rbase], cgv3);
+                    facc4.rank1Accum(rgAll[rbase + 128], cgv0);
+                    facc5.rank1Accum(rgAll[rbase + 128], cgv1);
+                    facc6.rank1Accum(rgAll[rbase + 128], cgv2);
+                    facc7.rank1Accum(rgAll[rbase + 128], cgv3);
+                    jj = jj + 1;
+                }
+                if (H == 1) {
+                    uint32 dbase = pOff * 128 + 64 * wc;
+                    uint32 xbase = pOff * 128 + 32 * wr;
+                    WaveVector<float32, 16> dcv0 = WaveVector.ofSlice(dAll, dbase, 1);
+                    WaveVector<float32, 16> dcv1 = WaveVector.ofSlice(dAll, dbase + 16, 1);
+                    WaveVector<float32, 16> dcv2 = WaveVector.ofSlice(dAll, dbase + 32, 1);
+                    WaveVector<float32, 16> dcv3 = WaveVector.ofSlice(dAll, dbase + 48, 1);
+                    iacc0.scaledAccumInto(facc0, xsAll[xbase], dcv0);
+                    iacc1.scaledAccumInto(facc1, xsAll[xbase], dcv1);
+                    iacc2.scaledAccumInto(facc2, xsAll[xbase], dcv2);
+                    iacc3.scaledAccumInto(facc3, xsAll[xbase], dcv3);
+                    iacc4.scaledAccumInto(facc4, xsAll[xbase + 16], dcv0);
+                    iacc5.scaledAccumInto(facc5, xsAll[xbase + 16], dcv1);
+                    iacc6.scaledAccumInto(facc6, xsAll[xbase + 16], dcv2);
+                    iacc7.scaledAccumInto(facc7, xsAll[xbase + 16], dcv3);
+                }
+                hh = hh + 1;
+            }
+
+            facc0.store(y, (uint32) ((int64) tw * (int64) outDim
+                + (int64) cw), 0, outDim);
+            facc1.store(y, (uint32) ((int64) tw * (int64) outDim
+                + (int64) (cw + 16)), 0, outDim);
+            facc2.store(y, (uint32) ((int64) tw * (int64) outDim
+                + (int64) (cw + 32)), 0, outDim);
+            facc3.store(y, (uint32) ((int64) tw * (int64) outDim
+                + (int64) (cw + 48)), 0, outDim);
+            facc4.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
+                + (int64) cw), 0, outDim);
+            facc5.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
+                + (int64) (cw + 16)), 0, outDim);
+            facc6.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
+                + (int64) (cw + 32)), 0, outDim);
+            facc7.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
+                + (int64) (cw + 48)), 0, outDim);
+        }
+    }
+
+    /** Whether the Q6_K tile covers the shape: as {@link #fits}, and the
+     *  resident (split) row's payload blocks 16-byte aligned, which the
+     *  dword-padded scale prefix gives when the block count is a multiple
+     *  of eight (every hidden size that is a multiple of 2048). */
+    public static boolean fits6(int64 rows, int64 outDim, int64 cols) {
+        return TcTile.fits(rows, outDim, cols) && (cols / 256L) % 8L == 0L;
+    }
+
+    /**
+     * The Q6_K twin, over the RESIDENT (split) payload: a row is its
+     * blocks' f16 scales back to back (dword-padded), then 208-byte
+     * payloads of { ql[128], qh[64], scales[16] }. Same tiles, same
+     * staging pipeline; what differs is the widen (a 6-bit value is a ql
+     * nibble and two qh bits, biased by 32, assembled and sign-extended on
+     * 32-bit words) and the scale granularity: Q6_K scales every 16
+     * elements, so the integer fold runs per mma rather than per two, and
+     * there is no min term. The scale panel holds a block's sixteen signed
+     * scales per column.
+     */
+    @Occupancy(maxThreads = 256)
+    @Kernel @FastMath
+    @Unlowered(backend = {"cpu", "amdgpu", "vulkan"}, tracked = "xpu-kernel-adaptor 1.8.3")
+    public static void q6kQ8TcTileKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp, uint32 rows,
+            uint32 outDim, uint32 tilesN8, int64 blocksPerRow) {
+        Shared<int8> aT = shared int8[36864];
+        Shared<int8> bT = shared int8[36864];
+        Shared<float32> xsAll = shared float32[256];
+        Shared<float32> dAll = shared float32[256];
+        // scAll[buf*2048 + col*16 + j]: the block's sixteen scales per column.
+        Shared<int32> scAll = shared int32[4096];
+
+        uint32 tid = KernelThread.x();
+        uint32 lane = tid % 32;
+        uint32 wid = tid / 32;
+        uint32 lane16 = lane % 16;
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 tileT = wg / tilesN8;
+        uint32 tileI8 = wg % tilesN8;
+        uint32 t0 = tileT * 128;
+        uint32 i0 = tileI8 * 128;
+        uint32 wr = wid / 2;
+        uint32 wc = wid % 2;
+        uint32 tw = t0 + 32 * wr;
+        uint32 cw = tileI8 * 128 + 64 * wc;
+        uint32 sCol = tid >> 1;
+        uint32 sH = tid & 1;
+        int32 shq = 2 * (int32) sH;
+        if (t0 < rows && i0 < outDim) {
+            int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+            int64 rowBytes = prefix + blocksPerRow * 208L;
+            int64 xRowBytes = blocksPerRow * 320L;
+            // This thread's column: its scale prefix and its first payload.
+            int64 sRow = (int64) (i0 + sCol) * rowBytes;
+            int64 sRo = sRow + prefix;
+            int64 sXb = (int64) (t0 + sCol) * xRowBytes;
+            uint32 aRow0 = tid >> 3;
+            uint32 aPart = tid & 7;
+            int64 aSrc0 = (int64) (t0 + aRow0) * xRowBytes + (int64) (16 * aPart);
+            int64 xr32 = 32L * xRowBytes;
+            uint32 aDst0 = aRow0 * 144 + 16 * aPart;
+
+            CooperativeMatrix<int8,16,16,0> ma;
+            CooperativeMatrix<int8,16,16,0> maB;
+            CooperativeMatrix<int8,16,16,1> mbA;
+            CooperativeMatrix<int8,16,16,1> mbB;
+            CooperativeMatrix<int8,16,16,1> mbC;
+            CooperativeMatrix<int8,16,16,1> mbD;
+            CooperativeMatrix<int32,16,16,2> mc0;
+            CooperativeMatrix<int32,16,16,2> mc1;
+            CooperativeMatrix<int32,16,16,2> mc2;
+            CooperativeMatrix<int32,16,16,2> mc3;
+            CooperativeMatrix<int32,16,16,2> iacc0;
+            CooperativeMatrix<int32,16,16,2> iacc1;
+            CooperativeMatrix<int32,16,16,2> iacc2;
+            CooperativeMatrix<int32,16,16,2> iacc3;
+            CooperativeMatrix<int32,16,16,2> iacc4;
+            CooperativeMatrix<int32,16,16,2> iacc5;
+            CooperativeMatrix<int32,16,16,2> iacc6;
+            CooperativeMatrix<int32,16,16,2> iacc7;
+            CooperativeMatrix<float32,16,16,2> facc0;
+            CooperativeMatrix<float32,16,16,2> facc1;
+            CooperativeMatrix<float32,16,16,2> facc2;
+            CooperativeMatrix<float32,16,16,2> facc3;
+            CooperativeMatrix<float32,16,16,2> facc4;
+            CooperativeMatrix<float32,16,16,2> facc5;
+            CooperativeMatrix<float32,16,16,2> facc6;
+            CooperativeMatrix<float32,16,16,2> facc7;
+            facc0.splat(0.0f);
+            facc1.splat(0.0f);
+            facc2.splat(0.0f);
+            facc3.splat(0.0f);
+            facc4.splat(0.0f);
+            facc5.splat(0.0f);
+            facc6.splat(0.0f);
+            facc7.splat(0.0f);
+
+            // Prefetch: the activation chunks, this thread's 32 ql bytes
+            // (bytes 32sH.. of the half's 64) and the half's 32 qh bytes;
+            // at a block boundary the column's sixteen scales (even
+            // threads) or the token's scale (odd).
+            Vector<int8,16> pa0 = xp.vload<16>(aSrc0);
+            Vector<int8,16> pa1 = xp.vload<16>(aSrc0 + xr32);
+            Vector<int8,16> pa2 = xp.vload<16>(aSrc0 + xr32 + xr32);
+            Vector<int8,16> pa3 = xp.vload<16>(aSrc0 + xr32 + xr32 + xr32);
+            Vector<int8,16> pl0 = packed.vload<16>(sRo + (int64) (32 * sH));
+            Vector<int8,16> pl1 = packed.vload<16>(sRo + (int64) (32 * sH) + 16L);
+            Vector<int8,16> ph0 = packed.vload<16>(sRo + 128L);
+            Vector<int8,16> ph1 = packed.vload<16>(sRo + 144L);
+            Vector<int8,16> psc = packed.vload<16>(sRo + 192L);
+            Vector<int8,4> px = xp.vload<4>(sXb + 288L);
+            int32 pd = ((int32) packed[sRow] & 255)
+                | (((int32) packed[sRow + 1L] & 255) << 8);
+
+            uint32 nh = (uint32) blocksPerRow * 2;
+            uint32 hh = 0;
+            while (hh < nh) {
+                uint32 H = hh & 1;
+                uint32 buf = H * 18432;
+                uint32 pOff = (hh >> 1) & 1;
+                int64 aDst = (int64) (buf + aDst0);
+                aT.vstore(aDst, pa0);
+                aT.vstore(aDst + 4608L, pa1);
+                aT.vstore(aDst + 9216L, pa2);
+                aT.vstore(aDst + 13824L, pa3);
+                {
+                    // k 32sH..32sH+31 from the low nibbles with qh bits
+                    // 2sH..2sH+1, k 64+32sH.. from the high nibbles with
+                    // bits 2sH+4..; both biased by 32 (Quant.q6kBlock).
+                    int64 dst = (int64) (buf + sCol * 144 + 32 * sH);
+                    Vector<int32,4> l0 = pl0.asWords();
+                    Vector<int32,4> l1 = pl1.asWords();
+                    Vector<int32,4> h0 = ph0.asWords() >> shq;
+                    Vector<int32,4> h1 = ph1.asWords() >> shq;
+                    Vector<int32,4> v0 = ((l0 & 252645135) | ((h0 & 50529027) << 4)) ^ 538976288;
+                    Vector<int32,4> v1 = ((l1 & 252645135) | ((h1 & 50529027) << 4)) ^ 538976288;
+                    Vector<int32,4> v2 = (((l0 >> 4) & 252645135) | (((h0 >> 4) & 50529027) << 4)) ^ 538976288;
+                    Vector<int32,4> v3 = (((l1 >> 4) & 252645135) | (((h1 >> 4) & 50529027) << 4)) ^ 538976288;
+                    v0 = v0 | ((v0 & 538976288) << 1) | ((v0 & 538976288) << 2);
+                    v1 = v1 | ((v1 & 538976288) << 1) | ((v1 & 538976288) << 2);
+                    v2 = v2 | ((v2 & 538976288) << 1) | ((v2 & 538976288) << 2);
+                    v3 = v3 | ((v3 & 538976288) << 1) | ((v3 & 538976288) << 2);
+                    bT.vstore(dst, v0.asBytes());
+                    bT.vstore(dst + 16L, v1.asBytes());
+                    bT.vstore(dst + 64L, v2.asBytes());
+                    bT.vstore(dst + 80L, v3.asBytes());
+                }
+                if (H == 0) {
+                    if (sH == 0) {
+                        dAll[pOff * 128 + sCol] = GgufFile.halfBitsToF32(pd);
+                        Vector<int32,4> sw = psc.asWords();
+                        uint32 cb = pOff * 2048 + sCol * 16;
+                        int32 s0 = sw[0];
+                        int32 s1 = sw[1];
+                        int32 s2 = sw[2];
+                        int32 s3 = sw[3];
+                        scAll[cb] = (s0 << 24) >> 24;
+                        scAll[cb + 1] = (s0 << 16) >> 24;
+                        scAll[cb + 2] = (s0 << 8) >> 24;
+                        scAll[cb + 3] = s0 >> 24;
+                        scAll[cb + 4] = (s1 << 24) >> 24;
+                        scAll[cb + 5] = (s1 << 16) >> 24;
+                        scAll[cb + 6] = (s1 << 8) >> 24;
+                        scAll[cb + 7] = s1 >> 24;
+                        scAll[cb + 8] = (s2 << 24) >> 24;
+                        scAll[cb + 9] = (s2 << 16) >> 24;
+                        scAll[cb + 10] = (s2 << 8) >> 24;
+                        scAll[cb + 11] = s2 >> 24;
+                        scAll[cb + 12] = (s3 << 24) >> 24;
+                        scAll[cb + 13] = (s3 << 16) >> 24;
+                        scAll[cb + 14] = (s3 << 8) >> 24;
+                        scAll[cb + 15] = s3 >> 24;
+                    } else {
+                        Vector<int32,1> xw = px.asWords();
+                        xsAll[pOff * 128 + sCol] = Cajeta.bitsToF32(xw[0]);
+                    }
+                }
+                if (hh + 1 < nh) {
+                    int64 nb = (int64) ((hh + 1) >> 1);
+                    uint32 nH = (hh + 1) & 1;
+                    int64 aS = aSrc0 + nb * 320L + (int64) (128 * nH);
+                    pa0 = xp.vload<16>(aS);
+                    aS = aS + xr32;
+                    pa1 = xp.vload<16>(aS);
+                    aS = aS + xr32;
+                    pa2 = xp.vload<16>(aS);
+                    aS = aS + xr32;
+                    pa3 = xp.vload<16>(aS);
+                    int64 bS = sRo + nb * 208L;
+                    pl0 = packed.vload<16>(bS + (int64) (64 * nH + 32 * sH));
+                    pl1 = packed.vload<16>(bS + (int64) (64 * nH + 32 * sH) + 16L);
+                    ph0 = packed.vload<16>(bS + 128L + (int64) (32 * nH));
+                    ph1 = packed.vload<16>(bS + 144L + (int64) (32 * nH));
+                    if (nH == 0) {
+                        if (sH == 0) {
+                            psc = packed.vload<16>(bS + 192L);
+                            pd = ((int32) packed[sRow + nb * 2L] & 255)
+                                | (((int32) packed[sRow + nb * 2L + 1L] & 255) << 8);
+                        } else {
+                            px = xp.vload<4>(sXb + nb * 320L + 288L);
+                        }
+                    }
+                }
+                Barrier.workgroup();
+
+                if (H == 0) {
+                    iacc0.splat(0);
+                    iacc1.splat(0);
+                    iacc2.splat(0);
+                    iacc3.splat(0);
+                    iacc4.splat(0);
+                    iacc5.splat(0);
+                    iacc6.splat(0);
+                    iacc7.splat(0);
+                }
+                uint32 cBase = pOff * 2048 + (64 * wc) * 16;
+                uint32 aBuf = buf + (32 * wr) * 144;
+                uint32 bBuf = buf + (64 * wc) * 144;
+                uint32 jj = 0;
+                while (jj < 8) {
+                    uint32 j = 8 * H + jj;
+                    WaveVector<int32, 16> scv0 = WaveVector.ofSlice(scAll, cBase + j, 16);
+                    WaveVector<int32, 16> scv1 = WaveVector.ofSlice(scAll, cBase + 256 + j, 16);
+                    WaveVector<int32, 16> scv2 = WaveVector.ofSlice(scAll, cBase + 512 + j, 16);
+                    WaveVector<int32, 16> scv3 = WaveVector.ofSlice(scAll, cBase + 768 + j, 16);
+                    uint32 kk = 16 * jj;
+                    mbA.load(bT, bBuf + kk, 1, 144);
+                    mbB.load(bT, bBuf + 16 * 144 + kk, 1, 144);
+                    mbC.load(bT, bBuf + 32 * 144 + kk, 1, 144);
+                    mbD.load(bT, bBuf + 48 * 144 + kk, 1, 144);
+                    ma.load(aT, aBuf + kk, 0, 144);
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
+                    mc0.mma(ma, mbA);
+                    mc1.mma(ma, mbB);
+                    mc2.mma(ma, mbC);
+                    mc3.mma(ma, mbD);
+                    mc0.scaledAccumI32(iacc0, scv0);
+                    mc1.scaledAccumI32(iacc1, scv1);
+                    mc2.scaledAccumI32(iacc2, scv2);
+                    mc3.scaledAccumI32(iacc3, scv3);
+                    maB.load(aT, aBuf + 16 * 144 + kk, 0, 144);
+                    mc0.splat(0);
+                    mc1.splat(0);
+                    mc2.splat(0);
+                    mc3.splat(0);
+                    mc0.mma(maB, mbA);
+                    mc1.mma(maB, mbB);
+                    mc2.mma(maB, mbC);
+                    mc3.mma(maB, mbD);
+                    mc0.scaledAccumI32(iacc4, scv0);
+                    mc1.scaledAccumI32(iacc5, scv1);
+                    mc2.scaledAccumI32(iacc6, scv2);
+                    mc3.scaledAccumI32(iacc7, scv3);
+                    jj = jj + 1;
+                }
+                if (H == 1) {
+                    uint32 dbase = pOff * 128 + 64 * wc;
+                    uint32 xbase = pOff * 128 + 32 * wr;
+                    WaveVector<float32, 16> dcv0 = WaveVector.ofSlice(dAll, dbase, 1);
+                    WaveVector<float32, 16> dcv1 = WaveVector.ofSlice(dAll, dbase + 16, 1);
+                    WaveVector<float32, 16> dcv2 = WaveVector.ofSlice(dAll, dbase + 32, 1);
+                    WaveVector<float32, 16> dcv3 = WaveVector.ofSlice(dAll, dbase + 48, 1);
+                    iacc0.scaledAccumInto(facc0, xsAll[xbase], dcv0);
+                    iacc1.scaledAccumInto(facc1, xsAll[xbase], dcv1);
+                    iacc2.scaledAccumInto(facc2, xsAll[xbase], dcv2);
+                    iacc3.scaledAccumInto(facc3, xsAll[xbase], dcv3);
+                    iacc4.scaledAccumInto(facc4, xsAll[xbase + 16], dcv0);
+                    iacc5.scaledAccumInto(facc5, xsAll[xbase + 16], dcv1);
+                    iacc6.scaledAccumInto(facc6, xsAll[xbase + 16], dcv2);
+                    iacc7.scaledAccumInto(facc7, xsAll[xbase + 16], dcv3);
+                }
+                hh = hh + 1;
+            }
+
+            facc0.store(y, (uint32) ((int64) tw * (int64) outDim
+                + (int64) cw), 0, outDim);
+            facc1.store(y, (uint32) ((int64) tw * (int64) outDim
+                + (int64) (cw + 16)), 0, outDim);
+            facc2.store(y, (uint32) ((int64) tw * (int64) outDim
+                + (int64) (cw + 32)), 0, outDim);
+            facc3.store(y, (uint32) ((int64) tw * (int64) outDim
+                + (int64) (cw + 48)), 0, outDim);
+            facc4.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
+                + (int64) cw), 0, outDim);
+            facc5.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
+                + (int64) (cw + 16)), 0, outDim);
+            facc6.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
+                + (int64) (cw + 32)), 0, outDim);
+            facc7.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
+                + (int64) (cw + 48)), 0, outDim);
+        }
+    }
+
+    /** The Q6_K GEMM in one launch over the resident (split) payload;
+     *  the caller has checked {@link #fits6}. */
+    public static void q6kQ8TcTileLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp, int64 rows,
+            int64 outDim, int64 cols) {
+        int64 tilesM8 = rows / 128L;
+        int64 tilesN8 = outDim / 128L;
+        KernelStream s = QuantKernel.stream();
+        q6kQ8TcTileKernel.launch(s,
+            grid: [(uint32) (tilesM8 * tilesN8)], block: [256])
+            (y, packed, xp, (uint32) rows, (uint32) outDim,
+             (uint32) tilesN8, cols / 256L);
+        return;
+    }
+
+    /** The whole GEMM in one launch: `y[token][row] = W[row] . x[token]`
+     *  over `rows` tokens of the q8_K stage `xp` and `outDim` rows of the
+     *  packed Q4_K weight; the caller has checked {@link #fits}. */
+    public static void q4kQ8TcTileLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp, int64 rows,
+            int64 outDim, int64 cols) {
+        int64 tilesM8 = rows / 128L;
+        int64 tilesN8 = outDim / 128L;
+        KernelStream s = QuantKernel.stream();
+        q4kQ8TcTileKernel.launch(s,
+            grid: [(uint32) (tilesM8 * tilesN8)], block: [256])
+            (y, packed, xp, (uint32) rows, (uint32) outDim,
+             (uint32) tilesN8, cols / 256L);
+        return;
+    }
+}

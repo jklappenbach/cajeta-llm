@@ -25,7 +25,11 @@ import dev.cajeta.llm.io.QuantKernel;
  *
  * The formats a GGUF carries its `token_embd` in: Q4_K (Q4_K_M files),
  * Q6_K, Q8_0, F16; the host decoder (Quant.dequantize) is the oracle for
- * each (EmbedKernelTest).
+ * each (EmbedKernelTest). The same kernels gather a whole prompt
+ * (1.8.3): workgroup w decodes token w of the batch into row w of the
+ * hidden state, which is what keeps a 512-token prompt's 8 MB embedding
+ * off the host (it was a host decode of every row plus an 8 MB upload,
+ * about 45 ms of a 118 ms prefill on sm_89).
  */
 public final class EmbedKernel {
 
@@ -61,8 +65,11 @@ public final class EmbedKernel {
             KernelBuffer<int8> packed, KernelBuffer<int32> tok,
             uint32 blocksPerRow) {
         uint32 e = KernelThread.x();          // 0..255: this lane's element of every block
-        int64 row = (int64) tok[0L];
+        // Workgroup w decodes the batch's w-th token into its row of hs.
+        int64 w = (int64) (KernelThread.globalIdX() / 256);
+        int64 row = (int64) tok[w];
         int64 rowOff = row * (int64) blocksPerRow * 144L;
+        int64 hsOff = w * (int64) blocksPerRow * 256L;
         uint32 g = e / 64;
         uint32 r = e - g * 64;
         uint32 s = r / 32;
@@ -88,7 +95,7 @@ public final class EmbedKernel {
             }
             int32 q = (((int32) packed[ro + 16L + (int64) (32 * g + l)] & 255)
                 >> (4 * (int32) s)) & 15;
-            hs[(int64) b * 256L + (int64) e] = d * (float32) sc * (float32) q
+            hs[hsOff + (int64) b * 256L + (int64) e] = d * (float32) sc * (float32) q
                 - dmin * (float32) mn;
             b = b + 1;
         }
@@ -100,8 +107,10 @@ public final class EmbedKernel {
             KernelBuffer<int8> packed, KernelBuffer<int32> tok,
             uint32 blocksPerRow) {
         uint32 e = KernelThread.x();
-        int64 row = (int64) tok[0L];
+        int64 w = (int64) (KernelThread.globalIdX() / 256);
+        int64 row = (int64) tok[w];
         int64 rowOff = row * (int64) blocksPerRow * 210L;
+        int64 hsOff = w * (int64) blocksPerRow * 256L;
         uint32 g = e / 128;
         uint32 r = e - g * 128;
         uint32 sl = r / 64;
@@ -118,7 +127,7 @@ public final class EmbedKernel {
                 >> (2 * (int32) sh)) & 3;
             int32 q = (ql | (qh << 4)) - 32;
             int32 scb = (int32) packed[ro + 192L + (int64) (e / 16)];
-            hs[(int64) b * 256L + (int64) e] = d * (float32) scb * (float32) q;
+            hs[hsOff + (int64) b * 256L + (int64) e] = d * (float32) scb * (float32) q;
             b = b + 1;
         }
     }
@@ -130,9 +139,11 @@ public final class EmbedKernel {
             KernelBuffer<int8> packed, KernelBuffer<int32> tok,
             uint32 blocksPerRow) {
         uint32 t = KernelThread.x();
-        int64 row = (int64) tok[0L];
+        int64 w = (int64) (KernelThread.globalIdX() / 256);
+        int64 row = (int64) tok[w];
         int64 rowOff = row * (int64) blocksPerRow * 34L;
         uint32 total = blocksPerRow * 32;
+        int64 hsOff = w * (int64) total;
         uint32 e = t;
         while (e < total) {
             uint32 b = e / 32;
@@ -140,7 +151,7 @@ public final class EmbedKernel {
             int64 ro = rowOff + (int64) b * 34L;
             float32 d = EmbedKernel.h16(packed, ro);
             int32 q = (int32) packed[ro + 2L + (int64) l];
-            hs[(int64) e] = d * (float32) q;
+            hs[hsOff + (int64) e] = d * (float32) q;
             e = e + 256;
         }
     }
@@ -151,12 +162,14 @@ public final class EmbedKernel {
             KernelBuffer<int8> packed, KernelBuffer<int32> tok,
             uint32 blocksPerRow) {
         uint32 t = KernelThread.x();
-        int64 row = (int64) tok[0L];
+        int64 w = (int64) (KernelThread.globalIdX() / 256);
+        int64 row = (int64) tok[w];
         int64 rowOff = row * (int64) blocksPerRow * 16L;
         uint32 total = blocksPerRow * 8;
+        int64 hsOff = w * (int64) total;
         uint32 e = t;
         while (e < total) {
-            hs[(int64) e] = EmbedKernel.h16(packed, rowOff + (int64) e * 2L);
+            hs[hsOff + (int64) e] = EmbedKernel.h16(packed, rowOff + (int64) e * 2L);
             e = e + 256;
         }
     }
@@ -166,16 +179,28 @@ public final class EmbedKernel {
     public static boolean embedRowLaunchNoSync(int32 ty,
             KernelBuffer<float32> hs, KernelBuffer<int8> packed,
             KernelBuffer<int32> tok, int64 blocksPerRow) {
+        return EmbedKernel.embedRowsLaunchNoSync(ty, hs, packed, tok, 1L,
+            blocksPerRow);
+    }
+
+    /** The batched gather (xpu-kernel-adaptor 1.8.3): `n` token ids from
+     *  `tok` decoded into `n` consecutive rows of `hs`, one workgroup a
+     *  token, so a prompt's embedding never passes through the host.
+     *  False when `ty` has no device decoder. */
+    public static boolean embedRowsLaunchNoSync(int32 ty,
+            KernelBuffer<float32> hs, KernelBuffer<int8> packed,
+            KernelBuffer<int32> tok, int64 n, int64 blocksPerRow) {
         KernelStream s = QuantKernel.stream();
         uint32 bpr = (uint32) blocksPerRow;
+        uint32 g = (uint32) n;
         if (ty == Quant.GG_Q4_K) {
-            embedRowQ4kKernel.launch(s, grid: [1], block: [256])(hs, packed, tok, bpr);
+            embedRowQ4kKernel.launch(s, grid: [g], block: [256])(hs, packed, tok, bpr);
         } else if (ty == Quant.GG_Q6_K) {
-            embedRowQ6kKernel.launch(s, grid: [1], block: [256])(hs, packed, tok, bpr);
+            embedRowQ6kKernel.launch(s, grid: [g], block: [256])(hs, packed, tok, bpr);
         } else if (ty == Quant.GG_Q8_0) {
-            embedRowQ80Kernel.launch(s, grid: [1], block: [256])(hs, packed, tok, bpr);
+            embedRowQ80Kernel.launch(s, grid: [g], block: [256])(hs, packed, tok, bpr);
         } else if (ty == Quant.GG_F16) {
-            embedRowF16Kernel.launch(s, grid: [1], block: [256])(hs, packed, tok, bpr);
+            embedRowF16Kernel.launch(s, grid: [g], block: [256])(hs, packed, tok, bpr);
         } else {
             return false;
         }

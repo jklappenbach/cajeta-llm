@@ -1154,6 +1154,92 @@ public class LinearKernelRouteTest {
         }
     }
 
+    /**
+     * The tensor-core tile is the Q4_K batched route where it lowers
+     * (xpu-kernel-adaptor 1.8.3): FIRES, the route record names it and its
+     * output agrees with the int8-deq multi-wave route to float rounding
+     * (the two fold the sub-block scales as the same integers and convert
+     * once per block, so only the float accumulation order differs); and
+     * DOES NOT FIRE with the switch off, where the deq route answers as
+     * before.
+     */
+    @Test
+    public void tensorCoreTileIsTheQ4kBatchedRouteAndAgreesWithDeqMw8() {
+        if (!KernelCap.usable("q4kQ8TcTileKernel")
+                || !KernelCap.usable("q4kWmmaDeqMw8Kernel")) {
+            DeviceSkip.tracked("backend " + Device.activeBackend()
+                + " has no tensor-core tile", "xpu-kernel-adaptor 1.8.3");
+            return;
+        }
+        if (Linear.backendIsVulkan() || !Linear.waveMv()
+                || !Linear.matrixCoresPay()) {
+            DeviceSkip.tracked("the tensor-core tile is not routed on "
+                + Device.activeBackend(), "xpu-kernel-adaptor 1.8.3");
+            return;
+        }
+        int32 rows = 256;
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q4_K, "q4_k.bin");
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ci, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L, (int64) rows * co);
+        Tensor<float32> got #= LinearKernelRouteTest.ramp(0L, (int64) rows * co);
+        QuantKernel.setRoutingEnabled(true);
+        boolean tcWas = Linear.tcEnabled();
+
+        // Reference, the switch off: the int8-deq multi-wave route.
+        Linear.setTc(false);
+        Linear.setDeqPrefill(true);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap refTap = heap PrefillTap();
+        Diag.register(refTap);
+        lin.matmulInto(rows, want, 0L);
+        Diag.register(null);
+        if (!refTap.sawContaining("batch-route", "q4 deqMw8")) {
+            Linear.setTc(tcWas);
+            Linear.setDeqPrefill(false);
+            Assert.fail("with the tile off the q4 deqMw8 route was not taken, saw "
+                + refTap.namesOf("batch-route"));
+            return;
+        }
+
+        // Under test: the switch on, same weight, same activation.
+        Linear.setTc(true);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap tcTap = heap PrefillTap();
+        Diag.register(tcTap);
+        lin.matmulInto(rows, got, 0L);
+        Diag.register(null);
+        Linear.setTc(tcWas);
+        Linear.setDeqPrefill(false);
+        if (!tcTap.saw("batch-route", "q4 tcTile")) {
+            Assert.fail("the tensor-core tile route was not taken, saw "
+                + tcTap.namesOf("batch-route"));
+            return;
+        }
+        LinearKernelRouteTest.assertLive(want, (int64) rows * co, "q4 deqMw8");
+        LinearKernelRouteTest.assertLive(got, (int64) rows * co, "q4 tcTile");
+        int64 i = 0;
+        while (i < (int64) rows * co) {
+            float32 a = want.flatGet(i);
+            float32 b = got.flatGet(i);
+            float32 d = a - b;
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 s = a;
+            if (s < 0.0f) { s = 0.0f - s; }
+            if (s < 1.0f) { s = 1.0f; }
+            if (d / s > 0.00001f) {
+                Assert.fail("element " + i + ": tensor-core tile " + b
+                    + " vs int8-deq multi-wave " + a
+                    + " - the two routes must agree to float rounding");
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
     @Test
     public void multiWavePackedQ4kAgreesWithDeqMw8() {
         if (!KernelCap.usable("q4kWmmaMwKernel")
@@ -1187,6 +1273,10 @@ public class LinearKernelRouteTest {
         QuantKernel.setRoutingEnabled(true);
 
         // Reference: the int8-deq multi-wave kernel (q4 deqMw8 / Part).
+        // The tensor-core tile is ahead of it on the route tree (1.8.3),
+        // so it is off for this comparison.
+        boolean tcWas = Linear.tcEnabled();
+        Linear.setTc(false);
         Linear.setQ4MwPacked(false);
         Linear.setDeqPrefill(true);
         Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
@@ -1197,6 +1287,7 @@ public class LinearKernelRouteTest {
         Diag.register(null);
         Linear.setDeqPrefill(false);
         if (!refTap.sawContaining("batch-route", "q4 deqMw8")) {
+            Linear.setTc(tcWas);
             Assert.fail("reference did not take the q4 deqMw8 route, saw "
                 + refTap.namesOf("batch-route"));
         }
@@ -1211,6 +1302,7 @@ public class LinearKernelRouteTest {
         lin.matmulInto(rows, got, 0L);
         Diag.register(null);
         Linear.setQ4MwPacked(false);
+        Linear.setTc(tcWas);
         if (!mwTap.saw("batch-route", "q4 mw")) {
             Assert.fail("the multi-wave packed route was not taken, saw "
                 + mwTap.namesOf("batch-route"));

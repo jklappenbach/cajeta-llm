@@ -487,12 +487,30 @@ public final class CausalLM extends InfModule {
         Tensor<float32> gate #= arena.take(rows, inter);
         Tensor<float32> up #= arena.take(rows, inter);
 
-        Tensor<float32> emb = this.model.embedTokens.weight;
-        int32 r = 0;
-        while (r < n) {
-            this.model.embedTokens.rowIntoTensor(tokens[off + r], hs,
-                (int64) r * h, this.cfg.hiddenSize);
-            r = r + 1;
+        // THE EMBEDDING STAYS ON THE DEVICE (xpu-kernel-adaptor 1.8.3)
+        // when the batched, resident prefill will take the chunk and the
+        // table has a device decoder: the ids go up (2 KB for 512 tokens)
+        // and one gather launch writes the hidden state where the layer
+        // stack reads it. The host decode of every row plus the 8 MB
+        // upload it replaces was 45 ms of a 118 ms prefill on sm_89.
+        this.pfEmbPending = 0;
+        if (Linear.devicePackOn() && this.batchReady(n)
+                && this.deviceEmbedReady()) {
+            this.ensurePrefillTok((int64) n);
+            int32 r0 = 0;
+            while (r0 < n) {
+                this.pfTokHost[(int64) r0] = tokens[off + r0];
+                r0 = r0 + 1;
+            }
+            this.pfTokDev.upload(this.pfTokHost, (int64) n);
+            this.pfEmbPending = n;
+        } else {
+            int32 r = 0;
+            while (r < n) {
+                this.model.embedTokens.rowIntoTensor(tokens[off + r], hs,
+                    (int64) r * h, this.cfg.hiddenSize);
+                r = r + 1;
+            }
         }
         int32 seqPos2 = this.seqLength(seq);
         this.forwardRows(seq, hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
@@ -569,6 +587,14 @@ public final class CausalLM extends InfModule {
         if (!CausalLM.fuseTail || !CausalLM.deviceArgmax) { return false; }
         if (!this.deviceResidentReady()) { return false; }
         if (!this.lmHead.isDeviceRouted()) { return false; }
+        return this.deviceEmbedReady();
+    }
+
+    /** Whether the embedding table is on the device with a decoder for
+     *  its format (EmbedKernel, or the f32 gather for a small f32 table):
+     *  what the pipelined decode and the batched prefill's gather share.
+     *  Tried once; the table is uploaded on the first yes. */
+    public boolean deviceEmbedReady() {
         if (!this.embTried) {
             this.embTried = true;
             int32 ty = this.model.embedTokens.packedType();
@@ -832,6 +858,17 @@ public final class CausalLM extends InfModule {
                 up, mlpOut, rows, startPos, h, qd, kvd, inter, nH, nKv, hd,
                 scores);
             return;
+        }
+        if (this.pfEmbPending > 0) {
+            // stepSeq left the embedding to the device for a batched
+            // prefill that did not engage: the host fills hs after all.
+            int32 re = 0;
+            while (re < this.pfEmbPending) {
+                this.model.embedTokens.rowIntoTensor(this.pfTokHost[(int64) re],
+                    hs, (int64) re * (int64) h, h);
+                re = re + 1;
+            }
+            this.pfEmbPending = 0;
         }
 
         int64 trl0 = Clock.nanoTime();
@@ -1195,6 +1232,14 @@ public final class CausalLM extends InfModule {
     // host append (the cache stays authoritative).
     KernelBuffer<int32> pfPosDev;
     int32[] pfPosHost;
+    /** The prompt's token ids for the device embedding gather (1.8.3):
+     *  uploaded by stepSeq when the batched, resident prefill will take
+     *  them, consumed by forwardRowsBatched's prologue. `pfEmbPending` is
+     *  the row count owed, 0 when the host filled hs instead. */
+    KernelBuffer<int32> pfTokDev;
+    int32[] pfTokHost;
+    int64 pfTokCap;
+    int32 pfEmbPending;
     int32 pfPosCap;
     /** Unit 59b: the next layer's input norm + pack already ran in
      *  the previous layer's down-combine tail. */
@@ -1211,6 +1256,14 @@ public final class CausalLM extends InfModule {
         this.pfHsHost #= heap float32[n];
         this.pfHsCap = n;
         CausalLM.pfGrowNs = CausalLM.pfGrowNs + (Clock.nanoTime() - rg0);
+        return;
+    }
+
+    void ensurePrefillTok(int64 n) {
+        if (this.pfTokCap >= n) { return; }
+        this.pfTokDev #= heap KernelBuffer<int32>((uint64) n);
+        this.pfTokHost #= heap int32[n];
+        this.pfTokCap = n;
         return;
     }
 
@@ -1865,6 +1918,9 @@ public final class CausalLM extends InfModule {
      *  other's entries — 25.3). */
     int64 stageTag;
     boolean batchSaid;
+    /** Whether the `prefill-embed` record (device gather or host fill)
+     *  has been said for this model. */
+    boolean embSaid;
     boolean decSaid;
     /** Refusing projections in the last `batchReady` scan (rides on the
      *  `prefill-mode` record as v1). */
@@ -1904,14 +1960,35 @@ public final class CausalLM extends InfModule {
         if (res) {
             int64 th0 = Clock.nanoTime();
             this.ensurePrefillRes(nHs);
-            float32[] hb = hs.hostBuffer();
-            int64 hb0 = hs.hostBase();
-            int64 c = 0;
-            while (c < nHs) {
-                this.pfHsHost[c] = hb[hb0 + c];
-                c = c + 1;
+            if (!this.embSaid) {
+                this.embSaid = true;
+                Diag.emit("prefill-embed", 0 - 1,
+                    this.pfEmbPending == rows ? "device" : "host",
+                    (int64) rows, 0L, 0L, 0L, 0L, 0L);
             }
-            this.pfHsDev.upload(this.pfHsHost, nHs);
+            if (this.pfEmbPending == rows) {
+                // The ids are on the device (stepSeq): gather the rows.
+                this.pfEmbPending = 0;
+                if (this.embTy >= 0) {
+                    EmbedKernel.embedRowsLaunchNoSync(this.embTy,
+                        this.pfHsDev, this.embDev, this.pfTokDev,
+                        (int64) rows,
+                        (int64) h / (int64) Quant.blockElems(this.embTy));
+                } else {
+                    QuantKernel.gatherRowsF32LaunchNoSync(this.pfHsDev,
+                        this.embF32Dev, this.pfTokDev, (int64) rows,
+                        (int64) h);
+                }
+            } else {
+                float32[] hb = hs.hostBuffer();
+                int64 hb0 = hs.hostBase();
+                int64 c = 0;
+                while (c < nHs) {
+                    this.pfHsHost[c] = hb[hb0 + c];
+                    c = c + 1;
+                }
+                this.pfHsDev.upload(this.pfHsHost, nHs);
+            }
             CausalLM.pfHeadNs = CausalLM.pfHeadNs
                 + (Clock.nanoTime() - th0);
         }
