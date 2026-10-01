@@ -25,9 +25,10 @@
 //            [--gguf model.gguf --tensor blk.%d.ffn_down.weight --layers 4,5,7]
 //            [--gguf model.gguf --tensor-list blk.0.attn_k.weight,blk.0.attn_v.weight]
 //
-// CUDA only for now: the L2 size and the timing events come from cudart.
-// A HIP leg is the same code with the hip runtime; a Vulkan leg has no
-// event clock and would print tier `unavailable`, which the table refuses.
+// CUDA, or HIP when built with -DGGML_LEG_HIP (build-ggml-leg.sh picks it from
+// the llama.cpp build it finds): the L2 size and the timing events come from
+// the vendor runtime. A Vulkan leg has no event clock and would print tier
+// `unavailable`, which the table refuses.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -36,7 +37,23 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#if defined(GGML_LEG_HIP)
+#include <hip/hip_runtime.h>
+#define LEG_LABEL "HIP"
+#define LEG_REG_NAME "ROCm"
+#define cudaEvent_t hipEvent_t
+#define cudaEventDestroy hipEventDestroy
+#define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventDefault hipEventDefault
+#define cudaEventElapsedTime hipEventElapsedTime
+#define cudaSuccess hipSuccess
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrL2CacheSize hipDeviceAttributeL2CacheSize
+#else
 #include <cuda_runtime.h>
+#define LEG_LABEL "CUDA"
+#define LEG_REG_NAME "CUDA"
+#endif
 
 #include <chrono>
 #include <cstdio>
@@ -61,7 +78,7 @@ static ggml_type type_of(const std::string & s) {
 
 static cudaEvent_t rearm(ggml_backend_event_t ev) {
     // ggml's event was created with cudaEventDisableTiming; replace it.
-    cudaEventDestroy((cudaEvent_t) ev->context);
+    (void) cudaEventDestroy((cudaEvent_t) ev->context);
     cudaEvent_t e;
     if (cudaEventCreateWithFlags(&e, cudaEventDefault) != cudaSuccess) {
         fprintf(stderr, "cudaEventCreate failed\n");
@@ -133,13 +150,14 @@ int main(int argc, char ** argv) {
     const char * backend_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     if (!backend) { printf("leg-refused\tllama.cpp\t%s\tmul_mat\tbackend init failed\n", backend_name); return 1; }
-    if (strcmp(backend_name, "CUDA") != 0) {
-        printf("leg-refused\tllama.cpp\t%s\tmul_mat\tthis leg times with CUDA events; backend is %s\n",
+    if (strcmp(backend_name, LEG_REG_NAME) != 0) {
+        printf("leg-refused\tllama.cpp\t%s\tmul_mat\tthis leg times with " LEG_LABEL " events; backend is %s\n",
                backend_name, backend_name);
         return 1;
     }
+    backend_name = LEG_LABEL;
     int l2 = 0;
-    cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0);
+    (void) cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0);
 
     // Tensors: `copies` weights of m rows x k, one activation k x n, one
     // output per weight, all in the backend's buffer.
@@ -153,7 +171,7 @@ int main(int argc, char ** argv) {
         y[c] = ggml_mul_mat(ctx, w[c], x);
     }
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!buf) { printf("leg-refused\tllama.cpp\tCUDA\tmul_mat\tbuffer allocation failed\n"); return 1; }
+    if (!buf) { printf("leg-refused\tllama.cpp\t" LEG_LABEL "\tmul_mat\tbuffer allocation failed\n"); return 1; }
     if (usage_weights) ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
     // Data: REAL tensors from the reference GGUF when --gguf is given
@@ -169,7 +187,7 @@ int main(int argc, char ** argv) {
     if (!gguf_path.empty()) {
         gguf_init_params gp = { true, &gmeta };
         gg = gguf_init_from_file(gguf_path.c_str(), gp);
-        if (!gg) { printf("leg-refused\tllama.cpp\tCUDA\tmul_mat\tcannot read %s\n", gguf_path.c_str()); return 1; }
+        if (!gg) { printf("leg-refused\tllama.cpp\t" LEG_LABEL "\tmul_mat\tcannot read %s\n", gguf_path.c_str()); return 1; }
         gf_file = fopen(gguf_path.c_str(), "rb");
     }
     std::vector<float> src((size_t) m * k);
@@ -185,17 +203,17 @@ int main(int argc, char ** argv) {
             if (!tensor_list.empty()) snprintf(name, sizeof name, "%s", tensor_list[c].c_str());
             else snprintf(name, sizeof name, tensor_fmt.c_str(), layers.empty() ? (int) c : layers[c]);
             int64_t id = gguf_find_tensor(gg, name);
-            if (id < 0) { printf("leg-refused\tllama.cpp\tCUDA\tmul_mat\tno tensor %s in the gguf\n", name); return 1; }
+            if (id < 0) { printf("leg-refused\tllama.cpp\t" LEG_LABEL "\tmul_mat\tno tensor %s in the gguf\n", name); return 1; }
             ggml_tensor * meta = ggml_get_tensor(gmeta, name);
             if (meta->type != type || meta->ne[0] != k || meta->ne[1] != m) {
-                printf("leg-refused\tllama.cpp\tCUDA\tmul_mat\t%s is %s %lld x %lld, not %s %lld x %lld\n", name,
+                printf("leg-refused\tllama.cpp\t" LEG_LABEL "\tmul_mat\t%s is %s %lld x %lld, not %s %lld x %lld\n", name,
                        ggml_type_name(meta->type), (long long) meta->ne[0], (long long) meta->ne[1],
                        ggml_type_name(type), (long long) k, (long long) m);
                 return 1;
             }
             size_t off = gguf_get_data_offset(gg) + gguf_get_tensor_offset(gg, id);
             fseek(gf_file, (long) off, SEEK_SET);
-            if (fread(q.data(), 1, q.size(), gf_file) != q.size()) { printf("leg-refused\tllama.cpp\tCUDA\tmul_mat\tshort read of %s\n", name); return 1; }
+            if (fread(q.data(), 1, q.size(), gf_file) != q.size()) { printf("leg-refused\tllama.cpp\t" LEG_LABEL "\tmul_mat\tshort read of %s\n", name); return 1; }
         } else if (fill == "pattern") {
             // Synthetic blocks: sane f16 scales in the header, a byte ramp
             // in the payload — the same shape of data cajeta's probes use.
@@ -219,14 +237,14 @@ int main(int argc, char ** argv) {
 
     // Warm-up and the non-zero guard.
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
-        printf("leg-refused\tllama.cpp\tCUDA\tmul_mat\tgraph compute failed\n");
+        printf("leg-refused\tllama.cpp\t" LEG_LABEL "\tmul_mat\tgraph compute failed\n");
         return 1;
     }
     std::vector<float> out((size_t) m * n);
     ggml_backend_tensor_get(y[copies - 1], out.data(), 0, out.size() * sizeof(float));
     bool live = false;
     for (float v : out) if (v != 0.0f) { live = true; break; }
-    if (!live) { printf("leg-refused\tllama.cpp\tCUDA\tmul_mat\tproduced zeros\n"); return 1; }
+    if (!live) { printf("leg-refused\tllama.cpp\t" LEG_LABEL "\tmul_mat\tproduced zeros\n"); return 1; }
 
     // The timer on the backend's own stream. THE SCALE IS PER BRACKET: on
     // this box the event clock's ratio to the host clock moved between
@@ -257,7 +275,7 @@ int main(int argc, char ** argv) {
         ggml_backend_event_record(e0, backend);
         for (int it = 0; it < iters; it++) {
             if (ggml_backend_graph_compute_async(backend, gf) != GGML_STATUS_SUCCESS) {
-                printf("leg-refused\tllama.cpp\tCUDA\tmul_mat\tgraph compute failed in the bracket\n");
+                printf("leg-refused\tllama.cpp\t" LEG_LABEL "\tmul_mat\tgraph compute failed in the bracket\n");
                 return 1;
             }
         }
@@ -266,7 +284,7 @@ int main(int argc, char ** argv) {
         int64_t h1 = host_ns();
         float ms_r = 0;
         if (cudaEventElapsedTime(&ms_r, c0, c1) != cudaSuccess) {
-            printf("leg-refused\tllama.cpp\tCUDA\tmul_mat\tcudaEventElapsedTime refused\n");
+            printf("leg-refused\tllama.cpp\t" LEG_LABEL "\tmul_mat\tcudaEventElapsedTime refused\n");
             return 1;
         }
         double host = (double) (h1 - h0);

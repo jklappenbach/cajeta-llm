@@ -17,7 +17,7 @@ LLAMA_BUILD_DIR="${LLAMA_BUILD_DIR:-$LLAMA_ROOT/build-cuda}"
 LLAMA_BIN="$LLAMA_BUILD_DIR/bin"
 LLAMA_COMMIT="$(git -C "$LLAMA_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-wsl_driver_dir="$(ls -d /usr/lib/wsl/drivers/nv_dispsi.inf_amd64_* 2>/dev/null | head -1)"
+wsl_driver_dir="$(ls -d /usr/lib/wsl/drivers/nv_dispsi.inf_amd64_* 2>/dev/null | head -1 || true)"
 if [[ -n "$wsl_driver_dir" ]]; then
     export LD_LIBRARY_PATH="$wsl_driver_dir:$LLAMA_BIN${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 else

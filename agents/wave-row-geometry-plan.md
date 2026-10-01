@@ -206,9 +206,62 @@ replaces BEFORE any timing.
 
 ## Unit 4 — the measured table (spec §5.2)
 
-- [ ] 4.1.1 Run the sweep across the formats on gfx1151 and record the
+- [x] 4.1.1 Run the sweep across the formats on gfx1151 and record the
       winners against the hand-found values, including whether four rows
       per wave generalizes past `q4k` and `q6k`.
+      q4_K and q6_K SWEPT on proton 2026-09-30 (`bench/ParityLeg
+      --rows-per-block N`, the 8B Q4_K_M's own tensors, min of three, us):
+
+      | shape | 1 | 2 | 4 | 8 |
+      |---|---|---|---|---|
+      | q4_K 1024x4096 | 16.75 | 16.91 | 16.67 | 16.68 |
+      | q6_K 1024x4096 | 21.56 | 21.50 | 21.15 | 21.64 |
+      | q4_K 4096x4096 | 47.15 | 47.63 | 47.47 | 47.24 |
+      | q4_K 14336x4096 | 148.1 | 148.1 | 148.9 | 149.2 |
+      | q4_K 4096x14336 | 158.4 | 158.9 | 159.3 | 159.7 |
+      | q6_K 4096x14336 | 223.6 | 222.0 | 222.1 | 222.6 |
+      | q6_K head | 1907 | 1908 | 1911 | 1927 |
+
+      Flat within about 1% at every cold engine shape, so one wave per
+      workgroup stays the default, as on sm_89 (9.3.3). The one place four
+      waves pays is a weight that stays in the 32 MB MALL (the q4_K
+      4096x14336 control: 45.5 us at 1, 41.8 at 4), which a decode never
+      is. BLOCKED for the other formats: ParityLeg reads only the Q4_K_M
+      layout and refuses a tensor of another type by name.
+      UNBLOCKED and SWEPT 2026-09-30: `ParityLeg --by-type` groups any
+      model's projection weights by (type, rows, cols) and runs each group on
+      its own tensors. The 8B in Q8_0, Q6_K, Q5_K_M, Q3_K_M and Q2_K, one to
+      eight waves per workgroup, three reps with the arm order rotated, min
+      of three, us:
+
+      | shape | 1 | 2 | 4 | 8 |
+      |---|---|---|---|---|
+      | q8_0 1024x4096 | 25.3 | 26.8 | 27.7 | 27.2 |
+      | q8_0 4096x4096 | 84.0 | 84.4 | 85.8 | 86.8 |
+      | q8_0 14336x4096 | 279.6 | 280.9 | 280.8 | 281.4 |
+      | q8_0 4096x14336 | 286.5 | 284.2 | 285.5 | 291.3 |
+      | q8_0 head | 2448 | 2471 | 2445 | 2448 |
+      | q6_K 4096x4096 | 68.0 | 67.9 | 67.6 | 67.4 |
+      | q6_K 14336x4096 | 221.9 | 221.7 | 221.9 | 223.3 |
+      | q5_K 4096x4096 | 59.8 | 61.3 | 60.9 | 60.7 |
+      | q5_K 14336x4096 | 186.0 | 188.3 | 189.2 | 188.4 |
+      | q5_K 4096x14336 | 196.6 | 198.0 | 197.3 | 193.1 |
+      | q3_K 4096x4096 | 40.9 | 41.0 | 40.6 | 41.2 |
+      | q3_K 14336x4096 | 118.6 | 119.0 | 118.8 | 120.9 |
+      | q3_K 4096x14336 | 125.0 | 126.7 | 124.9 | 125.0 |
+      | q2_K 4096x4096 | 33.5 | 34.5 | 34.3 | 34.3 |
+      | q2_K 14336x4096 | 100.8 | 100.1 | 100.9 | 98.8 |
+
+      No format prefers more than one wave by more than about 2% at any
+      cold shape (the largest, q5_K 4096x14336 and q2_K 14336x4096 at 8,
+      are 2.2% and 2.0%), and q8_0 1024x4096 prefers one by 6 to 9%. One
+      wave per workgroup stays the default for every format.
+      Four rows per wave, the q4k and q6k layout, has nothing left to win
+      at decode on this part: at one wave the other formats' large shapes
+      already stream 192 to 228 GB/s of weight (q8_0 218 to 228, q5_K 206
+      to 217, q3_K 202 to 213, q2_K 192), the same band as q4_K and q6_K
+      (200 to 226) and 75 to 89% of the 256 GB/s peak. The small shapes
+      are lower for every format alike, which is the fixed launch cost.
 - [ ] 4.1.2 The same on the NVIDIA box, which is a wave-32 part with
       different everything else.
 - [ ] 4.1.3 Record the table in the spec, where the adaptor draft can

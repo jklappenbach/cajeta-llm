@@ -2586,4 +2586,301 @@ public final class CausalLM extends InfModule {
         return;
     }
 
+
+    // ── batched decode (xpu-kernel-adaptor 13B) ─────────────────────────
+    //
+    // B sequences' decode rows in one step: every projection reads its
+    // weight once for all B (the column wave mat-vecs), attention stays per
+    // sequence on its own device planes. Per row it runs the single path's
+    // kernels, so each sequence's tokens equal its tokens decoded alone.
+
+    /** The most sequences one {@link #stepDecodeBatch} call carries. */
+    public static final int32 DECODE_BATCH_MAX = 8;
+    static boolean decodeBatchOn = true;
+    public static void setDecodeBatch(boolean on) { CausalLM.decodeBatchOn = on; }
+    int32 bdReady;
+    KernelBuffer<float32> bdHs;
+    KernelBuffer<float32> bdXn;
+    KernelBuffer<int8> bdXp;
+    KernelBuffer<float32> bdQ;
+    KernelBuffer<float32> bdK;
+    KernelBuffer<float32> bdV;
+    KernelBuffer<float32> bdG;
+    KernelBuffer<float32> bdU;
+    KernelBuffer<float32> bdLogits;
+    KernelBuffer<int32> bdTok;
+    int32[] bdTokHost;
+    float32[] bdHsHost;
+    int32[] bdPos;
+    KernelBuffer<float32>[] bdHsRow;
+    KernelBuffer<float32>[] bdXnRow;
+    KernelBuffer<float32>[] bdQRow;
+    KernelBuffer<float32>[] bdKRow;
+    KernelBuffer<float32>[] bdVRow;
+    KernelBuffer<float32>[] bdLogitRow;
+    KernelBuffer<int32>[] bdTokRow;
+    KernelBuffer<int8>[] bdXpHRow;
+    KernelBuffer<int8>[] bdXpQdRow;
+
+    /** Can decode rows of several sequences share one step: the resident
+     *  Llama layout, every projection and the head on a column route, and
+     *  the device attention tail. */
+    public boolean decodeBatchReady() {
+        if (!CausalLM.decodeBatchOn || !CausalLM.deviceArgmax) { return false; }
+        if (this.bdReady != 0) { return this.bdReady == 1; }
+        boolean ok = this.deviceResidentReady() && CausalLM.fuseTail
+            && CausalLM.devAttnOn && KernelCap.attendHere()
+            && DeviceKv.supports(this.cfg) && this.cfg.headDim <= 128
+            && this.lmHead.isDeviceRouted() && this.lmHead.colsReady()
+            && this.cfg.hiddenSize % 256 == 0
+            && this.cfg.intermediateSize % 256 == 0
+            && this.cfg.qDim() % 256 == 0;
+        int32 l = 0;
+        while (ok && l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            Attention a = d.selfAttn;
+            if (d.moe != null || d.subNorm || d.fourNorm) {
+                ok = false;
+            } else if (!a.qProj.colsReady() || !a.kProj.colsReady()
+                    || !a.vProj.colsReady() || !a.oProj.colsReady()
+                    || !d.mlp.gateProj.colsReady() || !d.mlp.upProj.colsReady()
+                    || !d.mlp.downProj.colsReady()) {
+                ok = false;
+            }
+            l = l + 1;
+        }
+        if (ok) { this.bdReady = 1; } else { this.bdReady = 2; }
+        Diag.emit("decode-batch", 0 - 1, ok ? "ready" : "refused",
+            0L, 0L, 0L, 0L, 0L, 0L);
+        return ok;
+    }
+
+    void ensureDecodeBatch() {
+        if (this.bdHs != null) { return; }
+        int64 n = (int64) CausalLM.DECODE_BATCH_MAX;
+        int64 h = (int64) this.cfg.hiddenSize;
+        int64 qd = (int64) this.cfg.qDim();
+        int64 kvd = (int64) this.cfg.kvDim();
+        int64 inter = (int64) this.cfg.intermediateSize;
+        int64 vocab = (int64) this.cfg.vocabSize;
+        int64 wide = h;
+        if (inter > wide) { wide = inter; }
+        if (qd > wide) { wide = qd; }
+        int64 pbH = Quant.q8kPackedBytes(h);
+        int64 pbQd = Quant.q8kPackedBytes(qd);
+        this.bdHs #= heap KernelBuffer<float32>((uint64) (n * h));
+        this.bdXn #= heap KernelBuffer<float32>((uint64) (n * h));
+        this.bdXp #= heap KernelBuffer<int8>((uint64) (n * Quant.q8kPackedBytes(wide)));
+        this.bdQ #= heap KernelBuffer<float32>((uint64) (n * qd));
+        this.bdK #= heap KernelBuffer<float32>((uint64) (n * kvd));
+        this.bdV #= heap KernelBuffer<float32>((uint64) (n * kvd));
+        this.bdG #= heap KernelBuffer<float32>((uint64) (n * inter));
+        this.bdU #= heap KernelBuffer<float32>((uint64) (n * inter));
+        this.bdLogits #= heap KernelBuffer<float32>((uint64) (n * vocab));
+        this.bdTok #= heap KernelBuffer<int32>((uint64) n);
+        this.bdTokHost #= heap int32[n];
+        this.bdHsHost #= heap float32[n * h];
+        this.bdPos #= heap int32[n];
+        this.bdHsRow #= heap KernelBuffer<float32>[n];
+        this.bdXnRow #= heap KernelBuffer<float32>[n];
+        this.bdQRow #= heap KernelBuffer<float32>[n];
+        this.bdKRow #= heap KernelBuffer<float32>[n];
+        this.bdVRow #= heap KernelBuffer<float32>[n];
+        this.bdLogitRow #= heap KernelBuffer<float32>[n];
+        this.bdTokRow #= heap KernelBuffer<int32>[n];
+        this.bdXpHRow #= heap KernelBuffer<int8>[n];
+        this.bdXpQdRow #= heap KernelBuffer<int8>[n];
+        int64 b = 0;
+        while (b < n) {
+            this.bdHsRow[b] #= this.bdHs.slice((uint64) (b * h), (uint64) h);
+            this.bdXnRow[b] #= this.bdXn.slice((uint64) (b * h), (uint64) h);
+            this.bdQRow[b] #= this.bdQ.slice((uint64) (b * qd), (uint64) qd);
+            this.bdKRow[b] #= this.bdK.slice((uint64) (b * kvd), (uint64) kvd);
+            this.bdVRow[b] #= this.bdV.slice((uint64) (b * kvd), (uint64) kvd);
+            this.bdLogitRow[b] #= this.bdLogits.slice((uint64) (b * vocab), (uint64) vocab);
+            this.bdTokRow[b] #= this.bdTok.slice((uint64) b, (uint64) 1);
+            this.bdXpHRow[b] #= this.bdXp.slice((uint64) (b * pbH), (uint64) pbH);
+            this.bdXpQdRow[b] #= this.bdXp.slice((uint64) (b * pbQd), (uint64) pbQd);
+            b = b + 1;
+        }
+        if (this.tokDev == null) {
+            int64 groups = (vocab + 1023L) / 1024L;
+            this.tokDev = heap KernelBuffer<int32>((uint64) 1);
+            this.tokHost = heap int32[1];
+            this.amPv = heap KernelBuffer<float32>((uint64) groups);
+            this.amPi = heap KernelBuffer<int32>((uint64) groups);
+            this.amCounter = heap KernelBuffer<int32>((uint64) 1);
+            int32[] z = heap int32[1];
+            this.amCounter.upload(z, 1L);
+        }
+        return;
+    }
+
+    /** Norm + pack of the first `n` rows: the single path's fused kernel, a workgroup per row, or its per-row two-launch fallback. */
+    void batchNormPack(int32 n, KernelBuffer<float32> w, float32 eps, int32 form) {
+        int64 h = (int64) this.cfg.hiddenSize;
+        if (Prim.rmsnormPackRowsDevice(this.bdXn, this.bdXp, this.bdHs, w, (int64) n,
+                h, eps, form)) {
+            return;
+        }
+        int64 r = 0;
+        while (r < (int64) n) {
+            Prim.rmsnormDevice(this.bdXnRow[r], this.bdHsRow[r], w, h, eps, form);
+            QuantKernel.q8kPackLaunchNoSync(this.bdXpHRow[r], this.bdXnRow[r], h);
+            r = r + 1;
+        }
+        return;
+    }
+
+    /**
+     * One decode token for each of `n` sequences `seqs[i]`, fed `tokens[i]`,
+     * in one pass over the weights; greedy tokens land in `out[i]`. Needs
+     * {@link #decodeBatchReady} and 1 <= n <= {@link #DECODE_BATCH_MAX}.
+     */
+    public void stepDecodeBatch(int32[] seqs, int32[] tokens, int32 n, int32[] out) {
+        if (n < 1 || n > CausalLM.DECODE_BATCH_MAX) {
+            throw heap LlmException("decode batch: " + n + " rows");
+        }
+        this.ensureResidentBuffers(this.cfg.hiddenSize);
+        this.ensureDecodeBatch();
+        int32 h = this.cfg.hiddenSize;
+        int32 qd = this.cfg.qDim();
+        int32 kvd = this.cfg.kvDim();
+        int32 inter = this.cfg.intermediateSize;
+        int32 nH = this.cfg.numHeads;
+        int32 nKv = this.cfg.numKvHeads;
+        int32 hd = this.cfg.headDim;
+        int32 vocab = this.cfg.vocabSize;
+        int64 pbH = Quant.q8kPackedBytes((int64) h);
+        int64 pbQd = Quant.q8kPackedBytes((int64) qd);
+        int64 pbI = Quant.q8kPackedBytes((int64) inter);
+        ActivationPool p = this.pool;
+        float32[] xb = p.x.hostBuffer();
+        int64 xbase = p.x.hostBase();
+        int32 b = 0;
+        while (b < n) {
+            int32 seq = seqs[(int64) b];
+            this.armRoutes(seq);
+            this.ensureDeviceKv(seq);
+            int32 pos = this.seqLength(seq);
+            if (pos >= this.maxSeq) {
+                throw heap LlmException("decode: context is full (maxSeq "
+                    + this.maxSeq + ")");
+            }
+            this.bdPos[(int64) b] = pos;
+            this.model.embedTokens.rowIntoTensor(tokens[(int64) b], p.x, 0, h);
+            int64 ci = 0;
+            int64 ro = (int64) b * (int64) h;
+            while (ci < (int64) h) {
+                this.bdHsHost[ro + ci] = xb[xbase + ci];
+                ci = ci + 1;
+            }
+            b = b + 1;
+        }
+        this.bdHs.upload(this.bdHsHost, (int64) n * (int64) h);
+        int32 li = 0;
+        while (li < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[li];
+            Attention a = d.selfAttn;
+            this.batchNormPack(n, d.inputLayernorm.deviceWeight(),
+                d.inputLayernorm.eps, d.normForm);
+            a.qProj.matvecCols(this.bdXp, pbH, n, this.bdQ, (int64) qd, false);
+            a.kProj.matvecCols(this.bdXp, pbH, n, this.bdK, (int64) kvd, false);
+            a.vProj.matvecCols(this.bdXp, pbH, n, this.bdV, (int64) kvd, false);
+            KernelBuffer<float32> qnw = null;
+            KernelBuffer<float32> knw = null;
+            float32 qnEps = 0.0f;
+            if (a.qNorm != null) {
+                qnw = a.qNorm.deviceWeight();
+                knw = a.kNorm.deviceWeight();
+                qnEps = a.qNorm.eps;
+            }
+            b = 0;
+            while (b < n) {
+                int64 r = (int64) b;
+                DeviceKv dkv = this.dkvOf(seqs[r]);
+                int32 pos = this.bdPos[r];
+                KernelBuffer<float32> qr = this.bdQRow[r];
+                if (!dkv.prep(li, qr, this.bdKRow[r], this.bdVRow[r],
+                        qnw, knw, qnEps, d.normForm, pos)) {
+                    if (a.qNorm != null) {
+                        Prim.qkNormDevice(qr, this.bdKRow[r],
+                            a.qNorm.deviceWeight(), a.kNorm.deviceWeight(),
+                            (int64) nH, (int64) nKv, (int64) hd, a.qNorm.eps,
+                            d.normForm);
+                    }
+                    dkv.rope(li, qr, this.bdKRow[r], pos);
+                    dkv.append(li, this.bdKRow[r], this.bdVRow[r], pos);
+                }
+                if (dkv.attendPartials(li, qr, pos, a.scale)) {
+                    AttnKernel.reducePackLaunchNoSync(this.bdXpQdRow[r], nH);
+                } else {
+                    dkv.attend(li, qr, pos, a.scale);
+                    QuantKernel.q8kPackLaunchNoSync(this.bdXpQdRow[r], dkv.out(),
+                        (int64) qd);
+                }
+                b = b + 1;
+            }
+            a.oProj.matvecCols(this.bdXp, pbQd, n, this.bdHs, (int64) h, true);
+            this.batchNormPack(n, d.postAttentionLayernorm.deviceWeight(),
+                d.postAttentionLayernorm.eps, d.normForm);
+            d.mlp.gateProj.matvecCols(this.bdXp, pbH, n, this.bdG, (int64) inter, false);
+            d.mlp.upProj.matvecCols(this.bdXp, pbH, n, this.bdU, (int64) inter, false);
+            int64 gn = (int64) n * (int64) inter;
+            if (!Prim.gluPackDevice(this.bdG, this.bdXp, this.bdU, gn, d.activation)) {
+                Prim.gluDevice(this.bdG, this.bdU, gn, d.activation);
+                QuantKernel.q8kPackRowsLaunchNoSync(this.bdXp, this.bdG, (int64) n,
+                    (int64) inter, (int64) inter);
+            }
+            d.mlp.downProj.matvecCols(this.bdXp, pbI, n, this.bdHs, (int64) h, true);
+            li = li + 1;
+        }
+        b = 0;
+        while (b < n) {
+            int64 r = (int64) b;
+            DeviceKv nd = this.dkvOf(seqs[r]);
+            nd.notePosition(this.bdPos[r]);
+            Prim.rmsnormDevice(this.bdXnRow[r], this.bdHsRow[r],
+                this.model.norm.deviceWeight(), (int64) h, this.model.norm.eps,
+                this.cfg.normForm);
+            QuantKernel.q8kPackLaunchNoSync(this.bdXpHRow[r], this.bdXnRow[r], (int64) h);
+            b = b + 1;
+        }
+        this.lmHead.matvecCols(this.bdXp, pbH, n, this.bdLogits, (int64) vocab, false);
+        b = 0;
+        while (b < n) {
+            QuantKernel.argmaxRowLaunchNoSync(this.bdTokRow[(int64) b],
+                this.bdLogitRow[(int64) b], (int64) vocab, this.amPv, this.amPi,
+                this.amCounter);
+            b = b + 1;
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        this.bdTok.download(this.bdTokHost, (int64) n);
+        b = 0;
+        while (b < n) {
+            out[(int64) b] = this.bdTokHost[(int64) b];
+            b = b + 1;
+        }
+        this.logitsStale = false;
+        return;
+    }
+
+    float32[] bdLogitsHost;
+
+    /** Make row `b` of the last {@link #stepDecodeBatch} the logits {@link #logits} returns. */
+    public void selectBatchLogits(int32 b) {
+        int64 v = (int64) this.cfg.vocabSize;
+        if (this.bdLogitsHost == null) { this.bdLogitsHost = heap float32[v]; }
+        this.bdLogitRow[(int64) b].download(this.bdLogitsHost, v);
+        float32[] lb = this.pool.logits.hostBuffer();
+        int64 base = this.pool.logits.hostBase();
+        int64 i = 0;
+        while (i < v) {
+            lb[base + i] = this.bdLogitsHost[i];
+            i = i + 1;
+        }
+        this.logitsStale = false;
+        return;
+    }
 }

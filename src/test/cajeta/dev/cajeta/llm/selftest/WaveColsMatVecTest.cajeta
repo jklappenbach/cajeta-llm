@@ -1,0 +1,124 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * The B-column wave mat-vecs of batched decode (xpu-kernel-adaptor 13B): one
+ * pass over the weights for up to eight sequences' activations. Every column
+ * must be BIT-identical to the one-column kernel on the same activation, so
+ * batching can never change a token, and the whole product is held to the
+ * host's dequantized GEMM.
+ */
+public class WaveColsMatVecTest {
+
+    public WaveColsMatVecTest() { return; }
+
+    static void check(String kernel, String single, int32 ty, String fixture,
+            int64 out, int64 cols) {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        if (!KernelCap.usable(kernel)) { DeviceSkip.noKernel(kernel, be); return; }
+        if (!KernelCap.usable(single)) { DeviceSkip.noKernel(single, be); return; }
+        int64 ncMax = (int64) QuantKernel.WAVE_COLS_MAX;
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int8[] raw #= CensusReachTest.tiled(ty, fixture, nBlocks);
+        float32[] x #= heap float32[ncMax * cols];
+        int64 i = 0;
+        while (i < ncMax * cols) {
+            x[i] = (float32) ((i * 37L + (i / cols) * 11L + 5L) % 67L - 33L) * 0.0625f;
+            i = i + 1;
+        }
+        float32[] want #= CensusReachTest.hostGemm(ty, raw, nBlocks, x, ncMax, out, cols);
+        int8[] dev #= raw;
+        if (Quant.splitOn(ty)) {
+            int8[] res #= heap int8[out * Quant.rowResidentBytes(ty, bpr)];
+            Quant.splitInto(ty, raw, 0L, out, bpr, res, 0L);
+            dev #= res;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) dev.count()));
+        wD.upload(dev);
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, ncMax, cols);
+        int64 pb = Quant.q8kPackedBytes(cols);
+        float32[] one #= heap float32[ncMax * out];
+        KernelBuffer<float32> yOne #= heap KernelBuffer<float32>((uint64) (ncMax * out));
+        int64 c = 0;
+        while (c < ncMax) {
+            KernelBuffer<int8> xc #= xp.slice((uint64) (c * pb), (uint64) pb);
+            if (ty == Quant.GG_Q4_K) {
+                QuantKernel.q4kQ8WaveMatVecLaunchNoSync(yOne, wD, xc, out, cols, c * out);
+            } else {
+                QuantKernel.q6kQ8WaveMatVecLaunchNoSync(yOne, wD, xc, out, cols, c * out);
+            }
+            c = c + 1;
+        }
+        QuantKernel.stream().sync();
+        yOne.download(one);
+        int32[] widths #= heap int32[5];
+        widths[0] = 1;
+        widths[1] = 2;
+        widths[2] = 3;
+        widths[3] = 5;
+        widths[4] = 8;
+        float32[] got #= heap float32[ncMax * out];
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (ncMax * out));
+        int32 wi = 0;
+        while (wi < 5) {
+            int32 nc = widths[wi];
+            int64 k = 0;
+            while (k < ncMax * out) { got[k] = -1.0f; k = k + 1; }
+            yD.upload(got);
+            if (ty == Quant.GG_Q4_K) {
+                QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(yD, wD, xp, out, cols,
+                    0L, nc, out, pb, false);
+            } else {
+                QuantKernel.q6kQ8WaveMatVecColsLaunchNoSync(yD, wD, xp, out, cols,
+                    0L, nc, out, pb, false);
+            }
+            QuantKernel.stream().sync();
+            yD.download(got);
+            k = 0;
+            while (k < ncMax * out) {
+                if (k < (int64) nc * out) {
+                    if (Cajeta.f32ToBits(got[k]) != Cajeta.f32ToBits(one[k])) {
+                        Assert.fail(kernel + " at " + nc + " columns: column "
+                            + (k / out) + " row " + (k % out) + " is " + got[k]
+                            + ", the one-column kernel gives " + one[k]);
+                        return;
+                    }
+                } else if (got[k] != -1.0f) {
+                    Assert.fail(kernel + " at " + nc + " columns wrote column "
+                        + (k / out) + ", past the columns it was given");
+                    return;
+                }
+                k = k + 1;
+            }
+            wi = wi + 1;
+        }
+        CensusReachTest.nearOnePercent(want, got, ncMax * out,
+            kernel + " at " + out + "x" + cols);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void q4kColumnsEqualTheOneColumnKernelAndTheHost() {
+        WaveColsMatVecTest.check("q4kQ8WaveMatVecColsKernel", "q4kQ8WaveMatVecKernel",
+            Quant.GG_Q4_K, "q4_k.bin", 96L, 4096L);
+    }
+
+    @Test
+    public void q6kColumnsEqualTheOneColumnKernelAndTheHost() {
+        WaveColsMatVecTest.check("q6kQ8WaveMatVecColsKernel", "q6kQ8WaveMatVecKernel",
+            Quant.GG_Q6_K, "q6_k.bin", 96L, 4096L);
+    }
+}

@@ -7,6 +7,7 @@ import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelTimer;
+import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 
@@ -16,8 +17,8 @@ import dev.cajeta.llm.io.QuantKernel;
  *
  * Q4_K is the subject because it is not a `splitOn` format, so the weight
  * is the plain 144-byte block layout with no resident scale prefix, and
- * because it carries the hand-tuned partition router (X1 below K=8192,
- * X3 above) and the 55296-byte N256 tile.
+ * because it carries the N256 tile beside the X1/X3 pair the router
+ * chooses between (QuantKernel.coopX1).
  *
  * Every arm reports whether the output came back NON-ZERO. A kernel that
  * fails to lower or fails to launch does not raise -- the registry finds
@@ -224,6 +225,121 @@ public class CoopTiming {
             CoopTiming.arm("N256G (@Occ)  ", 5, yb, pw, xh, rows, outDim, cols, scratch);
         }
         return;
+    }
+
+    /** Device ns per launch of `ty`'s shipped coop launcher with the tile pinned, min of three brackets; -1 when it did not run. */
+    static int64 tileNs(int32 ty, int32 tile, KernelBuffer<float32> yb,
+            KernelBuffer<int32> pw, KernelBuffer<float16> xh,
+            int64 rows, int64 outDim, int64 cols, float32[] scratch) {
+        QuantKernel.setCoopTileForce(tile);
+        KernelStream s = QuantKernel.stream();
+        int32 w = 0;
+        while (w < CoopTiming.WARMUP) {
+            QuantKernel.coopBatchLaunchNoSync(ty, yb, pw, xh, rows, outDim, cols);
+            w = w + 1;
+        }
+        s.sync();
+        int64 best = 0L - 1L;
+        int32 rep = 0;
+        while (rep < 3) {
+            CoopTiming.zero(yb, scratch);
+            s.sync();
+            int64 failBefore = Device.launchFailures();
+            KernelTimer timer #= KernelTimer.create();
+            int64 h0 = Clock.nanoTime();
+            timer.begin(s);
+            int32 it = 0;
+            while (it < CoopTiming.ITERS) {
+                QuantKernel.coopBatchLaunchNoSync(ty, yb, pw, xh, rows, outDim, cols);
+                it = it + 1;
+            }
+            timer.end(s);
+            s.sync();
+            int64 devNs = timer.elapsedNanos();
+            timer.destroy();
+            if (devNs < 0L) { devNs = Clock.nanoTime() - h0; }
+            if (Device.launchFailures() != failBefore || devNs < 0L
+                    || !CoopTiming.nonZero(yb, scratch)) {
+                QuantKernel.setCoopTileForce(0);
+                return 0L - 1L;
+            }
+            int64 per = devNs / (int64) CoopTiming.ITERS;
+            if (best < 0L || per < best) { best = per; }
+            rep = rep + 1;
+        }
+        QuantKernel.setCoopTileForce(0);
+        return best;
+    }
+
+    static void formatShape(int32 ty, String stem, int64 rows, int64 outDim,
+            int64 cols) {
+        String tn #= GgufFile.typeName(ty);
+        if (!Device.kernelAvailable(stem + "F16CoopX1Kernel")
+                || !Device.kernelAvailable(stem + "F16CoopX3Kernel")) {
+            System.stdout.println("tile-row " + tn + " " + outDim + "x" + cols
+                + " refused: no X1/X3 pair on " + Device.activeBackend());
+            return;
+        }
+        int64 nb = outDim * (cols / (int64) Quant.blockElems(ty));
+        int64 wbytes = nb * (int64) Quant.blockBytes(ty) + nb * 8L;
+        wbytes = (wbytes + 3L) / 4L * 4L;
+        int8[] wh #= heap int8[wbytes];
+        int64 i = 0;
+        while (i < wbytes) {
+            wh[i] = (int8) ((i * 7L + 13L) & 255L);
+            i = i + 1;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) wbytes);
+        wD.upload(wh);
+        KernelBuffer<int32> pw #= wD.wordView();
+        int64 xn = rows * cols;
+        float16[] xhh #= heap float16[xn];
+        int64 c = 0;
+        while (c < xn) {
+            xhh[c] = (float16) (0.02f * (float32) ((c % 7L) - 3L));
+            c = c + 1;
+        }
+        KernelBuffer<float16> xh #= heap KernelBuffer<float16>((uint64) xn);
+        xh.upload(xhh);
+        float32[] scratch #= heap float32[rows * outDim];
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) (rows * outDim));
+        int64 auto = CoopTiming.tileNs(ty, 0, yb, pw, xh, rows, outDim, cols, scratch);
+        int64 x1 = CoopTiming.tileNs(ty, 1, yb, pw, xh, rows, outDim, cols, scratch);
+        int64 x3 = CoopTiming.tileNs(ty, 3, yb, pw, xh, rows, outDim, cols, scratch);
+        System.stdout.println("tile-row " + tn + " tokens=" + rows + " " + outDim + "x"
+            + cols + " default_us=" + ((float64) auto / 1000.0) + " x1_us="
+            + ((float64) x1 / 1000.0) + " x3_us=" + ((float64) x3 / 1000.0)
+            + " timer=" + (KernelTimer.tierName().equals("unavailable") ? "host" : KernelTimer.tierName()));
+        return;
+    }
+
+    /** X1 against X3 for every format that ships both, at Llama-3.1-8B's prefill shapes (xpu-kernel-adaptor 5.4.2). */
+    public static int32 runFormats() {
+        System.stdout.println("backend: " + Device.activeBackend());
+        int32[] tys #= heap int32[14];
+        String[] stems #= heap String[14];
+        tys[0] = Quant.GG_Q2_K; stems[0] #= "q2k";
+        tys[1] = Quant.GG_Q3_K; stems[1] #= "q3k";
+        tys[2] = Quant.GG_Q4_K; stems[2] #= "q4k";
+        tys[3] = Quant.GG_Q5_K; stems[3] #= "q5k";
+        tys[4] = Quant.GG_Q6_K; stems[4] #= "q6k";
+        tys[5] = Quant.GG_Q4_0; stems[5] #= "q40";
+        tys[6] = Quant.GG_Q4_1; stems[6] #= "q41";
+        tys[7] = Quant.GG_Q5_0; stems[7] #= "q50";
+        tys[8] = Quant.GG_Q5_1; stems[8] #= "q51";
+        tys[9] = Quant.GG_Q8_0; stems[9] #= "q80";
+        tys[10] = Quant.GG_IQ4_NL; stems[10] #= "iq4nl";
+        tys[11] = Quant.GG_IQ4_XS; stems[11] #= "iq4xs";
+        tys[12] = Quant.GG_TQ1_0; stems[12] #= "tq10";
+        tys[13] = Quant.GG_TQ2_0; stems[13] #= "tq20";
+        int32 k = 0;
+        while (k < 14) {
+            CoopTiming.formatShape(tys[k], stems[k], 512L, 4096L, 4096L);
+            CoopTiming.formatShape(tys[k], stems[k], 512L, 14336L, 4096L);
+            CoopTiming.formatShape(tys[k], stems[k], 512L, 4096L, 14336L);
+            k = k + 1;
+        }
+        return 0;
     }
 
     public static int32 run() {

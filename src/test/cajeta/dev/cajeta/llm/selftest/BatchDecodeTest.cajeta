@@ -1,0 +1,97 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.EngineOptions;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.sched.Request;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * Batched decode (xpu-kernel-adaptor 13B): the decode rows of several
+ * sequences share one step, every weight read once for all of them. The
+ * batch must not change an answer, so each sequence's stream decoded in a
+ * batch of four is held equal, token for token, to the same prompt decoded
+ * alone, greedy and sampled alike.
+ */
+public class BatchDecodeTest {
+
+    static final int32 SEQS = 4;
+    static final int32 GEN = 24;
+
+    public BatchDecodeTest() { return; }
+
+    static #LlmEngine engine(int32 seqs) {
+        EngineOptions o #= heap EngineOptions(RoutableFixtureTest.FIX);
+        o.ctx = 128;
+        o.maxSeqs = seqs;
+        o.blockTokens = 16;
+        o.chunk = 64;
+        LlmEngine e #= LlmEngine.load(#o);
+        return #e;
+    }
+
+    /** Each prompt's stream alone and all four together; `temp` 0 is greedy. */
+    static void check(float32 temp) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        LlmEngine all #= BatchDecodeTest.engine(BatchDecodeTest.SEQS);
+        boolean ready = all.model().decodeBatchReady();
+        Diag.register(null);
+        if (!ready) {
+            all.close();
+            DeviceSkip.tracked("backend " + be + " does not route batched decode: "
+                + cap.namesOf("decode-batch"), "xpu-kernel-adaptor 13B");
+            return;
+        }
+        int32[] ids #= heap int32[BatchDecodeTest.SEQS];
+        int32 q = 0;
+        while (q < BatchDecodeTest.SEQS) {
+            int32[] p #= RoutableFixtureTest.promptOf(20 + 3 * q, 5 + 11 * q);
+            ids[q] = all.submitTokens(p, 20 + 3 * q, BatchDecodeTest.GEN,
+                #heap SampleParams(temp, (int64) (41 + q)));
+            q = q + 1;
+        }
+        all.runAll(400);
+        q = 0;
+        while (q < BatchDecodeTest.SEQS) {
+            LlmEngine one #= BatchDecodeTest.engine(1);
+            int32[] p #= RoutableFixtureTest.promptOf(20 + 3 * q, 5 + 11 * q);
+            int32 id = one.submitTokens(p, 20 + 3 * q, BatchDecodeTest.GEN,
+                #heap SampleParams(temp, (int64) (41 + q)));
+            one.runAll(400);
+            Request solo = one.request(id);
+            Request inBatch = all.request(ids[q]);
+            Assert.equals((int64) BatchDecodeTest.GEN, (int64) inBatch.generatedCount());
+            Assert.equals((int64) solo.generatedCount(), (int64) inBatch.generatedCount());
+            int32 k = 0;
+            while (k < solo.generatedCount()) {
+                if (solo.generatedAt(k) != inBatch.generatedAt(k)) {
+                    Assert.fail("sequence " + q + " token " + k + ": " + inBatch.generatedAt(k)
+                        + " in the batch, " + solo.generatedAt(k) + " decoded alone (temp "
+                        + temp + ")");
+                }
+                k = k + 1;
+            }
+            one.close();
+            q = q + 1;
+        }
+        all.close();
+    }
+
+    @Test
+    public void greedyStreamsMatchEachSequenceDecodedAlone() {
+        BatchDecodeTest.check(0.0f);
+    }
+
+    @Test
+    public void sampledStreamsMatchEachSequenceDecodedAlone() {
+        BatchDecodeTest.check(0.8f);
+    }
+}

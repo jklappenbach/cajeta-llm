@@ -276,17 +276,20 @@ public final class Scheduler {
 
     public boolean stepOnce() {
         int64 tso = Clock.nanoTime();
-        boolean more = this.stepOnceTimed(tso);
-        return more;
-    }
-
-    boolean stepOnceTimed(int64 tso) {
         this.steps = this.steps + 1;
         this.admitPhase();
         // 21.2.5: who owns a launch failure surfacing this step. Taken
         // AFTER admission so a request admitted this step counts.
         int32 lfOwner = Diag.on() ? this.soleRunning() : (0 - 1);
         PagedKvCache cache = this.model.kvCache();
+        boolean batching = this.model.decodeBatchReady();
+        int32 nb = 0;
+        if (batching && this.bIdx == null) {
+            this.bIdx = heap int32[CausalLM.DECODE_BATCH_MAX];
+            this.bSeq = heap int32[CausalLM.DECODE_BATCH_MAX];
+            this.bTok = heap int32[CausalLM.DECODE_BATCH_MAX];
+            this.bOut = heap int32[CausalLM.DECODE_BATCH_MAX];
+        }
         int32 i = 0;
         while (i < this.reqs.count()) {
             Request r = this.reqs.get(i);
@@ -319,63 +322,23 @@ public final class Scheduler {
                         (int64) r.totalLen,
                         (int64) cache.lengthOf(r.slot, 0));
                 }
-                Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
-                int32 ret = this.model.stepSeq(r.slot, r.all, r.cachedLen, n);
-                tso = Clock.nanoTime();
-                r.cachedLen = r.cachedLen + n;
-                this.prefillRowsN = this.prefillRowsN + n;
-                if (r.cachedLen == r.totalLen) {
-                    // The newest position was consumed: `ret` is the
-                    // model's argmax (interior chunks discard it). A
-                    // sampled request draws from the SAME logits instead
-                    // (they are still pooled from this stepSeq — requests
-                    // advance one at a time), with the penalty history
-                    // being its previously EMITTED tokens (8.5).
-                    // A greedy sampler's answer is `ret` already: the
-                    // model's argmax, taken on the device when the tail
-                    // ran there. Fetching the logits to scan them again on
-                    // the host was 0.65 ms of a 7 ms token (2026-09-30).
-                    int32 tok = ret;
-                    if (r.sampler != null && !r.sampler.isGreedy()) {
-                        tok = r.sampler.sample(this.model.logits(), r.all,
-                            r.promptLen, r.genCount);
+                if (batching && n == 1) {
+                    if (nb == CausalLM.DECODE_BATCH_MAX) {
+                        this.runDecodeBatch(nb);
+                        nb = 0;
                     }
-                    r.all[r.totalLen] = tok;
-                    r.totalLen = r.totalLen + 1;
-                    r.genCount = r.genCount + 1;
-                    // 8.8 — deliver before the next step begins.
-                    if (this.sink != null) {
-                        this.sink.onToken(i, tok);
-                    }
-                    // 8.7 — EOS, then stop strings, then the budget.
-                    int32 fin = Request.FINISH_NONE;
-                    if (r.sampler != null) {
-                        fin = this.stopReason(r);
-                    }
-                    if (fin == Request.FINISH_NONE
-                            && r.genCount >= r.maxNew) {
-                        fin = Request.FINISH_BUDGET;
-                    }
-                    if (fin != Request.FINISH_NONE) {
-                        r.finishReason = fin;
-                        // Unit 30: the request's routing, as records,
-                        // while its slot still holds the counts.
-                        if (Diag.on()) {
-                            this.model.emitRouteRecords(r.slot, i);
-                        }
-                        // A completed sequence's blocks feed the prompt
-                        // cache before they free (6.16's write, and what
-                        // makes 11.3.1's repeated-prefix win real).
-                        this.saveBlocks(r);
-                        this.model.releaseSeq(r.slot);
-                        this.slotReq[r.slot] = -1;
-                        r.slot = -1;
-                        r.state = Request.DONE;
-                    }
+                    this.bIdx[nb] = i;
+                    nb = nb + 1;
+                } else {
+                    Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
+                    int32 ret = this.model.stepSeq(r.slot, r.all, r.cachedLen, n);
+                    tso = Clock.nanoTime();
+                    this.consume(i, r, ret, n);
                 }
             }
             i = i + 1;
         }
+        if (nb > 0) { this.runDecodeBatch(nb); }
         // Completions freed blocks: same-step admission (6.24).
         this.admitPhase();
         // 21.2.5: launch failures become records. The counter moving
@@ -396,6 +359,101 @@ public final class Scheduler {
         boolean more = !this.allDone();
         Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
         return more;
+    }
+
+    /** Advance request `r` (index `i`) past `n` consumed tokens; `ret` is the model's argmax for its newest position. */
+    void consume(int32 i, Request r, int32 ret, int32 n) {
+        r.cachedLen = r.cachedLen + n;
+        this.prefillRowsN = this.prefillRowsN + n;
+        if (r.cachedLen == r.totalLen) {
+            // The newest position was consumed: `ret` is the
+            // model's argmax (interior chunks discard it). A
+            // sampled request draws from the SAME logits instead
+            // (they are still pooled from this stepSeq — requests
+            // advance one at a time), with the penalty history
+            // being its previously EMITTED tokens (8.5).
+            // A greedy sampler's answer is `ret` already: the model's
+            // argmax, taken on the device when the tail ran there. Fetching
+            // the logits to scan them again on the host was 0.65 ms of a
+            // 7 ms token (2026-09-30).
+            int32 tok = ret;
+            if (r.sampler != null && !r.sampler.isGreedy()) {
+                tok = r.sampler.sample(this.model.logits(), r.all,
+                    r.promptLen, r.genCount);
+            }
+            r.all[r.totalLen] = tok;
+            r.totalLen = r.totalLen + 1;
+            r.genCount = r.genCount + 1;
+            // 8.8 — deliver before the next step begins.
+            if (this.sink != null) {
+                this.sink.onToken(i, tok);
+            }
+            // 8.7 — EOS, then stop strings, then the budget.
+            int32 fin = Request.FINISH_NONE;
+            if (r.sampler != null) {
+                fin = this.stopReason(r);
+            }
+            if (fin == Request.FINISH_NONE
+                    && r.genCount >= r.maxNew) {
+                fin = Request.FINISH_BUDGET;
+            }
+            if (fin != Request.FINISH_NONE) {
+                r.finishReason = fin;
+                // Unit 30: the request's routing, as records,
+                // while its slot still holds the counts.
+                if (Diag.on()) {
+                    this.model.emitRouteRecords(r.slot, i);
+                }
+                // A completed sequence's blocks feed the prompt
+                // cache before they free (6.16's write, and what
+                // makes 11.3.1's repeated-prefix win real).
+                this.saveBlocks(r);
+                this.model.releaseSeq(r.slot);
+                this.slotReq[r.slot] = -1;
+                r.slot = -1;
+                r.state = Request.DONE;
+            }
+        }
+        return;
+    }
+
+    /** Scratch for one batched decode step: request indices, slots, tokens, results. */
+    int32[] bIdx;
+    int32[] bSeq;
+    int32[] bTok;
+    int32[] bOut;
+
+    /** Run the collected decode rows as one step (xpu-kernel-adaptor 13B),
+     *  dropping any a preemption stopped after it was collected. */
+    void runDecodeBatch(int32 nb) {
+        int32 m = 0;
+        int32 k = 0;
+        while (k < nb) {
+            Request r = this.reqs.get(this.bIdx[k]);
+            if (r.state == Request.RUNNING && r.slot >= 0) {
+                this.bIdx[m] = this.bIdx[k];
+                this.bSeq[m] = r.slot;
+                this.bTok[m] = r.all[r.cachedLen];
+                m = m + 1;
+            }
+            k = k + 1;
+        }
+        if (m == 0) { return; }
+        if (m == 1) {
+            Request r1 = this.reqs.get(this.bIdx[0]);
+            int32 ret = this.model.stepSeq(r1.slot, r1.all, r1.cachedLen, 1);
+            this.consume(this.bIdx[0], r1, ret, 1);
+            return;
+        }
+        this.model.stepDecodeBatch(this.bSeq, this.bTok, m, this.bOut);
+        k = 0;
+        while (k < m) {
+            Request rk = this.reqs.get(this.bIdx[k]);
+            if (rk.sampler != null) { this.model.selectBatchLogits(k); }
+            this.consume(this.bIdx[k], rk, this.bOut[k], 1);
+            k = k + 1;
+        }
+        return;
     }
 
     /** Drive to completion, with a hard progress cap. */

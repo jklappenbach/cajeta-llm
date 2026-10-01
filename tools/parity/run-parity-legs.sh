@@ -42,7 +42,7 @@ Q4_LAYERS=4,5,7,8,9,11,12,14,15,17,18,20,22,23,25,26
 Q6_LAYERS=0,1,2,3,6,10,13,16,19,21,24,27,28,29,30,31
 ALL16=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 
-echo ">> llama.cpp leg ($LLAMA_COMMIT, CUDA), real tensors from $MODEL"
+echo ">> llama.cpp leg ($LLAMA_COMMIT, $LLAMA_BUILD_DIR), real tensors from $MODEL"
 [[ -f "$MODEL" ]] || { echo "no reference model at $MODEL" >&2; exit 1; }
 rows="$out/llama-rows.tsv"
 {
@@ -92,5 +92,5 @@ crows="$out/cajeta-rows-$XPU_BACKEND.tsv"
 echo ">> the table"
 table="$here/census/parity-$XPU_BACKEND.tsv"
 ( cd "$here" && "$out/parity-join" --llama "$rows" --cajeta "$crows" \
-    --recorded-hot-ns 13330 --tolerance 0.05 ) | tee "$table"
+    --recorded-hot-ns "${RECORDED_HOT_NS:-13330}" --tolerance 0.05 ) | tee "$table"
 echo ">> wrote $table"
