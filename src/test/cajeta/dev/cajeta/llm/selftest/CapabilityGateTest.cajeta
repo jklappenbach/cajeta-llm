@@ -5,10 +5,14 @@ import dev.cajeta.unit.Test;
 import cajeta.io.file.File;
 import cajeta.lang.String;
 import cajeta.lang.System;
+import cajeta.lang.Optional;
 import cajeta.xpu.Device;
+import cajeta.xpu.KernelManifest;
 import dev.cajeta.llm.io.Checkpoint;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.model.MoeFfn;
 import dev.cajeta.llm.model.KernelCap;
 import dev.cajeta.llm.model.Linear;
 import dev.cajeta.llm.model.ModelConfig;
@@ -163,31 +167,74 @@ public class CapabilityGateTest {
     }
 
     /**
-     * 2b — a WAVE-32 kernel is closed on a wave that is not 32, however
-     * registered it is, and open where the wave is 32. Both arms, because
-     * a check needs a test that it fires and one that it does not.
-     * `q40Q8WaveMatVecKernel` is the witness: written for 32 lanes, and it
-     * lowers on every backend that runs this suite.
+     * 2b — a kernel that DECLARES its wave (`@Wave(width = 32)`) is usable
+     * wherever it is registered, and the backend that registered it built it
+     * at that width: the manifest says 32, on a 32-wave GPU and on the cpu
+     * backend whose own wave is the host SIMD width. There used to be a list
+     * of such kernels closed by name wherever the wave was not 32
+     * (KernelCap.WAVE32_ONLY, xpu-kernel-adaptor Unit 9); the declaration
+     * honored on every backend retired it (2026-09-30). Both arms: the
+     * declared kernel reads 32, and an undeclared wave mat-vec reads the
+     * backend's own wave.
      */
     @Test
-    public void aWave32KernelIsUsableOnlyOnAWaveOf32() {
-        // The grouped-id GLU/combine kernels still derive their lanes from a
-        // literal 32 (wave-row-geometry 2.2.4); the wave mat-vec family,
-        // grouped-id mat-vecs included, came off the list under
-        // xpu-kernel-adaptor Unit 9, so q40Q8 is the negative now.
-        String k = "q4kQ8IdGateUpGluKernel";
-        Assert.isTrue(KernelCap.wave32Only(k));
-        Assert.isTrue(!KernelCap.wave32Only("q2kQ8WaveMatVecKernel"));
-        Assert.isTrue(!KernelCap.wave32Only("q40Q8WaveMatVecKernel"));
-        if (!Device.kernelAvailable(k)) {
+    public void aDeclaredWaveKernelIsBuiltAtItsWidthWhereverItIsRegistered() {
+        String k = "rmsnormPackRowF32";
+        if (!KernelCap.usable(k)) {
             DeviceSkip.noKernel(k, Device.activeBackend());
             return;
         }
-        if (Device.waveSize() == 32) {
-            Assert.isTrue(KernelCap.usable(k));
-        } else {
-            Assert.isTrue(!KernelCap.usable(k));
+        KernelManifest m #= KernelManifest.of(k);
+        Assert.isTrue(m != null);
+        Optional<int32> w = m.waveWidth();
+        Assert.isTrue(w.isPresent());
+        Assert.equals(32L, (int64) w.get());
+        String u = "q2kQ8WaveMatVecKernel";
+        if (Device.kernelAvailable(u)) {
+            KernelManifest mu #= KernelManifest.of(u);
+            Optional<int32> wu = mu.waveWidth();
+            if (wu.isPresent()) {
+                Assert.equals((int64) Device.waveSize(), (int64) wu.get());
+            }
         }
+    }
+
+    /**
+     * 2c — AN EXPERT BANK'S ID-GEMM READINESS NAMES A KERNEL THAT IS USABLE
+     * HERE. Found 2026-09-30 with CAJETA_XPU_POISON: on cpu a Q4_K bank
+     * answered idMwReady() from its shape alone, the zero-sync batch route
+     * committed on that answer, gemmIdBatchMw then refused by name
+     * (q4kWmmaIdMwKernel does not lower there), its false was ignored, and
+     * the gate/up outputs stayed whatever the allocator had left: zero on
+     * a fresh page (a silently dropped expert), NaN on a recycled chunk (a
+     * router that threw). A readiness predicate is a promise to launch;
+     * each one asks the registry for the kernel it would launch, and the
+     * route takes the first arm whose promise holds. Both arms: a bank's
+     * Mw readiness agrees with the usability of its Mw kernel, and the id
+     * route of the toy's resident MoE agrees with the host (the
+     * ResidentMoeDecodeTest brackets, under the lever in CI).
+     */
+    @Test
+    public void aBankIsIdReadyOnlyForAKernelItCanLaunch() {
+        if (!Linear.residentEnabled()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        ExpertBank.resetResidency();
+        ExpertBank.setResidencyBudget(1152921504606846976L);
+        CausalLM m #= ResidentMoeDecodeTest.mk();
+        MoeFfn moe = m.moeAt(0);
+        ExpertBank db = moe.downBank();
+        Assert.isTrue(db.ensureSlab());
+        // The toy's banks are Q4_K at 512 rows: the shape admits every
+        // id arm, so readiness is decided by the registry alone.
+        Assert.equals((int64) Quant.GG_Q4_K, (int64) db.packedType());
+        Assert.equals(KernelCap.usable("q4kWmmaIdMwKernel"), db.idMwReady());
+        Assert.equals(KernelCap.usable("q4kWmmaIdEpiKernel"), db.idGemmReady());
+        Assert.equals(KernelCap.usable("q4kWmmaIdMw8Kernel"), db.idWideReady());
+        Assert.isFalse(db.coopIdReady());
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
     }
 
     /**

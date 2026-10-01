@@ -5,6 +5,7 @@ import cajeta.time.Clock;
 import cajeta.lang.String;
 import cajeta.lang.System;
 import cajeta.math.Tensor;
+import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import dev.cajeta.llm.io.Quant;
@@ -861,6 +862,15 @@ public final class MoeFfn extends InfModule {
                 }
                 e = e + 1;
             }
+            // Every probability failed `>= 0`: the logits are NaN, which
+            // is an upstream kernel's word about itself, not a route to
+            // take. Said by name rather than indexed at -1 (an abort that
+            // took a whole cpu leg down, 2026-09-30).
+            if (best < 0) {
+                throw heap LlmException("moe router: the logits of this row "
+                    + "are not finite (" + this.expertsN + " experts, top-"
+                    + this.usedN + ")");
+            }
             selOut[k] = best;
             wOut[k] = bp;
             this.sc.probs[best] = 0.0f - 1.0f;   // taken
@@ -1444,6 +1454,7 @@ public final class MoeFfn extends InfModule {
         if (!this.zeroSyncReady()) { return false; }
         int64 hid = (int64) this.hidden;
         if (hid % 256L != 0L || hid > 2048L || this.expertsN > 128) { return false; }
+        if (!KernelCap.usable("rmsnormRouterTopKKernel")) { return false; }
         this.ensureZeroSyncBufs();
         this.ensureRouterDev();
         this.ensureRtCounter();
@@ -1491,13 +1502,13 @@ public final class MoeFfn extends InfModule {
         if (preRouted) {
             // Unit 59: sel/w already selected by the fused norm+router.
         } else if (MoeFfn.fusedRouterOn && this.expertsN <= 128
-                && hid % 128 == 0) {
+                && hid % 128 == 0 && KernelCap.usable("routerTopKWaveKernel")) {
             // Unit 53: the wave form (registers, no LDS tree).
             QuantKernel.routerTopKWaveLaunchNoSync(this.selDev, this.wSelDev,
                 this.logitsDev, this.routerWDev, xDev, this.rtCounter,
                 (int64) this.expertsN, hid, (int64) this.usedN,
                 this.normTopk, this.wScale);
-        } else if (MoeFfn.fusedRouterOn) {
+        } else if (MoeFfn.fusedRouterOn && KernelCap.usable("routerTopKKernel")) {
             QuantKernel.routerTopKLaunchNoSync(this.selDev, this.wSelDev,
                 this.logitsDev, this.routerWDev, xDev, this.rtCounter,
                 (int64) this.expertsN, hid, (int64) this.usedN,
@@ -1850,20 +1861,37 @@ public final class MoeFfn extends InfModule {
         return;
     }
 
-    /** One bank's id-GEMM: the multi-wave kernel where it applies,
-     *  the epi-id kernel otherwise. */
+    /** The zero-sync batch route's per-bank gate: the 64-row multi-wave
+     *  id GEMM, or for a wide batch the 128-row tile it tries first. */
+    boolean mwServable(ExpertBank bank, boolean wide) {
+        if (bank.idMwReady()) { return true; }
+        return wide && bank.idWideReady();
+    }
+
+    /** One bank's id-GEMM: the multi-wave kernel where it applies, the
+     *  grouped coop tile, the 16-row epi tile otherwise. Each arm's
+     *  readiness is a promise to launch (ExpertBank.idMwReady and kin ask
+     *  the registry), so an arm that was ready and did not launch is a
+     *  defect, not a route: the layer's output would be whatever the
+     *  allocator left in `y` (found 2026-09-30 under CAJETA_XPU_POISON). */
     void idGemm(ExpertBank bank, KernelBuffer<float32> y,
             KernelBuffer<int8> xp, int32 nT, int32 nC, int32 groups) {
-        if (!bank.idMwReady() && bank.coopIdReady()) {
-            bank.gemmIdBatchCoop(y, Linear.btXh, MoeFfn.map64EDev,
+        boolean ran = false;
+        if (bank.idMwReady()) {
+            ran = bank.gemmIdBatchMw(y, xp, MoeFfn.map64EDev, MoeFfn.map64T0Dev,
+                MoeFfn.map64M1Dev, MoeFfn.metaDev, nC, groups);
+        } else if (bank.coopIdReady()) {
+            ran = bank.gemmIdBatchCoop(y, Linear.btXh, MoeFfn.map64EDev,
                 MoeFfn.map64T0Dev, MoeFfn.map64M1Dev, MoeFfn.metaDev, nC,
                 groups);
-        } else if (bank.idMwReady()) {
-            bank.gemmIdBatchMw(y, xp, MoeFfn.map64EDev, MoeFfn.map64T0Dev,
-                MoeFfn.map64M1Dev, MoeFfn.metaDev, nC, groups);
-        } else {
-            bank.gemmIdBatch(y, xp, MoeFfn.mapEDev, MoeFfn.mapT0Dev,
+        } else if (bank.idGemmReady()) {
+            ran = bank.gemmIdBatch(y, xp, MoeFfn.mapEDev, MoeFfn.mapT0Dev,
                 MoeFfn.mapM1Dev, nT, groups);
+        }
+        if (!ran) {
+            throw heap LlmException("moe: an expert bank's id GEMM was ready "
+                + "and did not launch (" + Device.activeBackend()
+                + "); its output would be unwritten");
         }
         return;
     }
@@ -2019,9 +2047,17 @@ public final class MoeFfn extends InfModule {
         this.gateB.ensureWidenSlab();
         this.upB.ensureWidenSlab();
         this.downB.ensureWidenSlab();
+        // 10.2: the wide tile when the step carries at least 64 rows
+        // per expert on average; a bank the wide kernel cannot serve
+        // keeps the 64-row one. Decided here because the route's gate
+        // depends on it: a bank is served when the arm the batch would
+        // take names a usable kernel (idMwReady, or idWideReady for a
+        // wide batch), and each predicate asks the registry (12.2.10).
+        boolean wide = MoeFfn.wideIdOn && np >= 64 * this.expertsN;
         boolean zeroSync = Linear.wmmaOn && !Linear.backendIsVulkan()
-            && this.gateB.idMwReady() && this.upB.idMwReady()
-            && this.downB.idMwReady();
+            && this.mwServable(this.gateB, wide)
+            && this.mwServable(this.upB, wide)
+            && this.mwServable(this.downB, wide);
         if (zeroSync) {
             this.ensureDevBatch(rows);
             QuantKernel.routerBatchF32LaunchNoSync(this.lgBatchDev,
@@ -2049,10 +2085,6 @@ public final class MoeFfn extends InfModule {
             // Every expert is resident by construction (the slabs), and
             // the host no longer knows which were selected: a launch
             // counts the bank.
-            // 10.2: the wide tile when the step carries at least 64 rows
-            // per expert on average; a bank the wide kernel cannot serve
-            // keeps the 64-row one.
-            boolean wide = MoeFfn.wideIdOn && np >= 64 * this.expertsN;
             int32 nC8Max = np / 128 + this.expertsN;
             boolean wg8 = false;
             boolean wu8 = false;
@@ -2062,20 +2094,24 @@ public final class MoeFfn extends InfModule {
                     MoeFfn.map128EDev, MoeFfn.map128T0Dev, MoeFfn.map128M1Dev,
                     MoeFfn.metaDev, nC8Max, this.expertsN);
             }
-            if (!wg8) {
-                this.gateB.gemmIdBatchMw(MoeFfn.bgDev, MoeFfn.xpBxDev,
+            // The zero-sync route committed on idMwReady(), which names a
+            // usable kernel; a false here is a defect, said out loud.
+            if (!wg8 && !this.gateB.gemmIdBatchMw(MoeFfn.bgDev, MoeFfn.xpBxDev,
                     MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
-                    MoeFfn.metaDev, nCMax, this.expertsN);
+                    MoeFfn.metaDev, nCMax, this.expertsN)) {
+                throw heap LlmException("moe: the gate bank's Mw id GEMM was "
+                    + "ready and did not launch; its output would be unwritten");
             }
             if (wide) {
                 wu8 = this.upB.gemmIdBatchWide(MoeFfn.buDev, MoeFfn.xpBxDev,
                     MoeFfn.map128EDev, MoeFfn.map128T0Dev, MoeFfn.map128M1Dev,
                     MoeFfn.metaDev, nC8Max, this.expertsN);
             }
-            if (!wu8) {
-                this.upB.gemmIdBatchMw(MoeFfn.buDev, MoeFfn.xpBxDev,
+            if (!wu8 && !this.upB.gemmIdBatchMw(MoeFfn.buDev, MoeFfn.xpBxDev,
                     MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
-                    MoeFfn.metaDev, nCMax, this.expertsN);
+                    MoeFfn.metaDev, nCMax, this.expertsN)) {
+                throw heap LlmException("moe: the up bank's Mw id GEMM was "
+                    + "ready and did not launch; its output would be unwritten");
             }
             MoeFfn.phaseSync();
             MoeFfn.fbGemm1Ns = MoeFfn.fbGemm1Ns
@@ -2094,10 +2130,11 @@ public final class MoeFfn extends InfModule {
                     MoeFfn.map128EDev, MoeFfn.map128T0Dev, MoeFfn.map128M1Dev,
                     MoeFfn.metaDev, nC8Max, this.expertsN);
             }
-            if (!wd8) {
-                this.downB.gemmIdBatchMw(MoeFfn.beDev, MoeFfn.xpBgDev,
+            if (!wd8 && !this.downB.gemmIdBatchMw(MoeFfn.beDev, MoeFfn.xpBgDev,
                     MoeFfn.map64EDev, MoeFfn.map64T0Dev, MoeFfn.map64M1Dev,
-                    MoeFfn.metaDev, nCMax, this.expertsN);
+                    MoeFfn.metaDev, nCMax, this.expertsN)) {
+                throw heap LlmException("moe: the down bank's Mw id GEMM was "
+                    + "ready and did not launch; its output would be unwritten");
             }
             MoeFfn.phaseSync();
             MoeFfn.fbGemm2Ns = MoeFfn.fbGemm2Ns
@@ -2187,10 +2224,8 @@ public final class MoeFfn extends InfModule {
         // One unready bank used to send all three to that loop.
         boolean devId = Linear.wmmaOn && !Linear.backendIsVulkan();
         boolean idPathUp = devId
-            && (this.gateB.idGemmReady() || this.gateB.coopIdReady())
-            && (this.upB.idGemmReady() || this.upB.coopIdReady());
-        boolean idPathDown = devId
-            && (this.downB.idGemmReady() || this.downB.coopIdReady());
+            && this.gateB.idServable() && this.upB.idServable();
+        boolean idPathDown = devId && this.downB.idServable();
         boolean idPath = idPathUp || idPathDown;
         int32 nT = 0;
         int32 nC = 0;

@@ -495,6 +495,23 @@ phase "building the test binary"
 # amdgpu, f32 A/B operands are Portable while the f32 ACCUMULATOR is Native —
 # it is the accumulator of f16/bf16 WMMA) now demotes to the portable tile as
 # a GROUP and lowers, rather than being skipped. Fixed in cajeta 2026-08-21.
+# CAJETA_UNIT_FILTER=Scheduler,WordForm runs only the tests whose qualified
+# name contains one of the substrings (dev.cajeta.unit 0.3.2): the iteration
+# lever for a binary that takes ten minutes to build on cpu and fifteen to
+# run. The census stands down for a filtered run, and the release pass is
+# skipped; a filtered run is never the leg.
+if [ -n "${CAJETA_UNIT_FILTER:-}" ]; then
+    echo ">> CAJETA_UNIT_FILTER=${CAJETA_UNIT_FILTER}: a partial run, no census, no release pass"
+    RELEASE_PASS=0
+fi
+# Fresh device memory is poisoned (0xFF) for the whole suite, on every
+# backend (cajeta's CAJETA_XPU_POISON, 2026-09-30). A kernel that reads a
+# buffer region nothing wrote then answers NaN deterministically, where a
+# zero page let it pass and a recycled chunk turned a test red only when
+# some unrelated test had run first (ResidentMoeDecodeTest's capped arm,
+# xpu-kernel-adaptor 12.2.10). CAJETA_XPU_POISON=0 is the control.
+export CAJETA_XPU_POISON="${CAJETA_XPU_POISON:-1}"
+echo ">> device buffers: CAJETA_XPU_POISON=${CAJETA_XPU_POISON}"
 "$CAJETA" --emit=exe --profile=test --xpu-backend="${XPU_BACKEND:-cpu}" \
     --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja,$logging_cja" \
     -o "$out/llamatests" \

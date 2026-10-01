@@ -1,0 +1,192 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.EngineOptions;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.sched.Scheduler;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.sched.Request;
+
+/**
+ * End-to-end prefill and decode throughput, the phase split llama-bench
+ * reports as `pp` and `tg` (xpu-kernel-adaptor 14.1.4). One engine, a
+ * warm-up request, then `reps` timed requests of `--p` prompt tokens and
+ * `--n` generated tokens each. The prompt is llama-bench's kind: token ids
+ * drawn from the vocabulary by a fixed generator, so no tokenizer is in
+ * the comparison, and no stop token ends a request early.
+ *
+ * Prefill is the wall time from submit to the first generated token, so
+ * it includes that token's head and sample, as `pp` does not. Decode is
+ * the time from the first generated token to the last, over n - 1 tokens.
+ *
+ *   EndToEnd.run --model M.gguf --device cuda [--p 512] [--n 128]
+ *                [--reps 3] [--chunk 512]
+ */
+public class EndToEnd {
+
+    /** Launches so far, summed over every registered kernel. */
+    static int64 launches() {
+        int64 t = 0L;
+        int32 k = 0;
+        int32 n = Device.registeredKernelCount();
+        while (k < n) {
+            t = t + Device.kernelLaunchCount(Device.registeredKernel(k));
+            k = k + 1;
+        }
+        return t;
+    }
+
+    public static int32 run(String[] args) {
+        String model #= "";
+        String device #= "";
+        String prefillWeights #= "";
+        int32 promptN = 512;
+        int32 maxNew = 128;
+        int32 reps = 3;
+        int32 chunk = 0;
+        int32 i = 0;
+        int32 n = (int32) args.count();
+        while (i < n) {
+            if (args[i].equals("--model") && i + 1 < n) { model #= "" + args[i + 1]; i = i + 2; }
+            else if (args[i].equals("--device") && i + 1 < n) { device #= "" + args[i + 1]; i = i + 2; }
+            else if (args[i].equals("--prefill-weights") && i + 1 < n) { prefillWeights #= "" + args[i + 1]; i = i + 2; }
+            else if (args[i].equals("--p") && i + 1 < n) { promptN = Integer.parseInt(args[i + 1]); i = i + 2; }
+            else if (args[i].equals("--n") && i + 1 < n) { maxNew = Integer.parseInt(args[i + 1]); i = i + 2; }
+            else if (args[i].equals("--reps") && i + 1 < n) { reps = Integer.parseInt(args[i + 1]); i = i + 2; }
+            else if (args[i].equals("--chunk") && i + 1 < n) { chunk = Integer.parseInt(args[i + 1]); i = i + 2; }
+            else { i = i + 1; }
+        }
+        if (model.size() == 0L) {
+            System.stdout.println("usage: EndToEnd.run --model M.gguf --device cuda"
+                + " [--p 512] [--n 128] [--reps 3] [--chunk 512]");
+            return 2;
+        }
+        EngineOptions o #= heap EngineOptions(model);
+        o.ctx = promptN + maxNew + 16;
+        o.maxSeqs = 1;
+        if (chunk > 0) { o.chunk = chunk; }
+        if (device.size() > 0L) { o.device = "" + device; }
+        if (prefillWeights.size() > 0L) { o.prefillWeights = "" + prefillWeights; }
+        int32 useChunk = o.chunk;
+        LlmEngine e #= LlmEngine.load(#o);
+        int32 vocab = e.model().cfg.vocabSize;
+        System.stdout.println("end-to-end: backend " + Device.activeBackend()
+            + ", prompt " + promptN + ", generate " + maxNew + ", chunk "
+            + useChunk + ", vocab " + vocab);
+
+        int32[] prompt #= heap int32[promptN];
+        float64 bestPp = 0.0;
+        float64 bestTg = 0.0;
+        int32 r = 0;
+        while (r <= reps) {
+            // A different prompt per request, so no prefix is reused.
+            int64 state = 88172645463325252L + (int64) r * 7919L;
+            int32 k = 0;
+            while (k < promptN) {
+                state = state ^ (state << 13);
+                state = state ^ (state >>> 7);
+                state = state ^ (state << 17);
+                int64 v = state % (int64) (vocab - 1000);
+                if (v < 0L) { v = 0L - v; }
+                prompt[k] = (int32) v + 500;
+                k = k + 1;
+            }
+            SampleParams sp #= heap SampleParams(0.0f, 0L);
+            int32[] noStops #= heap int32[0];
+            sp.stopTokens #= noStops;
+            int64 t0 = Clock.nanoTime();
+            int32 id = e.submitTokens(prompt, promptN, maxNew, #sp);
+            Request rq = e.request(id);
+            int64 t1 = 0L;
+            int64 l0 = EndToEnd.launches();
+            int64 l1 = 0L;
+            int32 nk = Device.registeredKernelCount();
+            int64[] per1 #= heap int64[nk];
+            int32 guard = 0;
+            int64 inStep = 0L;
+            while (!rq.isDone() && guard < (promptN + maxNew) * 4) {
+                int64 ts0 = Clock.nanoTime();
+                e.stepOnce();
+                inStep = inStep + (Clock.nanoTime() - ts0);
+                if (t1 == 0L && rq.generatedCount() >= 1) {
+                    t1 = Clock.nanoTime();
+                    CausalLM.resetDecodeTimers();
+                    CausalLM.resetResidentTimers();
+                    Scheduler.resetSchedulerOwnNs();
+                    l1 = EndToEnd.launches();
+                    int32 q = 0;
+                    while (q < nk) {
+                        per1[q] = Device.kernelLaunchCount(Device.registeredKernel(q));
+                        q = q + 1;
+                    }
+                }
+                guard = guard + 1;
+            }
+            int64 t2 = Clock.nanoTime();
+            int32 got = rq.generatedCount();
+            float64 ppMs = (float64) (t1 - t0) / 1000000.0;
+            float64 tgMs = (float64) (t2 - t1) / 1000000.0;
+            float64 pp = (float64) promptN / (ppMs / 1000.0);
+            float64 tg = 0.0;
+            if (got > 1) { tg = (float64) (got - 1) / (tgMs / 1000.0); }
+            System.stdout.println("e2e-row\t" + Device.activeBackend() + "\t"
+                + (r == 0 ? "warmup" : "timed") + "\t" + promptN + "\t" + got
+                + "\t" + ppMs + "\t" + pp + "\t" + tgMs + "\t" + tg);
+            int64 l2 = EndToEnd.launches();
+            if (got > 1) {
+                float64 dn = (float64) (got - 1) * 1000.0;
+                float64 pre = (float64) CausalLM.decodePreNs() / dn;
+                float64 loop = (float64) CausalLM.residentLoopNs() / dn;
+                float64 tail = (float64) CausalLM.decodeNormNs() / dn;
+                float64 sync = (float64) CausalLM.decodeSyncNs() / dn;
+                float64 head = (float64) CausalLM.decodeLmHeadNs() / dn;
+                float64 all = (float64) (t2 - t1) / dn;
+                float64 fwd = (float64) CausalLM.decodeForwardNs() / dn;
+                float64 step = (float64) CausalLM.decodeStepNs() / dn;
+                System.stdout.println("e2e-phase-us\tpre " + pre + "\tlayers " + loop
+                    + "\ttail " + tail + "\tsync " + sync + "\treadback " + head
+                    + "\tforward-gaps " + (fwd - loop - tail - sync - head)
+                    + "\tstep-gaps " + (step - fwd - pre)
+                    + "\tscheduler " + ((float64) Scheduler.schedulerOwnNs() / dn)
+                    + "\tengine-step " + ((float64) inStep / dn - step - (float64) Scheduler.schedulerOwnNs() / dn)
+                    + "\tbench-loop " + (all - (float64) inStep / dn)
+                    + "\ttoken " + all);
+            }
+            System.stdout.println("e2e-defer\tqueued " + KernelStream.deferStat(KernelStream.DEFER_QUEUED)
+                + "\treplayed " + KernelStream.deferStat(KernelStream.DEFER_REPLAYED)
+                + "\tdirect " + KernelStream.deferStat(KernelStream.DEFER_DIRECT)
+                + "\tgraphs " + KernelStream.deferStat(KernelStream.DEFER_GRAPHS_BUILT)
+                + "\tgraph launches " + KernelStream.deferStat(KernelStream.DEFER_GRAPH_LAUNCHES)
+                + "\tpatches " + KernelStream.deferStat(KernelStream.DEFER_PATCHES)
+                + "\tflushes " + KernelStream.deferStat(KernelStream.DEFER_FLUSHES));
+            System.stdout.println("e2e-launches\tprefill " + (l1 - l0) + "\tdecode "
+                + (l2 - l1) + "\tper token " + ((float64) (l2 - l1) / (float64) (got - 1)));
+            if (r == reps) {
+                int32 q = 0;
+                while (q < nk) {
+                    String kn #= Device.registeredKernel(q);
+                    int64 dl = Device.kernelLaunchCount(kn) - per1[q];
+                    if (dl > 0L) {
+                        System.stdout.println("e2e-decode-kernel\t" + kn + "\t"
+                            + ((float64) dl / (float64) (got - 1)));
+                    }
+                    q = q + 1;
+                }
+            }
+            if (r > 0) {
+                if (pp > bestPp) { bestPp = pp; }
+                if (tg > bestTg) { bestTg = tg; }
+            }
+            r = r + 1;
+        }
+        System.stdout.println("e2e-best\t" + Device.activeBackend() + "\tpp"
+            + promptN + "\t" + bestPp + "\ttg" + maxNew + "\t" + bestTg);
+        e.close();
+        return 0;
+    }
+}

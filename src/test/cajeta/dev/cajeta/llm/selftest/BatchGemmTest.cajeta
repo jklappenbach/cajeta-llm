@@ -5,6 +5,7 @@ import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
 import dev.cajeta.llm.model.KernelCap;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
@@ -91,6 +92,71 @@ public class BatchGemmTest {
     public void q4kBatchMatchesHostDequantAcrossARaggedTokenTile() {
         BatchGemmTest.check("q4kQ8BatchMatMulKernel", Quant.GG_Q4_K, "q4_k.bin",
             40L, 96L, 512L);
+    }
+
+    /**
+     * The multi-wave deq tile against the SAME host oracle. Until
+     * 2026-09-30 the tile was credited by the route tests, which reached it
+     * through a ragged prefill chunk padded to 16 rows wherever the
+     * matrix-core probe said the cores pay; the 16-byte word loads (cajeta
+     * 1c773170) took the dp4a batch kernel from 0.95 to 0.33 ms at the
+     * probe's shape on sm_89, under the tile's 0.47, so the probe answers
+     * "do not pay" there and the route tests no longer reach the tile at
+     * all. A route that moves takes its credit with it; a kernel still
+     * shipped and still taken where the cores pay keeps a check of its own.
+     * The tile is held to the host, not to the batch kernel it used to be
+     * judged against (6.4.8), which is also what decides 6.4.16 on cpu the
+     * day its closure lifts: there the two disagreed and neither had an
+     * oracle.
+     */
+    @Test
+    public void q4kDeqMwTileMatchesHostDequant() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q8kPackKernel")) {
+            DeviceSkip.noKernel("q8kPackKernel", be);
+            return;
+        }
+        if (!KernelCap.usable("q4kWidenKernel")) { DeviceSkip.noKernel("q4kWidenKernel", be); return; }
+        if (!KernelCap.usable("q4kWmmaDeqMwKernel")) { DeviceSkip.noKernel("q4kWmmaDeqMwKernel", be); return; }
+        int64 rows = 16L;
+        int64 out = 128L;
+        int64 cols = 512L;
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int8[] raw #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        float32[] want #= CensusReachTest.hostGemm(Quant.GG_Q4_K, raw, nBlocks, x, rows, out, cols);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+        wD.upload(raw);
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<int8> deq #= heap KernelBuffer<int8>((uint64) (out * cols));
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        float32[] got #= heap float32[rows * out];
+        yD.upload(got);
+        WmmaKernel.q4kWidenLaunch(deq, wD, out, cols);
+        WmmaKernel.q4kWmmaDeqMwLaunch(yD, wD, deq, xp, rows, out, cols);
+        QuantKernel.stream().sync();
+        yD.download(got);
+        int64 t = 0;
+        while (t < rows) {
+            boolean live = false;
+            int64 i = 0;
+            while (i < out) {
+                if (got[t * out + i] != 0.0f) { live = true; }
+                i = i + 1;
+            }
+            if (!live) {
+                Assert.fail("q4kWmmaDeqMwKernel at " + rows + "x" + out + "x" + cols
+                    + ": token row " + t + " is entirely zero");
+                return;
+            }
+            t = t + 1;
+        }
+        CensusReachTest.nearOnePercent(want, got, rows * out,
+            "q4kWmmaDeqMwKernel at " + rows + "x" + out + "x" + cols);
+        ValueCheck.credit(vc);
     }
 
     @Test

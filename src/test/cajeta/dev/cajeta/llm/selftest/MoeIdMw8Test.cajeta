@@ -8,6 +8,7 @@ import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.io.WmmaKernel;
 
@@ -64,10 +65,11 @@ public class MoeIdMw8Test {
         return false;
     }
 
-    static #KernelBuffer<int8> packActs() {
+    /** The f32 activations every arm packs: NP tokens plus a 128-row pad. */
+    static #float32[] acts() {
         int64 cols = (int64) MoeIdMw8Test.COLS;
         int64 npp = (int64) MoeIdMw8Test.NP + 128L;
-        float32[] xv = heap float32[npp * cols];
+        float32[] xv #= heap float32[npp * cols];
         int64 i = 0;
         while (i < npp * cols) {
             xv[i] = (float32) ((i % 25) - 12) / 64.0f
@@ -75,6 +77,13 @@ public class MoeIdMw8Test {
                 + (float32) (i % 7) * 0.01f;
             i = i + 1;
         }
+        return #xv;
+    }
+
+    static #KernelBuffer<int8> packActs() {
+        int64 cols = (int64) MoeIdMw8Test.COLS;
+        int64 npp = (int64) MoeIdMw8Test.NP + 128L;
+        float32[] xv #= MoeIdMw8Test.acts();
         KernelBuffer<float32> xf = heap KernelBuffer<float32>(
             (uint64) (npp * cols));
         xf.upload(xv, npp * cols);
@@ -85,11 +94,13 @@ public class MoeIdMw8Test {
         return #xp;
     }
 
-    static #KernelBuffer<int8> q4kSlab() {
+    /** The Q4_K expert slab's bytes: expert-major, row-major, 144 bytes a
+     *  block; the host oracle decodes the same bytes. */
+    static #int8[] q4kSlabBytes() {
         int32 rowBytes = (MoeIdMw8Test.COLS / 256) * 144;
         int64 total = (int64) MoeIdMw8Test.E
             * (int64) MoeIdMw8Test.ROWS_E * (int64) rowBytes;
-        int8[] raw = heap int8[total];
+        int8[] raw #= heap int8[total];
         int64 i = 0;
         while (i < total) {
             int64 blk = i / 144L;
@@ -105,10 +116,120 @@ public class MoeIdMw8Test {
             }
             i = i + 1;
         }
+        return #raw;
+    }
+
+    static #KernelBuffer<int8> q4kSlab() {
+        int8[] raw #= MoeIdMw8Test.q4kSlabBytes();
+        int64 total = (int64) raw.count();
         KernelBuffer<int8> slab = heap KernelBuffer<int8>(
             (uint64) (total + 4L));
         slab.upload(raw, total);
         return #slab;
+    }
+
+    /**
+     * The HOST oracle of the id GEMM: token t belongs to the group whose
+     * row range holds it (gOff), and y[t, r] = W_e[r, :] . x[t, :] over the
+     * dequantized Q4_K rows of that expert. Pad output rows (t >= NP) are
+     * not compared: a chunk's pad rows read stale activations by design.
+     */
+    static #float32[] hostIdGemm(int8[] slab, float32[] xv) {
+        int64 cols = (int64) MoeIdMw8Test.COLS;
+        int64 rows = (int64) MoeIdMw8Test.ROWS_E;
+        int64 bpr = cols / 256L;
+        int64 rowBytes = bpr * 144L;
+        int64 np = (int64) MoeIdMw8Test.NP;
+        float32[] want #= heap float32[np * rows];
+        float32[] w #= heap float32[rows * cols];
+        int32 e = 0;
+        while (e < MoeIdMw8Test.E) {
+            int64 r = 0;
+            while (r < rows) {
+                int64 ro = ((int64) e * rows + r) * rowBytes;
+                Quant.dequantize(Quant.GG_Q4_K, slab, ro, bpr, w, r * cols);
+                r = r + 1;
+            }
+            int64 t = (int64) MoeIdMw8Test.gOff(e);
+            int64 tEnd = (int64) MoeIdMw8Test.gOff(e + 1);
+            while (t < tEnd) {
+                r = 0;
+                while (r < rows) {
+                    float64 acc = 0.0;
+                    int64 c = 0;
+                    while (c < cols) {
+                        acc = acc + (float64) w[r * cols + c]
+                            * (float64) xv[t * cols + c];
+                        c = c + 1;
+                    }
+                    want[t * rows + r] = (float32) acc;
+                    r = r + 1;
+                }
+                t = t + 1;
+            }
+            e = e + 1;
+        }
+        return #want;
+    }
+
+    /**
+     * The wide Q4_K id GEMM against the HOST, not against the chunk id
+     * kernel: on cpu the chunk kernel (fromWords) does not lower, so the
+     * agreement test above skips there while the resident MoE route
+     * launches this kernel on every decode token (ExpertBank.gemmIdBatchWide,
+     * since 2026-09-30). A kernel a route launches has a check that does
+     * not depend on another kernel being registered.
+     */
+    @Test
+    public void q4kWideIdMatchesTheHostDequantGemm() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable("q8kPackKernel")) {
+            DeviceSkip.noKernel("q8kPackKernel", be);
+            return;
+        }
+        if (!KernelCap.usable("q4kWmmaIdMw8Kernel")) {
+            DeviceSkip.noKernel("q4kWmmaIdMw8Kernel", be);
+            return;
+        }
+        int8[] raw #= MoeIdMw8Test.q4kSlabBytes();
+        float32[] xv #= MoeIdMw8Test.acts();
+        float32[] want #= MoeIdMw8Test.hostIdGemm(raw, xv);
+        KernelBuffer<int8> slab #= MoeIdMw8Test.q4kSlab();
+        KernelBuffer<int32> slabW #= slab.wordView();
+        int32 cap = MoeIdMw8Test.NP / 64 + MoeIdMw8Test.E + 1;
+        int32[] mE = heap int32[cap];
+        int32[] mT0 = heap int32[cap];
+        int32[] mM1 = heap int32[cap];
+        int32 n8 = MoeIdMw8Test.buildMaps(128, mE, mT0, mM1);
+        KernelBuffer<int32> e8 = heap KernelBuffer<int32>((uint64) n8);
+        KernelBuffer<int32> t8 = heap KernelBuffer<int32>((uint64) n8);
+        KernelBuffer<int32> m8 = heap KernelBuffer<int32>((uint64) n8);
+        e8.upload(mE, (int64) n8);
+        t8.upload(mT0, (int64) n8);
+        m8.upload(mM1, (int64) n8);
+        int32[] metaH = heap int32[4];
+        metaH[0] = n8;
+        metaH[1] = n8;
+        KernelBuffer<int32> meta = heap KernelBuffer<int32>((uint64) 4);
+        meta.upload(metaH, 2L);
+        int64 outDim = (int64) MoeIdMw8Test.ROWS_E;
+        int64 nAll = ((int64) MoeIdMw8Test.NP + 128L) * outDim;
+        int64 nOut = (int64) MoeIdMw8Test.NP * outDim;
+        float32[] zero = heap float32[nAll];
+        KernelBuffer<float32> y = heap KernelBuffer<float32>((uint64) nAll);
+        y.upload(zero, nAll);
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<int8> xp #= MoeIdMw8Test.packActs();
+        WmmaKernel.q4kWmmaIdMw8LaunchNoSync(y, slab, slabW, xp, e8, t8,
+            m8, meta, (int64) n8 + 3L, outDim, (int64) MoeIdMw8Test.COLS,
+            (int64) MoeIdMw8Test.ROWS_E);
+        QuantKernel.stream().sync();
+        float32[] got = heap float32[nAll];
+        y.download(got, nAll);
+        CensusReachTest.nearOnePercent(want, got, nOut,
+            "wide Q4_K id GEMM vs host at " + MoeIdMw8Test.NP + " tokens");
+        ValueCheck.credit(vc);
     }
 
     /** One map entry per `stride`-row chunk of each group. */
