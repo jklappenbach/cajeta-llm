@@ -1240,6 +1240,82 @@ public class LinearKernelRouteTest {
         }
     }
 
+    /** The fused gate|up tile (1.8.3): one launch over the concatenated
+     *  packed weight writes [rows x (outA + outB)], and each half agrees
+     *  with the projection's own batched launch to float rounding (the
+     *  same kernel over the same bytes, a different grid). FIRES: the
+     *  pair takes the fused tile; the record names it. */
+    @Test
+    public void fusedGateUpTileAgreesWithTheSeparateTiles() {
+        if (!KernelCap.usable("q4kQ8TcTileKernel")) {
+            DeviceSkip.tracked("backend " + Device.activeBackend()
+                + " has no tensor-core tile", "xpu-kernel-adaptor 1.8.3");
+            return;
+        }
+        if (Linear.backendIsVulkan() || !Linear.waveMv()
+                || !Linear.matrixCoresPay()) {
+            DeviceSkip.tracked("the tensor-core tile is not routed on "
+                + Device.activeBackend(), "xpu-kernel-adaptor 1.8.3");
+            return;
+        }
+        int32 rows = 256;
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        Linear a #= LinearKernelRouteTest.tiled(Quant.GG_Q4_K, "q4_k.bin");
+        // b is twice as tall, so the fused output's tail columns come
+        // from rows the first projection never had.
+        int64 cob = co * 2L;
+        Linear b #= LinearKernelRouteTest.tiledAt(Quant.GG_Q4_K, "q4_k.bin",
+            (int32) ci, (int32) cob);
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ci, 0L);
+        Tensor<float32> wantA #= LinearKernelRouteTest.ramp(0L, (int64) rows * co);
+        Tensor<float32> wantB #= LinearKernelRouteTest.ramp(0L, (int64) rows * cob);
+        QuantKernel.setRoutingEnabled(true);
+        boolean tcWas = Linear.tcEnabled();
+        Linear.setTc(true);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        a.matmulInto(rows, wantA, 0L);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        b.matmulInto(rows, wantB, 0L);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap tap = heap PrefillTap();
+        Diag.register(tap);
+        boolean took = a.fusedPairBatchKeep(b, rows);
+        Diag.register(null);
+        Linear.setTc(tcWas);
+        if (!took || !tap.saw("batch-route", "q4 tcTile gate|up")) {
+            Assert.fail("the fused gate|up tile was not taken, saw "
+                + tap.namesOf("batch-route"));
+            return;
+        }
+        QuantKernel.stream().sync();
+        int64 fo = co + cob;
+        float32[] got #= heap float32[(int64) rows * fo];
+        a.fusedBatchOut().download(got, (int64) rows * fo);
+        LinearKernelRouteTest.assertLive(wantA, (int64) rows * co, "gate alone");
+        int64 r = 0;
+        while (r < (int64) rows) {
+            int64 c = 0;
+            while (c < fo) {
+                float32 w = c < co ? wantA.flatGet(r * co + c)
+                    : wantB.flatGet(r * cob + (c - co));
+                float32 g = got[r * fo + c];
+                float32 d = w - g;
+                if (d < 0.0f) { d = 0.0f - d; }
+                float32 m = w < 0.0f ? 0.0f - w : w;
+                if (m < 1.0f) { m = 1.0f; }
+                if (d / m > 0.00001f) {
+                    Assert.fail("fused gate|up row " + r + " col " + c + ": "
+                        + g + " vs the separate tile's " + w);
+                    return;
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+    }
+
     @Test
     public void multiWavePackedQ4kAgreesWithDeqMw8() {
         if (!KernelCap.usable("q4kWmmaMwKernel")

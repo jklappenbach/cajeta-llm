@@ -453,7 +453,9 @@ public final class CausalLM extends InfModule {
         if (n <= 0) {
             throw heap LlmException("step: token count must be positive");
         }
+        int64 tStep0 = Clock.nanoTime();
         this.armRoutes(seq);
+        CausalLM.pfArmNs = CausalLM.pfArmNs + (Clock.nanoTime() - tStep0);
         int32 seqPos = this.seqLength(seq);
         if (seqPos + n > this.maxSeq) {
             throw heap LlmException("step: " + n
@@ -486,6 +488,8 @@ public final class CausalLM extends InfModule {
         Tensor<float32> v #= arena.take(rows, kvd);
         Tensor<float32> gate #= arena.take(rows, inter);
         Tensor<float32> up #= arena.take(rows, inter);
+        int64 tEmb0 = Clock.nanoTime();
+        CausalLM.pfArenaNs = CausalLM.pfArenaNs + (tEmb0 - tStep0);
 
         // THE EMBEDDING STAYS ON THE DEVICE (xpu-kernel-adaptor 1.8.3)
         // when the batched, resident prefill will take the chunk and the
@@ -513,9 +517,12 @@ public final class CausalLM extends InfModule {
             }
         }
         int32 seqPos2 = this.seqLength(seq);
+        CausalLM.pfEmbedNs = CausalLM.pfEmbedNs + (Clock.nanoTime() - tEmb0);
         this.forwardRows(seq, hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
             n, seqPos2);
-        return this.lastStepArgmax();
+        int32 am = this.lastStepArgmax();
+        CausalLM.pfStepNs = CausalLM.pfStepNs + (Clock.nanoTime() - tStep0);
+        return am;
     }
 
     /**
@@ -1089,16 +1096,7 @@ public final class CausalLM extends InfModule {
             this.lmHead.matvecStagedKeep();
             boolean devAm = CausalLM.deviceArgmax;
             if (devAm) {
-                if (this.tokDev == null) {
-                    int64 groups = ((int64) this.cfg.vocabSize + 1023L) / 1024L;
-                    this.tokDev = heap KernelBuffer<int32>((uint64) 1);
-                    this.tokHost = heap int32[1];
-                    this.amPv = heap KernelBuffer<float32>((uint64) groups);
-                    this.amPi = heap KernelBuffer<int32>((uint64) groups);
-                    this.amCounter = heap KernelBuffer<int32>((uint64) 1);
-                    int32[] z = heap int32[1];
-                    this.amCounter.upload(z, 1L);
-                }
+                this.ensureArgmaxBuffers();
                 KernelBuffer<int32> amOut = this.tokDev;
                 if (this.pipe) { amOut = this.pipeSlot(this.pipeOut); }
                 QuantKernel.argmaxRowLaunchNoSync(amOut,
@@ -1256,6 +1254,22 @@ public final class CausalLM extends InfModule {
         this.pfHsHost #= heap float32[n];
         this.pfHsCap = n;
         CausalLM.pfGrowNs = CausalLM.pfGrowNs + (Clock.nanoTime() - rg0);
+        return;
+    }
+
+    /** The device argmax's slot, its partial-reduction scratch and its
+     *  counter, shared by decode's fused tail and the prefill's. */
+    void ensureArgmaxBuffers() {
+        if (this.tokDev == null) {
+            int64 groups = ((int64) this.cfg.vocabSize + 1023L) / 1024L;
+            this.tokDev = heap KernelBuffer<int32>((uint64) 1);
+            this.tokHost = heap int32[1];
+            this.amPv = heap KernelBuffer<float32>((uint64) groups);
+            this.amPi = heap KernelBuffer<int32>((uint64) groups);
+            this.amCounter = heap KernelBuffer<int32>((uint64) 1);
+            int32[] z = heap int32[1];
+            this.amCounter.upload(z, 1L);
+        }
         return;
     }
 
@@ -1554,7 +1568,28 @@ public final class CausalLM extends InfModule {
     public static int64 prefillStageNs()  { return CausalLM.pfStageNs; }
     public static int64 prefillRopeNs()   { return CausalLM.pfRopeNs; }
     public static int64 prefillAttendNs() { return CausalLM.pfAttendNs; }
+    /** Host time of the prefill step outside the layer stack (1.8.3):
+     *  the arena, the embedding, and the whole stepSeq. */
+    static int64 pfArenaNs;
+    static int64 pfEmbedNs;
+    static int64 pfStepNs;
+    static int64 pfArmNs;
+    static int64 pfQueueNs;
+    static int64 pfSyncNs;
+    public static int64 prefillArmNs() { return CausalLM.pfArmNs; }
+    public static int64 prefillQueueNs() { return CausalLM.pfQueueNs; }
+    public static int64 prefillSyncNs() { return CausalLM.pfSyncNs; }
+    public static int64 prefillArenaNs() { return CausalLM.pfArenaNs; }
+    public static int64 prefillEmbedNs() { return CausalLM.pfEmbedNs; }
+    public static int64 prefillStepNs() { return CausalLM.pfStepNs; }
+
     public static void resetPrefillTimers() {
+        CausalLM.pfArenaNs = 0L;
+        CausalLM.pfEmbedNs = 0L;
+        CausalLM.pfStepNs = 0L;
+        CausalLM.pfArmNs = 0L;
+        CausalLM.pfQueueNs = 0L;
+        CausalLM.pfSyncNs = 0L;
         CausalLM.pfGrowNs = 0L;
         CausalLM.pfKvBackNs = 0L;
         CausalLM.pfLazyNs = 0L;
@@ -1586,6 +1621,10 @@ public final class CausalLM extends InfModule {
     // same graph submission). Off = the two-round-trip host tail, kept
     // for tied embeddings, un-routed formats, and the bench's A/B arm.
     static boolean fuseTail = true;
+    /** Flush the deferred stream every this many layers of a resident
+     *  batched prefill (0 = only at the tail, the measured default). */
+    static int32 pfFlushLayers = 0;
+    public static void setPrefillFlushLayers(int32 n) { CausalLM.pfFlushLayers = n; }
     public static void setFuseTail(boolean on) {
         CausalLM.fuseTail = on;
     }
@@ -1918,6 +1957,9 @@ public final class CausalLM extends InfModule {
      *  other's entries — 25.3). */
     int64 stageTag;
     boolean batchSaid;
+    /** Whether the `prefill-tail` record (fused device tail or host) has
+     *  been said for this model. */
+    boolean tailSaid;
     /** Whether the `prefill-embed` record (device gather or host fill)
      *  has been said for this model. */
     boolean embSaid;
@@ -2389,6 +2431,17 @@ public final class CausalLM extends InfModule {
                     nHs);
                 CausalLM.pfPrimNs = CausalLM.pfPrimNs
                     + (CausalLM.pfMark() - ta2);
+                // A mid-prefill flush of the deferred stream (1.8.3, the
+                // bench's --pf-flush): MEASURED NOT TO PAY on sm_89. The
+                // whole prefill is one 678-launch graph submitted at the
+                // tail's sync, and the host queues it in 0.7 ms of the 47
+                // ms step, so there is nothing to overlap; a flush per
+                // layer costs 81 ms (a graph's build and patch per flush),
+                // every 4 or 8 layers is within noise of none. Off.
+                if (CausalLM.pfFlushLayers > 0
+                        && (l + 1) % CausalLM.pfFlushLayers == 0) {
+                    QuantKernel.stream().flush();
+                }
             } else {
                 d.mlp.gateProj.matmulInto(rows, gate, 0L);
                 d.mlp.upProj.matmulInto(rows, up, 0L);
@@ -2423,26 +2476,57 @@ public final class CausalLM extends InfModule {
             }
             l = l + 1;
         }
+        boolean devTail = false;
         if (res) {
-            // Only the LAST row of hs comes home (10.12.35): the sole
-            // consumer after this loop is the final rmsnorm + logits
-            // over row rows-1, and hs is an arena slice that dies with
-            // the call — nothing reads the other rows. 16 KB down
-            // instead of 8 MB + a 2M-element host copy loop.
+            // Only the LAST row of hs matters after this loop (10.12.35):
+            // the sole consumer is the final rmsnorm + logits over row
+            // rows-1, and hs is an arena slice that dies with the call.
             int64 tt0 = Clock.nanoTime();
             this.ensurePrefillLast((int64) h);
             Prim.sliceF32Device(this.pfLastDev, this.pfHsDev,
                 (int64) h, (int64) (rows - 1) * (int64) h);
             KernelStream ps = QuantKernel.stream();
-            ps.sync();
-            this.pfLastDev.download(this.pfHsHost, (int64) h);
-            float32[] hb2 = hs.hostBuffer();
-            int64 hb02 = hs.hostBase()
-                + (int64) (rows - 1) * (int64) h;
-            int64 c2 = 0;
-            while (c2 < (int64) h) {
-                hb2[hb02 + c2] = this.pfHsHost[c2];
-                c2 = c2 + 1;
+            if (CausalLM.fuseTail && CausalLM.deviceArgmax
+                    && this.lmHead.isDeviceRouted()) {
+                // THE FUSED TAIL, as decode's (1.8.3): the final norm, the
+                // head and the argmax ride the chain's stream and one int
+                // comes down, in place of a 16 KB download, a host norm,
+                // an upload, a second launch-and-sync and a 0.5 MB logits
+                // download (measured 4 ms of a 74 ms prefill on sm_89). A
+                // sampler that needs the logits fetches them lazily.
+                Prim.rmsnormDevice(this.pfXnDev, this.pfLastDev,
+                    this.model.norm.deviceWeight(), (int64) h,
+                    this.model.norm.eps, this.cfg.normForm);
+                Linear.stageDeviceActivation(this.pfXnDev, (int64) h);
+                this.lmHead.matvecStagedKeep();
+                this.ensureArgmaxBuffers();
+                QuantKernel.argmaxRowLaunchNoSync(this.tokDev,
+                    this.lmHead.out(), (int64) this.cfg.vocabSize, this.amPv,
+                    this.amPi, this.amCounter);
+                int64 tq1 = Clock.nanoTime();
+                CausalLM.pfQueueNs = CausalLM.pfQueueNs + (tq1 - pcT0);
+                ps.sync();
+                CausalLM.pfSyncNs = CausalLM.pfSyncNs + (Clock.nanoTime() - tq1);
+                this.tokDev.download(this.tokHost, 1L);
+                this.lastArgmax = this.tokHost[0];
+                this.logitsStale = true;
+                devTail = true;
+            } else {
+                ps.sync();
+                this.pfLastDev.download(this.pfHsHost, (int64) h);
+                float32[] hb2 = hs.hostBuffer();
+                int64 hb02 = hs.hostBase()
+                    + (int64) (rows - 1) * (int64) h;
+                int64 c2 = 0;
+                while (c2 < (int64) h) {
+                    hb2[hb02 + c2] = this.pfHsHost[c2];
+                    c2 = c2 + 1;
+                }
+            }
+            if (!this.tailSaid) {
+                this.tailSaid = true;
+                Diag.emit("prefill-tail", 0 - 1, devTail ? "device" : "host",
+                    (int64) rows, 0L, 0L, 0L, 0L, 0L);
             }
             CausalLM.pfTailHsNs = CausalLM.pfTailHsNs
                 + (Clock.nanoTime() - tt0);
@@ -2506,10 +2590,12 @@ public final class CausalLM extends InfModule {
         }
 
         int64 tl0 = Clock.nanoTime();
-        int64 lastH = (int64) (rows - 1) * (int64) h;
-        Prim.rmsnormRowHost(hs, lastH, this.model.norm.weight,
-            this.model.norm.eps, xn, lastH, h, this.cfg.normForm);
-        this.lmHead.matvecInto(xn, lastH, this.pool.logits, 0);
+        if (!devTail) {
+            int64 lastH = (int64) (rows - 1) * (int64) h;
+            Prim.rmsnormRowHost(hs, lastH, this.model.norm.weight,
+                this.model.norm.eps, xn, lastH, h, this.cfg.normForm);
+            this.lmHead.matvecInto(xn, lastH, this.pool.logits, 0);
+        }
         CausalLM.pfLogitsNs = CausalLM.pfLogitsNs
             + (Clock.nanoTime() - tl0);
         // 11.1: what this step paid on the host besides its launches --

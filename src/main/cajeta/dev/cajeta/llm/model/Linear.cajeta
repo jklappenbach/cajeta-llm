@@ -2987,6 +2987,10 @@ public final class Linear extends InfModule {
         return;
     }
 
+    /** The fused pair's concatenated batch output (View genre: a plain
+     *  return of interior state). */
+    public KernelBuffer<float32> fusedBatchOut() { return this.fusedYBatch; }
+
     void ensureFusedY(int32 rows) {
         if (this.fusedYBatch != null && this.fusedYRows >= rows) {
             return;
@@ -3020,10 +3024,72 @@ public final class Linear extends InfModule {
             && Linear.q4Mw8On;
     }
 
+    /** The concatenated packed copy alone (no widen): what the
+     *  tensor-core tile reads for a fused pair. */
+    void ensureFusedPacked2(Linear b) {
+        if (this.fusedPackedDev != null) { return; }
+        this.ensureDevice();
+        b.ensureDevice();
+        int64 an = this.packedBytes;
+        int64 bn = b.packedBytes;
+        this.fusedOut = (int64) this.outDim + (int64) b.outDim;
+        this.fusedPackedDev #= heap KernelBuffer<int8>(
+            (uint64) (an + bn));
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, this.payloadDev,
+            an, 0L);
+        WmmaKernel.concatI8Launch(this.fusedPackedDev, b.payloadDev,
+            bn, an);
+        return;
+    }
+
+    /** Whether the tensor-core tile may take a batched launch of this
+     *  projection (1.8.3): the switch, the kernel, the measured probe,
+     *  and neither a slot nor an expert window. The shape is asked
+     *  separately. */
+    boolean tcAdmits() {
+        Linear.ensureKernelAvail();
+        return Linear.wmmaOn && Linear.tcOn && Linear.avQ4Tc
+            && !Linear.backendIsVulkan()
+            && !this.slotMode && this.winStage == null
+            && Linear.matrixCoresPay();
+    }
+
+    /** Fused gate|up on the tensor-core tile (1.8.3): ONE launch over the
+     *  concatenated packed weight, so the two 14336-row grids (448 tiles
+     *  each, 3.5 waves of the part's 128 SMs, the last half empty) become
+     *  one 896-tile grid of seven full waves. The caller's fused GLU
+     *  reads `fusedYBatch` as for the Mw8 fused launch. */
+    boolean fusedPairTc(Linear b, int32 rows) {
+        if (this.hasEpilogue() || b.hasEpilogue()) { return false; }
+        if (this.packedTy != Quant.GG_Q4_K || b.packedTy != Quant.GG_Q4_K) {
+            return false;
+        }
+        if (this.inDim != b.inDim) { return false; }
+        if (!this.tcAdmits() || !b.tcAdmits()) { return false; }
+        int64 padRows = ((int64) rows + 127L) / 128L * 128L;
+        int64 fusedOut = (int64) this.outDim + (int64) b.outDim;
+        if (!TcTile.fits(padRows, fusedOut, (int64) this.inDim)) { return false; }
+        this.ensureFusedPacked2(b);
+        this.ensureFusedY((int32) padRows);
+        Linear.ensureBtXp();
+        int64 t0 = Clock.nanoTime();
+        this.sayRoute(17592186044416L, "q4 tcTile gate|up");
+        TcTile.q4kQ8TcTileLaunchNoSync(this.fusedYBatch,
+            this.fusedPackedDev, Linear.btXp, padRows, this.fusedOut,
+            (int64) this.inDim);
+        int64 t1 = Clock.nanoTime();
+        Linear.wmmaCalls = Linear.wmmaCalls + 1L;
+        Linear.btWmmaNs = Linear.btWmmaNs + (t1 - t0);
+        Linear.btLaunchNs = Linear.btLaunchNs + (t1 - t0);
+        Linear.btCalls = Linear.btCalls + 1L;
+        return true;
+    }
+
     /** Fused gate|up: one launch; the caller runs the fused GLU over
      *  `fusedYBatch`. Returns false (nothing launched) when the route
      *  does not apply. */
     boolean fusedPairBatchKeep(Linear b, int32 rows) {
+        if (this.fusedPairTc(b, rows)) { return true; }
         // A fused launch writes ONE concatenated output; a per-projection
         // bias does not belong to it (spec 4.12). Step aside rather than
         // grow a concatenated-bias buffer for a route the coop GEMM
