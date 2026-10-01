@@ -3,6 +3,7 @@ package dev.cajeta.llm.io;
 import cajeta.lang.Cajeta;
 import cajeta.xpu.Barrier;
 import cajeta.xpu.CooperativeMatrix;
+import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelThread;
@@ -71,16 +72,17 @@ public final class TcTile {
     // allocator use the 255 a 256-thread block allows (the accumulators
     // alone are 160 registers a thread). Held on amdgpu and vulkan, where
     // the double-buffered tiles' 98 KB of shared memory is over the 64 KB
-    // those parts offer a workgroup, and on cpu, where the cooperative
-    // matrix is the software tile and a 128x128 workgroup tile has not
-    // been measured to pay; the Mw8 deq GEMMs stay those backends' route,
-    // and the kernel's availability is what the batched route asks.
+    // those parts offer a workgroup; the Mw8 deq GEMMs stay those
+    // backends' route. On cpu it lowers (the software tile) and the route
+    // asks the measured Linear.matrixCoresPay, whose matrix-core arm is
+    // this tile, before taking it.
     @Occupancy(maxThreads = 256)
     @Kernel @FastMath
-    @Unlowered(backend = {"cpu", "amdgpu", "vulkan"}, tracked = "xpu-kernel-adaptor 1.8.3")
+    @Unlowered(backend = {"amdgpu", "vulkan"}, tracked = "xpu-kernel-adaptor 1.8.3")
     public static void q4kQ8TcTileKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp, uint32 rows,
-            uint32 outDim, uint32 tilesN8, int64 blocksPerRow) {
+            uint32 outDim, uint32 tilesN8, int64 blocksPerRow,
+            KernelBuffer<float32> part, uint32 splits) {
         // Half-block tiles, [buffer][row][k] at stride 144, two buffers each.
         Shared<int8> aT = shared int8[36864];
         Shared<int8> bT = shared int8[36864];
@@ -99,8 +101,14 @@ public final class TcTile {
         uint32 wid = tid / 32;
         uint32 lane16 = lane % 16;
         uint32 wg = KernelThread.globalIdX() / 256;
-        uint32 tileT = wg / tilesN8;
-        uint32 tileI8 = wg % tilesN8;
+        // Split-K: workgroups `tile * splits + split` share a tile, each
+        // over its own run of blocksPerRow / splits blocks.
+        uint32 tile = wg / splits;
+        uint32 split = wg % splits;
+        int64 nbs = blocksPerRow / (int64) splits;
+        int64 bOff = (int64) split * nbs;
+        uint32 tileT = tile / tilesN8;
+        uint32 tileI8 = tile % tilesN8;
         uint32 t0 = tileT * 128;
         uint32 i0 = tileI8 * 128;
         uint32 wr = wid / 2;
@@ -114,8 +122,8 @@ public final class TcTile {
         if (t0 < rows && i0 < outDim) {
             int64 rowBytes = blocksPerRow * 144L;
             int64 xRowBytes = blocksPerRow * 320L;
-            int64 sRo = (int64) (i0 + sCol) * rowBytes;
-            int64 sXb = (int64) (t0 + sCol) * xRowBytes;
+            int64 sRo = (int64) (i0 + sCol) * rowBytes + bOff * 144L;
+            int64 sXb = (int64) (t0 + sCol) * xRowBytes + bOff * 320L;
             // The activation chunks this thread copies: chunk c = tid + 256i
             // is token c/8, 16-byte part c%8 of the half's 128 bytes, so
             // eight consecutive threads read one token's 128 contiguous
@@ -125,7 +133,8 @@ public final class TcTile {
             // three more base registers.
             uint32 aRow0 = tid >> 3;
             uint32 aPart = tid & 7;
-            int64 aSrc0 = (int64) (t0 + aRow0) * xRowBytes + (int64) (16 * aPart);
+            int64 aSrc0 = (int64) (t0 + aRow0) * xRowBytes + (int64) (16 * aPart)
+                + bOff * 320L;
             int64 xr32 = 32L * xRowBytes;
             uint32 aDst0 = aRow0 * 144 + 16 * aPart;
 
@@ -186,7 +195,7 @@ public final class TcTile {
                 pq1 = xp.vload<16>(sXb + 272L);
             }
 
-            uint32 nh = (uint32) blocksPerRow * 2;
+            uint32 nh = (uint32) nbs * 2;
             uint32 hh = 0;
             while (hh < nh) {
                 uint32 H = hh & 1;
@@ -408,6 +417,27 @@ public final class TcTile {
                 hh = hh + 1;
             }
 
+            if (splits > 1) {
+                // SPLIT-K: this workgroup's partial tile goes to its slot of
+                // `part` (row-major 128x128); the fixup launch sums the
+                // slots into y. A fold in this kernel (the last arriver
+                // summing the others' slots) was measured 2026-10-01 to
+                // cost the unsplit shapes 5% (289 to 305 us at
+                // 512x4096x14336): the accumulators read under a loop
+                // after the main loop changed the allocator's hand at
+                // 255 registers. The partial store alone does not.
+                uint32 pbase = (tile * splits + split) * 16384;
+                uint32 pw = (32 * wr) * 128 + 64 * wc;
+                facc0.store(part, pbase + pw, 0, 128);
+                facc1.store(part, pbase + pw + 16, 0, 128);
+                facc2.store(part, pbase + pw + 32, 0, 128);
+                facc3.store(part, pbase + pw + 48, 0, 128);
+                facc4.store(part, pbase + pw + 2048, 0, 128);
+                facc5.store(part, pbase + pw + 2048 + 16, 0, 128);
+                facc6.store(part, pbase + pw + 2048 + 32, 0, 128);
+                facc7.store(part, pbase + pw + 2048 + 48, 0, 128);
+                return;
+            }
             facc0.store(y, (uint32) ((int64) tw * (int64) outDim
                 + (int64) cw), 0, outDim);
             facc1.store(y, (uint32) ((int64) tw * (int64) outDim
@@ -448,10 +478,11 @@ public final class TcTile {
      */
     @Occupancy(maxThreads = 256)
     @Kernel @FastMath
-    @Unlowered(backend = {"cpu", "amdgpu", "vulkan"}, tracked = "xpu-kernel-adaptor 1.8.3")
+    @Unlowered(backend = {"amdgpu", "vulkan"}, tracked = "xpu-kernel-adaptor 1.8.3")
     public static void q6kQ8TcTileKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp, uint32 rows,
-            uint32 outDim, uint32 tilesN8, int64 blocksPerRow) {
+            uint32 outDim, uint32 tilesN8, int64 blocksPerRow,
+            KernelBuffer<float32> part, uint32 splits) {
         Shared<int8> aT = shared int8[36864];
         Shared<int8> bT = shared int8[36864];
         Shared<float32> xsAll = shared float32[256];
@@ -464,8 +495,14 @@ public final class TcTile {
         uint32 wid = tid / 32;
         uint32 lane16 = lane % 16;
         uint32 wg = KernelThread.globalIdX() / 256;
-        uint32 tileT = wg / tilesN8;
-        uint32 tileI8 = wg % tilesN8;
+        // Split-K: workgroups `tile * splits + split` share a tile, each
+        // over its own run of blocksPerRow / splits blocks.
+        uint32 tile = wg / splits;
+        uint32 split = wg % splits;
+        int64 nbs = blocksPerRow / (int64) splits;
+        int64 bOff = (int64) split * nbs;
+        uint32 tileT = tile / tilesN8;
+        uint32 tileI8 = tile % tilesN8;
         uint32 t0 = tileT * 128;
         uint32 i0 = tileI8 * 128;
         uint32 wr = wid / 2;
@@ -480,12 +517,13 @@ public final class TcTile {
             int64 rowBytes = prefix + blocksPerRow * 208L;
             int64 xRowBytes = blocksPerRow * 320L;
             // This thread's column: its scale prefix and its first payload.
-            int64 sRow = (int64) (i0 + sCol) * rowBytes;
-            int64 sRo = sRow + prefix;
-            int64 sXb = (int64) (t0 + sCol) * xRowBytes;
+            int64 sRow = (int64) (i0 + sCol) * rowBytes + bOff * 2L;
+            int64 sRo = (int64) (i0 + sCol) * rowBytes + prefix + bOff * 208L;
+            int64 sXb = (int64) (t0 + sCol) * xRowBytes + bOff * 320L;
             uint32 aRow0 = tid >> 3;
             uint32 aPart = tid & 7;
-            int64 aSrc0 = (int64) (t0 + aRow0) * xRowBytes + (int64) (16 * aPart);
+            int64 aSrc0 = (int64) (t0 + aRow0) * xRowBytes + (int64) (16 * aPart)
+                + bOff * 320L;
             int64 xr32 = 32L * xRowBytes;
             uint32 aDst0 = aRow0 * 144 + 16 * aPart;
 
@@ -541,7 +579,7 @@ public final class TcTile {
             int32 pd = ((int32) packed[sRow] & 255)
                 | (((int32) packed[sRow + 1L] & 255) << 8);
 
-            uint32 nh = (uint32) blocksPerRow * 2;
+            uint32 nh = (uint32) nbs * 2;
             uint32 hh = 0;
             while (hh < nh) {
                 uint32 H = hh & 1;
@@ -704,6 +742,27 @@ public final class TcTile {
                 hh = hh + 1;
             }
 
+            if (splits > 1) {
+                // SPLIT-K: this workgroup's partial tile goes to its slot of
+                // `part` (row-major 128x128); the fixup launch sums the
+                // slots into y. A fold in this kernel (the last arriver
+                // summing the others' slots) was measured 2026-10-01 to
+                // cost the unsplit shapes 5% (289 to 305 us at
+                // 512x4096x14336): the accumulators read under a loop
+                // after the main loop changed the allocator's hand at
+                // 255 registers. The partial store alone does not.
+                uint32 pbase = (tile * splits + split) * 16384;
+                uint32 pw = (32 * wr) * 128 + 64 * wc;
+                facc0.store(part, pbase + pw, 0, 128);
+                facc1.store(part, pbase + pw + 16, 0, 128);
+                facc2.store(part, pbase + pw + 32, 0, 128);
+                facc3.store(part, pbase + pw + 48, 0, 128);
+                facc4.store(part, pbase + pw + 2048, 0, 128);
+                facc5.store(part, pbase + pw + 2048 + 16, 0, 128);
+                facc6.store(part, pbase + pw + 2048 + 32, 0, 128);
+                facc7.store(part, pbase + pw + 2048 + 48, 0, 128);
+                return;
+            }
             facc0.store(y, (uint32) ((int64) tw * (int64) outDim
                 + (int64) cw), 0, outDim);
             facc1.store(y, (uint32) ((int64) tw * (int64) outDim
@@ -730,11 +789,101 @@ public final class TcTile {
             int64 outDim, int64 cols) {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
+        int64 tiles = tilesM8 * tilesN8;
+        int64 nb = cols / 256L;
+        int64 sp = TcTile.splitsFor(tiles, nb);
+        TcTile.ensureScratch(tiles, sp);
         KernelStream s = QuantKernel.stream();
         q6kQ8TcTileKernel.launch(s,
-            grid: [(uint32) (tilesM8 * tilesN8)], block: [256])
+            grid: [(uint32) (tiles * sp)], block: [256])
             (y, packed, xp, (uint32) rows, (uint32) outDim,
-             (uint32) tilesN8, cols / 256L);
+             (uint32) tilesN8, nb, TcTile.part, (uint32) sp);
+        TcTile.fixupLaunch(y, rows, outDim, tilesN8, sp);
+        return;
+    }
+
+    /** The split-K fixup: y[t][c] is the sum over the splits of their
+     *  partial tiles, one thread an element. */
+    @Kernel
+    public static void tcSplitFixupKernel(KernelBuffer<float32> y,
+            KernelBuffer<float32> part, uint32 rows, uint32 outDim,
+            uint32 tilesN8, uint32 splits) {
+        uint32 e = KernelThread.globalIdX();
+        uint32 total = rows * outDim;
+        if (e < total) {
+            uint32 t = e / outDim;
+            uint32 c = e - t * outDim;
+            uint32 tile = (t / 128) * tilesN8 + c / 128;
+            int64 at = (int64) (tile * splits) * 16384L
+                + (int64) ((t % 128) * 128 + c % 128);
+            float32 acc = 0.0f;
+            uint32 sp = 0;
+            while (sp < splits) {
+                acc = acc + part[at + (int64) sp * 16384L];
+                sp = sp + 1;
+            }
+            y[(int64) e] = acc;
+        }
+    }
+
+    static void fixupLaunch(KernelBuffer<float32> y, int64 rows, int64 outDim,
+            int64 tilesN8, int64 splits) {
+        if (splits <= 1L) { return; }
+        int64 total = rows * outDim;
+        KernelStream s = QuantKernel.stream();
+        tcSplitFixupKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
+            block: [256])
+            (y, TcTile.part, (uint32) rows, (uint32) outDim, (uint32) tilesN8,
+             (uint32) splits);
+        return;
+    }
+
+    // ── split-K ─────────────────────────────────────────────────────
+    // A 128x128 tile grid narrower than the part leaves multiprocessors
+    // idle: the 1024x4096 projections at 512 tokens are 32 workgroups
+    // for 128 SMs, and measured 81 us against llama.cpp's 31 (which
+    // balances with stream-K). Splitting K across workgroups fills the
+    // part at the cost of one partial tile per split (64 KB, L2-resident
+    // at these sizes) and a fixup launch that sums them: 45 us.
+    static KernelBuffer<float32> part;
+    static int64 partCap;
+    static int64 splitOverride = 0L;
+
+    /** Force the split count (the parity leg's `--splitk`); 0 measures. */
+    public static void setSplitOverride(int64 v) { TcTile.splitOverride = v; }
+
+    /** The split count for `tiles` workgroup tiles over `nb` blocks: the
+     *  smallest divisor of `nb` (at most 8) that fills the part's
+     *  multiprocessors, 1 when the grid already does. */
+    public static int64 splitsFor(int64 tiles, int64 nb) {
+        if (TcTile.splitOverride > 0L) {
+            if (nb % TcTile.splitOverride == 0L) { return TcTile.splitOverride; }
+            return 1L;
+        }
+        int64 sms = (int64) Device.multiprocessorCount();
+        if (sms <= 0L) { sms = 128L; }
+        if (tiles >= sms) { return 1L; }
+        int64 sp = 1L;
+        int64 cand = 2L;
+        while (cand <= 8L) {
+            if (nb % cand == 0L) {
+                sp = cand;
+                if (tiles * cand >= sms) { return cand; }
+            }
+            cand = cand + 1L;
+        }
+        return sp;
+    }
+
+    /** The partial tiles for a split launch, grown as needed (an in-flight
+     *  launch may still read the old buffer, so the stream drains first). */
+    static void ensureScratch(int64 tiles, int64 splits) {
+        int64 need = splits > 1L ? tiles * splits * 16384L : 1L;
+        if (TcTile.part == null || TcTile.partCap < need) {
+            QuantKernel.stream().sync();
+            TcTile.part #= heap KernelBuffer<float32>((uint64) need);
+            TcTile.partCap = need;
+        }
         return;
     }
 
@@ -746,11 +895,16 @@ public final class TcTile {
             int64 outDim, int64 cols) {
         int64 tilesM8 = rows / 128L;
         int64 tilesN8 = outDim / 128L;
+        int64 tiles = tilesM8 * tilesN8;
+        int64 nb = cols / 256L;
+        int64 sp = TcTile.splitsFor(tiles, nb);
+        TcTile.ensureScratch(tiles, sp);
         KernelStream s = QuantKernel.stream();
         q4kQ8TcTileKernel.launch(s,
-            grid: [(uint32) (tilesM8 * tilesN8)], block: [256])
+            grid: [(uint32) (tiles * sp)], block: [256])
             (y, packed, xp, (uint32) rows, (uint32) outDim,
-             (uint32) tilesN8, cols / 256L);
+             (uint32) tilesN8, nb, TcTile.part, (uint32) sp);
+        TcTile.fixupLaunch(y, rows, outDim, tilesN8, sp);
         return;
     }
 }

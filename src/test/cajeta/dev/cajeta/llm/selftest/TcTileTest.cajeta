@@ -7,6 +7,7 @@ import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.io.TcTile;
 import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.Linear;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
 
@@ -126,6 +127,151 @@ public class TcTileTest {
         Assert.isFalse(TcTile.fits6(128L, 128L, 1024L));
         Assert.isTrue(TcTile.fits6(512L, 4096L, 14336L));
         Assert.isTrue(TcTile.fits6(512L, 1024L, 4096L));
+    }
+
+    /** Split-K (1.8.3): a forced 4-way split of a shape that needs none
+     *  lands the same product, so the partials, the arrival count and
+     *  the last arriver's fold are exercised on a grid where every tile
+     *  has four contributors; and the counters are left at zero, so a
+     *  second split launch is right too. */
+    static void checkSplit(int32 ty, int64 rows, int64 out, int64 cols) {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        String kn #= ty == Quant.GG_Q4_K ? "q4kQ8TcTileKernel" : "q6kQ8TcTileKernel";
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        if (!KernelCap.usable(kn)) { DeviceSkip.noKernel(kn, be); return; }
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        String fx #= ty == Quant.GG_Q4_K ? "q4_k.bin" : "q6_k.bin";
+        int8[] raw #= CensusReachTest.tiled(ty, fx, nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        float32[] want #= CensusReachTest.hostGemm(ty, raw, nBlocks, x, rows, out, cols);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) 1);
+        if (Quant.splitOn(ty)) {
+            int8[] res #= heap int8[out * Quant.rowResidentBytes(ty, bpr)];
+            Quant.splitInto(ty, raw, 0L, out, bpr, res, 0L);
+            KernelBuffer<int8> wS #= heap KernelBuffer<int8>((uint64) ((int64) res.count()));
+            wS.upload(res);
+            wD #= wS;
+        } else {
+            KernelBuffer<int8> wR #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+            wR.upload(raw);
+            wD #= wR;
+        }
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        float32[] got #= heap float32[rows * out];
+        TcTile.setSplitOverride(4L);
+        int32 pass = 0;
+        while (pass < 2) {
+            yD.upload(got);
+            if (ty == Quant.GG_Q4_K) {
+                TcTile.q4kQ8TcTileLaunchNoSync(yD, wD, xp, rows, out, cols);
+            } else {
+                TcTile.q6kQ8TcTileLaunchNoSync(yD, wD, xp, rows, out, cols);
+            }
+            QuantKernel.stream().sync();
+            yD.download(got);
+            CensusReachTest.nearOnePercent(want, got, rows * out,
+                kn + " split 4 at " + rows + "x" + out + "x" + cols + " pass " + pass);
+            pass = pass + 1;
+        }
+        TcTile.setSplitOverride(0L);
+        ValueCheck.credit(vc);
+    }
+
+    /** At the engine's own shape (512 tokens, the 4096x14336 ffn_down),
+     *  where the measured split is 1, forced splits of 2 and 4 agree with
+     *  the unsplit launch to float rounding. The host GEMM at this size is
+     *  too slow to be the oracle; the unsplit launch, held to the host at
+     *  the shapes above, is. */
+    @Test
+    public void q4kSplitKAgreesWithTheUnsplitLaunchAtTheEngineShape() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        if (!KernelCap.usable("q4kQ8TcTileKernel")) { DeviceSkip.noKernel("q4kQ8TcTileKernel", be); return; }
+        if (!Linear.matrixCoresPay()) {
+            DeviceSkip.tracked("the tile is the software tile on " + be
+                + "; the engine shape is not run on it", "xpu-kernel-adaptor 1.8.3");
+            return;
+        }
+        int64 rows = 512L;
+        int64 out = 4096L;
+        int64 cols = 14336L;
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int8[] raw #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+        wD.upload(raw);
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        float32[] want #= heap float32[rows * out];
+        float32[] got #= heap float32[rows * out];
+        TcTile.setSplitOverride(1L);
+        yD.upload(want);
+        TcTile.q4kQ8TcTileLaunchNoSync(yD, wD, xp, rows, out, cols);
+        QuantKernel.stream().sync();
+        yD.download(want);
+        int64 sp = 2L;
+        while (sp <= 4L) {
+            TcTile.setSplitOverride(sp);
+            int32 pass = 0;
+            while (pass < 3) {
+                TcTile.q4kQ8TcTileLaunchNoSync(yD, wD, xp, rows, out, cols);
+                pass = pass + 1;
+            }
+            QuantKernel.stream().sync();
+            yD.download(got);
+            int64 i = 0;
+            while (i < rows * out) {
+                float32 a = want[i];
+                float32 b = got[i];
+                float32 d = a - b;
+                if (d < 0.0f) { d = 0.0f - d; }
+                float32 m = a < 0.0f ? 0.0f - a : a;
+                if (m < 1.0f) { m = 1.0f; }
+                if (d / m > 0.0001f) {
+                    TcTile.setSplitOverride(0L);
+                    Assert.fail("split " + sp + " element " + i + ": " + b
+                        + " vs unsplit " + a);
+                    return;
+                }
+                i = i + 1;
+            }
+            sp = sp * 2L;
+        }
+        TcTile.setSplitOverride(0L);
+    }
+
+    @Test
+    public void q4kSplitKLandsTheSameProduct() {
+        TcTileTest.checkSplit(Quant.GG_Q4_K, 256L, 256L, 1024L);
+    }
+
+    @Test
+    public void q6kSplitKLandsTheSameProduct() {
+        TcTileTest.checkSplit(Quant.GG_Q6_K, 256L, 256L, 2048L);
+    }
+
+    @Test
+    public void theSplitCountFillsThePartAndDividesTheBlocks() {
+        TcTile.setSplitOverride(0L);
+        int64 sms = (int64) Device.multiprocessorCount();
+        if (sms <= 0L) { sms = 128L; }
+        // A grid already as wide as the part splits nothing.
+        Assert.equals(1L, TcTile.splitsFor(sms, 16L));
+        Assert.equals(1L, TcTile.splitsFor(sms * 3L, 56L));
+        // A narrow grid splits by a divisor of the block count, at most 8.
+        int64 s32 = TcTile.splitsFor(32L, 16L);
+        Assert.isTrue(16L % s32 == 0L);
+        Assert.isTrue(s32 >= 1L && s32 <= 8L);
+        if (sms > 32L) { Assert.isTrue(s32 > 1L); }
+        Assert.isTrue(56L % TcTile.splitsFor(8L, 56L) == 0L);
+        // A prime block count cannot split.
+        Assert.equals(1L, TcTile.splitsFor(8L, 13L));
     }
 
     @Test
