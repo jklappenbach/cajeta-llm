@@ -47,9 +47,9 @@ import dev.cajeta.llm.model.KernelCap;
  * than real weights (2026-09-24), which is reason enough to measure both
  * legs on the same real bytes.
  *
- * Run:  ParityLeg.run --build <cajeta-llm commit> [--gguf model.gguf]
+ * Run:  ParityLeg.run --build <cajeta-llm commit> [--gguf model.gguf [--by-type]]
  *                     [--copies-bytes N] [--rows-per-block N]
- *                     [--family wave|scalar|scalar-f32|batch|wmma] [--n N]
+ *                     [--family wave|scalar|scalar-f32|batch|wmma|cols|mmq] [--n N]
  *                     [--scalar-rows-per-block N]
  */
 public class ParityLeg {
@@ -80,8 +80,20 @@ public class ParityLeg {
     static final int32 WMMA = 4;
     /** The B-column wave mat-vecs at `batchN` columns a launch: batched decode (xpu-kernel-adaptor 13B). */
     static final int32 COLS = 5;
+    /** The LDS-tiled dp4a MMQ GEMMs at `batchN` tokens, the Vulkan batch route beside the coop GEMM (xpu-kernel-adaptor 11.1.2). */
+    static final int32 MMQ = 6;
     static int32 family = 0;
     static int64 batchN = 1L;
+    /** Accept the host-bounded bracket where the backend has no device timer (Vulkan), labelled `host`. */
+    static boolean hostClock = false;
+    static KernelBuffer<int32>[] wArms;
+    static KernelBuffer<int32> xpW;
+
+    /** Does the family launch `batchN` tokens at once? */
+    static boolean batched() {
+        return ParityLeg.family == ParityLeg.BATCH || ParityLeg.family == ParityLeg.WMMA
+            || ParityLeg.family == ParityLeg.COLS || ParityLeg.family == ParityLeg.MMQ;
+    }
 
     /** Does this leg's kernel for `ty` read the packed q8 activation? */
     static boolean packs(int32 ty) {
@@ -89,6 +101,7 @@ public class ParityLeg {
         if (ParityLeg.family == ParityLeg.BATCH) { return true; }
         if (ParityLeg.family == ParityLeg.COLS) { return true; }
         if (ParityLeg.family == ParityLeg.WMMA) { return true; }
+        if (ParityLeg.family == ParityLeg.MMQ) { return true; }
         return ParityLeg.family == ParityLeg.SCALAR && ty == Quant.GG_Q4_K;
     }
 
@@ -97,6 +110,7 @@ public class ParityLeg {
         if (ParityLeg.family == ParityLeg.BATCH) { return Quant.splitOn(ty); }
         if (ParityLeg.family == ParityLeg.COLS) { return Quant.splitOn(ty); }
         if (ParityLeg.family == ParityLeg.WMMA) { return Quant.splitOn(ty); }
+        if (ParityLeg.family == ParityLeg.MMQ) { return Quant.splitOn(ty); }
         if (ParityLeg.family != ParityLeg.WAVE && ParityLeg.packs(ty)) { return false; }
         return Quant.splitOn(ty);
     }
@@ -112,6 +126,10 @@ public class ParityLeg {
     }
 
     static #String kernelName(int32 ty) {
+        if (ParityLeg.family == ParityLeg.MMQ) {
+            if (ty == Quant.GG_Q4_K) { return #"q4kQ8MmqKernel"; }
+            return #"q6kQ8MmqKernel";
+        }
         if (ParityLeg.family == ParityLeg.COLS) {
             if (ty == Quant.GG_Q4_K) { return #"q4kQ8WaveMatVecColsKernel"; }
             return #"q6kQ8WaveMatVecColsKernel";
@@ -145,7 +163,17 @@ public class ParityLeg {
 
     static void launch(int32 ty, KernelBuffer<float32> y, KernelBuffer<int8> w,
             KernelBuffer<int8> xp, KernelBuffer<float32> xf, int64 rows,
-            int64 cols) {
+            int64 cols, int64 arm) {
+        if (ParityLeg.family == ParityLeg.MMQ) {
+            if (ty == Quant.GG_Q4_K) {
+                QuantKernel.q4kQ8MmqLaunchNoSync(y, ParityLeg.wArms[arm], ParityLeg.xpW,
+                    ParityLeg.batchN, rows, cols);
+            } else {
+                QuantKernel.q6kQ8MmqLaunchNoSync(y, ParityLeg.wArms[arm], ParityLeg.xpW,
+                    ParityLeg.batchN, rows, cols);
+            }
+            return;
+        }
         if (ParityLeg.family == ParityLeg.COLS) {
             int64 pb = Quant.q8kPackedBytes(cols);
             if (ty == Quant.GG_Q4_K) {
@@ -196,7 +224,7 @@ public class ParityLeg {
     /** The activation pack this leg's bracket carries: one row, or all
      *  `batchN` rows for the batch family. */
     static void pack(KernelBuffer<int8> xpb, KernelBuffer<float32> xf, int64 cols) {
-        if (ParityLeg.family == ParityLeg.BATCH || ParityLeg.family == ParityLeg.WMMA || ParityLeg.family == ParityLeg.COLS) {
+        if (ParityLeg.batched()) {
             QuantKernel.q8kPackRowsLaunchNoSync(xpb, xf, ParityLeg.batchN, cols, cols);
         } else {
             QuantKernel.q8kPackLaunchNoSync(xpb, xf, cols);
@@ -298,7 +326,7 @@ public class ParityLeg {
 
         // The activation: f32 on the device, packed inside the bracket.
         int64 nTok = 1L;
-        if (ParityLeg.family == ParityLeg.BATCH || ParityLeg.family == ParityLeg.WMMA || ParityLeg.family == ParityLeg.COLS) {
+        if (ParityLeg.batched()) {
             nTok = ParityLeg.batchN;
         }
         float32[] hx #= heap float32[nTok * cols];
@@ -336,6 +364,15 @@ public class ParityLeg {
             }
             c = c + 1;
         }
+        if (ParityLeg.family == ParityLeg.MMQ) {
+            ParityLeg.wArms #= heap KernelBuffer<int32>[copies];
+            c = 0;
+            while (c < copies) {
+                ParityLeg.wArms[c] #= arms[c].wordView();
+                c = c + 1;
+            }
+            ParityLeg.xpW #= xpb.wordView();
+        }
         int64 yN = nTok * rows;
         KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) yN);
         float32[] scratch #= heap float32[yN];
@@ -351,7 +388,7 @@ public class ParityLeg {
             c = 0;
             while (c < copies) {
                 if (pack) { ParityLeg.pack(xpb, xf, cols); }
-                ParityLeg.launch(ty, y, arms[c], xpb, xf, rows, cols);
+                ParityLeg.launch(ty, y, arms[c], xpb, xf, rows, cols, c);
                 c = c + 1;
             }
             w = w + 1;
@@ -391,7 +428,7 @@ public class ParityLeg {
         c = 0;
         while (c < copies) {
             if (pack) { ParityLeg.pack(xpb, xf, cols); }
-            ParityLeg.launch(ty, y, arms[c], xpb, xf, rows, cols);
+            ParityLeg.launch(ty, y, arms[c], xpb, xf, rows, cols, c);
             c = c + 1;
         }
         s.sync();
@@ -412,7 +449,7 @@ public class ParityLeg {
                 c = 0;
                 while (c < copies) {
                     if (pack) { ParityLeg.pack(xpb, xf, cols); }
-                    ParityLeg.launch(ty, y, arms[c], xpb, xf, rows, cols);
+                    ParityLeg.launch(ty, y, arms[c], xpb, xf, rows, cols, c);
                     c = c + 1;
                 }
                 it = it + 1;
@@ -423,9 +460,11 @@ public class ParityLeg {
             int64 dev = t.elapsedNanos();
             t.destroy();
             int64 host = h1 - h0;
-            if (dev > 0L && host > 0L && (ns < 0L || host < ns)) {
+            if ((dev > 0L || ParityLeg.hostClock) && host > 0L && (ns < 0L || host < ns)) {
                 ns = host;
-                scaleRow = ((float64) dev * KernelTimer.clockScale()) / (float64) host;
+                if (dev > 0L) {
+                    scaleRow = ((float64) dev * KernelTimer.clockScale()) / (float64) host;
+                }
             }
             round = round + 1;
         }
@@ -447,6 +486,7 @@ public class ParityLeg {
         r.l2Bytes = Device.l2CacheBytes();
         r.residency #= ParityTable.residency(poolBytes, r.l2Bytes);
         r.tier #= KernelTimer.tierName();
+        if (ParityLeg.hostClock && scaleRow == 0.0) { r.tier #= "host"; }
         r.nsPerLaunch = per;
         r.bytesPerLaunch = pBytes + nTok * cols * 4L + nTok * rows * 4L;
         r.flopsPerLaunch = 2.0 * (float64) nTok * (float64) rows * (float64) cols;
@@ -523,8 +563,60 @@ public class ParityLeg {
         return;
     }
 
+    static boolean hasWaveKernel(int32 ty) {
+        return ty == Quant.GG_Q4_K || ty == Quant.GG_Q6_K || ty == Quant.GG_Q5_K
+            || ty == Quant.GG_Q8_0 || ty == Quant.GG_Q2_K || ty == Quant.GG_Q3_K;
+    }
+
+    /** Every (type, rows, cols) class of the model's projection weights with a wave kernel, each on its own tensors, the pool capped near the pool target (wave-row-geometry 4.1.1). */
+    static void realShapesByType(GgufFile g) {
+        int32 nt = (int32) g.tensorCount();
+        int32[] tys #= heap int32[nt];
+        int64[] rs #= heap int64[nt];
+        int64[] cs #= heap int64[nt];
+        boolean[] live #= heap boolean[nt];
+        int32 i = 0;
+        while (i < nt) {
+            String nm #= "" + g.nameAt(i);
+            int64[] shp #= g.shapeOfName(nm);
+            tys[i] = g.typeOfName(nm);
+            live[i] = (nm.startsWith("blk.") || nm.equals("output.weight"))
+                && (int32) shp.count() == 2 && ParityLeg.hasWaveKernel(tys[i])
+                && shp[1] % 256L == 0L;
+            if (live[i]) { rs[i] = shp[0]; cs[i] = shp[1]; }
+            i = i + 1;
+        }
+        String[] names #= heap String[64];
+        i = 0;
+        while (i < nt) {
+            if (live[i]) {
+                int64 bytes = rs[i] * (cs[i] / (int64) Quant.blockElems(tys[i]))
+                    * (int64) Quant.blockBytes(tys[i]);
+                int64 cap = (ParityLeg.poolTarget + bytes - 1L) / bytes;
+                if (cap < 1L) { cap = 1L; }
+                if (cap > 64L) { cap = 64L; }
+                int32 n = 0;
+                int32 j = i;
+                while (j < nt) {
+                    if (live[j] && tys[j] == tys[i] && rs[j] == rs[i] && cs[j] == cs[i]) {
+                        if ((int64) n < cap) {
+                            names[n] #= "" + g.nameAt(j);
+                            n = n + 1;
+                        }
+                        if (j != i) { live[j] = false; }
+                    }
+                    j = j + 1;
+                }
+                ParityLeg.shapeReal(g, tys[i], rs[i], cs[i], names, n);
+            }
+            i = i + 1;
+        }
+        return;
+    }
+
     public static int32 run(String[] args) {
         String gguf #= "";
+        boolean byType = false;
         int32 i = 0;
         int32 n = (int32) args.count();
         while (i < n) {
@@ -534,6 +626,12 @@ public class ParityLeg {
             } else if (args[i].equals("--copies-bytes") && i + 1 < n) {
                 ParityLeg.poolTarget = Long.parseLong(args[i + 1]);
                 i = i + 2;
+            } else if (args[i].equals("--host-clock")) {
+                ParityLeg.hostClock = true;
+                i = i + 1;
+            } else if (args[i].equals("--by-type")) {
+                byType = true;
+                i = i + 1;
             } else if (args[i].equals("--gguf") && i + 1 < n) {
                 gguf #= "" + args[i + 1];
                 i = i + 2;
@@ -557,6 +655,9 @@ public class ParityLeg {
                 } else if (args[i + 1].equals("cols")) {
                     ParityLeg.family = ParityLeg.COLS;
                     if (ParityLeg.batchN < 1L || ParityLeg.batchN > 8L) { ParityLeg.batchN = 4L; }
+                } else if (args[i + 1].equals("mmq")) {
+                    ParityLeg.family = ParityLeg.MMQ;
+                    if (ParityLeg.batchN < 2L) { ParityLeg.batchN = 512L; }
                 } else {
                     ParityLeg.family = ParityLeg.WAVE;
                 }
@@ -578,11 +679,11 @@ public class ParityLeg {
             System.stdout.println("# cajeta leg: wave rows per workgroup "
                 + QuantKernel.waveRowsPerBlock() + " (block "
                 + QuantKernel.waveRowBlock() + ")");
-        } else if (ParityLeg.family == ParityLeg.BATCH || ParityLeg.family == ParityLeg.WMMA
-                || ParityLeg.family == ParityLeg.COLS) {
+        } else if (ParityLeg.batched()) {
             System.stdout.println("# cajeta leg: "
                 + (ParityLeg.family == ParityLeg.BATCH ? "batch"
-                    : (ParityLeg.family == ParityLeg.COLS ? "columns" : "matrix-core"))
+                    : (ParityLeg.family == ParityLeg.COLS ? "columns"
+                        : (ParityLeg.family == ParityLeg.MMQ ? "mmq" : "matrix-core")))
                 + " family, " + ParityLeg.batchN
                 + " tokens per launch, kernels " + ParityLeg.kernelName(Quant.GG_Q4_K)
                 + " and " + ParityLeg.kernelName(Quant.GG_Q6_K));
@@ -605,7 +706,11 @@ public class ParityLeg {
         System.stdout.println(hot);
         if (gguf.size() > 0L) {
             GgufFile g #= heap GgufFile(gguf);
-            ParityLeg.realShapes(g);
+            if (byType) {
+                ParityLeg.realShapesByType(g);
+            } else {
+                ParityLeg.realShapes(g);
+            }
             return 0;
         }
         // The engine's seven, cold, synthetic.
