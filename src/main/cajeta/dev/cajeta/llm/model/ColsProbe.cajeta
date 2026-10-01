@@ -1,0 +1,378 @@
+package dev.cajeta.llm.model;
+
+import cajeta.lang.Optional;
+import cajeta.lang.String;
+import cajeta.time.Clock;
+import cajeta.xpu.Autotune;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelManifest;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * Does one pass of the COLUMN mat-vec over a weight serve B decode rows
+ * cheaper than B single-row wave mat-vecs, on this device, for this
+ * format? Measured, checked and remembered (xpu-kernel-adaptor 13.1.1 to
+ * 13.1.4).
+ *
+ * The batched decode (13B) shares one step across B sequences, and its
+ * projections take the column kernel, which reads each weight once for
+ * all B rows. On gfx1151, where a single mat-vec is already at the bus,
+ * that is close to B times the throughput. On sm_89 the same Q4_K column
+ * kernel takes 1.5x the time of eight wave mat-vecs and the Q6_K one 0.6x
+ * (ParityLeg, 2026-10-01), so the batched decode was flat there and no
+ * device attribute could have said so: the attributes give the roofline,
+ * and the question is how far below it each kernel sits on this part.
+ *
+ * Each candidate is held to the host mat-vec at every row BEFORE its time
+ * counts: a fast wrong kernel is not a candidate (13.1.2). The verdict is
+ * stored per device fingerprint under the two kernels' manifest
+ * fingerprint, so a rebuilt kernel is measured again (13.1.4), and the
+ * probe runs at prewarm, never on a token a user waits for (13.2.1).
+ * {@link Linear#matvecCols} takes the column kernel where the verdict is
+ * yes and B wave launches where it is no.
+ */
+public final class ColsProbe {
+
+    public ColsProbe() { return; }
+
+    static String tuneDir = "";
+    public static void setTuneDir(String d) { ColsProbe.tuneDir = d; }
+
+    // Verdicts per format: 0 unmeasured, 1 pays, 2 does not.
+    static int32 v4k;
+    static int32 v6k;
+    static int64 probesN;
+    static int64 checksN;
+    static int64 lastColsNs;
+    static int64 lastWaveNs;
+    static String lastRefusal = "";
+    static boolean poisonCols;
+    static String buildIdOverride = "";
+
+    /** How many decode rows the probe measures at: the batch ceiling. */
+    public static int32 rows() { return CausalLM.DECODE_BATCH_MAX; }
+
+    public static int64 probes() { return ColsProbe.probesN; }
+    public static int64 checks() { return ColsProbe.checksN; }
+    public static int64 colsNs() { return ColsProbe.lastColsNs; }
+    public static int64 waveNs() { return ColsProbe.lastWaveNs; }
+    public static String lastRefused() { return ColsProbe.lastRefusal; }
+
+    /** Test seam: corrupt the column candidate's output before its check. */
+    public static void setPoisonCols(boolean on) { ColsProbe.poisonCols = on; }
+    /** Test seam: the build id the store is keyed under ("" = the manifests'). */
+    public static void setBuildIdForTest(String id) { ColsProbe.buildIdOverride = id; }
+
+    /** Pin a verdict (1 = pays, 2 = does not), or 0 to measure again. */
+    public static void setPays(int32 ty, int32 v) {
+        if (ty == Quant.GG_Q4_K) { ColsProbe.v4k = v; }
+        if (ty == Quant.GG_Q6_K) { ColsProbe.v6k = v; }
+    }
+
+    public static String colsKernel(int32 ty) {
+        if (ty == Quant.GG_Q4_K) { return "q4kQ8WaveMatVecColsKernel"; }
+        if (ty == Quant.GG_Q6_K) { return "q6kQ8WaveMatVecColsKernel"; }
+        return "";
+    }
+
+    public static String waveKernel(int32 ty) {
+        if (ty == Quant.GG_Q4_K) { return "q4kQ8WaveMatVecKernel"; }
+        if (ty == Quant.GG_Q6_K) { return "q6kQ8WaveMatVecKernel"; }
+        return "";
+    }
+
+    static #String knob(int32 ty) {
+        String tn #= GgufFile.typeName(ty);
+        String k #= "colsPays-" + tn + "-b" + ColsProbe.rows();
+        return #k;
+    }
+
+    /** The two kernels' manifests, so a rebuilt kernel is measured again. */
+    static #String buildId(int32 ty) {
+        if (ColsProbe.buildIdOverride.byteLength() > 0) {
+            String o #= ColsProbe.buildIdOverride.substring(0,
+                ColsProbe.buildIdOverride.byteLength());
+            return #o;
+        }
+        String ck #= ColsProbe.colsKernel(ty);
+        String wk #= ColsProbe.waveKernel(ty);
+        String id #= ColsProbe.fingerprint(ck) + "/" + ColsProbe.fingerprint(wk);
+        return #id;
+    }
+
+    static #String fingerprint(String kernel) {
+        KernelManifest m #= KernelManifest.of(kernel);
+        if (m == null) {
+            String none #= "none";
+            return #none;
+        }
+        String f #= "v" + m.vgpr().orElse(0 - 1)
+            + "s" + m.sgpr().orElse(0 - 1)
+            + "l" + m.ldsStaticBytes().orElse(0 - 1)
+            + "p" + m.spillBytes().orElse(0 - 1)
+            + "w" + m.waveWidth().orElse(0 - 1);
+        return #f;
+    }
+
+    /** Drop the stored verdict for `ty` (a test's clean slate). */
+    public static void forgetStored(int32 ty) {
+        if (ColsProbe.tuneDir.byteLength() == 0) { return; }
+        String k #= ColsProbe.knob(ty);
+        Autotune.invalidate(ColsProbe.tuneDir, k);
+    }
+
+    static int32 verdictOf(int32 ty) {
+        if (ty == Quant.GG_Q4_K) { return ColsProbe.v4k; }
+        if (ty == Quant.GG_Q6_K) { return ColsProbe.v6k; }
+        return 2;
+    }
+
+    /**
+     * Whether the column kernel pays for `ty` at the batch ceiling here:
+     * the in-process verdict, else the store's (keyed by device and the
+     * kernels' build), else a measurement that is then remembered.
+     */
+    public static boolean pays(int32 ty) {
+        if (ColsProbe.colsKernel(ty).byteLength() == 0) { return false; }
+        int32 v = ColsProbe.verdictOf(ty);
+        if (v != 0) { return v == 1; }
+        if (!KernelCap.usable(ColsProbe.colsKernel(ty))) { return false; }
+        if (!KernelCap.usable(ColsProbe.waveKernel(ty))
+                || !KernelCap.usable("q8kPackKernel")) {
+            // No single-row alternative to measure against: the column
+            // kernel is the only route and takes it.
+            ColsProbe.setPays(ty, 1);
+            return true;
+        }
+        String bid #= ColsProbe.buildId(ty);
+        if (ColsProbe.tuneDir.byteLength() > 0) {
+            String k #= ColsProbe.knob(ty);
+            Optional<int32> t = Autotune.recallFor(ColsProbe.tuneDir, k, bid);
+            if (t.isPresent() && (t.get() == 1 || t.get() == 2)) {
+                ColsProbe.setPays(ty, t.get());
+                return t.get() == 1;
+            }
+        }
+        boolean yes = ColsProbe.measure(ty);
+        int32 nv = yes ? 1 : 2;
+        ColsProbe.setPays(ty, nv);
+        if (ColsProbe.tuneDir.byteLength() > 0) {
+            String k #= ColsProbe.knob(ty);
+            Autotune.rememberFor(ColsProbe.tuneDir, k, nv, bid);
+        }
+        return yes;
+    }
+
+    /** Both candidates on one synthetic weight at the batch ceiling, each
+     *  checked against the host mat-vec, then timed; true when the column
+     *  kernel is the cheaper. */
+    static boolean measure(int32 ty) {
+        ColsProbe.probesN = ColsProbe.probesN + 1L;
+        ColsProbe.lastRefusal = "";
+        int64 rows = (int64) ColsProbe.rows();
+        int64 out = 4096L;
+        int64 cols = 4096L;
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int64 bb = (int64) Quant.blockBytes(ty);
+        // A weight whose dot with a positive activation does not CANCEL:
+        // random quants summed over 4096 columns cancel to a fraction of
+        // their terms, and the q8_K activation's quantization noise then
+        // reads as a 4 percent disagreement with the f32 host (measured
+        // 2026-10-01). Every quant is the same positive value, the mins
+        // are zero and the scales vary by block, so the sum is a sum, the
+        // bytes still stream, and a kernel reading the wrong layout or
+        // the wrong column still shows.
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 o = b * bb;
+            int64 j = 0;
+            if (ty == Quant.GG_Q4_K) {
+                raw[o] = (int8) (b % 16L);
+                raw[o + 1L] = (int8) 60;           // d: a half near one
+                raw[o + 2L] = (int8) 0;
+                raw[o + 3L] = (int8) 0;            // dmin: zero
+                j = 4L;
+                while (j < 16L) {                  // 6-bit scales 1..12
+                    raw[o + j] = (int8) (((b + j) % 12L) + 1L);
+                    j = j + 1;
+                }
+                while (j < 144L) {                 // every nibble 5
+                    raw[o + j] = (int8) 85;
+                    j = j + 1;
+                }
+            } else {
+                while (j < 128L) {                 // ql: every nibble 8
+                    raw[o + j] = (int8) 136;
+                    j = j + 1;
+                }
+                while (j < 192L) {                 // qh: every pair 2
+                    raw[o + j] = (int8) 170;
+                    j = j + 1;
+                }
+                while (j < 208L) {                 // int8 scales 1..3
+                    raw[o + j] = (int8) (((b + j) % 3L) + 1L);
+                    j = j + 1;
+                }
+                raw[o + 208L] = (int8) (b % 16L);
+                raw[o + 209L] = (int8) 56;         // d: a half near half
+            }
+            b = b + 1;
+        }
+        float32[] x #= heap float32[rows * cols];
+        int64 z = 0;
+        while (z < rows * cols) {
+            x[z] = 0.01f * (float32) ((z % 11L) + 1L)
+                + 0.002f * (float32) (z / cols);
+            z = z + 1;
+        }
+        // The host oracle, every row.
+        float32[] want #= heap float32[rows * out];
+        int64 r = 0;
+        while (r < rows) {
+            if (ty == Quant.GG_Q4_K) {
+                Quant.q4kMatVecIntoAt(raw, 0L, out, cols, x, r * cols, want, r * out);
+            } else {
+                Quant.q6kMatVecIntoAt(raw, 0L, out, cols, x, r * cols, want, r * out);
+            }
+            r = r + 1;
+        }
+        // The device holds the row-split layout for a split format. No
+        // alias of `raw` here: `int8[] dev #= raw` then `dev #= res` frees
+        // raw's bytes under the oracle above (measured, a SIGSEGV in
+        // q6kMatVecIntoAt, 2026-10-01).
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) 1);
+        if (Quant.splitOn(ty)) {
+            int8[] res #= heap int8[out * Quant.rowResidentBytes(ty, bpr)];
+            Quant.splitInto(ty, raw, 0L, out, bpr, res, 0L);
+            KernelBuffer<int8> wS #= heap KernelBuffer<int8>((uint64) ((int64) res.count()));
+            wS.upload(res);
+            wD #= wS;
+        } else {
+            KernelBuffer<int8> wR #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+            wR.upload(raw);
+            wD #= wR;
+        }
+        KernelBuffer<float32> xD #= heap KernelBuffer<float32>((uint64) (rows * cols));
+        xD.upload(x);
+        int64 pb = Quant.q8kPackedBytes(cols);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) (rows * pb));
+        KernelBuffer<float32> yC #= heap KernelBuffer<float32>((uint64) (rows * out));
+        KernelBuffer<float32> yW #= heap KernelBuffer<float32>((uint64) (rows * out));
+        float32[] got #= heap float32[rows * out];
+        KernelStream s = QuantKernel.stream();
+        QuantKernel.q8kPackLaunchNoSync(xp, xD, rows * cols);
+        s.sync();
+        // The check first, each candidate once.
+        ColsProbe.launchCols(ty, yC, wD, xp, rows, out, cols, pb);
+        s.sync();
+        yC.download(got);
+        if (ColsProbe.poisonCols) { got[out + 3L] = got[out + 3L] + 1000.0f; }
+        boolean colsOk = ColsProbe.near(want, got, rows * out);
+        ColsProbe.checksN = ColsProbe.checksN + 1L;
+        ColsProbe.launchWaves(ty, yW, wD, xp, rows, out, cols, pb);
+        s.sync();
+        yW.download(got);
+        boolean waveOk = ColsProbe.near(want, got, rows * out);
+        ColsProbe.checksN = ColsProbe.checksN + 1L;
+        if (!colsOk) {
+            ColsProbe.lastRefusal = ColsProbe.colsKernel(ty)
+                + " disagrees with the host mat-vec at " + rows + " rows";
+            Diag.emit("cols-probe", 0 - 1, ColsProbe.lastRefusal, (int64) ty,
+                rows, 0L, 0L, 0L, 0L);
+            return false;
+        }
+        if (!waveOk) {
+            // The single-row route is wrong here: the column kernel, which
+            // checked, is the only candidate that may be selected.
+            ColsProbe.lastRefusal = ColsProbe.waveKernel(ty)
+                + " disagrees with the host mat-vec";
+            Diag.emit("cols-probe", 0 - 1, ColsProbe.lastRefusal, (int64) ty,
+                rows, 0L, 0L, 0L, 0L);
+            return true;
+        }
+        int64 cBest = 0L - 1L;
+        int64 wBest = 0L - 1L;
+        int32 round = 0;
+        while (round < 3) {
+            int64 t0 = Clock.nanoTime();
+            ColsProbe.launchCols(ty, yC, wD, xp, rows, out, cols, pb);
+            s.sync();
+            int64 t1 = Clock.nanoTime();
+            ColsProbe.launchWaves(ty, yW, wD, xp, rows, out, cols, pb);
+            s.sync();
+            int64 t2 = Clock.nanoTime();
+            if (round > 0) {
+                if (cBest < 0L || t1 - t0 < cBest) { cBest = t1 - t0; }
+                if (wBest < 0L || t2 - t1 < wBest) { wBest = t2 - t1; }
+            }
+            round = round + 1;
+        }
+        ColsProbe.lastColsNs = cBest;
+        ColsProbe.lastWaveNs = wBest;
+        Diag.emit("cols-probe", 0 - 1, cBest < wBest ? "pays" : "does not pay",
+            (int64) ty, rows, cBest, wBest, 0L, 0L);
+        return cBest < wBest;
+    }
+
+    static void launchCols(int32 ty, KernelBuffer<float32> y, KernelBuffer<int8> w,
+            KernelBuffer<int8> xp, int64 rows, int64 out, int64 cols, int64 pb) {
+        if (ty == Quant.GG_Q4_K) {
+            QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(y, w, xp, out, cols, 0L,
+                (int32) rows, out, pb, false);
+        } else {
+            QuantKernel.q6kQ8WaveMatVecColsLaunchNoSync(y, w, xp, out, cols, 0L,
+                (int32) rows, out, pb, false);
+        }
+    }
+
+    static void launchWaves(int32 ty, KernelBuffer<float32> y, KernelBuffer<int8> w,
+            KernelBuffer<int8> xp, int64 rows, int64 out, int64 cols, int64 pb) {
+        int64 r = 0;
+        while (r < rows) {
+            KernelBuffer<int8> xr #= xp.slice((uint64) (r * pb), (uint64) pb);
+            if (ty == Quant.GG_Q4_K) {
+                QuantKernel.q4kQ8WaveMatVecLaunchNoSync(y, w, xr, out, cols, r * out);
+            } else {
+                QuantKernel.q6kQ8WaveMatVecLaunchNoSync(y, w, xr, out, cols, r * out);
+            }
+            r = r + 1;
+        }
+    }
+
+    /** The batch GEMMs' bar (11.1.1): 1% relative plus 0.01 absolute, the
+     *  q8_K activation's own quantization. */
+    static boolean near(float32[] want, float32[] got, int64 n) {
+        boolean live = false;
+        int64 i = 0;
+        while (i < n) {
+            float32 g = got[i];
+            if (g != 0.0f) { live = true; }
+            float32 diff = want[i] - g;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = want[i] < 0.0f ? 0.0f - want[i] : want[i];
+            if ((float64) diff > (float64) mag * 0.01 + 0.01) {
+                ColsProbe.mismatchAt = i;
+                ColsProbe.mismatchWant = want[i];
+                ColsProbe.mismatchGot = g;
+                return false;
+            }
+            i = i + 1;
+        }
+        if (!live) { ColsProbe.mismatchAt = 0L - 2L; }
+        return live;
+    }
+
+    static int64 mismatchAt = 0L - 1L;
+    static float32 mismatchWant;
+    static float32 mismatchGot;
+    /** The first element the last check refused (-1 none, -2 all zero). */
+    public static int64 mismatchAt() { return ColsProbe.mismatchAt; }
+    public static float32 mismatchWant() { return ColsProbe.mismatchWant; }
+    public static float32 mismatchGot() { return ColsProbe.mismatchGot; }
+}
