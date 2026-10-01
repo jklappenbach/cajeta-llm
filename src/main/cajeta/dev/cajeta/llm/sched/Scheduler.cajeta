@@ -281,6 +281,12 @@ public final class Scheduler {
         // 21.2.5: who owns a launch failure surfacing this step. Taken
         // AFTER admission so a request admitted this step counts.
         int32 lfOwner = Diag.on() ? this.soleRunning() : (0 - 1);
+        // A pipeline serves one sole running request; the moment it is not
+        // sole (a second admission) or not running, its pending step is
+        // finished here and the plain steps take over.
+        if (this.pipeInFlight && this.soleRunning() != this.pipeReq) {
+            this.finishPipe();
+        }
         PagedKvCache cache = this.model.kvCache();
         boolean batching = this.model.decodeBatchReady();
         int32 nb = 0;
@@ -322,7 +328,14 @@ public final class Scheduler {
                         (int64) r.totalLen,
                         (int64) cache.lengthOf(r.slot, 0));
                 }
-                if (batching && n == 1) {
+                // One greedy sequence in decode takes the pipeline before
+                // the batch: a batch of one is the plain step with a sync.
+                if (this.pipeFor(i, r, n)) {
+                    Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
+                    this.stepPipelined(i, r);
+                    tso = Clock.nanoTime();
+                } else if (batching && n == 1) {
+                    if (this.pipeInFlight) { this.finishPipe(); }
                     if (nb == CausalLM.DECODE_BATCH_MAX) {
                         this.runDecodeBatch(nb);
                         nb = 0;
@@ -330,6 +343,7 @@ public final class Scheduler {
                     this.bIdx[nb] = i;
                     nb = nb + 1;
                 } else {
+                    if (this.pipeInFlight) { this.finishPipe(); }
                     Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
                     int32 ret = this.model.stepSeq(r.slot, r.all, r.cachedLen, n);
                     tso = Clock.nanoTime();
@@ -359,6 +373,96 @@ public final class Scheduler {
         boolean more = !this.allDone();
         Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
         return more;
+    }
+
+    // ── 12.2.11: the pipelined greedy decode ───────────────────────────
+    // One running request, greedy, in the decode regime: step N+1 is queued
+    // on the device before step N's argmax is read, so the host's share of
+    // a token (its own bookkeeping, the launches, the readback) overlaps
+    // the device's. The device reads the next token from the slot the
+    // previous argmax wrote (CausalLM.queueStep), so the host never has to
+    // know a token before the step that consumes it is queued. Each
+    // stepOnce in this regime: queue the SPECULATIVE next step, then wait
+    // for the previous one and emit its token. A finish (EOS, stop string,
+    // budget) leaves one queued step past the end; it is drained and its
+    // position dies with the slot.
+    boolean pipeInFlight;
+    int32 pipeOut;          // the slot the in-flight step's argmax writes
+    int32 pipeReq = 0 - 1;  // the request index the pipeline serves
+
+    boolean pipeFor(int32 i, Request r, int32 n) {
+        // In flight for this request: its position is already consumed (n
+        // reads 0 here), and this step awaits it, speculating the next.
+        if (this.pipeInFlight) { return this.pipeReq == i; }
+        if (n != 1) { return false; }
+        if (r.cachedLen != r.totalLen - 1) { return false; }
+        if (r.sampler != null && !r.sampler.isGreedy()) { return false; }
+        if (this.soleRunning() != i) { return false; }
+        return this.model.pipelineReady(r.slot);
+    }
+
+    void stepPipelined(int32 i, Request r) {
+        if (!this.pipeInFlight) {
+            // The seed: the token to consume is known to the host.
+            this.model.pipeSeed(0, r.all[r.totalLen - 1]);
+            this.model.queueStep(r.slot, 0, 1);
+            this.pipeInFlight = true;
+            this.pipeOut = 1;
+            this.pipeReq = i;
+            r.cachedLen = r.cachedLen + 1;
+            this.prefillRowsN = this.prefillRowsN + 1;
+            return;
+        }
+        int32 inS = this.pipeOut;
+        int32 outS = 1 - inS;
+        // Speculate only when this token cannot be the last by budget and
+        // the context has a position left; a stop the host cannot foresee
+        // costs one queued step, drained below.
+        boolean spec = r.genCount + 1 < r.maxNew
+            && this.model.hasRoom(r.slot);
+        if (spec) { this.model.queueStep(r.slot, inS, outS); }
+        int32 tok = this.model.awaitStep(this.pipeOut);
+        // The position was consumed when the step was queued: n = 0 here.
+        this.consume(i, r, tok, 0);
+        if (r.state != Request.RUNNING) {
+            this.drainPipe();
+            return;
+        }
+        if (spec) {
+            this.pipeOut = outS;
+            r.cachedLen = r.cachedLen + 1;
+            this.prefillRowsN = this.prefillRowsN + 1;
+        } else {
+            this.pipeInFlight = false;
+            this.pipeReq = 0 - 1;
+        }
+        return;
+    }
+
+    /** Finish the pipeline's pending step: await its argmax, emit the
+     *  token, and take the plain steps from here. */
+    void finishPipe() {
+        if (!this.pipeInFlight) { return; }
+        int32 i = this.pipeReq;
+        this.pipeInFlight = false;
+        this.pipeReq = 0 - 1;
+        int32 tok = this.model.awaitStep(this.pipeOut);
+        this.model.drainPipe();
+        if (i >= 0 && i < this.reqs.count()) {
+            Request r = this.reqs.get(i);
+            if (r.state == Request.RUNNING) { this.consume(i, r, tok, 0); }
+        }
+        return;
+    }
+
+    /** A finished request's queued speculative step: let it end before the
+     *  slot it reads is released, and forget the pipeline. */
+    void drainPipe() {
+        if (!this.pipeInFlight) { return; }
+        this.model.drainPipe();
+        this.pipeInFlight = false;
+        this.pipeReq = 0 - 1;
+        return;
     }
 
     /** Advance request `r` (index `i`) past `n` consumed tokens; `ret` is the model's argmax for its newest position. */

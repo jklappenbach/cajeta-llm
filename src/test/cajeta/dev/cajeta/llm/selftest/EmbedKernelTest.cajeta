@@ -1,0 +1,133 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.EmbedKernel;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * The device embedding-row decoders against the host decoder
+ * (xpu-kernel-adaptor 12.2.11). A table of a few rows is built from a
+ * fixture's blocks, the token id is written where the pipeline keeps it (a
+ * pinned buffer the device reads), and the decoded row must equal
+ * Quant.dequantize's row to the half's own precision. The token chosen is
+ * not row 0 (a decoder that ignored the id would pass on row 0), and a
+ * second token on the same table must read a different row.
+ */
+public class EmbedKernelTest {
+
+    public EmbedKernelTest() { return; }
+
+    static void check(int32 ty, String fixture, int64 dim) {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        String k #= EmbedKernel.kernelName(ty);
+        if (!KernelCap.usable(k)) { DeviceSkip.noKernel(k, be); return; }
+        int64 be_ = (int64) Quant.blockElems(ty);
+        int64 bpr = dim / be_;
+        int64 rows = 5L;
+        int8[] raw #= CensusReachTest.tiled(ty, fixture, rows * bpr);
+        KernelBuffer<int8> table #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+        table.upload(raw);
+        KernelBuffer<int32> tok #= heap KernelBuffer<int32>((uint64) 1);
+        KernelBuffer<float32> hs #= heap KernelBuffer<float32>((uint64) dim);
+        int32[] ids = heap int32[2];
+        ids[0] = 3;
+        ids[1] = 1;
+        float32[] got = heap float32[dim];
+        float32[] want = heap float32[dim];
+        int64[] vc #= ValueCheck.mark();
+        int32 i = 0;
+        while (i < 2) {
+            int32[] one = heap int32[1];
+            one[0] = ids[i];
+            tok.upload(one);
+            Assert.isTrue(EmbedKernel.embedRowLaunchNoSync(ty, hs, table, tok, bpr));
+            QuantKernel.stream().sync();
+            hs.download(got);
+            int64 bb = (int64) Quant.blockBytes(ty);
+            Quant.dequantize(ty, raw, (int64) ids[i] * bpr * bb, bpr, want, 0L);
+            int64 j = 0;
+            boolean live = false;
+            while (j < dim) {
+                float32 diff = want[j] - got[j];
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = want[j] < 0.0f ? 0.0f - want[j] : want[j];
+                if (got[j] != 0.0f) { live = true; }
+                if (diff > mag * 0.0005f + 0.000001f) {
+                    Assert.fail(k + " token " + ids[i] + " element " + j
+                        + ": device " + got[j] + " vs host " + want[j]);
+                    return;
+                }
+                j = j + 1;
+            }
+            Assert.isTrue(live);
+            i = i + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void q4kRowMatchesTheHostDecoder() {
+        EmbedKernelTest.check(Quant.GG_Q4_K, "q4_k.bin", 1024L);
+    }
+
+    @Test
+    public void q6kRowMatchesTheHostDecoder() {
+        EmbedKernelTest.check(Quant.GG_Q6_K, "q6_k.bin", 1024L);
+    }
+
+    @Test
+    public void q80RowMatchesTheHostDecoder() {
+        EmbedKernelTest.check(Quant.GG_Q8_0, "q8_0.bin", 1024L);
+    }
+
+    @Test
+    public void f16RowMatchesTheHostDecoder() {
+        // No F16 fixture in the k-quant set: the halves are made here.
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("embedRowF16Kernel")) {
+            DeviceSkip.noKernel("embedRowF16Kernel", be);
+            return;
+        }
+        int64 dim = 512L;
+        int64 rows = 4L;
+        int8[] raw #= heap int8[rows * dim * 2L];
+        int64 n = rows * dim;
+        int64 i = 0;
+        while (i < n) {
+            // Halves with a spread of exponents: (i % 97 - 48) / 16 as f16 bits
+            // via the f32 to f16 round of the writer's own table.
+            int32 h = (int32) ((i * 37L + 11L) % 30000L);
+            raw[i * 2L] = (int8) (h & 255);
+            raw[i * 2L + 1L] = (int8) ((h >> 8) & 255);
+            i = i + 1;
+        }
+        KernelBuffer<int8> table #= heap KernelBuffer<int8>((uint64) (n * 2L));
+        table.upload(raw);
+        KernelBuffer<int32> tok #= heap KernelBuffer<int32>((uint64) 1);
+        int32[] one = heap int32[1];
+        one[0] = 2;
+        tok.upload(one);
+        KernelBuffer<float32> hs #= heap KernelBuffer<float32>((uint64) dim);
+        int64[] vc #= ValueCheck.mark();
+        Assert.isTrue(EmbedKernel.embedRowLaunchNoSync(Quant.GG_F16, hs, table, tok, dim / 8L));
+        QuantKernel.stream().sync();
+        float32[] got = heap float32[dim];
+        hs.download(got);
+        float32[] want = heap float32[dim];
+        Quant.dequantize(Quant.GG_F16, raw, 2L * dim * 2L, dim / 8L, want, 0L);
+        int64 j = 0;
+        while (j < dim) {
+            Assert.isTrue(got[j] == want[j]);
+            j = j + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+}

@@ -1,0 +1,184 @@
+package dev.cajeta.llm.model;
+
+import cajeta.lang.String;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelThread;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * The embedding row of a token id that lives ON THE DEVICE, decoded from
+ * the packed table straight into the hidden-state buffer
+ * (xpu-kernel-adaptor 12.2.11).
+ *
+ * A decode token's first act was a host decode of its embedding row and
+ * an upload, which meant the host had to KNOW the token first: the
+ * previous step's argmax came back over the bus, the row was built, the
+ * next step was queued. Read on the device, the token id never has to
+ * reach the host before the next step is queued, which is what lets step
+ * N+1 ride behind step N on the stream (CausalLM.queueStep). One
+ * workgroup per launch, one lane per element of a block; every lane
+ * decodes its own block header, which is sixteen bytes read 256 times
+ * and far below a launch's floor.
+ *
+ * The formats a GGUF carries its `token_embd` in: Q4_K (Q4_K_M files),
+ * Q6_K, Q8_0, F16; the host decoder (Quant.dequantize) is the oracle for
+ * each (EmbedKernelTest).
+ */
+public final class EmbedKernel {
+
+    public EmbedKernel() { return; }
+
+    /** Which packed formats have a device row decoder. */
+    public static boolean hasKernel(int32 ty) {
+        return ty == Quant.GG_Q4_K || ty == Quant.GG_Q6_K
+            || ty == Quant.GG_Q8_0 || ty == Quant.GG_F16;
+    }
+
+    /** The kernel name the launch for `ty` would use, for KernelCap.usable. */
+    public static String kernelName(int32 ty) {
+        if (ty == Quant.GG_Q4_K) { return "embedRowQ4kKernel"; }
+        if (ty == Quant.GG_Q6_K) { return "embedRowQ6kKernel"; }
+        if (ty == Quant.GG_Q8_0) { return "embedRowQ80Kernel"; }
+        if (ty == Quant.GG_F16) { return "embedRowF16Kernel"; }
+        return "";
+    }
+
+    /** The f16 at byte offset `off` of a device buffer, as f32. */
+    @Device
+    static float32 h16(KernelBuffer<int8> raw, int64 off) {
+        int32 h = ((int32) raw[off] & 255)
+            | (((int32) raw[off + 1L] & 255) << 8);
+        return GgufFile.halfBitsToF32(h);
+    }
+
+    /** hs[0..dim) = table[tok[0], :] for a Q4_K table of `blocksPerRow`
+     *  256-element blocks per row. */
+    @Kernel
+    public static void embedRowQ4kKernel(KernelBuffer<float32> hs,
+            KernelBuffer<int8> packed, KernelBuffer<int32> tok,
+            uint32 blocksPerRow) {
+        uint32 e = KernelThread.x();          // 0..255: this lane's element of every block
+        int64 row = (int64) tok[0L];
+        int64 rowOff = row * (int64) blocksPerRow * 144L;
+        uint32 g = e / 64;
+        uint32 r = e - g * 64;
+        uint32 s = r / 32;
+        uint32 l = r - s * 32;
+        uint32 sb = e / 32;
+        uint32 b = 0;
+        while (b < blocksPerRow) {
+            int64 ro = rowOff + (int64) b * 144L;
+            float32 d = EmbedKernel.h16(packed, ro);
+            float32 dmin = EmbedKernel.h16(packed, ro + 2L);
+            // The 6-bit scale and min of sub-block `sb` (Quant.headK4).
+            int32 sc = 0;
+            int32 mn = 0;
+            if (sb < 4) {
+                sc = ((int32) packed[ro + 4L + (int64) sb] & 255) & 63;
+                mn = ((int32) packed[ro + 8L + (int64) sb] & 255) & 63;
+            } else {
+                int32 dj = (int32) packed[ro + 4L + (int64) (sb - 4)] & 255;
+                int32 mj = (int32) packed[ro + 8L + (int64) (sb - 4)] & 255;
+                int32 kj = (int32) packed[ro + 12L + (int64) (sb - 4)] & 255;
+                sc = (kj & 15) | ((dj >> 2) & 48);
+                mn = (kj >> 4) | ((mj >> 2) & 48);
+            }
+            int32 q = (((int32) packed[ro + 16L + (int64) (32 * g + l)] & 255)
+                >> (4 * (int32) s)) & 15;
+            hs[(int64) b * 256L + (int64) e] = d * (float32) sc * (float32) q
+                - dmin * (float32) mn;
+            b = b + 1;
+        }
+    }
+
+    /** The Q6_K row: { u8 ql[128]; u8 qh[64]; i8 scales[16]; f16 d }. */
+    @Kernel
+    public static void embedRowQ6kKernel(KernelBuffer<float32> hs,
+            KernelBuffer<int8> packed, KernelBuffer<int32> tok,
+            uint32 blocksPerRow) {
+        uint32 e = KernelThread.x();
+        int64 row = (int64) tok[0L];
+        int64 rowOff = row * (int64) blocksPerRow * 210L;
+        uint32 g = e / 128;
+        uint32 r = e - g * 128;
+        uint32 sl = r / 64;
+        uint32 l64 = r - sl * 64;
+        uint32 sh = r / 32;
+        uint32 l32 = r - sh * 32;
+        uint32 b = 0;
+        while (b < blocksPerRow) {
+            int64 ro = rowOff + (int64) b * 210L;
+            float32 d = EmbedKernel.h16(packed, ro + 208L);
+            int32 ql = (((int32) packed[ro + (int64) (64 * g + l64)] & 255)
+                >> (4 * (int32) sl)) & 15;
+            int32 qh = (((int32) packed[ro + 128L + (int64) (32 * g + l32)] & 255)
+                >> (2 * (int32) sh)) & 3;
+            int32 q = (ql | (qh << 4)) - 32;
+            int32 scb = (int32) packed[ro + 192L + (int64) (e / 16)];
+            hs[(int64) b * 256L + (int64) e] = d * (float32) scb * (float32) q;
+            b = b + 1;
+        }
+    }
+
+    /** The Q8_0 row: 32-element blocks of { f16 d; i8 q[32] }; lane `t`
+     *  takes elements t, t + 256, ... */
+    @Kernel
+    public static void embedRowQ80Kernel(KernelBuffer<float32> hs,
+            KernelBuffer<int8> packed, KernelBuffer<int32> tok,
+            uint32 blocksPerRow) {
+        uint32 t = KernelThread.x();
+        int64 row = (int64) tok[0L];
+        int64 rowOff = row * (int64) blocksPerRow * 34L;
+        uint32 total = blocksPerRow * 32;
+        uint32 e = t;
+        while (e < total) {
+            uint32 b = e / 32;
+            uint32 l = e - b * 32;
+            int64 ro = rowOff + (int64) b * 34L;
+            float32 d = EmbedKernel.h16(packed, ro);
+            int32 q = (int32) packed[ro + 2L + (int64) l];
+            hs[(int64) e] = d * (float32) q;
+            e = e + 256;
+        }
+    }
+
+    /** The F16 row: 8-element blocks of halves (16 bytes). */
+    @Kernel
+    public static void embedRowF16Kernel(KernelBuffer<float32> hs,
+            KernelBuffer<int8> packed, KernelBuffer<int32> tok,
+            uint32 blocksPerRow) {
+        uint32 t = KernelThread.x();
+        int64 row = (int64) tok[0L];
+        int64 rowOff = row * (int64) blocksPerRow * 16L;
+        uint32 total = blocksPerRow * 8;
+        uint32 e = t;
+        while (e < total) {
+            hs[(int64) e] = EmbedKernel.h16(packed, rowOff + (int64) e * 2L);
+            e = e + 256;
+        }
+    }
+
+    /** Launch the decoder for `ty`, one workgroup of 256 lanes, on the
+     *  engine stream; false when `ty` has no device decoder. */
+    public static boolean embedRowLaunchNoSync(int32 ty,
+            KernelBuffer<float32> hs, KernelBuffer<int8> packed,
+            KernelBuffer<int32> tok, int64 blocksPerRow) {
+        KernelStream s = QuantKernel.stream();
+        uint32 bpr = (uint32) blocksPerRow;
+        if (ty == Quant.GG_Q4_K) {
+            embedRowQ4kKernel.launch(s, grid: [1], block: [256])(hs, packed, tok, bpr);
+        } else if (ty == Quant.GG_Q6_K) {
+            embedRowQ6kKernel.launch(s, grid: [1], block: [256])(hs, packed, tok, bpr);
+        } else if (ty == Quant.GG_Q8_0) {
+            embedRowQ80Kernel.launch(s, grid: [1], block: [256])(hs, packed, tok, bpr);
+        } else if (ty == Quant.GG_F16) {
+            embedRowF16Kernel.launch(s, grid: [1], block: [256])(hs, packed, tok, bpr);
+        } else {
+            return false;
+        }
+        return true;
+    }
+}

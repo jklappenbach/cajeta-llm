@@ -46,6 +46,16 @@ Llama 3.x, Mistral, Qwen2/3, Gemma 3 (text). Perf gates: decode ≥60% /
 prefill ≥50% of llama.cpp on Llama-3.1-8B-Instruct Q4_K_M at gfx1151/ROCm,
 measured baseline first.
 
+Measured 2026-10-01 on an RTX 4090 (sm_89, WSL2), Llama-3.1-8B-Instruct
+Q4_K_M, interleaved with llama-bench on the same minute because the box's
+GPU clock is bimodal: decode (tg128) cajeta 164.9 to 165.5 tokens a second
+against llama-bench's 155.5 to 166.3 over four pairs; the token is 6.05 ms
+of device time with the host hidden behind it (the deferred stream replays
+a token as one CUDA graph, the decode token's embedding row is decoded on
+the device, and step N+1 is queued before step N's argmax is read:
+`bench/EndToEnd`). Prefill (pp512) is 3.7k tokens a second against 11.5k
+and is the batched route's open item.
+
 ## Building
 
 ```

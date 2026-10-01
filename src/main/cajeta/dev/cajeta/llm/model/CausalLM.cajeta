@@ -7,7 +7,9 @@ import cajeta.collection.ArrayList;
 import cajeta.lang.String;
 import cajeta.lang.System;
 import cajeta.time.Clock;
+import cajeta.xpu.Event;
 import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.MemoryKind;
 import cajeta.xpu.KernelStream;
 import cajeta.math.Tensor;
 import dev.cajeta.llm.LlmException;
@@ -309,6 +311,10 @@ public final class CausalLM extends InfModule {
      * the blocks leaves the next request inheriting this one's position.
      */
     public void releaseSeq(int32 seq) {
+        // A queued pipelined step may still be reading this sequence's
+        // planes (the speculative step past a finish, 12.2.11): let it end
+        // before anything it reads is reset.
+        if (this.pipeQueued > 0) { this.drainPipe(); }
         this.cache.release(seq);
         DeviceKv rd = this.dkvRaw(seq);
         if (rd != null) { rd.reset(); }
@@ -507,6 +513,173 @@ public final class CausalLM extends InfModule {
         return am;
     }
 
+    // ── 12.2.11: the pipelined greedy decode ───────────────────────────
+    //
+    // A decode token was: host embedding row, upload, 356 launches, sync,
+    // argmax down, repeat. The host's share (about 0.65 ms of a 6.3 ms
+    // token on sm_89) sat between tokens because step N+1 could not be
+    // queued until the host had read step N's argmax to build the next
+    // row. With the row decoded on the device from a token id the device
+    // itself wrote, step N+1 is queued while step N runs: the host's work
+    // overlaps the device's, and the token costs the longer of the two.
+    // Greedy only (the argmax is the sample); a sampler that reads logits
+    // keeps the synchronous step. The scheduler drives it:
+    // pipeSeed(slot, token) -> queueStep(seq, in, out) -> awaitStep(out).
+
+    KernelBuffer<int32> pipeSlot(int32 i) {
+        if (i == 0) { return this.pipeTok0; }
+        return this.pipeTok1;
+    }
+
+    Event pipeEvent(int32 i) {
+        if (i == 0) { return this.pipeEv0; }
+        return this.pipeEv1;
+    }
+
+    /** Whether the pipelined decode can serve sequence `seq`: the resident
+     *  chain with its fused tail and device argmax, and an embedding table
+     *  in a packed format the device decodes (EmbedKernel). The table is
+     *  uploaded on the first yes. */
+    public boolean pipelineReady(int32 seq) {
+        if (!CausalLM.pipeOn) { return false; }
+        if (!CausalLM.fuseTail || !CausalLM.deviceArgmax) { return false; }
+        if (!this.deviceResidentReady()) { return false; }
+        if (!this.lmHead.isDeviceRouted()) { return false; }
+        if (!this.embTried) {
+            this.embTried = true;
+            int32 ty = this.model.embedTokens.packedType();
+            int8[] bytes = this.model.embedTokens.packedBytes();
+            boolean have = false;
+            if (ty >= 0 && bytes != null && EmbedKernel.hasKernel(ty)
+                    && KernelCap.usable(EmbedKernel.kernelName(ty))
+                    && this.cfg.hiddenSize % Quant.blockElems(ty) == 0) {
+                KernelBuffer<int8> dev #= heap KernelBuffer<int8>(
+                    (uint64) ((int64) bytes.count()));
+                dev.upload(bytes);
+                this.embDev #= dev;
+                this.embTy = ty;
+                have = true;
+            } else if (ty < 0 && this.model.embedTokens.weight != null
+                    && KernelCap.usable("gatherRowsF32Kernel")) {
+                // An f32 table (a toy fixture, or a file that ships one):
+                // uploaded whole when it is small enough to be worth a
+                // resident copy; the row is then a gather.
+                Tensor<float32> w = this.model.embedTokens.weight;
+                int64 n = (int64) this.cfg.vocabSize * (int64) this.cfg.hiddenSize;
+                if (n * 4L <= 1073741824L) {
+                    float32[] hb = w.hostBuffer();
+                    int64 base = w.hostBase();
+                    float32[] flat #= heap float32[n];
+                    int64 i = 0;
+                    while (i < n) { flat[i] = hb[base + i]; i = i + 1; }
+                    KernelBuffer<float32> dev #= heap KernelBuffer<float32>((uint64) n);
+                    dev.upload(flat);
+                    this.embF32Dev #= dev;
+                    this.embTy = 0 - 1;
+                    have = true;
+                }
+            }
+            if (have) {
+                this.pipeTok0 = heap KernelBuffer<int32>(0L, (uint64) 1);
+                this.pipeTok0.allocate(MemoryKind.Pinned);
+                this.pipeTok1 = heap KernelBuffer<int32>(0L, (uint64) 1);
+                this.pipeTok1.allocate(MemoryKind.Pinned);
+                this.pipeEv0 #= Event.create();
+                this.pipeEv1 #= Event.create();
+                this.pipeHost = heap int32[1];
+                this.embHave = true;
+            }
+        }
+        return this.embHave;
+    }
+
+    /** The embedding table's packed format, -1 when held as f32. */
+    public int32 embeddingPackedType() {
+        return this.model.embedTokens.packedType();
+    }
+
+    /** Write `token` into pipe slot `slot` from the host (the seed of a
+     *  pipeline: the prompt's last argmax). No step may be reading it. */
+    public void pipeSeed(int32 slot, int32 token) {
+        this.pipeHost[0] = token;
+        this.pipeSlot(slot).hostStore(this.pipeHost);
+    }
+
+    /** Queue one decode step of `seq` whose input token is read from pipe
+     *  slot `inSlot` on the device and whose argmax is written to slot
+     *  `outSlot`; returns without waiting. The position is consumed as by
+     *  stepSeq(n = 1). */
+    public void queueStep(int32 seq, int32 inSlot, int32 outSlot) {
+        this.armRoutes(seq);
+        int32 seqPos = this.seqLength(seq);
+        if (seqPos >= this.maxSeq) {
+            throw heap LlmException("decode: context is full (maxSeq "
+                + this.maxSeq + ")");
+        }
+        int32 h = this.cfg.hiddenSize;
+        this.ensureResidentBuffers(h);
+        this.ensureDeviceKv(seq);
+        int64 tq0 = Clock.nanoTime();
+        if (this.embTy >= 0) {
+            EmbedKernel.embedRowLaunchNoSync(this.embTy, this.hsDev, this.embDev,
+                this.pipeSlot(inSlot),
+                (int64) h / (int64) Quant.blockElems(this.embTy));
+        } else {
+            QuantKernel.gatherRowsF32LaunchNoSync(this.hsDev, this.embF32Dev,
+                this.pipeSlot(inSlot), 1L, (int64) h);
+        }
+        CausalLM.dtPreNs = CausalLM.dtPreNs + (Clock.nanoTime() - tq0);
+        ActivationPool p = this.pool;
+        this.pipe = true;
+        this.pipeOut = outSlot;
+        int64 tfw0 = Clock.nanoTime();
+        this.forwardRows(seq, p.x, p.xn, p.q, p.k, p.v, p.attnOut,
+            p.attnProj, p.gate, p.up, p.mlpOut, 1, seqPos);
+        CausalLM.dtForwardNs = CausalLM.dtForwardNs
+            + (Clock.nanoTime() - tfw0);
+        this.pipe = false;
+        this.pipeQueued = this.pipeQueued + 1;
+        CausalLM.pipeStepsN = CausalLM.pipeStepsN + 1L;
+        CausalLM.dtStepNs = CausalLM.dtStepNs + (Clock.nanoTime() - tq0);
+    }
+
+    /** Wait for the step whose argmax goes to slot `outSlot` and return
+     *  that argmax. */
+    public int32 awaitStep(int32 outSlot) {
+        int64 ta0 = Clock.nanoTime();
+        this.pipeEvent(outSlot).waitHost();
+        if (this.pipeQueued > 0) { this.pipeQueued = this.pipeQueued - 1; }
+        CausalLM.dtSyncNs = CausalLM.dtSyncNs + (Clock.nanoTime() - ta0);
+        int64 tr0 = Clock.nanoTime();
+        this.pipeSlot(outSlot).hostLoad(this.pipeHost);
+        this.lastArgmax = this.pipeHost[0];
+        this.logitsStale = true;
+        CausalLM.dtArgmaxNs = CausalLM.dtArgmaxNs + (Clock.nanoTime() - tr0);
+        return this.lastArgmax;
+    }
+
+    /** Whether `seq` has a position left for one more queued step. */
+    public boolean hasRoom(int32 seq) {
+        return this.seqLength(seq) < this.maxSeq;
+    }
+
+    /** Let every queued step finish (a speculative step past a finished
+     *  sequence, before its slot is released). */
+    public void drainPipe() {
+        QuantKernel.stream().sync();
+        this.pipeQueued = 0;
+    }
+
+    /** The pipelined decode, on by default; off is the bench's control arm
+     *  and the scheduler's plain step. */
+    public static void setPipelined(boolean on) { CausalLM.pipeOn = on; }
+    static boolean pipeOn = true;
+
+    /** Steps queued through the pipeline in this process: the instrument
+     *  that proves a run took it. */
+    static int64 pipeStepsN;
+    public static int64 pipelinedSteps() { return CausalLM.pipeStepsN; }
+
     /**
      * The shared step function over `rows` consecutive positions starting
      * at absolute `startPos`: the layer stack (norm → GQA attention with
@@ -560,7 +733,7 @@ public final class CausalLM extends InfModule {
                     + (Clock.nanoTime() - tsk0);
             }
         }
-        if (resident) {
+        if (resident && !this.pipe) {
             int64 tp0 = Clock.nanoTime();
             this.ensureResidentBuffers(h);
             this.ensureDeviceKv(seq);
@@ -865,12 +1038,25 @@ public final class CausalLM extends InfModule {
                     int32[] z = heap int32[1];
                     this.amCounter.upload(z, 1L);
                 }
-                QuantKernel.argmaxRowLaunchNoSync(this.tokDev,
+                KernelBuffer<int32> amOut = this.tokDev;
+                if (this.pipe) { amOut = this.pipeSlot(this.pipeOut); }
+                QuantKernel.argmaxRowLaunchNoSync(amOut,
                     this.lmHead.out(), (int64) this.cfg.vocabSize, this.amPv,
                     this.amPi, this.amCounter);
             }
             int64 tf1 = Clock.nanoTime();
             KernelStream fs = QuantKernel.stream();
+            if (this.pipe) {
+                // Queued, not run: the slot's event marks the argmax, the
+                // flush submits everything queued so the device starts now,
+                // and the host returns to queue the next step behind it.
+                this.pipeEvent(this.pipeOut).recordOn(fs);
+                fs.flush();
+                this.logitsStale = true;
+                CausalLM.dtNormNs = CausalLM.dtNormNs + (tf1 - tf0);
+                CausalLM.dtTok = CausalLM.dtTok + 1L;
+                return;
+            }
             fs.sync();
             int64 tf2 = Clock.nanoTime();
             if (devAm) {
@@ -942,6 +1128,24 @@ public final class CausalLM extends InfModule {
     KernelBuffer<float32> xnDev;
     KernelBuffer<int32> tokDev;    // the fused tail's argmax word
     int32[] tokHost;
+    // 12.2.11 — the pipelined greedy decode: two pinned token slots the
+    // device reads (the next step's embedding gather) and writes (this
+    // step's argmax), an event per slot, the packed embedding table on the
+    // device. `pipe` marks a step being QUEUED rather than run: no host
+    // embedding, no sync, no download; the caller awaits the slot's event.
+    KernelBuffer<int32> pipeTok0;
+    KernelBuffer<int32> pipeTok1;
+    Event pipeEv0;
+    Event pipeEv1;
+    int32[] pipeHost;
+    boolean pipe;
+    int32 pipeOut;
+    int32 pipeQueued;              // steps queued and not yet awaited or drained
+    KernelBuffer<int8> embDev;
+    KernelBuffer<float32> embF32Dev;
+    int32 embTy;
+    boolean embTried;
+    boolean embHave;
     KernelBuffer<float32> amPv;    // the argmax's per-workgroup partials
     KernelBuffer<int32> amPi;
     KernelBuffer<int32> amCounter;
