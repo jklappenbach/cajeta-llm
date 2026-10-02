@@ -184,6 +184,130 @@ public class NormPackTest {
         ValueCheck.credit(vc);
     }
 
+    /** The fused gate|up GLU packed straight to q8_K over `rows` rows of
+     *  the concatenated projection output (1.8.3), against the fused GLU
+     *  launch followed by the rows pack: every payload byte identical. */
+    static void runFusedGluPack(int64 rows, int64 inter, int32 act) {
+        int64 n = rows * 2L * inter;
+        float32[] hs = heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            hs[i] = (float32) (((i * 37L + 11L) % 197L) - 98L) / 11.0f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> src #= heap KernelBuffer<float32>((uint64) n);
+        src.upload(hs, n);
+        int64 pb = rows * (inter / 256L) * 320L;
+        KernelBuffer<float32> o1 #= heap KernelBuffer<float32>((uint64) (rows * inter));
+        KernelBuffer<int8> p1 #= heap KernelBuffer<int8>((uint64) pb);
+        KernelBuffer<int8> p2 #= heap KernelBuffer<int8>((uint64) pb);
+        Prim.gluFusedDevice(o1, src, rows, inter, act);
+        QuantKernel.q8kPackRowsLaunchNoSync(p1, o1, rows, inter, inter);
+        int64[] vc #= ValueCheck.mark();
+        Assert.isTrue(Prim.gluFusedPackDevice(p2, src, rows, inter, act));
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int8[] qa = heap int8[pb];
+        int8[] qb = heap int8[pb];
+        p1.download(qa, pb);
+        p2.download(qb, pb);
+        i = 0;
+        boolean nz = false;
+        while (i < pb) {
+            if (i % 320L >= 292L) { i = i + 1; continue; }
+            if (qa[i] != qb[i]) {
+                Assert.fail("fused glu packed byte differs at " + i + ": "
+                    + (int32) qa[i] + " vs " + (int32) qb[i]);
+                return;
+            }
+            if (qa[i] != (int8) 0) { nz = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(nz);
+        ValueCheck.credit(vc);
+    }
+
+    /** Three rows at the 8B's FFN width, silu: the row stride through the
+     *  fused [rows x 2*inter] output. */
+    @Test
+    public void fusedGluPackOverRowsMatchesTheGluThenThePackAt14336() {
+        NormPackTest.need("gluFusedPackF32", "gluFusedF32");
+        NormPackTest.runFusedGluPack(3L, 14336L, 0);
+    }
+
+    /** Two rows, gelu-tanh, at the toy's width. */
+    @Test
+    public void fusedGluPackOverRowsMatchesTheGluThenThePackAt512Gelu() {
+        NormPackTest.need("gluFusedPackF32", "gluFusedF32");
+        NormPackTest.runFusedGluPack(2L, 512L, 1);
+    }
+
+    /** The fused norm-and-pack over rows (the prefill's use, 1.8.3): each
+     *  row's pack equals the rows pack of the batch norm's output. */
+    @Test
+    public void fusedNormPackOverRowsMatchesTheNormThenThePack() {
+        NormPackTest.need("rmsnormPackRowF32", "rmsnormRowsF32");
+        int64 rows = 3L;
+        int64 dim = 4096L;
+        int64 n = rows * dim;
+        float32[] hx = heap float32[n];
+        float32[] hw = heap float32[dim];
+        int64 i = 0;
+        while (i < n) {
+            hx[i] = (float32) (((i * 53L + 7L) % 211L) - 105L) / 9.0f;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < dim) { hw[i] = 1.0f + (float32) (i % 13) * 0.01f; i = i + 1; }
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> w #= heap KernelBuffer<float32>((uint64) dim);
+        x.upload(hx, n);
+        w.upload(hw, dim);
+        int64 pb = rows * (dim / 256L) * 320L;
+        KernelBuffer<float32> o1 #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> o2 #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<int8> p1 #= heap KernelBuffer<int8>((uint64) pb);
+        KernelBuffer<int8> p2 #= heap KernelBuffer<int8>((uint64) pb);
+        float32 eps = 0.00001f;
+        Prim.rmsnormBatchDevice(o1, x, w, rows, dim, eps, 0);
+        QuantKernel.q8kPackRowsLaunchNoSync(p1, o1, rows, dim, dim);
+        int64[] vc #= ValueCheck.mark();
+        Assert.isTrue(Prim.rmsnormPackRowsDevice(o2, p2, x, w, rows, dim, eps, 0));
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a = heap float32[n];
+        float32[] b = heap float32[n];
+        o1.download(a, n);
+        o2.download(b, n);
+        i = 0;
+        while (i < n) {
+            float32 d = a[i] - b[i];
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 m = a[i] < 0.0f ? 0.0f - a[i] : a[i];
+            if (d > m * 0.00001f + 0.000001f) {
+                Assert.fail("normed row differs at " + i + ": " + a[i] + " vs " + b[i]);
+                return;
+            }
+            i = i + 1;
+        }
+        int8[] qa = heap int8[pb];
+        int8[] qb = heap int8[pb];
+        p1.download(qa, pb);
+        p2.download(qb, pb);
+        i = 0;
+        int64 off = 0L;
+        while (i < pb) {
+            if (i % 320L >= 292L) { i = i + 1; continue; }
+            if (qa[i] != qb[i]) { off = off + 1L; }
+            i = i + 1;
+        }
+        // The batch norm's sum of squares is not the fused kernel's tree,
+        // so a quant may round the other way at a last bit: a handful of
+        // bytes, never a block's worth.
+        Assert.isTrue(off < 64L);
+        ValueCheck.credit(vc);
+    }
+
     /** The 8B's FFN width, silu. */
     @Test
     public void fusedGluPackMatchesTwoLaunchesAt14336() {
