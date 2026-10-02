@@ -2412,6 +2412,356 @@ public final class AttnKernel {
         }
     }
 
+    /**
+     * The single-pass flash prefill (xpu-kernel-adaptor 1.8.3): the query
+     * tile of {@link #attnFlashPrefillTileKernel} (64 (query, head) pairs
+     * on one K/V head, hd 128), but ONE pass over the keys with the online
+     * softmax, in 64-key blocks. The tile kernel ran two passes (a max
+     * pass, then the exp pass), computed Q.K^T in both, carried a 2^10
+     * residual pair for the probabilities as well as the query, and took
+     * five barriers a 32-key batch: 121 us a layer at 512 tokens on sm_89,
+     * 17 TFLOPS. Here each 64-key block costs one Q.K^T and one P.V, both
+     * with their 2^10 residual pair (without the probabilities' pair the
+     * 128-row case sits 0.00023 off the host floor at an element of
+     * magnitude 0.004, past the test's 0.1% + 0.0002), and four barriers;
+     * the
+     * running max, the rescale factor and the normalizer live with the
+     * four lanes that own a row, and the output accumulators are rescaled
+     * through the epilogue verb into a fresh tile each block (two sets,
+     * alternating), which is the fragment-opaque form of O = alpha O + P V.
+     */
+    @Kernel @FastMath @Wave(width = 32)
+    @Occupancy(maxThreads = 256)
+    @Unlowered(backend = "cpu", tracked = "xpu-kernel-adaptor 4.2.1")
+    public static void attnFlashPrefillOnlineKernel(KernelBuffer<float32> out,
+            KernelBuffer<float32> q, KernelBuffer<float16> kPool,
+            KernelBuffer<float16> vPool, uint32 rows, uint32 nH,
+            uint32 nKv, uint32 startPos, float32 scale) {
+        Shared<float16> qs = shared float16[8704];
+        Shared<float16> ql = shared float16[8704];
+        // ks holds the block's keys for Q.K^T, then the f16 probabilities
+        // (64 x 72) and their 2^10 residuals (another 64 x 72) for P.V: the
+        // keys are dead once the scores are stored.
+        Shared<float16> ks = shared float16[9216];
+        Shared<float16> vs = shared float16[8704];
+        Shared<float32> ss = shared float32[4352];
+        Shared<float32> alpha = shared float32[64];
+        Shared<float32> lrow = shared float32[64];
+        Shared<float32> ones = shared float32[16];
+        uint32 tid = KernelThread.x();
+        uint32 lane = tid % 32;
+        uint32 wid = tid / 32;
+        uint32 wg = KernelThread.globalIdX() / 256;
+        uint32 group = nH / nKv;
+        uint32 qt = 64 / group;
+        // HEAVY TILES FIRST: a causal query tile attends to every key up
+        // to its own, so the last tile costs eight 64-key blocks and the
+        // first one; with workgroups issued in query order the first wave
+        // of the part was all light tiles and the second all heavy, and
+        // the launch ran at the heavy wave's length. Last tile first lets
+        // the light ones fill in behind.
+        uint32 nTiles = (rows + qt - 1) / qt;
+        uint32 qb = (nTiles - 1) - wg / nKv;
+        uint32 kvh = wg % nKv;
+        uint32 r0 = qb * qt;
+        uint32 kvDim = nKv * 128;
+        uint32 wr = wid / 2;
+        uint32 wc = wid % 2;
+        if (r0 < rows) {
+            uint32 lastPos = startPos + r0 + qt - 1;
+            if (lastPos > startPos + rows - 1) { lastPos = startPos + rows - 1; }
+            uint32 kEnd = lastPos + 1;
+            uint32 sp = tid / 4;
+            uint32 sd = (tid % 4) * 32;
+            uint32 sq = r0 + sp / group;
+            uint32 sh = kvh * group + sp % group;
+            uint32 di = 0;
+            while (di < 32) {
+                float32 qv = 0.0f;
+                if (sq < rows) {
+                    qv = q[(int64) sq * (int64) (nH * 128) + (int64) (sh * 128)
+                        + (int64) (sd + di)] * scale;
+                }
+                qs[sp * 136 + sd + di] = (float16) qv;
+                di = di + 1;
+            }
+            if (tid < 16) { ones[tid] = 1.0f; }
+            Barrier.workgroup();
+            // The residual is taken against the f16 READ BACK from LDS, as
+            // the two-pass tile does: taken against the register value, it
+            // came out zero (the round trip folded under @FastMath) and the
+            // scores sat 0.8% off the host floor (2026-10-01).
+            di = 0;
+            while (di < 32) {
+                float32 qw = 0.0f;
+                if (sq < rows) {
+                    qw = q[(int64) sq * (int64) (nH * 128) + (int64) (sh * 128)
+                        + (int64) (sd + di)] * scale;
+                }
+                float32 qr = qw - (float32) qs[sp * 136 + sd + di];
+                ql[sp * 136 + sd + di] = (float16) (qr * 1024.0f);
+                di = di + 1;
+            }
+            Barrier.workgroup();
+
+            CooperativeMatrix<float16,16,16,0> qa;
+            CooperativeMatrix<float16,16,16,0> qla;
+            CooperativeMatrix<float16,16,16,1> kb;
+            CooperativeMatrix<float32,16,16,2> sacc;
+            CooperativeMatrix<float32,16,16,2> sres;
+            CooperativeMatrix<float16,16,16,0> pa;
+            CooperativeMatrix<float16,16,16,0> pla;
+            CooperativeMatrix<float16,16,16,1> vb;
+            CooperativeMatrix<float32,16,16,2> pl0;
+            CooperativeMatrix<float32,16,16,2> pl1;
+            CooperativeMatrix<float32,16,16,2> pl2;
+            CooperativeMatrix<float32,16,16,2> pl3;
+            CooperativeMatrix<float32,16,16,2> oA0;
+            CooperativeMatrix<float32,16,16,2> oA1;
+            CooperativeMatrix<float32,16,16,2> oA2;
+            CooperativeMatrix<float32,16,16,2> oA3;
+            CooperativeMatrix<float32,16,16,2> oB0;
+            CooperativeMatrix<float32,16,16,2> oB1;
+            CooperativeMatrix<float32,16,16,2> oB2;
+            CooperativeMatrix<float32,16,16,2> oB3;
+            oA0.splat(0.0f);
+            oA1.splat(0.0f);
+            oA2.splat(0.0f);
+            oA3.splat(0.0f);
+            oB0.splat(0.0f);
+            oB1.splat(0.0f);
+            oB2.splat(0.0f);
+            oB3.splat(0.0f);
+            // The column factors are built AT each use: a WaveVector held
+            // in a local across the loop read as zero (the scores lost their
+            // residual, 0.8% off the host floor at 5 rows, 2026-10-01).
+            // K/V staging roles: key tid/4 of the block, dims (tid%4)*32..
+            uint32 kk = tid / 4;
+            uint32 kd = (tid % 4) * 32;
+            // Softmax roles: row tid/4, keys (tid%4)*16.. of the block.
+            uint32 rr = tid / 4;
+            uint32 rk = (tid % 4) * 16;
+            uint32 rpos = startPos + r0 + rr / group;
+            if (r0 + rr / group >= rows) { rpos = startPos + rows - 1; }
+            float32 mrun = -1.0e30f;
+            float32 lrun = 0.0f;
+            uint32 sBase = wr * 1088 + wc * 32;
+            uint32 pBase = wr * 1152;
+            uint32 oDim = wc * 64;
+
+            uint32 blk = 0;
+            uint32 kb0 = 0;
+            while (kb0 < kEnd) {
+                uint32 kpos = kb0 + kk;
+                if (kpos >= kEnd) { kpos = kEnd - 1; }
+                int64 kOff = (int64) kpos * (int64) kvDim
+                    + (int64) (kvh * 128) + (int64) kd;
+                int64 sOff = (int64) (kk * 136 + kd);
+                ks.vstore(sOff, kPool.vload<8>(kOff));
+                ks.vstore(sOff + 8L, kPool.vload<8>(kOff + 8L));
+                ks.vstore(sOff + 16L, kPool.vload<8>(kOff + 16L));
+                ks.vstore(sOff + 24L, kPool.vload<8>(kOff + 24L));
+                vs.vstore(sOff, vPool.vload<8>(kOff));
+                vs.vstore(sOff + 8L, vPool.vload<8>(kOff + 8L));
+                vs.vstore(sOff + 16L, vPool.vload<8>(kOff + 16L));
+                vs.vstore(sOff + 24L, vPool.vload<8>(kOff + 24L));
+                Barrier.workgroup();
+                // S for this wave's 16 pairs x 32 keys: two tiles.
+                uint32 kt = 0;
+                while (kt < 2) {
+                    sacc.splat(0.0f);
+                    sres.splat(0.0f);
+                    uint32 kcol = (wc * 32 + kt * 16) * 136;
+                    uint32 kst = 0;
+                    while (kst < 8) {
+                        qa.load(qs, wr * 2176 + kst * 16, 0, 136);
+                        qla.load(ql, wr * 2176 + kst * 16, 0, 136);
+                        kb.load(ks, kcol + kst * 16, 1, 136);
+                        sacc.mma(qa, kb);
+                        sres.mma(qla, kb);
+                        kst = kst + 1;
+                    }
+                    sres.scaledAccumInto(sacc, ones[0], WaveVector.broadcast(0.0009765625f));
+                    sacc.store(ss, sBase + kt * 16, 0, 68);
+                    kt = kt + 1;
+                }
+                Barrier.workgroup();
+                // The online softmax over the row's 64 scores of this block.
+                float32 mx = -1.0e30f;
+                uint32 j = 0;
+                while (j < 16) {
+                    uint32 kabs = kb0 + rk + j;
+                    if (kabs <= rpos && kabs < kEnd) {
+                        float32 sv = ss[rr * 68 + rk + j];
+                        if (sv > mx) { mx = sv; }
+                    }
+                    j = j + 1;
+                }
+                float32 bmax = Wave.reduceMaxF32Segmented(mx, 4);
+                float32 mNew = mrun;
+                if (bmax > mNew) { mNew = bmax; }
+                float32 al = 0.0f;
+                if (mrun > -1.0e29f) { al = Math.exp(mrun - mNew); }
+                float32 psum = 0.0f;
+                j = 0;
+                while (j < 16) {
+                    uint32 kabs2 = kb0 + rk + j;
+                    float32 pv = 0.0f;
+                    if (kabs2 <= rpos && kabs2 < kEnd) {
+                        pv = Math.exp(ss[rr * 68 + rk + j] - mNew);
+                    }
+                    ks[rr * 72 + rk + j] = (float16) pv;
+                    ss[rr * 68 + rk + j] = pv;
+                    psum = psum + pv;
+                    j = j + 1;
+                }
+                float32 bsum = Wave.reduceSumF32Segmented(psum, 4);
+                lrun = lrun * al + bsum;
+                mrun = mNew;
+                if (tid % 4 == 0) { alpha[rr] = al; }
+                // The probability residual against the f16 read back (see
+                // the query's, above); its own lanes wrote these, so no
+                // barrier stands between.
+                j = 0;
+                while (j < 16) {
+                    float32 phf = (float32) ks[rr * 72 + rk + j];
+                    ks[4608 + rr * 72 + rk + j] =
+                        (float16) ((ss[rr * 68 + rk + j] - phf) * 1024.0f);
+                    j = j + 1;
+                }
+                Barrier.workgroup();
+                // O_new = alpha O + P V, into the other accumulator set.
+                if ((blk & 1) == 0) {
+                    oB0.splat(0.0f);
+                    oB1.splat(0.0f);
+                    oB2.splat(0.0f);
+                    oB3.splat(0.0f);
+                    pl0.splat(0.0f);
+                    pl1.splat(0.0f);
+                    pl2.splat(0.0f);
+                    pl3.splat(0.0f);
+                    uint32 ks2 = 0;
+                    while (ks2 < 4) {
+                        pa.load(ks, pBase + ks2 * 16, 0, 72);
+                        pla.load(ks, 4608 + pBase + ks2 * 16, 0, 72);
+                        uint32 vrow = (ks2 * 16) * 136 + oDim;
+                        vb.load(vs, vrow, 0, 136);
+                        oB0.mma(pa, vb);
+                        pl0.mma(pla, vb);
+                        vb.load(vs, vrow + 16, 0, 136);
+                        oB1.mma(pa, vb);
+                        pl1.mma(pla, vb);
+                        vb.load(vs, vrow + 32, 0, 136);
+                        oB2.mma(pa, vb);
+                        pl2.mma(pla, vb);
+                        vb.load(vs, vrow + 48, 0, 136);
+                        oB3.mma(pa, vb);
+                        pl3.mma(pla, vb);
+                        ks2 = ks2 + 1;
+                    }
+                    pl0.scaledAccumInto(oB0, ones[0], WaveVector.broadcast(0.0009765625f));
+                    pl1.scaledAccumInto(oB1, ones[0], WaveVector.broadcast(0.0009765625f));
+                    pl2.scaledAccumInto(oB2, ones[0], WaveVector.broadcast(0.0009765625f));
+                    pl3.scaledAccumInto(oB3, ones[0], WaveVector.broadcast(0.0009765625f));
+                    oA0.scaledAccumInto(oB0, alpha[wr * 16], WaveVector.broadcast(1.0f));
+                    oA1.scaledAccumInto(oB1, alpha[wr * 16], WaveVector.broadcast(1.0f));
+                    oA2.scaledAccumInto(oB2, alpha[wr * 16], WaveVector.broadcast(1.0f));
+                    oA3.scaledAccumInto(oB3, alpha[wr * 16], WaveVector.broadcast(1.0f));
+                } else {
+                    oA0.splat(0.0f);
+                    oA1.splat(0.0f);
+                    oA2.splat(0.0f);
+                    oA3.splat(0.0f);
+                    pl0.splat(0.0f);
+                    pl1.splat(0.0f);
+                    pl2.splat(0.0f);
+                    pl3.splat(0.0f);
+                    uint32 ks3 = 0;
+                    while (ks3 < 4) {
+                        pa.load(ks, pBase + ks3 * 16, 0, 72);
+                        pla.load(ks, 4608 + pBase + ks3 * 16, 0, 72);
+                        uint32 vrow = (ks3 * 16) * 136 + oDim;
+                        vb.load(vs, vrow, 0, 136);
+                        oA0.mma(pa, vb);
+                        pl0.mma(pla, vb);
+                        vb.load(vs, vrow + 16, 0, 136);
+                        oA1.mma(pa, vb);
+                        pl1.mma(pla, vb);
+                        vb.load(vs, vrow + 32, 0, 136);
+                        oA2.mma(pa, vb);
+                        pl2.mma(pla, vb);
+                        vb.load(vs, vrow + 48, 0, 136);
+                        oA3.mma(pa, vb);
+                        pl3.mma(pla, vb);
+                        ks3 = ks3 + 1;
+                    }
+                    pl0.scaledAccumInto(oA0, ones[0], WaveVector.broadcast(0.0009765625f));
+                    pl1.scaledAccumInto(oA1, ones[0], WaveVector.broadcast(0.0009765625f));
+                    pl2.scaledAccumInto(oA2, ones[0], WaveVector.broadcast(0.0009765625f));
+                    pl3.scaledAccumInto(oA3, ones[0], WaveVector.broadcast(0.0009765625f));
+                    oB0.scaledAccumInto(oA0, alpha[wr * 16], WaveVector.broadcast(1.0f));
+                    oB1.scaledAccumInto(oA1, alpha[wr * 16], WaveVector.broadcast(1.0f));
+                    oB2.scaledAccumInto(oA2, alpha[wr * 16], WaveVector.broadcast(1.0f));
+                    oB3.scaledAccumInto(oA3, alpha[wr * 16], WaveVector.broadcast(1.0f));
+                }
+                Barrier.workgroup();
+                blk = blk + 1;
+                kb0 = kb0 + 64;
+            }
+
+            // The output: O / l per row, through the wave's LDS slot.
+            if (tid % 4 == 0) { lrow[rr] = lrun; }
+            Barrier.workgroup();
+            boolean inB = (blk & 1) == 1;
+            uint32 slot = wid * 256;
+            uint32 fj = 0;
+            while (fj < 4) {
+                if (inB) {
+                    if (fj == 0) { oB0.store(ss, slot, 0, 16); }
+                    else if (fj == 1) { oB1.store(ss, slot, 0, 16); }
+                    else if (fj == 2) { oB2.store(ss, slot, 0, 16); }
+                    else { oB3.store(ss, slot, 0, 16); }
+                } else {
+                    if (fj == 0) { oA0.store(ss, slot, 0, 16); }
+                    else if (fj == 1) { oA1.store(ss, slot, 0, 16); }
+                    else if (fj == 2) { oA2.store(ss, slot, 0, 16); }
+                    else { oA3.store(ss, slot, 0, 16); }
+                }
+                uint32 e = lane;
+                while (e < 256) {
+                    uint32 pr = wr * 16 + e / 16;
+                    uint32 qi = r0 + pr / group;
+                    if (qi < rows) {
+                        uint32 hh = kvh * group + pr % group;
+                        float32 inv = 1.0f / lrow[pr];
+                        out[(int64) qi * (int64) (nH * 128) + (int64) (hh * 128)
+                            + (int64) (oDim + fj * 16 + e % 16)] = ss[slot + e] * inv;
+                    }
+                    e = e + 32;
+                }
+                fj = fj + 1;
+            }
+        }
+    }
+
+    static boolean attnOnlineOn = true;
+    public static void setPrefillOnline(boolean on) { AttnKernel.attnOnlineOn = on; }
+    public static boolean prefillOnlineOn() { return AttnKernel.attnOnlineOn; }
+
+    static void flashPrefillOnlineLaunchNoSync(KernelBuffer<float32> out,
+            KernelBuffer<float32> q, KernelBuffer<float16> kPool,
+            KernelBuffer<float16> vPool, int32 rows, int32 nH, int32 nKv,
+            int32 startPos, float32 scale) {
+        int32 qt = 64 / (nH / nKv);
+        int64 tiles = ((int64) rows + (int64) qt - 1L) / (int64) qt;
+        KernelStream s = QuantKernel.stream();
+        attnFlashPrefillOnlineKernel.launch(s,
+            grid: [(uint32) (tiles * (int64) nKv)], block: [256])
+            (out, q, kPool, vPool, (uint32) rows, (uint32) nH, (uint32) nKv,
+             (uint32) startPos, scale);
+        return;
+    }
+
     static boolean attnTileOn = true;
     public static void setPrefillTile(boolean on) { AttnKernel.attnTileOn = on; }
     static boolean floorCheckOn = false;
@@ -2585,6 +2935,16 @@ public final class AttnKernel {
         // loop, xpu-kernel-adaptor 4.2.1) the wave prefill kernels below
         // serve the same shapes, so the gate on the attend as a whole asks
         // for those and this branch asks for its own kernel.
+        // The single-pass online tile first (1.8.3), the two-pass tile
+        // behind it; both serve the same shapes, and the tile switch
+        // governs both (the online switch picks the variant).
+        if (AttnKernel.attnTileOn && AttnKernel.attnOnlineOn
+                && AttnKernel.tileServes(nH, nKv, hd)
+                && KernelCap.usable("attnFlashPrefillOnlineKernel")) {
+            AttnKernel.flashPrefillOnlineLaunchNoSync(out, q, kPool, vPool,
+                rows, nH, nKv, startPos, scale);
+            return;
+        }
         if (AttnKernel.attnTileOn && AttnKernel.tileServes(nH, nKv, hd)
                 && KernelCap.usable("attnFlashPrefillTileKernel")) {
             AttnKernel.flashPrefillTileLaunchNoSync(out, q, kPool, vPool,

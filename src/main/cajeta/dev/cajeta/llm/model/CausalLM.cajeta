@@ -498,8 +498,11 @@ public final class CausalLM extends InfModule {
         // stack reads it. The host decode of every row plus the 8 MB
         // upload it replaces was 45 ms of a 118 ms prefill on sm_89.
         this.pfEmbPending = 0;
-        if (Linear.devicePackOn() && this.batchReady(n)
-                && this.deviceEmbedReady()) {
+        // Asked once here and reused by forwardRows: batchReady scans every
+        // layer and emits the refusal records.
+        boolean willBatch = this.batchReady(n);
+        this.pfBatchHint = willBatch ? 1 : 2;
+        if (Linear.devicePackOn() && willBatch && this.deviceEmbedReady()) {
             this.ensurePrefillTok((int64) n);
             int32 r0 = 0;
             while (r0 < n) {
@@ -811,7 +814,15 @@ public final class CausalLM extends InfModule {
         // weights; the per-row path below reads all 4.58 GB of an 8B
         // checkpoint once PER PROMPT TOKEN, which is 2.4 TB for a
         // 512-token prompt and is why prefill(512) took 34 s.
-        boolean batched = rows > 1 && this.batchReady(rows);
+        boolean batched = rows > 1;
+        if (batched) {
+            if (this.pfBatchHint != 0) {
+                batched = this.pfBatchHint == 1;
+            } else {
+                batched = this.batchReady(rows);
+            }
+        }
+        this.pfBatchHint = 0;
         // ONE `dkv` PER ENGINE, so it can serve at most one sequence
         // (15.2.8). `DeviceKv` carries a single `int32 seq` and a single set
         // of planes; a second sequence entering prefill reuses the first
@@ -1238,6 +1249,8 @@ public final class CausalLM extends InfModule {
     int32[] pfTokHost;
     int64 pfTokCap;
     int32 pfEmbPending;
+    /** stepSeq's batchReady answer for forwardRows: 0 unasked, 1 yes, 2 no. */
+    int32 pfBatchHint;
     int32 pfPosCap;
     /** Unit 59b: the next layer's input norm + pack already ran in
      *  the previous layer's down-combine tail. */
@@ -1922,7 +1935,12 @@ public final class CausalLM extends InfModule {
     int32 refuse(int32 layer, String proj, int32 ty, String why, int32 rows) {
         if (!Diag.on()) { return 1; }
         String tn #= GgufFile.typeName(ty);
-        String key = proj + " " + tn + ": " + why;
+        // Owned: the key is kept in refusedKeys and read back by the next
+        // refusal. A `=` here recorded a borrow of the concatenation's
+        // temporary, dead at the end of the statement, and the second ask
+        // of the same key (batchReady is asked twice a prefill since
+        // 1.8.3) compared against freed memory: SIGSEGV in the cpu leg.
+        String key #= proj + " " + tn + ": " + why;
         if (this.refusedKeys == null) {
             this.refusedKeys = heap ArrayList<String>();
         }
