@@ -1,6 +1,7 @@
 package dev.cajeta.llm.selftest;
 
 import dev.cajeta.llm.model.KernelCap;
+import cajeta.lang.Math;
 import cajeta.lang.String;
 import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
@@ -182,5 +183,195 @@ public class QkPrepTest {
     public void fusedPrepMatchesOnASmallerHead() {
         QkPrepTest.need(true);
         QkPrepTest.run(6, 2, 64, true);
+    }
+
+    /** The PREFILL twin (1.8.3): RoPE of q and k over `rows` rows and the
+     *  K/V range append in ONE launch, against the two batched ropes and
+     *  the range append it replaces. The same rotation per element, so
+     *  q and k agree to the same bar as the decode prep and the planes to
+     *  half rounding. `from` is the first plane row, so a mid-sequence
+     *  chunk lands where the range append puts it. */
+    static void runRows(int32 nH, int32 nKv, int32 hd, int32 rows, int32 from) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable("ropeAppendRowsKernel")) { DeviceSkip.noKernel("ropeAppendRowsKernel", be); return; }
+        if (!KernelCap.usable("ropeF32")) { DeviceSkip.noKernel("ropeF32", be); return; }
+        if (!KernelCap.usable("kvAppendRangeKernel")) { DeviceSkip.noKernel("kvAppendRangeKernel", be); return; }
+        int64 qd = (int64) rows * (int64) (nH * hd);
+        int64 kvd = (int64) (nKv * hd);
+        int64 kvn = (int64) rows * kvd;
+        int32 cap = from + rows + 3;
+        KernelBuffer<float32> q1 #= QkPrepTest.fill(qd, 1);
+        KernelBuffer<float32> k1 #= QkPrepTest.fill(kvn, 2);
+        KernelBuffer<float32> v1 #= QkPrepTest.fill(kvn, 3);
+        KernelBuffer<float32> q2 #= QkPrepTest.fill(qd, 1);
+        KernelBuffer<float32> k2 #= QkPrepTest.fill(kvn, 2);
+        KernelBuffer<float32> v2 #= QkPrepTest.fill(kvn, 3);
+        KernelBuffer<float32> inv #= QkPrepTest.fill((int64) (hd / 2), 6);
+        int32[] ph = heap int32[(int64) rows];
+        int32 r = 0;
+        while (r < rows) { ph[(int64) r] = from + r; r = r + 1; }
+        KernelBuffer<int32> pos #= heap KernelBuffer<int32>((uint64) rows);
+        pos.upload(ph, (int64) rows);
+        KernelBuffer<float16> kp1 #= QkPrepTest.fillHalf(kvd * (int64) cap, 7);
+        KernelBuffer<float16> vp1 #= QkPrepTest.fillHalf(kvd * (int64) cap, 8);
+        KernelBuffer<float16> kp2 #= QkPrepTest.fillHalf(kvd * (int64) cap, 7);
+        KernelBuffer<float16> vp2 #= QkPrepTest.fillHalf(kvd * (int64) cap, 8);
+        // The separate verbs, held to a host rotation and a host append
+        // first, so the reference the fused launch is compared with is
+        // itself checked (and the census credits ropeF32 and the range
+        // append here).
+        int64[] vr #= ValueCheck.mark();
+        Prim.ropeBatchDevice(q1, inv, pos, (int64) rows, nH, hd);
+        Prim.ropeBatchDevice(k1, inv, pos, (int64) rows, nKv, hd);
+        AttnKernel.kvAppendRangeLaunchNoSync(kp1, vp1, k1, v1, (int32) kvd,
+            from, rows);
+        QuantKernel.stream().sync();
+        QkPrepTest.againstHost(q1, k1, v1, kp1, vp1, inv, rows, nH, nKv, hd, from, cap);
+        ValueCheck.credit(vr);
+        int64[] vc #= ValueCheck.mark();
+        AttnKernel.ropeAppendRowsLaunchNoSync(q2, k2, v2, kp2, vp2, inv, pos,
+            rows, nH, nKv, hd, from);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        QkPrepTest.same(q1, q2, qd, "q");
+        QkPrepTest.same(k1, k2, kvn, "k");
+        QkPrepTest.sameHalf(kp1, kp2, kvd * (int64) cap, "K plane");
+        QkPrepTest.sameHalf(vp1, vp2, kvd * (int64) cap, "V plane");
+        // Vacuity: the launch rotated q, and the K plane's first appended
+        // row is no longer the fill.
+        float32[] hq = heap float32[qd];
+        q2.download(hq, qd);
+        KernelBuffer<float32> q0 #= QkPrepTest.fill(qd, 1);
+        float32[] h0 = heap float32[qd];
+        q0.download(h0, qd);
+        int64 moved = 0L;
+        int64 i = 0;
+        while (i < qd) {
+            if (hq[i] != h0[i]) { moved = moved + 1L; }
+            i = i + 1;
+        }
+        Assert.isTrue(moved > qd / 4L);
+        KernelBuffer<float16> kp0 #= QkPrepTest.fillHalf(kvd * (int64) cap, 7);
+        float16[] a = heap float16[kvd * (int64) cap];
+        float16[] b = heap float16[kvd * (int64) cap];
+        kp0.download(a, kvd * (int64) cap);
+        kp2.download(b, kvd * (int64) cap);
+        int64 rowMoved = 0L;
+        int64 j = (int64) from * kvd;
+        while (j < (int64) (from + 1) * kvd) {
+            if ((float32) a[j] != (float32) b[j]) { rowMoved = rowMoved + 1L; }
+            j = j + 1;
+        }
+        Assert.isTrue(rowMoved > kvd / 4L);
+        ValueCheck.credit(vc);
+    }
+
+    /** ropeF32 and the range append against the host: rotate the fill
+     *  of q and k on the host with the same formula, compare the device
+     *  q and k to 1e-4 relative (the device's cos and sin are not the
+     *  host's to the last bit), and the planes' appended rows to the
+     *  host k and v rounded to half. */
+    static void againstHost(KernelBuffer<float32> qD, KernelBuffer<float32> kD,
+            KernelBuffer<float32> vD, KernelBuffer<float16> kpD,
+            KernelBuffer<float16> vpD, KernelBuffer<float32> invD, int32 rows,
+            int32 nH, int32 nKv, int32 hd, int32 from, int32 cap) {
+        int32 half = hd / 2;
+        float32[] inv = heap float32[(int64) half];
+        invD.download(inv, (int64) half);
+        int64 qd = (int64) rows * (int64) (nH * hd);
+        int64 kvd = (int64) (nKv * hd);
+        int64 kvn = (int64) rows * kvd;
+        KernelBuffer<float32> q0 #= QkPrepTest.fill(qd, 1);
+        KernelBuffer<float32> k0 #= QkPrepTest.fill(kvn, 2);
+        float32[] qh = heap float32[qd];
+        float32[] kh = heap float32[kvn];
+        float32[] vh = heap float32[kvn];
+        q0.download(qh, qd);
+        k0.download(kh, kvn);
+        vD.download(vh, kvn);
+        QkPrepTest.hostRope(qh, rows, nH, hd, from, inv);
+        QkPrepTest.hostRope(kh, rows, nKv, hd, from, inv);
+        float32[] qg = heap float32[qd];
+        float32[] kg = heap float32[kvn];
+        qD.download(qg, qd);
+        kD.download(kg, kvn);
+        QkPrepTest.near(qh, qg, qd, "ropeF32 q against the host");
+        QkPrepTest.near(kh, kg, kvn, "ropeF32 k against the host");
+        int64 pn = kvd * (int64) cap;
+        float16[] kp = heap float16[pn];
+        float16[] vp = heap float16[pn];
+        kpD.download(kp, pn);
+        vpD.download(vp, pn);
+        int64 i = 0;
+        while (i < kvn) {
+            int64 o = (int64) from * kvd + i;
+            float32 wk = (float32) ((float16) kh[i]);
+            float32 wv = (float32) ((float16) vh[i]);
+            float32 dk = (float32) kp[o] - wk;
+            float32 dv = (float32) vp[o] - wv;
+            if (dk < 0.0f) { dk = 0.0f - dk; }
+            if (dv < 0.0f) { dv = 0.0f - dv; }
+            float32 mk = wk < 0.0f ? 0.0f - wk : wk;
+            if (dk > mk * 0.001f + 0.001f || dv != 0.0f) {
+                Assert.fail("the range append differs from the host at plane element "
+                    + o + ": K " + (float32) kp[o] + " vs " + wk + ", V "
+                    + (float32) vp[o] + " vs " + wv);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    static void hostRope(float32[] t, int32 rows, int32 nHeads, int32 hd,
+            int32 from, float32[] inv) {
+        int32 half = hd / 2;
+        int32 r = 0;
+        while (r < rows) {
+            int32 h = 0;
+            while (h < nHeads) {
+                int64 base = (int64) r * (int64) (nHeads * hd) + (int64) (h * hd);
+                int32 d = 0;
+                while (d < half) {
+                    float32 ang = (float32) (from + r) * inv[(int64) d];
+                    float32 c = Math.cos(ang);
+                    float32 sn = Math.sin(ang);
+                    float32 a = t[base + (int64) d];
+                    float32 b = t[base + (int64) (d + half)];
+                    t[base + (int64) d] = a * c - b * sn;
+                    t[base + (int64) (d + half)] = a * sn + b * c;
+                    d = d + 1;
+                }
+                h = h + 1;
+            }
+            r = r + 1;
+        }
+        return;
+    }
+
+    static void near(float32[] want, float32[] got, int64 n, String what) {
+        int64 i = 0;
+        while (i < n) {
+            float32 d = want[i] - got[i];
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 mag = want[i] < 0.0f ? 0.0f - want[i] : want[i];
+            if (d > mag * 0.0001f + 0.0001f) {
+                Assert.fail(what + " differs at " + i + ": " + got[i]
+                    + " vs " + want[i]);
+                return;
+            }
+            i = i + 1;
+        }
+        return;
+    }
+
+    @Test
+    public void prefillRopeAppendMatchesSeparateLaunchesAtLlamaGqa() {
+        QkPrepTest.runRows(32, 8, 128, 64, 0);
+    }
+
+    @Test
+    public void prefillRopeAppendMatchesSeparateLaunchesMidSequence() {
+        QkPrepTest.runRows(6, 2, 64, 37, 5);
     }
 }

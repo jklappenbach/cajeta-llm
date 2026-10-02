@@ -400,6 +400,58 @@ public final class AttnKernel {
     }
 
     /**
+     * The prefill's RoPE and K/V append in ONE launch (1.8.3): a thread
+     * per (row, q head, rotation pair d < hd/2). It rotates q's pair in
+     * place; a thread whose head is also a k head (h < nKv) rotates k's
+     * pair in place too, writes the rotated pair into the K plane at
+     * plane row `fromRow + r` and copies V's two elements beside it.
+     * Three launches (two ropeF32 and kvAppendRangeKernel, 72 us a layer
+     * at 512 tokens on sm_89) become one. The rotation is ropeF32's,
+     * operation for operation, so q, k and the planes are what the
+     * three launches produce; k is still rotated in place because the
+     * mid-sequence cache-authority path downloads it.
+     */
+    @Kernel
+    public static void ropeAppendRowsKernel(KernelBuffer<float32> q,
+            KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool,
+            KernelBuffer<float32> invFreq, KernelBuffer<int32> pos,
+            uint32 rows, uint32 nH, uint32 nKv, uint32 hd, uint32 fromRow) {
+        uint32 id = KernelThread.globalIdX();
+        uint32 half = hd / 2;
+        uint32 lanes = rows * nH * half;
+        if (id < lanes) {
+            uint32 r = id / (nH * half);
+            uint32 rem = id % (nH * half);
+            uint32 h = rem / half;
+            uint32 d = rem % half;
+            float32 ang = (float32) pos[r] * invFreq[d];
+            float32 c = Math.cos(ang);
+            float32 s = Math.sin(ang);
+            uint32 qb = r * (nH * hd) + h * hd;
+            float32 a = q[qb + d];
+            float32 b = q[qb + d + half];
+            q[qb + d] = a * c - b * s;
+            q[qb + d + half] = a * s + b * c;
+            if (h < nKv) {
+                uint32 kvDim = nKv * hd;
+                uint32 kb = r * kvDim + h * hd;
+                float32 ka = k[kb + d];
+                float32 kb2 = k[kb + d + half];
+                float32 k0 = ka * c - kb2 * s;
+                float32 k1 = ka * s + kb2 * c;
+                k[kb + d] = k0;
+                k[kb + d + half] = k1;
+                uint32 o = (fromRow + r) * kvDim + h * hd;
+                kPool[o + d] = (float16) k0;
+                kPool[o + d + half] = (float16) k1;
+                vPool[o + d] = (float16) v[kb + d];
+                vPool[o + d + half] = (float16) v[kb + d + half];
+            }
+        }
+    }
+
+    /**
      * Prefill scores: one wave per `(query row, head, key position)`.
      *
      * Causal by construction — row `r` sits at absolute position
@@ -2139,6 +2191,20 @@ public final class AttnKernel {
             }
             out[r * (nH * hd) + h * hd + lane] = acc * rs;
         }
+    }
+
+    /** {@link #ropeAppendRowsKernel} over `rows` rows; NoSync. */
+    public static void ropeAppendRowsLaunchNoSync(KernelBuffer<float32> q,
+            KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool,
+            KernelBuffer<float32> invFreq, KernelBuffer<int32> pos,
+            int32 rows, int32 nH, int32 nKv, int32 hd, int32 fromRow) {
+        uint32 lanes = (uint32) (rows * nH * (hd / 2));
+        KernelStream s = QuantKernel.stream();
+        ropeAppendRowsKernel.launch(s, grid: [(lanes + 127) / 128], block: [128])
+            (q, k, v, kPool, vPool, invFreq, pos, (uint32) rows, (uint32) nH,
+             (uint32) nKv, (uint32) hd, (uint32) fromRow);
+        return;
     }
 
     public static void kvAppendRangeLaunchNoSync(KernelBuffer<float16> kPool,
