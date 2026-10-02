@@ -566,12 +566,13 @@ every timing leg and wait for the go; filtered suite only
       stays false and the LDS kernel stays as the control.
       NOTE 2026-10-02: "bit-identical" holds on the GPUs and on an 8-lane
       cpu host, but NOT on a 16-lane cpu host. On proton (AVX-512, llm main
-      00159a4, v0.32.2) the two arms differ by one f32 ulp at row 0: L1
-      0.096958 against LDS 0.0969581. That is consistent with the two arms
-      summing a row in a different order at the 16-lane wave. Both arms
-      stay right against the host twin.
-      `theTwoTableResidencyArmsAgreeExactly` keeps exact agreement off cpu
-      and takes a tolerance on cpu. The L1 decision above is unaffected.
+      00159a4, v0.32.2) all four rows differ identically: L1 0.096958
+      against LDS 0.0969581, absdiff 2.235e-8 (3 ulps), relative 2.3e-7.
+      That is consistent with the two arms summing a row in a different
+      order at the 16-lane wave. Both arms stay right against the host
+      twin. The proton session's pending edit keeps
+      `theTwoTableResidencyArmsAgreeExactly` bit-exact off cpu and holds
+      cpu to 1e-6 relative. The L1 decision above is unaffected.
 
 ### 6.2 Coding
 - [x] 6.2.1 Decoders; host; kernels; registration; gates last.
