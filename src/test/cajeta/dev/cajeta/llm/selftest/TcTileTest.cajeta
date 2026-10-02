@@ -181,6 +181,88 @@ public class TcTileTest {
         ValueCheck.credit(vc);
     }
 
+    /** The ACCUMULATING launch (1.8.3): `y += W x` into a prefilled
+     *  output, the residual add folded into the tile's epilogue. Held to
+     *  the host GEMM plus the prefill at the batch GEMMs' bar, unsplit and
+     *  under a forced 4-way split (where the fixup adds the partials to
+     *  the prefill), twice each, so a launch that zeroed the output or
+     *  added it twice shows. */
+    static void checkAccum(int32 ty, int64 rows, int64 out, int64 cols, int64 split) {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        String kn #= ty == Quant.GG_Q4_K ? "q4kQ8TcTileKernel" : "q6kQ8TcTileKernel";
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        if (!KernelCap.usable(kn)) { DeviceSkip.noKernel(kn, be); return; }
+        if (!KernelCap.usable("tcSplitFixupKernel")) { DeviceSkip.noKernel("tcSplitFixupKernel", be); return; }
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        String fx #= ty == Quant.GG_Q4_K ? "q4_k.bin" : "q6_k.bin";
+        int8[] raw #= CensusReachTest.tiled(ty, fx, nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        float32[] want #= CensusReachTest.hostGemm(ty, raw, nBlocks, x, rows, out, cols);
+        float32[] pre #= heap float32[rows * out];
+        int64 e = 0;
+        while (e < rows * out) {
+            pre[e] = 0.25f * (float32) ((e * 7L) % 13L) - 1.5f;
+            want[e] = want[e] + pre[e];
+            e = e + 1L;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) 1);
+        if (Quant.splitOn(ty)) {
+            int8[] res #= heap int8[out * Quant.rowResidentBytes(ty, bpr)];
+            Quant.splitInto(ty, raw, 0L, out, bpr, res, 0L);
+            KernelBuffer<int8> wS #= heap KernelBuffer<int8>((uint64) ((int64) res.count()));
+            wS.upload(res);
+            wD #= wS;
+        } else {
+            KernelBuffer<int8> wR #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+            wR.upload(raw);
+            wD #= wR;
+        }
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        float32[] got #= heap float32[rows * out];
+        TcTile.setSplitOverride(split);
+        int32 pass = 0;
+        while (pass < 2) {
+            yD.upload(pre);
+            if (ty == Quant.GG_Q4_K) {
+                TcTile.q4kQ8TcTileAccumNoSync(yD, wD, xp, rows, out, cols);
+            } else {
+                TcTile.q6kQ8TcTileAccumNoSync(yD, wD, xp, rows, out, cols);
+            }
+            QuantKernel.stream().sync();
+            yD.download(got);
+            CensusReachTest.nearOnePercent(want, got, rows * out,
+                kn + " accumulating, split " + split + ", at " + rows + "x" + out
+                + "x" + cols + " pass " + pass);
+            pass = pass + 1;
+        }
+        TcTile.setSplitOverride(0L);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void q4kTileAccumulatesIntoTheOutput() {
+        TcTileTest.checkAccum(Quant.GG_Q4_K, 256L, 384L, 1024L, 1L);
+    }
+
+    @Test
+    public void q4kTileAccumulatesIntoTheOutputUnderASplit() {
+        TcTileTest.checkAccum(Quant.GG_Q4_K, 256L, 384L, 1024L, 4L);
+    }
+
+    @Test
+    public void q6kTileAccumulatesIntoTheOutput() {
+        TcTileTest.checkAccum(Quant.GG_Q6_K, 256L, 256L, 2048L, 1L);
+    }
+
+    @Test
+    public void q6kTileAccumulatesIntoTheOutputUnderASplit() {
+        TcTileTest.checkAccum(Quant.GG_Q6_K, 256L, 256L, 2048L, 4L);
+    }
+
     /** At the engine's own shape (512 tokens, the 4096x14336 ffn_down),
      *  where the measured split is 1, forced splits of 2 and 4 agree with
      *  the unsplit launch to float rounding. The host GEMM at this size is

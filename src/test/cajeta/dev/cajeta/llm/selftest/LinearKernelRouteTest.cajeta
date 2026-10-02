@@ -2318,4 +2318,86 @@ public class LinearKernelRouteTest {
         this.padRemainderRoute(Quant.GG_Q4_0, "q4_0.bin", "q4_0");
         return;
     }
+
+    /** The ACCUMULATING tile route (1.8.3): `dst += W x` in one launch, the
+     *  residual add folded into the GEMM's epilogue. FIRES at a row count
+     *  that tiles: the record names it and dst minus its prefill agrees
+     *  with the projection's own batched output to float rounding. DOES
+     *  NOT FIRE on a ragged row count, where the padded launch would write
+     *  rows past the residual's end, and nothing is launched. */
+    @Test
+    public void accumulatingTileAddsTheProductIntoTheResidual() {
+        if (!KernelCap.usable("q4kQ8TcTileKernel")) {
+            DeviceSkip.tracked("backend " + Device.activeBackend()
+                + " has no tensor-core tile", "xpu-kernel-adaptor 1.8.3");
+            return;
+        }
+        if (Linear.backendIsVulkan() || !Linear.waveMv()
+                || !Linear.matrixCoresPay()) {
+            DeviceSkip.tracked("the tensor-core tile is not routed on "
+                + Device.activeBackend(), "xpu-kernel-adaptor 1.8.3");
+            return;
+        }
+        int32 rows = 256;
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        int64 n = (int64) rows * co;
+        Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q4_K, "q4_k.bin");
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ci, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L, n);
+        QuantKernel.setRoutingEnabled(true);
+        boolean tcWas = Linear.tcEnabled();
+        Linear.setTc(true);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        lin.matmulInto(rows, want, 0L);
+
+        float32[] pre #= heap float32[n];
+        int64 e = 0;
+        while (e < n) {
+            pre[e] = 0.5f * (float32) ((e * 5L) % 11L) - 2.0f;
+            e = e + 1L;
+        }
+        KernelBuffer<float32> dst #= heap KernelBuffer<float32>((uint64) n);
+        dst.upload(pre);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap tap = heap PrefillTap();
+        Diag.register(tap);
+        boolean took = lin.matmulBatchAccum(rows, dst);
+        Diag.register(null);
+        // Ragged: refused, nothing launched, dst untouched.
+        Linear.stageBatch(x, 0L, 200, (int32) ci, Linear.nextStageTag());
+        boolean ragged = lin.matmulBatchAccum(200, dst);
+        Linear.setTc(tcWas);
+        if (!took || !tap.saw("batch-route", "q4 tcTile +=")) {
+            Assert.fail("the accumulating tile was not taken, saw "
+                + tap.namesOf("batch-route"));
+            return;
+        }
+        if (ragged) {
+            Assert.fail("the accumulating tile took a ragged 200-row launch");
+            return;
+        }
+        QuantKernel.stream().sync();
+        float32[] got #= heap float32[n];
+        dst.download(got, n);
+        LinearKernelRouteTest.assertLive(want, n, "the projection alone");
+        int64 i = 0;
+        while (i < n) {
+            float32 a = want.flatGet(i);
+            float32 b = got[i] - pre[i];
+            float32 d = a - b;
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 s = a;
+            if (s < 0.0f) { s = 0.0f - s; }
+            if (s < 1.0f) { s = 1.0f; }
+            if (d / s > 0.0001f) {
+                Assert.fail("element " + i + ": accumulated " + got[i]
+                    + " minus the prefill " + pre[i] + " is " + b
+                    + ", the projection alone " + a);
+                return;
+            }
+            i = i + 1;
+        }
+    }
 }
