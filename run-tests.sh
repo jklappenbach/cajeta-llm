@@ -75,6 +75,7 @@ cajeta_artifact_path() {
 # failures the cpu compile could never see).
 XPU_BACKEND="${XPU_BACKEND:-${CAJETA_XPU_BACKEND:-cpu}}"
 echo ">> compile backend: ${XPU_BACKEND}"
+echo ">> kernel gate: CAJETA_XPU_KERNEL_GATE=${CAJETA_XPU_KERNEL_GATE:-unset (enforcing)}"
 
 # Run one suite binary and report what it ACTUALLY exercised.
 #
