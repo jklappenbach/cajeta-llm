@@ -126,7 +126,7 @@ census_table() {
     mkdir -p "$here/build"
     tsv="$here/build/census-${be}.tsv"
     { printf 'backend\tkernel\tclass\tlaunches\tchecks\tmanifest\tnote\n'
-      grep "^census-row"$'\t' "$log" | cut -f2- | sort -t$'\t' -k2,2
+      { grep "^census-row"$'\t' "$log" || true; } | cut -f2- | sort -t$'\t' -k2,2
       for errlog in "$out/lib.err" "$out/test.err"; do
           [ -s "$errlog" ] || continue
           sed -n 's/.*\[xpu-kernel-skipped\] \([A-Za-z0-9_]*\): \(.*\)$/\1\t\2/p' "$errlog"

@@ -2238,8 +2238,9 @@ public final class Linear extends InfModule {
      * Is a 16-row matrix-core GEMM cheaper HERE than the dotAccum batch
      * kernel over the same 16 rows (xpu-kernel-adaptor 11.2.2)? Measured
      * once per process, the first time a ragged chunk asks, on a synthetic
-     * Q4_K 4096x4096 weight: both kernels are warmed, then the faster of
-     * two synced launches each is compared. No backend is named and no
+     * Q4_K 4096x4096 weight: both kernels are warmed, then the fastest of
+     * six bursts of four launches each is compared by
+     * {@link #matrixCoresPayBy}. No backend is named and no
      * tier is assumed; the two parts measured so far answer in opposite
      * directions by a wide margin (sm_89: 0.19 ms against 1.0 ms; cpu: 123
      * ms against 7.5 ms), which is why the question is asked of the device.
@@ -2318,17 +2319,32 @@ public final class Linear extends InfModule {
         s.sync();
         int64 wBest = 0L - 1L;
         int64 bBest = 0L - 1L;
+        // Two warm rounds of one launch are not read. Each timed round brackets a burst of
+        // launches per sync, so the sync is a small part of what is timed, and the fastest round wins.
+        int32 warm = 2;
+        int32 rounds = warm + 6;
+        int32 burst = 4;
         int32 round = 0;
-        while (round < 3) {
+        while (round < rounds) {
+            int32 n = 1;
+            if (round >= warm) { n = burst; }
             int64 t0 = Clock.nanoTime();
-            if (tile) {
-                TcTile.q4kQ8TcTileLaunchNoSync(y, wD, xp, mcRows, out, cols);
-            } else {
-                WmmaKernel.q4kWmmaLaunch(y, wD, xp, rows, out, cols);
+            int32 k = 0;
+            while (k < n) {
+                if (tile) {
+                    TcTile.q4kQ8TcTileLaunchNoSync(y, wD, xp, mcRows, out, cols);
+                } else {
+                    WmmaKernel.q4kWmmaLaunch(y, wD, xp, rows, out, cols);
+                }
+                k = k + 1;
             }
             s.sync();
             int64 t1 = Clock.nanoTime();
-            QuantKernel.q4kQ8BatchMatMulLaunchNoSync(y, wD, xp, rows, out, cols);
+            k = 0;
+            while (k < n) {
+                QuantKernel.q4kQ8BatchMatMulLaunchNoSync(y, wD, xp, rows, out, cols);
+                k = k + 1;
+            }
             s.sync();
             int64 t2 = Clock.nanoTime();
             // Round 0 is the warm-up and is not read, unless it already
@@ -2341,15 +2357,23 @@ public final class Linear extends InfModule {
                 Linear.mcProbeBatchNs = t2 - t1;
                 return false;
             }
-            if (round > 0) {
-                if (wBest < 0L || t1 - t0 < wBest) { wBest = t1 - t0; }
-                if (bBest < 0L || t2 - t1 < bBest) { bBest = t2 - t1; }
+            if (round >= warm) {
+                int64 w = (t1 - t0) / (int64) n;
+                int64 bt = (t2 - t1) / (int64) n;
+                if (wBest < 0L || w < wBest) { wBest = w; }
+                if (bBest < 0L || bt < bBest) { bBest = bt; }
             }
             round = round + 1;
         }
         Linear.mcProbeWmmaNs = wBest;
         Linear.mcProbeBatchNs = bBest;
-        return wBest < bBest;
+        return Linear.matrixCoresPayBy(wBest, bBest);
+    }
+
+    /** The probe's verdict from its per-launch times: the matrix-core arm pays unless it is more
+     *  than a tenth slower, since the batch arm is timed at 16 rows and grows with the chunk. */
+    public static boolean matrixCoresPayBy(int64 wmmaNs, int64 batchNs) {
+        return wmmaNs * 10L <= batchNs * 11L;
     }
 
     void matmulBatchKeep(int32 rows) {
