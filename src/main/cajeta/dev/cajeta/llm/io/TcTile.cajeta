@@ -1,16 +1,25 @@
 package dev.cajeta.llm.io;
 
+import cajeta.collection.ArrayList;
 import cajeta.lang.Cajeta;
+import cajeta.lang.String;
 import cajeta.xpu.Barrier;
 import cajeta.xpu.CooperativeMatrix;
 import cajeta.xpu.Device;
+import cajeta.xpu.DeviceFacts;
+import cajeta.xpu.KernelFacts;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelThread;
+import cajeta.xpu.ShapeCandidate;
+import cajeta.xpu.ShapeChoice;
+import cajeta.xpu.ShapeFilter;
+import cajeta.xpu.ShapeResult;
 import cajeta.xpu.Shared;
 import cajeta.xpu.TileOps;
 import cajeta.xpu.Vector;
 import cajeta.xpu.WaveVector;
+import cajeta.xpu.XpuLaunchException;
 
 /**
  * The tensor-core prefill tile for Q4_K (xpu-kernel-adaptor 1.8.3): one
@@ -62,410 +71,118 @@ public final class TcTile {
 
     public TcTile() { return; }
 
-    /** Whether the tile covers the shape: tokens and rows on the 128
-     *  grid, columns a whole number of 256-element blocks. */
-    public static boolean fits(int64 rows, int64 outDim, int64 cols) {
-        return rows % 128L == 0L && outDim % 128L == 0L && cols % 256L == 0L
-            && rows > 0L && outDim > 0L && cols > 0L;
+    /** The Q4_K tile family's name in the shape store (xpu-tile-shape-selection §4). */
+    public static final String Q4_FAMILY = "q4kTcTile";
+
+    /** The default listed shape's registered kernel, 128x128 over 32x64
+     *  warp tiles: what the route's availability check and the census
+     *  name. Every listed shape registers under its own `QkTile_*_q4kQ8`. */
+    public static final String Q4_KERNEL = "QkTile_128_128_32_64_128_q4kQ8";
+
+    // The family's listed shapes, one object per instantiation in
+    // QkTile's @Instantiate list; a shape listed there and missing here is
+    // what TcTileTest.q4kEveryListedShapeMatchesTheHost reports.
+    static ArrayList<Q4TileShape> q4Shapes;
+    static String shapeDir = "";
+    // The last choice, by problem: the store is asked once per shape.
+    static int64 memoRows = -1L;
+    static int64 memoOut = -1L;
+    static int64 memoCols = -1L;
+    static int32 memoIdx = -1;
+
+    /** The shape store's directory (the engine's tune dir); "" keeps no cache. */
+    public static void setShapeDir(String d) {
+        TcTile.shapeDir #= d.clone();
+        TcTile.forgetShapes();
     }
 
-    // The launch is a literal block of 256; the pin lets the register
-    // allocator use the 255 a 256-thread block allows (the accumulators
-    // alone are 160 registers a thread). Held on amdgpu and vulkan, where
-    // the double-buffered tiles' 98 KB of shared memory is over the 64 KB
-    // those parts offer a workgroup; the Mw8 deq GEMMs stay those
-    // backends' route. On cpu it lowers (the software tile) and the route
-    // asks the measured Linear.matrixCoresPay, whose matrix-core arm is
-    // this tile, before taking it.
-    @Occupancy(maxThreads = 256)
-    @Kernel @FastMath
-    @Unlowered(backend = {"amdgpu", "vulkan"}, tracked = "xpu-kernel-adaptor 1.8.3")
-    public static void q4kQ8TcTileKernel(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int8> xp, uint32 rows,
-            uint32 outDim, uint32 tilesN8, int64 blocksPerRow,
-            KernelBuffer<float32> part, uint32 splits, uint32 accum) {
-        // Half-block tiles, [buffer][row][k] at stride 144, two buffers each.
-        Shared<int8> aT = shared int8[36864];
-        Shared<int8> bT = shared int8[36864];
-        // Per-block panels, two buffers each: xsAll[buf*128 + token] is the
-        // token's q8_K scale, dAll[buf*128 + col] the column's d,
-        // rgAll[buf*1024 + (tokenTile*8 + j)*16 + tok] = xs * bsum_j,
-        // scAll[buf*1024 + col*8 + j] = sc_j, cgAll[...] = -dmin * mn_j.
-        Shared<float32> xsAll = shared float32[256];
-        Shared<float32> dAll = shared float32[256];
-        Shared<float32> rgAll = shared float32[2048];
-        Shared<int32> scAll = shared int32[2048];
-        Shared<float32> cgAll = shared float32[2048];
+    /** Drop the remembered choice, so the next launch asks the store (and
+     *  the family override) again. */
+    public static void forgetShapes() { TcTile.memoRows = -1L; }
 
-        uint32 tid = KernelThread.x();
-        uint32 lane = tid % 32;
-        uint32 wid = tid / 32;
-        uint32 lane16 = lane % 16;
-        uint32 wg = KernelThread.globalIdX() / 256;
-        // Split-K: workgroups `tile * splits + split` share a tile, each
-        // over its own run of blocksPerRow / splits blocks.
-        uint32 tile = wg / splits;
-        uint32 split = wg % splits;
-        int64 nbs = blocksPerRow / (int64) splits;
-        int64 bOff = (int64) split * nbs;
-        uint32 tileT = tile / tilesN8;
-        uint32 tileI8 = tile % tilesN8;
-        uint32 t0 = tileT * 128;
-        uint32 i0 = tileI8 * 128;
-        uint32 wr = wid / 2;
-        uint32 wc = wid % 2;
-        uint32 tw = t0 + 32 * wr;
-        uint32 cw = tileI8 * 128 + 64 * wc;
-        // Staging roles: thread -> (column of the 128, which 32-byte nibble
-        // group of the half-block), and the same pair as (token, panel role).
-        uint32 sCol = tid >> 1;
-        uint32 sH = tid & 1;
-        if (t0 < rows && i0 < outDim) {
-            int64 rowBytes = blocksPerRow * 144L;
-            int64 xRowBytes = blocksPerRow * 320L;
-            int64 sRo = (int64) (i0 + sCol) * rowBytes + bOff * 144L;
-            int64 sXb = (int64) (t0 + sCol) * xRowBytes + bOff * 320L;
-            // The activation chunks this thread copies: chunk c = tid + 256i
-            // is token c/8, 16-byte part c%8 of the half's 128 bytes, so
-            // eight consecutive threads read one token's 128 contiguous
-            // bytes (a whole line a group; the contiguous-per-thread
-            // mapping measured 10% slower, 2026-10-01). The three further
-            // tokens are 32 rows on, added per load rather than hoisted as
-            // three more base registers.
-            uint32 aRow0 = tid >> 3;
-            uint32 aPart = tid & 7;
-            int64 aSrc0 = (int64) (t0 + aRow0) * xRowBytes + (int64) (16 * aPart)
-                + bOff * 320L;
-            int64 xr32 = 32L * xRowBytes;
-            uint32 aDst0 = aRow0 * 144 + 16 * aPart;
-
-            CooperativeMatrix<int8,16,16,0> ma;
-            CooperativeMatrix<int8,16,16,0> maB;
-            CooperativeMatrix<int8,16,16,1> mbA;
-            CooperativeMatrix<int8,16,16,1> mbB;
-            CooperativeMatrix<int8,16,16,1> mbC;
-            CooperativeMatrix<int8,16,16,1> mbD;
-            CooperativeMatrix<int32,16,16,2> mc0;
-            CooperativeMatrix<int32,16,16,2> mc1;
-            CooperativeMatrix<int32,16,16,2> mc2;
-            CooperativeMatrix<int32,16,16,2> mc3;
-            CooperativeMatrix<int32,16,16,2> iacc0;
-            CooperativeMatrix<int32,16,16,2> iacc1;
-            CooperativeMatrix<int32,16,16,2> iacc2;
-            CooperativeMatrix<int32,16,16,2> iacc3;
-            CooperativeMatrix<int32,16,16,2> iacc4;
-            CooperativeMatrix<int32,16,16,2> iacc5;
-            CooperativeMatrix<int32,16,16,2> iacc6;
-            CooperativeMatrix<int32,16,16,2> iacc7;
-            CooperativeMatrix<float32,16,16,2> facc0;
-            CooperativeMatrix<float32,16,16,2> facc1;
-            CooperativeMatrix<float32,16,16,2> facc2;
-            CooperativeMatrix<float32,16,16,2> facc3;
-            CooperativeMatrix<float32,16,16,2> facc4;
-            CooperativeMatrix<float32,16,16,2> facc5;
-            CooperativeMatrix<float32,16,16,2> facc6;
-            CooperativeMatrix<float32,16,16,2> facc7;
-            // ACCUMULATE (1.8.3): `y += W x`, the residual add folded in.
-            // Unsplit, the accumulators start from y's tile; split, they
-            // start at zero and the fixup adds the partials to y.
-            if (accum != 0 && splits == 1) {
-                facc0.load(y, (uint32) ((int64) tw * (int64) outDim + (int64) cw), 0, outDim);
-                facc1.load(y, (uint32) ((int64) tw * (int64) outDim + (int64) (cw + 16)), 0, outDim);
-                facc2.load(y, (uint32) ((int64) tw * (int64) outDim + (int64) (cw + 32)), 0, outDim);
-                facc3.load(y, (uint32) ((int64) tw * (int64) outDim + (int64) (cw + 48)), 0, outDim);
-                facc4.load(y, (uint32) ((int64) (tw + 16) * (int64) outDim + (int64) cw), 0, outDim);
-                facc5.load(y, (uint32) ((int64) (tw + 16) * (int64) outDim + (int64) (cw + 16)), 0, outDim);
-                facc6.load(y, (uint32) ((int64) (tw + 16) * (int64) outDim + (int64) (cw + 32)), 0, outDim);
-                facc7.load(y, (uint32) ((int64) (tw + 16) * (int64) outDim + (int64) (cw + 48)), 0, outDim);
-            } else {
-                facc0.splat(0.0f);
-                facc1.splat(0.0f);
-                facc2.splat(0.0f);
-                facc3.splat(0.0f);
-                facc4.splat(0.0f);
-                facc5.splat(0.0f);
-                facc6.splat(0.0f);
-                facc7.splat(0.0f);
-            }
-
-            // The prefetch registers: the next half's activation chunks,
-            // its weight nibbles, and at a block boundary the column
-            // header (even threads) or the token's sums and scale (odd).
-            Vector<int8,16> pa0 = xp.vload<16>(aSrc0);
-            Vector<int8,16> pa1 = xp.vload<16>(aSrc0 + xr32);
-            Vector<int8,16> pa2 = xp.vload<16>(aSrc0 + xr32 + xr32);
-            Vector<int8,16> pa3 = xp.vload<16>(aSrc0 + xr32 + xr32 + xr32);
-            Vector<int8,16> pb0 = packed.vload<16>(sRo + 16L + (int64) (32 * sH));
-            Vector<int8,16> pb1 = packed.vload<16>(sRo + 32L + (int64) (32 * sH));
-            // pq0 is the column header on an even thread, the first four
-            // token sums on an odd one; the union of the two roles' registers
-            // is what the kernel pays, so the roles share.
-            Vector<int8,16> pq0 = pb0;
-            Vector<int8,16> pq1 = pb0;
-            Vector<int8,4> px = xp.vload<4>(sXb + 288L);
-            if (sH == 0) {
-                pq0 = packed.vload<16>(sRo);
-            } else {
-                pq0 = xp.vload<16>(sXb + 256L);
-                pq1 = xp.vload<16>(sXb + 272L);
-            }
-
-            uint32 nh = (uint32) nbs * 2;
-            uint32 hh = 0;
-            while (hh < nh) {
-                uint32 H = hh & 1;
-                uint32 buf = H * 18432;
-                uint32 pOff = (hh >> 1) & 1;
-                // Store the prefetched half into its buffer. The buffer
-                // was last read two halves ago, behind a barrier.
-                int64 aDst = (int64) (buf + aDst0);
-                aT.vstore(aDst, pa0);
-                aT.vstore(aDst + 4608L, pa1);
-                aT.vstore(aDst + 9216L, pa2);
-                aT.vstore(aDst + 13824L, pa3);
-                {
-                    // Nibble group sH of the half: low nibbles are k
-                    // 64sH..64sH+31 of the staged half, high ones
-                    // 64sH+32..64sH+63 (Quant.q4kBlock).
-                    int64 dst = (int64) (buf + sCol * 144 + 64 * sH);
-                    Vector<int32,4> w0 = pb0.asWords();
-                    Vector<int32,4> w1 = pb1.asWords();
-                    bT.vstore(dst, (w0 & 252645135).asBytes());
-                    bT.vstore(dst + 16L, (w1 & 252645135).asBytes());
-                    bT.vstore(dst + 32L, ((w0 >> 4) & 252645135).asBytes());
-                    bT.vstore(dst + 48L, ((w1 >> 4) & 252645135).asBytes());
-                }
-                if (H == 0) {
-                    if (sH == 0) {
-                        Vector<int32,4> hw = pq0.asWords();
-                        int32 h0 = hw[0];
-                        int32 h1 = hw[1];
-                        int32 h2 = hw[2];
-                        int32 h3 = hw[3];
-                        float32 dv = GgufFile.halfBitsToF32(h0 & 65535);
-                        float32 dmv = GgufFile.halfBitsToF32((h0 >> 16) & 65535);
-                        int32 d0 = h1 & 255;
-                        int32 d1 = (h1 >> 8) & 255;
-                        int32 d2 = (h1 >> 16) & 255;
-                        int32 d3 = (h1 >> 24) & 255;
-                        int32 m0 = h2 & 255;
-                        int32 m1 = (h2 >> 8) & 255;
-                        int32 m2 = (h2 >> 16) & 255;
-                        int32 m3 = (h2 >> 24) & 255;
-                        int32 k0 = h3 & 255;
-                        int32 k1 = (h3 >> 8) & 255;
-                        int32 k2 = (h3 >> 16) & 255;
-                        int32 k3 = (h3 >> 24) & 255;
-                        uint32 cb = pOff * 1024 + sCol * 8;
-                        dAll[pOff * 128 + sCol] = dv;
-                        scAll[cb] = d0 & 63;
-                        scAll[cb + 1] = d1 & 63;
-                        scAll[cb + 2] = d2 & 63;
-                        scAll[cb + 3] = d3 & 63;
-                        scAll[cb + 4] = (k0 & 15) | ((d0 >> 2) & 48);
-                        scAll[cb + 5] = (k1 & 15) | ((d1 >> 2) & 48);
-                        scAll[cb + 6] = (k2 & 15) | ((d2 >> 2) & 48);
-                        scAll[cb + 7] = (k3 & 15) | ((d3 >> 2) & 48);
-                        cgAll[cb] = 0.0f - dmv * (float32) (m0 & 63);
-                        cgAll[cb + 1] = 0.0f - dmv * (float32) (m1 & 63);
-                        cgAll[cb + 2] = 0.0f - dmv * (float32) (m2 & 63);
-                        cgAll[cb + 3] = 0.0f - dmv * (float32) (m3 & 63);
-                        cgAll[cb + 4] = 0.0f - dmv
-                            * (float32) ((k0 >> 4) | ((m0 >> 2) & 48));
-                        cgAll[cb + 5] = 0.0f - dmv
-                            * (float32) ((k1 >> 4) | ((m1 >> 2) & 48));
-                        cgAll[cb + 6] = 0.0f - dmv
-                            * (float32) ((k2 >> 4) | ((m2 >> 2) & 48));
-                        cgAll[cb + 7] = 0.0f - dmv
-                            * (float32) ((k3 >> 4) | ((m3 >> 2) & 48));
-                    } else {
-                        Vector<int32,4> q0 = pq0.asWords();
-                        Vector<int32,4> q1 = pq1.asWords();
-                        Vector<int32,1> xw = px.asWords();
-                        float32 xv = Cajeta.bitsToF32(xw[0]);
-                        xsAll[pOff * 128 + sCol] = xv;
-                        uint32 rb = pOff * 1024 + (sCol >> 4) * 128 + (sCol & 15);
-                        rgAll[rb] = xv * (float32) q0[0];
-                        rgAll[rb + 16] = xv * (float32) q0[1];
-                        rgAll[rb + 32] = xv * (float32) q0[2];
-                        rgAll[rb + 48] = xv * (float32) q0[3];
-                        rgAll[rb + 64] = xv * (float32) q1[0];
-                        rgAll[rb + 80] = xv * (float32) q1[1];
-                        rgAll[rb + 96] = xv * (float32) q1[2];
-                        rgAll[rb + 112] = xv * (float32) q1[3];
-                    }
-                }
-                // Prefetch the next half while this one computes.
-                if (hh + 1 < nh) {
-                    int64 nb = (int64) ((hh + 1) >> 1);
-                    uint32 nH = (hh + 1) & 1;
-                    int64 aS = aSrc0 + nb * 320L + (int64) (128 * nH);
-                    pa0 = xp.vload<16>(aS);
-                    aS = aS + xr32;
-                    pa1 = xp.vload<16>(aS);
-                    aS = aS + xr32;
-                    pa2 = xp.vload<16>(aS);
-                    aS = aS + xr32;
-                    pa3 = xp.vload<16>(aS);
-                    int64 bS = sRo + nb * 144L + 16L + (int64) (64 * nH + 32 * sH);
-                    pb0 = packed.vload<16>(bS);
-                    pb1 = packed.vload<16>(bS + 16L);
-                    if (nH == 0) {
-                        if (sH == 0) {
-                            pq0 = packed.vload<16>(sRo + nb * 144L);
-                        } else {
-                            int64 xb = sXb + nb * 320L;
-                            pq0 = xp.vload<16>(xb + 256L);
-                            pq1 = xp.vload<16>(xb + 272L);
-                            px = xp.vload<4>(xb + 288L);
-                        }
-                    }
-                }
-                Barrier.workgroup();
-
-                if (H == 0) {
-                    iacc0.splat(0);
-                    iacc1.splat(0);
-                    iacc2.splat(0);
-                    iacc3.splat(0);
-                    iacc4.splat(0);
-                    iacc5.splat(0);
-                    iacc6.splat(0);
-                    iacc7.splat(0);
-                }
-                uint32 pBase = pOff * 1024;
-                uint32 cBase = pBase + (64 * wc) * 8;
-                uint32 aBuf = buf + (32 * wr) * 144;
-                uint32 bBuf = buf + (64 * wc) * 144;
-                uint32 jj = 0;
-                while (jj < 4) {
-                    uint32 j = 4 * H + jj;
-                    WaveVector<float32, 16> cgv0 = WaveVector.ofSlice(cgAll, cBase + j, 8);
-                    WaveVector<float32, 16> cgv1 = WaveVector.ofSlice(cgAll, cBase + 128 + j, 8);
-                    WaveVector<float32, 16> cgv2 = WaveVector.ofSlice(cgAll, cBase + 256 + j, 8);
-                    WaveVector<float32, 16> cgv3 = WaveVector.ofSlice(cgAll, cBase + 384 + j, 8);
-                    uint32 rbase = pBase + (16 * wr + j) * 16;
-                    uint32 kk = 32 * jj;
-                    mc0.splat(0);
-                    mc1.splat(0);
-                    mc2.splat(0);
-                    mc3.splat(0);
-                    mbA.load(bT, bBuf + kk, 1, 144);
-                    mbB.load(bT, bBuf + 16 * 144 + kk, 1, 144);
-                    mbC.load(bT, bBuf + 32 * 144 + kk, 1, 144);
-                    mbD.load(bT, bBuf + 48 * 144 + kk, 1, 144);
-                    ma.load(aT, aBuf + kk, 0, 144);
-                    mc0.mma(ma, mbA);
-                    mc1.mma(ma, mbB);
-                    mc2.mma(ma, mbC);
-                    mc3.mma(ma, mbD);
-                    mbA.load(bT, bBuf + kk + 16, 1, 144);
-                    mbB.load(bT, bBuf + 16 * 144 + kk + 16, 1, 144);
-                    mbC.load(bT, bBuf + 32 * 144 + kk + 16, 1, 144);
-                    mbD.load(bT, bBuf + 48 * 144 + kk + 16, 1, 144);
-                    ma.load(aT, aBuf + kk + 16, 0, 144);
-                    mc0.mma(ma, mbA);
-                    mc1.mma(ma, mbB);
-                    mc2.mma(ma, mbC);
-                    mc3.mma(ma, mbD);
-                    TileOps.scaledAccumI32(mc0, iacc0, scAll, cBase + j, 8);
-                    TileOps.scaledAccumI32(mc1, iacc1, scAll, cBase + 128 + j, 8);
-                    TileOps.scaledAccumI32(mc2, iacc2, scAll, cBase + 256 + j, 8);
-                    TileOps.scaledAccumI32(mc3, iacc3, scAll, cBase + 384 + j, 8);
-                    // The second token tile over the same weights.
-                    mc0.splat(0);
-                    mc1.splat(0);
-                    mc2.splat(0);
-                    mc3.splat(0);
-                    mbA.load(bT, bBuf + kk, 1, 144);
-                    mbB.load(bT, bBuf + 16 * 144 + kk, 1, 144);
-                    mbC.load(bT, bBuf + 32 * 144 + kk, 1, 144);
-                    mbD.load(bT, bBuf + 48 * 144 + kk, 1, 144);
-                    maB.load(aT, aBuf + 16 * 144 + kk, 0, 144);
-                    mc0.mma(maB, mbA);
-                    mc1.mma(maB, mbB);
-                    mc2.mma(maB, mbC);
-                    mc3.mma(maB, mbD);
-                    mbA.load(bT, bBuf + kk + 16, 1, 144);
-                    mbB.load(bT, bBuf + 16 * 144 + kk + 16, 1, 144);
-                    mbC.load(bT, bBuf + 32 * 144 + kk + 16, 1, 144);
-                    mbD.load(bT, bBuf + 48 * 144 + kk + 16, 1, 144);
-                    maB.load(aT, aBuf + 16 * 144 + kk + 16, 0, 144);
-                    mc0.mma(maB, mbA);
-                    mc1.mma(maB, mbB);
-                    mc2.mma(maB, mbC);
-                    mc3.mma(maB, mbD);
-                    TileOps.scaledAccumI32(mc0, iacc4, scAll, cBase + j, 8);
-                    TileOps.scaledAccumI32(mc1, iacc5, scAll, cBase + 128 + j, 8);
-                    TileOps.scaledAccumI32(mc2, iacc6, scAll, cBase + 256 + j, 8);
-                    TileOps.scaledAccumI32(mc3, iacc7, scAll, cBase + 384 + j, 8);
-                    facc0.rank1Accum(rgAll[rbase], cgv0);
-                    facc1.rank1Accum(rgAll[rbase], cgv1);
-                    facc2.rank1Accum(rgAll[rbase], cgv2);
-                    facc3.rank1Accum(rgAll[rbase], cgv3);
-                    facc4.rank1Accum(rgAll[rbase + 128], cgv0);
-                    facc5.rank1Accum(rgAll[rbase + 128], cgv1);
-                    facc6.rank1Accum(rgAll[rbase + 128], cgv2);
-                    facc7.rank1Accum(rgAll[rbase + 128], cgv3);
-                    jj = jj + 1;
-                }
-                if (H == 1) {
-                    uint32 dbase = pOff * 128 + 64 * wc;
-                    uint32 xbase = pOff * 128 + 32 * wr;
-                    WaveVector<float32, 16> dcv0 = WaveVector.ofSlice(dAll, dbase, 1);
-                    WaveVector<float32, 16> dcv1 = WaveVector.ofSlice(dAll, dbase + 16, 1);
-                    WaveVector<float32, 16> dcv2 = WaveVector.ofSlice(dAll, dbase + 32, 1);
-                    WaveVector<float32, 16> dcv3 = WaveVector.ofSlice(dAll, dbase + 48, 1);
-                    iacc0.scaledAccumInto(facc0, xsAll[xbase], dcv0);
-                    iacc1.scaledAccumInto(facc1, xsAll[xbase], dcv1);
-                    iacc2.scaledAccumInto(facc2, xsAll[xbase], dcv2);
-                    iacc3.scaledAccumInto(facc3, xsAll[xbase], dcv3);
-                    iacc4.scaledAccumInto(facc4, xsAll[xbase + 16], dcv0);
-                    iacc5.scaledAccumInto(facc5, xsAll[xbase + 16], dcv1);
-                    iacc6.scaledAccumInto(facc6, xsAll[xbase + 16], dcv2);
-                    iacc7.scaledAccumInto(facc7, xsAll[xbase + 16], dcv3);
-                }
-                hh = hh + 1;
-            }
-
-            if (splits > 1) {
-                // SPLIT-K: this workgroup's partial tile goes to its slot of
-                // `part` (row-major 128x128); the fixup launch sums the
-                // slots into y. A fold in this kernel (the last arriver
-                // summing the others' slots) was measured 2026-10-01 to
-                // cost the unsplit shapes 5% (289 to 305 us at
-                // 512x4096x14336): the accumulators read under a loop
-                // after the main loop changed the allocator's hand at
-                // 255 registers. The partial store alone does not.
-                uint32 pbase = (tile * splits + split) * 16384;
-                uint32 pw = (32 * wr) * 128 + 64 * wc;
-                facc0.store(part, pbase + pw, 0, 128);
-                facc1.store(part, pbase + pw + 16, 0, 128);
-                facc2.store(part, pbase + pw + 32, 0, 128);
-                facc3.store(part, pbase + pw + 48, 0, 128);
-                facc4.store(part, pbase + pw + 2048, 0, 128);
-                facc5.store(part, pbase + pw + 2048 + 16, 0, 128);
-                facc6.store(part, pbase + pw + 2048 + 32, 0, 128);
-                facc7.store(part, pbase + pw + 2048 + 48, 0, 128);
-                return;
-            }
-            facc0.store(y, (uint32) ((int64) tw * (int64) outDim
-                + (int64) cw), 0, outDim);
-            facc1.store(y, (uint32) ((int64) tw * (int64) outDim
-                + (int64) (cw + 16)), 0, outDim);
-            facc2.store(y, (uint32) ((int64) tw * (int64) outDim
-                + (int64) (cw + 32)), 0, outDim);
-            facc3.store(y, (uint32) ((int64) tw * (int64) outDim
-                + (int64) (cw + 48)), 0, outDim);
-            facc4.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
-                + (int64) cw), 0, outDim);
-            facc5.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
-                + (int64) (cw + 16)), 0, outDim);
-            facc6.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
-                + (int64) (cw + 32)), 0, outDim);
-            facc7.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
-                + (int64) (cw + 48)), 0, outDim);
+    static ArrayList<Q4TileShape> shapes() {
+        if (TcTile.q4Shapes == null) {
+            TcTile.q4Shapes #= heap ArrayList<Q4TileShape>();
+            TcTile.q4Shapes.add(#heap QkTile<128, 128, 32, 64, 128>());
+            TcTile.q4Shapes.add(#heap QkTile<64, 64, 32, 32, 128>());
         }
+        return TcTile.q4Shapes;
+    }
+
+    /** The index in {@link #shapes} of the shape registered as `name`, or -1. */
+    static int32 shapeIndex(String name) {
+        ArrayList<Q4TileShape> list = TcTile.shapes();
+        int32 n = (int32) list.count();
+        int32 i = 0;
+        while (i < n) {
+            String k #= list.get(i).kernel();
+            if (k.equals(name)) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /** Whether some listed shape covers the problem: tokens and rows on
+     *  its grid, columns a whole number of 256-element blocks. */
+    public static boolean fits(int64 rows, int64 outDim, int64 cols) {
+        ArrayList<Q4TileShape> list = TcTile.shapes();
+        int32 n = (int32) list.count();
+        int32 i = 0;
+        while (i < n) {
+            if (list.get(i).fits(rows, outDim, cols)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /**
+     * The shape the family runs at this problem (xpu-tile-shape-selection
+     * §3, §4, §6): the listed shapes that fit go through the feasibility
+     * filter at the device's facts, and the choice times the survivors at
+     * first use and remembers the winner under the device, the build and
+     * the exact problem. An override on the family (`ShapeChoice.
+     * setShapeOverride`) wins. No survivor is a refusal by name.
+     */
+    static int32 q4ChooseIndex(KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 outDim, int64 cols) {
+        ArrayList<Q4TileShape> list = TcTile.shapes();
+        if (TcTile.memoRows == rows && TcTile.memoOut == outDim && TcTile.memoCols == cols
+                && TcTile.memoIdx >= 0) {
+            return TcTile.memoIdx;
+        }
+        ShapeFilter f #= heap ShapeFilter(TcTile.Q4_FAMILY, DeviceFacts.current(), rows, outDim, cols);
+        int32 n = (int32) list.count();
+        int32 i = 0;
+        while (i < n) {
+            Q4TileShape sh = list.get(i);
+            if (sh.fits(rows, outDim, cols)) {
+                String kn #= sh.kernel();
+                KernelFacts kf #= KernelFacts.measured(kn, 0);
+                f.consider(#heap ShapeCandidate(#kn, sh.tileM(), sh.tileN(), sh.threads(), 256, 8), #kf);
+            }
+            i = i + 1;
+        }
+        if (f.survivorCount() == 0) {
+            String why #= f.refusal();
+            throw heap XpuLaunchException(#why);
+        }
+        Q4ShapeProbe probe #= heap Q4ShapeProbe(f, packed, xp, rows, outDim, cols);
+        ShapeResult r #= ShapeChoice.choose(TcTile.shapeDir, f, probe);
+        if (r.survivor < 0) {
+            String why #= r.refusal.clone();
+            throw heap XpuLaunchException(#why);
+        }
+        int32 idx = TcTile.shapeIndex(r.kernel);
+        if (idx < 0) {
+            String why #= "the shape choice named " + r.kernel
+                + ", which the Q4_K tile family does not list";
+            throw heap XpuLaunchException(#why);
+        }
+        TcTile.memoRows = rows;
+        TcTile.memoOut = outDim;
+        TcTile.memoCols = cols;
+        TcTile.memoIdx = idx;
+        return idx;
     }
 
     /** Whether the Q6_K tile covers the shape: as {@link #fits}, and the
@@ -833,13 +550,13 @@ public final class TcTile {
         int64 tiles = tilesM8 * tilesN8;
         int64 nb = cols / 256L;
         int64 sp = TcTile.splitsFor(tiles, nb);
-        TcTile.ensureScratch(tiles, sp);
+        TcTile.ensureScratch(tiles, sp, 16384L);
         KernelStream s = QuantKernel.stream();
         q6kQ8TcTileKernel.launch(s,
             grid: [(uint32) (tiles * sp)], block: [256])
             (y, packed, xp, (uint32) rows, (uint32) outDim,
              (uint32) tilesN8, nb, TcTile.part, (uint32) sp, accum);
-        TcTile.fixupLaunch(y, rows, outDim, tilesN8, sp, accum);
+        TcTile.fixupLaunch(y, rows, outDim, tilesN8, sp, accum, 128L, 128L);
         return;
     }
 
@@ -848,20 +565,21 @@ public final class TcTile {
     @Kernel
     public static void tcSplitFixupKernel(KernelBuffer<float32> y,
             KernelBuffer<float32> part, uint32 rows, uint32 outDim,
-            uint32 tilesN8, uint32 splits, uint32 accum) {
+            uint32 tilesN8, uint32 splits, uint32 accum, uint32 tileM, uint32 tileN) {
         uint32 e = KernelThread.globalIdX();
         uint32 total = rows * outDim;
         if (e < total) {
             uint32 t = e / outDim;
             uint32 c = e - t * outDim;
-            uint32 tile = (t / 128) * tilesN8 + c / 128;
-            int64 at = (int64) (tile * splits) * 16384L
-                + (int64) ((t % 128) * 128 + c % 128);
+            uint32 tile = (t / tileM) * tilesN8 + c / tileN;
+            int64 slot = (int64) tileM * (int64) tileN;
+            int64 at = (int64) (tile * splits) * slot
+                + (int64) ((t % tileM) * tileN + c % tileN);
             float32 acc = 0.0f;
             if (accum != 0) { acc = y[(int64) e]; }
             uint32 sp = 0;
             while (sp < splits) {
-                acc = acc + part[at + (int64) sp * 16384L];
+                acc = acc + part[at + (int64) sp * slot];
                 sp = sp + 1;
             }
             y[(int64) e] = acc;
@@ -869,9 +587,9 @@ public final class TcTile {
     }
 
     static void fixupLaunch(KernelBuffer<float32> y, int64 rows, int64 outDim,
-            int64 tilesN8, int64 splits, uint32 accum) {
+            int64 tilesN8, int64 splits, uint32 accum, int64 tileM, int64 tileN) {
         if (splits <= 1L) { return; }
-        TcTile.fixupLaunchAs(y, TcTile.part, rows, outDim, tilesN8, splits, accum);
+        TcTile.fixupLaunchAs(y, TcTile.part, rows, outDim, tilesN8, splits, accum, tileM, tileN);
         return;
     }
 
@@ -881,19 +599,19 @@ public final class TcTile {
     public static void fixupLaunchOver(KernelBuffer<float32> y,
             KernelBuffer<float32> partials, int64 rows, int64 outDim,
             int64 tilesN8, int64 splits) {
-        TcTile.fixupLaunchAs(y, partials, rows, outDim, tilesN8, splits, (uint32) 0);
+        TcTile.fixupLaunchAs(y, partials, rows, outDim, tilesN8, splits, (uint32) 0, 128L, 128L);
         return;
     }
 
     static void fixupLaunchAs(KernelBuffer<float32> y,
             KernelBuffer<float32> partials, int64 rows, int64 outDim,
-            int64 tilesN8, int64 splits, uint32 accum) {
+            int64 tilesN8, int64 splits, uint32 accum, int64 tileM, int64 tileN) {
         int64 total = rows * outDim;
         KernelStream s = QuantKernel.stream();
         tcSplitFixupKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)],
             block: [256])
             (y, partials, (uint32) rows, (uint32) outDim, (uint32) tilesN8,
-             (uint32) splits, accum);
+             (uint32) splits, accum, (uint32) tileM, (uint32) tileN);
         return;
     }
 
@@ -936,8 +654,8 @@ public final class TcTile {
 
     /** The partial tiles for a split launch, grown as needed (an in-flight
      *  launch may still read the old buffer, so the stream drains first). */
-    static void ensureScratch(int64 tiles, int64 splits) {
-        int64 need = splits > 1L ? tiles * splits * 16384L : 1L;
+    static void ensureScratch(int64 tiles, int64 splits, int64 slot) {
+        int64 need = splits > 1L ? tiles * splits * slot : 1L;
         if (TcTile.part == null || TcTile.partCap < need) {
             QuantKernel.stream().sync();
             TcTile.part #= heap KernelBuffer<float32>((uint64) need);
@@ -968,18 +686,17 @@ public final class TcTile {
     static void q4kQ8TcTileLaunchAs(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp, int64 rows,
             int64 outDim, int64 cols, uint32 accum) {
-        int64 tilesM8 = rows / 128L;
-        int64 tilesN8 = outDim / 128L;
-        int64 tiles = tilesM8 * tilesN8;
+        int32 idx = TcTile.q4ChooseIndex(packed, xp, rows, outDim, cols);
+        Q4TileShape sh = TcTile.shapes().get(idx);
+        int64 tm = (int64) sh.tileM();
+        int64 tn = (int64) sh.tileN();
+        int64 tilesN = outDim / tn;
+        int64 tiles = (rows / tm) * tilesN;
         int64 nb = cols / 256L;
         int64 sp = TcTile.splitsFor(tiles, nb);
-        TcTile.ensureScratch(tiles, sp);
-        KernelStream s = QuantKernel.stream();
-        q4kQ8TcTileKernel.launch(s,
-            grid: [(uint32) (tiles * sp)], block: [256])
-            (y, packed, xp, (uint32) rows, (uint32) outDim,
-             (uint32) tilesN8, nb, TcTile.part, (uint32) sp, accum);
-        TcTile.fixupLaunch(y, rows, outDim, tilesN8, sp, accum);
+        TcTile.ensureScratch(tiles, sp, tm * tn);
+        sh.launchAs(y, packed, xp, rows, outDim, cols, TcTile.part, sp, accum);
+        TcTile.fixupLaunch(y, rows, outDim, tilesN, sp, accum, tm, tn);
         return;
     }
 }
