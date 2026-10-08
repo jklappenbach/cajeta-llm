@@ -40,9 +40,9 @@ import cajeta.xpu.WaveVector;
  * kernel's, measured bit for bit against it by TcTileTest at every listed
  * shape.
  */
-@Instantiate({QkTile<128, 128, 32, 64, 128>, QkTile<64, 64, 32, 32, 128>})
+@Instantiate({QkTile<64, 64, 32, 32, 128>})
 @Requires(TM == TN && TM % WM == 0 && TN % WN == 0 && WM % 16 == 0 && WN % 16 == 0
-    && (TM / WM) * (TN / WN) * 16 == TN && KS == 128)
+    && (TM / WM) * (TN / WN) * 16 == TN && KS == 128 && (WN / 16) % 2 == 0)
 public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
         implements Q4TileShape {
 
@@ -133,7 +133,7 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
             uint32 aDst0 = aRow0 * 144 + 16 * aPart;
             uint32 aDstP = (TM / 4) * 144;
             CooperativeMatrix<int8,16,16,0> ma;
-            CooperativeMatrix<int8,16,16,1> mb;
+            CooperativeMatrix<int8,16,16,1>[WN / 16] mb;
             CooperativeMatrix<int32,16,16,2>[WN / 16] mc;
             CooperativeMatrix<int32,16,16,2>[WM / 16][WN / 16] iacc;
             CooperativeMatrix<float32,16,16,2>[WM / 16][WN / 16] facc;
@@ -302,25 +302,46 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                 while (jj < 4) {
                     uint32 j = 4 * H + jj;
                     uint32 kk = 32 * jj;
+                    // The B fragments of the slab are loaded as a set
+                    // before the mma set, and the column scales once per
+                    // slab for every row fragment: the hand-written
+                    // 128x128 kernel's shape, which a single reloaded
+                    // operand and per-row scale loads read 6% slower on
+                    // sm_89 (pp512 46.1 against 43.2 ms, 2026-10-08).
+                    // The column scales of the slab, loaded as a set before
+                    // the mma loops, and the rank-1 updates row-major after
+                    // them: the hand-written kernel's order, which ptxas
+                    // schedules 7% faster than the interleaved one at 255
+                    // registers (pace probe, 2026-10-08).
                     for (uint32 i = 0; i < WM / 16; i = i + 1) {
-                        uint32 rbase = rPanel + (((WM / 16) * wr + i) * 8 + j) * 16;
                         for (uint32 n = 0; n < WN / 16; n = n + 1) { mc[n].splat(0); }
-                        ma.load(aT, aBuf + i * (16 * 144) + kk, 0, 144);
                         for (uint32 n = 0; n < WN / 16; n = n + 1) {
-                            mb.load(bT, bBuf + n * (16 * 144) + kk, 1, 144);
-                            mc[n].mma(ma, mb);
+                            mb[n].load(bT, bBuf + n * (16 * 144) + kk, 1, 144);
+                        }
+                        ma.load(aT, aBuf + i * (16 * 144) + kk, 0, 144);
+                        for (uint32 n = 0; n < WN / 16; n = n + 1) { mc[n].mma(ma, mb[n]); }
+                        for (uint32 n = 0; n < WN / 16; n = n + 1) {
+                            mb[n].load(bT, bBuf + n * (16 * 144) + kk + 16, 1, 144);
                         }
                         ma.load(aT, aBuf + i * (16 * 144) + kk + 16, 0, 144);
-                        for (uint32 n = 0; n < WN / 16; n = n + 1) {
-                            mb.load(bT, bBuf + n * (16 * 144) + kk + 16, 1, 144);
-                            mc[n].mma(ma, mb);
-                        }
+                        for (uint32 n = 0; n < WN / 16; n = n + 1) { mc[n].mma(ma, mb[n]); }
                         for (uint32 n = 0; n < WN / 16; n = n + 1) {
                             TileOps.scaledAccumI32(mc[n], iacc[i][n], scAll, cBase + n * 128 + j, 8);
                         }
-                        for (uint32 n = 0; n < WN / 16; n = n + 1) {
-                            WaveVector<float32, 16> cgv = WaveVector.ofSlice(cgAll, cBase + n * 128 + j, 8);
-                            facc[i][n].rank1Accum(rgAll[rbase], cgv);
+                    }
+                    // The column scales a pair at a time, each pair's rank-1
+                    // updates for every row fragment before the next pair:
+                    // the fragment indexer takes a loop variable and a
+                    // literal, not a guarded or clamped index, so the
+                    // hand-written kernel's "four vectors, then eight
+                    // updates" is reached in halves.
+                    for (uint32 n = 0; n < WN / 16; n = n + 2) {
+                        WaveVector<float32, 16> cgA = WaveVector.ofSlice(cgAll, cBase + n * 128 + j, 8);
+                        WaveVector<float32, 16> cgB = WaveVector.ofSlice(cgAll, cBase + n * 128 + 128 + j, 8);
+                        for (uint32 i = 0; i < WM / 16; i = i + 1) {
+                            uint32 rbase = rPanel + (((WM / 16) * wr + i) * 8 + j) * 16;
+                            facc[i][n].rank1Accum(rgAll[rbase], cgA);
+                            facc[i][n + 1].rank1Accum(rgAll[rbase], cgB);
                         }
                     }
                     jj = jj + 1;

@@ -1,6 +1,14 @@
 package dev.cajeta.llm.selftest;
 
 import cajeta.lang.String;
+import cajeta.time.Clock;
+import cajeta.xpu.Autotune;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.DeviceFacts;
+import cajeta.xpu.KernelFacts;
+import cajeta.xpu.ShapeCandidate;
+import cajeta.xpu.ShapeFilter;
+import dev.cajeta.llm.io.Q4ShapeProbe;
 import cajeta.xpu.Device;
 import cajeta.xpu.ShapeChoice;
 import cajeta.xpu.KernelBuffer;
@@ -452,5 +460,139 @@ public class TcTileTest {
             i = i + 1;
         }
         if (found == 0) { Assert.fail("no QkTile_*_q4kQ8 instantiation is registered: the Q4_K tile is not a family yet"); }
+    }
+
+    /** A shape's cost the way a replayed prefill pays it: launches back to
+     *  back on the stream, sixteen a bracket, the best of three brackets
+     *  after a warm one. One launch a sync, which is what the choice's
+     *  probe timed, adds a launch floor a split shape pays twice. */
+    static int64 burstNanos(String kernel, KernelBuffer<float32> yD, KernelBuffer<int8> wD,
+            KernelBuffer<int8> xp, int64 rows, int64 out, int64 cols) {
+        ShapeChoice.setShapeOverride(TcTile.Q4_FAMILY, kernel);
+        TcTile.forgetShapes();
+        KernelStream s = QuantKernel.stream();
+        int64 best = -1L;
+        int32 round = 0;
+        while (round < 4) {
+            s.sync();
+            int64 t0 = Clock.nanoTime();
+            int32 k = 0;
+            while (k < 16) {
+                TcTile.q4kQ8TcTileLaunchNoSync(yD, wD, xp, rows, out, cols);
+                k = k + 1;
+            }
+            s.sync();
+            int64 t = (Clock.nanoTime() - t0) / 16L;
+            if (round > 0 && (best < 0L || t < best)) { best = t; }
+            round = round + 1;
+        }
+        ShapeChoice.clearShapeOverride(TcTile.Q4_FAMILY);
+        TcTile.forgetShapes();
+        return best;
+    }
+
+    static void chosenIsFastest(int64 rows, int64 out, int64 cols) {
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int8[] raw #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+        wD.upload(raw);
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        int32 n = Device.registeredKernelCount();
+        String bestName #= "";
+        int64 bestT = -1L;
+        int32 i = 0;
+        while (i < n) {
+            String name #= Device.registeredKernel(i);
+            if (name.startsWith("QkTile_") && name.endsWith("_q4kQ8")) {
+                int64 t = TcTileTest.burstNanos(name, yD, wD, xp, rows, out, cols);
+                System.stdout.println("  [shape-burst] " + rows + "x" + out + "x" + cols
+                    + " " + name + " " + t + " ns a launch");
+                if (bestT < 0L || t < bestT) { bestT = t; bestName #= name.clone(); }
+            }
+            i = i + 1;
+        }
+        // The choice, cold: no override, no memo, no remembered answer.
+        TcTile.forgetShapes();
+        Autotune.invalidate("", "shape." + TcTile.Q4_FAMILY + "." + rows + "x" + out + "x" + cols);
+        TcTile.q4kQ8TcTileLaunchNoSync(yD, wD, xp, rows, out, cols);
+        QuantKernel.stream().sync();
+        String chosen #= TcTile.lastQ4Kernel();
+        int64 chosenT = TcTileTest.burstNanos(chosen, yD, wD, xp, rows, out, cols);
+        System.stdout.println("  [shape-burst] " + rows + "x" + out + "x" + cols
+            + " chose " + chosen + " at " + chosenT + " ns; best " + bestName + " at " + bestT);
+        if (chosenT * 1000L > bestT * 1030L) {
+            Assert.fail("at " + rows + "x" + out + "x" + cols + " the choice named " + chosen
+                + ", " + chosenT + " ns a launch in a burst, where " + bestName
+                + " runs " + bestT + " ns: the probe's one launch a sync misread the shapes");
+        }
+    }
+
+    /** tile-shape-selection 4.7.3.1: at the engine's own problems the shape
+     *  the family chooses is the one a replayed prefill runs fastest, within
+     *  the choice's own tie margin. On 2026-10-08 the probe chose 64x64 for
+     *  the 1024-wide projections, where 128x128 split four ways is faster
+     *  back to back, and pp512 read 2.5 ms slower than the single tile. */
+    @Test
+    public void q4kTheChosenShapeIsTheFastestInABurst() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        if (!KernelCap.usable(TcTile.Q4_KERNEL)) { DeviceSkip.noKernel(TcTile.Q4_KERNEL, be); return; }
+        TcTileTest.chosenIsFastest(512L, 1024L, 4096L);
+        TcTileTest.chosenIsFastest(512L, 4096L, 4096L);
+    }
+
+    /** tile-shape-selection 4.7.3.1: the probe prices a shape the way the
+     *  engine pays for it. One launch a sync adds the launch floor, which a
+     *  split shape (two launches) pays twice and a replayed prefill never
+     *  pays, so at the 1024-wide projection the probe read 128x128 split
+     *  four ways at the price of 64x64 and flipped the choice between
+     *  processes. The probe's per-launch price must sit within a fifth of
+     *  a sixteen-launch burst's. */
+    @Test
+    public void q4kTheProbePricesAShapeAsTheEngineRunsIt() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        if (!KernelCap.usable(TcTile.Q4_KERNEL)) { DeviceSkip.noKernel(TcTile.Q4_KERNEL, be); return; }
+        int64 rows = 512L;
+        int64 out = 1024L;
+        int64 cols = 4096L;
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int8[] raw #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+        wD.upload(raw);
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        int64 burst = TcTileTest.burstNanos(TcTile.Q4_KERNEL, yD, wD, xp, rows, out, cols);
+        ShapeFilter f #= heap ShapeFilter(TcTile.Q4_FAMILY, DeviceFacts.current(), rows, out, cols);
+        String kn #= TcTile.Q4_KERNEL.clone();
+        KernelFacts kf #= KernelFacts.measured(kn, 0);
+        f.consider(#heap ShapeCandidate(#kn, 128, 128, 256, 256, 8), #kf);
+        if (f.survivorCount() != 1) {
+            Assert.fail("the filter refused the default shape at " + rows + "x" + out + "x" + cols
+                + ": " + f.refusal());
+            return;
+        }
+        Q4ShapeProbe probe #= heap Q4ShapeProbe(f, wD, xp, rows, out, cols);
+        int64 priced = -1L;
+        int32 round = 0;
+        while (round < 6) {
+            int64 t = probe.timeNanos(0);
+            if (round > 0 && (priced < 0L || t < priced)) { priced = t; }
+            round = round + 1;
+        }
+        System.stdout.println("  [shape-price] " + rows + "x" + out + "x" + cols + " "
+            + TcTile.Q4_KERNEL + " probe " + priced + " ns a launch, burst " + burst);
+        if (priced * 10L > burst * 12L) {
+            Assert.fail("the probe prices " + TcTile.Q4_KERNEL + " at " + priced
+                + " ns a launch where a burst runs it at " + burst
+                + ": the launch floor is in the price");
+        }
     }
 }

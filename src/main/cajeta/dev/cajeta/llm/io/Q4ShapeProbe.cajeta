@@ -12,14 +12,19 @@ import cajeta.xpu.ShapeVerdict;
  * Times one survivor of the Q4_K tile family's filter at the caller's
  * problem (xpu-tile-shape-selection §4): the shape's own launch over the
  * caller's weights and activations into a scratch output, with the split
- * count the route would take, synced before and after. ShapeChoice runs
- * the rounds and the interleaving; this answers one launch.
+ * count the route would take, as a burst of launches between two syncs
+ * priced per launch. ShapeChoice runs the rounds and the interleaving.
  */
 public final class Q4ShapeProbe implements ShapeProbe {
     ShapeFilter f;
     KernelBuffer<int8> packed;
     KernelBuffer<int8> xp;
-    KernelBuffer<float32> y;
+    // The scratch output every probe launches into, grown to the largest
+    // problem and kept: a buffer a probe allocated and freed per problem
+    // (58 MB at the fused gate|up) churned device memory at warm-up for
+    // a choice the store usually answers without a launch.
+    static KernelBuffer<float32> y;
+    static int64 yCount = 0L;
     int64 rows;
     int64 outDim;
     int64 cols;
@@ -32,7 +37,14 @@ public final class Q4ShapeProbe implements ShapeProbe {
         this.rows = rows;
         this.outDim = outDim;
         this.cols = cols;
-        this.y #= heap KernelBuffer<float32>((uint64) (rows * outDim));
+    }
+
+    static KernelBuffer<float32> output(int64 n) {
+        if (Q4ShapeProbe.y == null || Q4ShapeProbe.yCount < n) {
+            Q4ShapeProbe.y #= heap KernelBuffer<float32>((uint64) n);
+            Q4ShapeProbe.yCount = n;
+        }
+        return Q4ShapeProbe.y;
     }
 
     public int64 timeNanos(int32 i) {
@@ -47,13 +59,29 @@ public final class Q4ShapeProbe implements ShapeProbe {
         int64 nb = this.cols / 256L;
         int64 sp = TcTile.splitsFor(tiles, nb);
         TcTile.ensureScratch(tiles, sp, tm * tn);
+        KernelBuffer<float32> y = Q4ShapeProbe.output(this.rows * this.outDim);
         KernelStream s = QuantKernel.stream();
         s.sync();
+        // A burst, priced per launch: one launch a sync carries the launch
+        // floor and the sync, which doubled the price of a split shape
+        // (two launches) against an unsplit one and flipped the choice at
+        // the 1024-wide projection between processes (2026-10-08). A
+        // replayed prefill runs the shape back to back, so that is the
+        // price that matters.
         int64 t0 = Clock.nanoTime();
-        sh.launchAs(this.y, this.packed, this.xp, this.rows, this.outDim, this.cols,
-            TcTile.part, sp, (uint32) 0);
-        TcTile.fixupLaunch(this.y, this.rows, this.outDim, tilesN, sp, (uint32) 0, tm, tn);
+        int32 k = 0;
+        while (k < Q4ShapeProbe.BURST) {
+            sh.launchAs(y, this.packed, this.xp, this.rows, this.outDim, this.cols,
+                TcTile.part, sp, (uint32) 0);
+            TcTile.fixupLaunch(y, this.rows, this.outDim, tilesN, sp, (uint32) 0, tm, tn);
+            k = k + 1;
+        }
         s.sync();
-        return Clock.nanoTime() - t0;
+        return (Clock.nanoTime() - t0) / (int64) Q4ShapeProbe.BURST;
     }
+
+    /** Launches a sample. Eight amortizes a 10 us floor to a few percent
+     *  of the smallest engine problem (34 us); the fused gate|up problem
+     *  then costs 13 ms a sample, once a process. */
+    static final int32 BURST = 8;
 }
