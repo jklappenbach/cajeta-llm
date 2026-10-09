@@ -6,7 +6,6 @@ import cajeta.lang.String;
 import cajeta.lang.System;
 import cajeta.xpu.Barrier;
 import cajeta.xpu.CooperativeMatrix;
-import cajeta.xpu.GroupOp;
 import cajeta.xpu.WaveVector;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
@@ -114,7 +113,7 @@ public final class AttnKernel {
      * of a few microseconds each were three too many per decode layer
      * (unit 48's profile: ~1150 launches per token, 3.4 ms of gaps).
      * Thread d < half owns the rotation pair (d, d + half); the norm
-     * reduction is one Workgroup.reduce over the block. Values match
+     * reduction is a shared-memory tree over the block. Values match
      * the separate kernels bit for bit: the same norm formula, the same
      * rotation, the same order of operations per element.
      */
@@ -126,8 +125,9 @@ public final class AttnKernel {
             KernelBuffer<float32> invFreq, uint32 nH, uint32 nKv,
             uint32 hd, uint32 norm, float32 eps, int32 form,
             uint32 row, float32 pos) {
+        Shared<float32> part = shared float32[4];
         uint32 lane = KernelThread.x();
-        uint32 head = Workgroup.x();
+        uint32 head = KernelThread.globalIdX() / 128;
         if (head >= nH + nKv) { return; }
         boolean isQ = head < nH;
         uint32 kh = head - nH;
@@ -144,7 +144,11 @@ public final class AttnKernel {
                 ss = ss + x * x;
                 i = i + 128;
             }
-            float32 tot = Workgroup.reduce(GroupOp.Add, ss);
+            // Unit 54: four wave partials, one barrier.
+            float32 wsum = Wave.reduceSumF32(ss);
+            if (lane % 32 == 0) { part[lane / 32] = wsum; }
+            Barrier.workgroup();
+            float32 tot = part[0] + part[1] + part[2] + part[3];
             float32 scale = 1.0f
                 / Math.sqrt(tot / (float32) hd + eps);
             uint32 j = lane;
@@ -3199,6 +3203,7 @@ public final class AttnKernel {
             KernelBuffer<float32> part, uint32 nH, uint32 splits) {
         Shared<float32> vals = shared float32[1024];
         Shared<float32> gls = shared float32[8];
+        Shared<float32> amx = shared float32[8];
         uint32 tid = KernelThread.x();
         uint32 blk = Workgroup.x();
         if (blk * 2 + 1 >= nH + 1) { return; }
@@ -3250,7 +3255,15 @@ public final class AttnKernel {
         // The pack, as q8kPackKernel.
         float32 ax = x;
         if (x < 0.0f) { ax = 0.0f - x; }
-        float32 bmax = Workgroup.reduce(GroupOp.Max, ax);
+        float32 wm = Wave.reduceMaxF32(ax);
+        if (lane == 0) { amx[w] = wm; }
+        Barrier.workgroup();
+        float32 bmax = amx[0];
+        uint32 j = 1;
+        while (j < 8) {
+            if (amx[j] > bmax) { bmax = amx[j]; }
+            j = j + 1;
+        }
         float32 inv = 0.0f;
         if (bmax > 0.0f) { inv = 127.0f / bmax; }
         int32 qi = (int32) Math.round(x * inv);
