@@ -40,7 +40,7 @@ import cajeta.xpu.WaveVector;
  * kernel's, measured bit for bit against it by TcTileTest at every listed
  * shape.
  */
-@Instantiate({QkTile<64, 64, 32, 32, 128>})
+@Instantiate({QkTile<64, 64, 32, 32, 128>, QkTile<128, 128, 32, 64, 128>})
 @Requires(TM == TN && TM % WM == 0 && TN % WN == 0 && WM % 16 == 0 && WN % 16 == 0
     && (TM / WM) * (TN / WN) * 16 == TN && KS == 128 && (WN / 16) % 2 == 0)
 public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
@@ -81,7 +81,9 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
     // asks the measured Linear.matrixCoresPay before taking it.
     @Occupancy(maxThreads = 2 * TN)
     @Kernel @FastMath
-    @Unlowered(backend = {"amdgpu", "vulkan"}, tracked = "xpu-kernel-adaptor 1.8.3")
+    // The 128x128 member needs 73 KB of LDS and is declined on amdgpu; the
+    // 64x64 member fits and lowers, so the hold is per instantiation.
+    @Unlowered(backend = {"amdgpu", "vulkan"}, tracked = "xpu-kernel-adaptor 1.8.3", mayLower = true)
     public static void q4kQ8(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp, uint32 rows,
             uint32 outDim, uint32 tilesN, int64 blocksPerRow,
@@ -329,19 +331,33 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                             TileOps.scaledAccumI32(mc[n], iacc[i][n], scAll, cBase + n * 128 + j, 8);
                         }
                     }
-                    // The column scales a pair at a time, each pair's rank-1
-                    // updates for every row fragment before the next pair:
-                    // the fragment indexer takes a loop variable and a
-                    // literal, not a guarded or clamped index, so the
-                    // hand-written kernel's "four vectors, then eight
-                    // updates" is reached in halves.
-                    for (uint32 n = 0; n < WN / 16; n = n + 2) {
+                    // The column scales four at a time where the wave has
+                    // four column groups (the 128x128 shape), then in pairs
+                    // for the rest: the fragment indexer takes a loop
+                    // variable plus a literal, so each width is its own
+                    // loop and only one of them has trips at a given WN.
+                    // Four vectors loaded, then the row factor once per row
+                    // fragment, then the updates: the hand-written kernel's
+                    // load order, which is the order ptxas schedules.
+                    uint32 rbase = rPanel + ((WM / 16) * 8 * wr + j) * 16;
+                    for (uint32 n = 0; n + 3 < WN / 16; n = n + 4) {
+                        WaveVector<float32, 16> cgA = WaveVector.ofSlice(cgAll, cBase + n * 128 + j, 8);
+                        WaveVector<float32, 16> cgB = WaveVector.ofSlice(cgAll, cBase + n * 128 + 128 + j, 8);
+                        WaveVector<float32, 16> cgC = WaveVector.ofSlice(cgAll, cBase + n * 128 + 256 + j, 8);
+                        WaveVector<float32, 16> cgD = WaveVector.ofSlice(cgAll, cBase + n * 128 + 384 + j, 8);
+                        for (uint32 i = 0; i < WM / 16; i = i + 1) {
+                            facc[i][n].rank1Accum(rgAll[rbase + 128 * i], cgA);
+                            facc[i][n + 1].rank1Accum(rgAll[rbase + 128 * i], cgB);
+                            facc[i][n + 2].rank1Accum(rgAll[rbase + 128 * i], cgC);
+                            facc[i][n + 3].rank1Accum(rgAll[rbase + 128 * i], cgD);
+                        }
+                    }
+                    for (uint32 n = ((WN / 16) / 4) * 4; n + 1 < WN / 16; n = n + 2) {
                         WaveVector<float32, 16> cgA = WaveVector.ofSlice(cgAll, cBase + n * 128 + j, 8);
                         WaveVector<float32, 16> cgB = WaveVector.ofSlice(cgAll, cBase + n * 128 + 128 + j, 8);
                         for (uint32 i = 0; i < WM / 16; i = i + 1) {
-                            uint32 rbase = rPanel + (((WM / 16) * wr + i) * 8 + j) * 16;
-                            facc[i][n].rank1Accum(rgAll[rbase], cgA);
-                            facc[i][n + 1].rank1Accum(rgAll[rbase], cgB);
+                            facc[i][n].rank1Accum(rgAll[rbase + 128 * i], cgA);
+                            facc[i][n + 1].rank1Accum(rgAll[rbase + 128 * i], cgB);
                         }
                     }
                     jj = jj + 1;
