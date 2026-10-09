@@ -1,0 +1,174 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.AttnKernel;
+import dev.cajeta.llm.model.KernelCap;
+
+/**
+ * workgroup-reduce 6.1.1: the bit gate for the whole-workgroup reductions
+ * that move to `Workgroup.reduce`, at the engine's shapes. Each kernel
+ * declares a 32-lane wave, so its output is compared bit for bit on every
+ * backend against the row recorded on the hand-written tree.
+ */
+public class WorkgroupReduceGoldenTest {
+
+    static final int64 DIM = 2048L;
+    static final int64 COLS = 768L;
+
+    public WorkgroupReduceGoldenTest() { return; }
+
+    static #KernelBuffer<int8> zeros(int64 n) {
+        int8[] h = heap int8[n];
+        KernelBuffer<int8> b #= heap KernelBuffer<int8>((uint64) n);
+        b.upload(h, n);
+        return #b;
+    }
+
+    static #KernelBuffer<float32> floats(float32[] h, int64 n) {
+        KernelBuffer<float32> b #= heap KernelBuffer<float32>((uint64) n);
+        b.upload(h, n);
+        return #b;
+    }
+
+    static #float32[] bytesAsFloats(int8[] b, int64 n) {
+        float32[] f = heap float32[n];
+        int64 i = 0;
+        while (i < n) { f[i] = (float32) b[i]; i = i + 1; }
+        return #f;
+    }
+
+    /**
+     * One down-combine launch with its norm and pack tail. The combine
+     * weight is zero and the slab is zero, so the residual stays the seed
+     * and the tail norms known values.
+     */
+    static void tail(String kernel, int32 ggmlType) {
+        if (!KernelCap.usable(kernel)) {
+            DeviceSkip.noKernel(kernel, Device.activeBackend());
+            return;
+        }
+        int64 rows = WorkgroupReduceGoldenTest.DIM;
+        int64 cols = WorkgroupReduceGoldenTest.COLS;
+        float32[] seed = heap float32[rows];
+        float32[] nwh = heap float32[rows];
+        int64 j = 0;
+        while (j < rows) {
+            seed[j] = (float32) (((j * 37L) % 101L) - 50L) / 32.0f;
+            nwh[j] = 0.8f + (float32) (j % 3L) * 0.1f;
+            j = j + 1;
+        }
+        KernelBuffer<float32> hs #= WorkgroupReduceGoldenTest.floats(seed, rows);
+        KernelBuffer<float32> nw #= WorkgroupReduceGoldenTest.floats(nwh, rows);
+        float32[] w0 = heap float32[1];
+        KernelBuffer<float32> wSel #= WorkgroupReduceGoldenTest.floats(w0, 1L);
+        int32[] s0 = heap int32[1];
+        KernelBuffer<int32> sel #= heap KernelBuffer<int32>((uint64) 1);
+        sel.upload(s0, 1L);
+        int32[] c0 = heap int32[4];
+        KernelBuffer<int32> counter #= heap KernelBuffer<int32>((uint64) 4);
+        counter.upload(c0, 4L);
+        int64 xRowBlocks = cols / 256L;
+        KernelBuffer<int8> xp #= WorkgroupReduceGoldenTest.zeros(xRowBlocks * 320L + 64L);
+        int64 pb = (rows / 256L) * 320L;
+        KernelBuffer<float32> o #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> p #= WorkgroupReduceGoldenTest.zeros(pb);
+        int64[] vc #= ValueCheck.mark();
+        if (ggmlType == 0) {
+            int64 bpr = cols / 32L;
+            KernelBuffer<int8> img #= WorkgroupReduceGoldenTest.zeros(rows * bpr * 2L + 64L);
+            KernelBuffer<int8> deq #= WorkgroupReduceGoldenTest.zeros(
+                (rows / 16L + 1L) * bpr * 512L + 512L);
+            QuantKernel.symQ8IdDownCombineTailLaunchNoSync(hs, deq, img, xp,
+                sel, wSel, 1, rows, cols, xRowBlocks, o, p, nw, rows,
+                0.00001f, 1, counter);
+        } else {
+            int64 blockBytes = 144L;
+            if (ggmlType == 14) { blockBytes = 210L; }
+            KernelBuffer<int8> slab #= WorkgroupReduceGoldenTest.zeros(
+                rows * (cols / 256L) * blockBytes + 512L);
+            Assert.isTrue(QuantKernel.idDownCombineTailLaunchNoSync(ggmlType,
+                hs, slab, xp, sel, wSel, 1, rows, cols, xRowBlocks, o, p,
+                nw, rows, 0.00001f, 1, counter));
+        }
+        QuantKernel.stream().sync();
+        float32[] normed = heap float32[rows];
+        o.download(normed, rows);
+        boolean live = false;
+        j = 0;
+        while (j < rows) {
+            if (normed[j] != 0.0f) { live = true; }
+            j = j + 1;
+        }
+        Assert.isTrue(live);
+        int8[] packed = heap int8[pb];
+        p.download(packed, pb);
+        float32[] pf #= WorkgroupReduceGoldenTest.bytesAsFloats(packed, pb);
+        boolean a = WaveGolden.checkPinned(kernel, "tail-normed", normed, rows);
+        boolean b = WaveGolden.checkPinned(kernel, "tail-packed", pf, pb);
+        if (a && b) { ValueCheck.credit(vc); }
+    }
+
+    @Test
+    public void q4kDownCombineTailNormIsBitExact() {
+        WorkgroupReduceGoldenTest.tail("q4kQ8IdDownCombineKernel", 12);
+    }
+
+    @Test
+    public void q6kDownCombineTailNormIsBitExact() {
+        WorkgroupReduceGoldenTest.tail("q6kQ8IdDownCombineKernel", 14);
+    }
+
+    @Test
+    public void symDownCombineTailNormIsBitExact() {
+        WorkgroupReduceGoldenTest.tail("symQ8IdDownCombineKernel", 0);
+    }
+
+    /** The split-decode reduce and pack: its block maximum crosses eight waves. */
+    @Test
+    public void attnReducePackIsBitExact() {
+        String kernel #= "attnReducePackQ8Kernel";
+        if (!KernelCap.usable(kernel)) {
+            DeviceSkip.noKernel(kernel, Device.activeBackend());
+            return;
+        }
+        int32 nH = 32;
+        int32 splits = 8;
+        int64 n = (int64) nH * (int64) splits * 130L;
+        float32[] h = heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            int64 slot = i % 130L;
+            int64 seg = i / 130L;
+            if (slot < 128L) {
+                h[i] = (float32) (((i * 13L) % 29L) - 14L) / 8.0f;
+            } else if (slot == 128L) {
+                h[i] = (float32) (seg % 5L) * 0.25f - 0.5f;
+            } else {
+                h[i] = 1.0f + (float32) (seg % 3L) * 0.5f;
+            }
+            i = i + 1;
+        }
+        KernelBuffer<float32> part #= WorkgroupReduceGoldenTest.floats(h, n);
+        int64 pb = (int64) (nH / 2) * 320L;
+        KernelBuffer<int8> packed #= WorkgroupReduceGoldenTest.zeros(pb);
+        int64[] vc #= ValueCheck.mark();
+        AttnKernel.reducePackFromLaunchNoSync(packed, part, nH, splits);
+        QuantKernel.stream().sync();
+        int8[] got = heap int8[pb];
+        packed.download(got, pb);
+        boolean live = false;
+        i = 0;
+        while (i < pb) {
+            if (got[i] != 0) { live = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(live);
+        float32[] gf #= WorkgroupReduceGoldenTest.bytesAsFloats(got, pb);
+        if (WaveGolden.checkPinned(kernel, "h32s8", gf, pb)) { ValueCheck.credit(vc); }
+    }
+}
