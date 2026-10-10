@@ -1,0 +1,103 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.ShapeChoice;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/** The 8-wave packed WMMA Q4_K GEMM as a family (xpu-tile-shape-selection 4.8.1). */
+public class WmmaMwFamilyTest {
+
+    /** One member, forced through the family override, held to the host GEMM. */
+    static void checkAs(String kernel, int64 rows, int64 out, int64 cols) {
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        if (!KernelCap.usable(kernel)) { DeviceSkip.noKernel(kernel, be); return; }
+        int64 nBlocks = out * (cols / 256L);
+        int8[] raw #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", nBlocks);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        float32[] want #= CensusReachTest.hostGemm(Quant.GG_Q4_K, raw, nBlocks, x, rows, out, cols);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+        wD.upload(raw);
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (rows * out));
+        float32[] got #= heap float32[rows * out];
+        yD.upload(got);
+        Assert.isTrue(WmmaKernel.fitsMw(rows, out, cols));
+        WmmaKernel.q4kWmmaMwLaunch(yD, wD, xp, rows, out, cols);
+        QuantKernel.stream().sync();
+        String ran #= WmmaKernel.lastMwKernel();
+        if (!ran.equals(kernel)) {
+            Assert.fail("the Mw family launched " + ran + " under an override naming " + kernel);
+            return;
+        }
+        yD.download(got);
+        int64 t = 0;
+        while (t < rows) {
+            boolean live = false;
+            int64 i = 0;
+            while (i < out) {
+                if (got[t * out + i] != 0.0f) { live = true; }
+                i = i + 1;
+            }
+            if (!live) {
+                Assert.fail(kernel + " at " + rows + "x" + out + "x" + cols
+                    + ": token row " + t + " is entirely zero");
+                return;
+            }
+            t = t + 1;
+        }
+        CensusReachTest.nearOnePercent(want, got, rows * out,
+            kernel + " at " + rows + "x" + out + "x" + cols);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void q4kEveryListedMwShapeMatchesTheHost() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        int32 n = Device.registeredKernelCount();
+        int32 found = 0;
+        int32 checked = 0;
+        int32 i = 0;
+        while (i < n) {
+            String name #= Device.registeredKernel(i);
+            if (name.startsWith("MwTile_") && name.endsWith("_q4kQ8")) {
+                found = found + 1;
+                String why #= WmmaKernel.mwPruneReason(name, 256L, 256L, 1024L);
+                if (why.count() > 0L) {
+                    System.stdout.println("  [device-skip] [tracked: xpu-tile-shape-selection 4.9.1] (skipped: "
+                        + why + " on " + be + ")");
+                } else {
+                    ShapeChoice.setShapeOverride(WmmaKernel.MW_FAMILY, name);
+                    WmmaKernel.forgetMwShapes();
+                    WmmaMwFamilyTest.checkAs(name, 256L, 256L, 1024L);
+                    ShapeChoice.clearShapeOverride(WmmaKernel.MW_FAMILY);
+                    WmmaKernel.forgetMwShapes();
+                    checked = checked + 1;
+                }
+            }
+            i = i + 1;
+        }
+        if (found == 0) { Assert.fail("no MwTile_*_q4kQ8 instantiation is registered: the Mw GEMM is not a family yet"); }
+        if (checked == 0) {
+            DeviceSkip.tracked("every listed Mw member is pruned by the shape filter on " + be
+                + " at 256x256x1024", "xpu-tile-shape-selection 4.9.1");
+        }
+    }
+
+    @Test
+    public void theMwFamilyRefusesAnOffGridProblem() {
+        Assert.isTrue(WmmaKernel.fitsMw(256L, 256L, 1024L));
+        Assert.isFalse(WmmaKernel.fitsMw(256L, 256L, 1000L));
+        Assert.isFalse(WmmaKernel.fitsMw(48L, 256L, 1024L));
+    }
+}

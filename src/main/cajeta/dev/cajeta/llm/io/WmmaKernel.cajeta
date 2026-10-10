@@ -1692,376 +1692,7 @@ public final class WmmaKernel {
         return;
     }
 
-    /**
-     * Multi-wave PACKED Q4_K x Q8_K GEMM (Unit 6.2.1).
-     *
-     * The q4kWmmaDeqMw8Kernel tiling — 8 waves per workgroup, a 128-token
-     * by 128-row tile, eight f32 accumulators in a 4x2 wave tiling (four
-     * token sub-tiles x two column tiles), cf/cg and rg pre-folded
-     * into LDS once per block, a barrier-free j-loop, and a rowBase
-     * grid-sweep window — but the weight operand is read at its NATIVE
-     * 4.5 bpw and expanded IN REGISTER, never through LDS and never from
-     * a pre-dequantized int8 copy (which costs 8.5 bpw of weight-read
-     * bandwidth — the measured 0.53x).
-     *
-     * The B feed is q4kWmmaIdMwKernel's: a K-slice of 16 Q4_K elements is
-     * 16 CONTIGUOUS bytes of the lane's own weight row — the even
-     * sub-block's low nibbles or the odd one's high nibbles — so the lane
-     * reads four words from `packedW`, masks, and presents the fragment.
-     * Four words and four ALU ops per column tile per half, no LDS
-     * tile for B and no widen barriers.
-     *
-     * Wave width is Group.width() (a compile-time fold). The workgroup is
-     * 8 waves, so the block is 8*Group.width() threads and the lane/wave
-     * split derives from it; the 16x16 MMA tile stays a type-param
-     * constant. Requires rows % 128 == 0 and outDim % 128 == 0.
-     */
-    @Kernel @FastMath
-    @Occupancy(maxWaves = 8)
-    @Unlowered(backend = "vulkan", tracked = "xpu-kernel-adaptor 3.2.6")
-    public static void q4kWmmaMwKernel(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int32> packedW,
-            KernelBuffer<int8> xp, uint32 rows, uint32 outDim,
-            uint32 tilesN8, int64 blocksPerRow, uint32 rowBase) {
-        // 10.12.33 slice form: ONE array for all eight token tiles,
-        // read as xsAll[tile * 16] — the eight separate arrays and the
-        // 8-arm wave-uniform store chain they needed are gone.
-        Shared<float32> xsAll = shared float32[128];
-        Shared<float32> rgAll = shared float32[1024];
-        Shared<float32> cfAll = shared float32[1024];
-        Shared<float32> cgAll = shared float32[1024];
-        // The K-half's activation tile: 128 tokens x 128 k of int8,
-        // [token][k] with a LITERAL row stride of 144 (128 + 16 pad).
-        // 144 and not 128 because a 128-byte stride puts every row on the
-        // same LDS bank (32 banks x 4 B = 128 B a cycle) — a 16-way
-        // conflict; 144 = 36 dwords shifts four banks a row, 2-way at
-        // worst, and stays a multiple of 16 so every fragment base is
-        // 16 B-aligned. A plain Shared read at a compile-time-constant
-        // stride is also what the wide fragment load requires: a swizzle
-        // or BlockPadded would disable it.
-        Shared<int8> aTile = shared int8[18432];
-        int32 wv = Group.width();
-        uint32 wvu = (uint32) wv;
-        uint32 nThreads = (uint32) (8 * wv);
-        uint32 tid = KernelThread.x();
-        uint32 lane = tid % wvu;
-        uint32 wid = tid / wvu;
-        uint32 lane16 = lane % 16;
-        uint32 wg = KernelThread.globalIdX() / (uint32) (8 * wv);
-        uint32 tileT = wg / tilesN8;
-        uint32 tileI8 = wg % tilesN8;
-        uint32 t0 = tileT * 128;
-        uint32 i0 = rowBase + tileI8 * 128 + wid * 16;
-        // 4x2 wave tiling: the 8 waves cover the 128x128 output as 2
-        // wave-rows x 4 wave-columns — wave `wid` owns FOUR token tiles
-        // from `tw` and TWO column tiles from `cw`. Four token tiles and
-        // not two because every column tile costs a fromWords unpack.
-        // `i0` stays the wave's 16-column STAGING window, unchanged.
-        uint32 wr = wid / 4;
-        uint32 wc = wid % 4;
-        uint32 tw = t0 + 64 * wr;
-        uint32 cw = rowBase + tileI8 * 128 + 32 * wc;
-        if (t0 < rows && i0 < outDim) {
-            int64 rowBytes = blocksPerRow * 144L;
-            int64 xRowBytes = blocksPerRow * 320L;
-            int64 myRo = (int64) (i0 + lane16) * rowBytes;
-            // This lane's weight row in each of the two column tiles.
-            int64 wRo0 = (int64) (cw + lane16) * rowBytes;
-            int64 wRo1 = wRo0 + rowBytes * 16L;
-            // The wave's four token tiles start at token tile 4 * wr.
-            uint32 aBase = wr * 9216;
-
-            CooperativeMatrix<int8,16,16,0> ma;
-            // 4x2 tiling: TWO B fragments — the wave's two column tiles,
-            // each its own fromWords unpack — feed eight mmas against
-            // the four token tiles, so one A load serves two mmas.
-            CooperativeMatrix<int8,16,16,1> mbA;
-            CooperativeMatrix<int8,16,16,1> mbB;
-            CooperativeMatrix<int32,16,16,2> mc0;
-            CooperativeMatrix<int32,16,16,2> mc1;
-            CooperativeMatrix<int32,16,16,2> mc2;
-            CooperativeMatrix<int32,16,16,2> mc3;
-            CooperativeMatrix<int32,16,16,2> mc4;
-            CooperativeMatrix<int32,16,16,2> mc5;
-            CooperativeMatrix<int32,16,16,2> mc6;
-            CooperativeMatrix<int32,16,16,2> mc7;
-            CooperativeMatrix<float32,16,16,2> facc0;
-            CooperativeMatrix<float32,16,16,2> facc1;
-            CooperativeMatrix<float32,16,16,2> facc2;
-            CooperativeMatrix<float32,16,16,2> facc3;
-            CooperativeMatrix<float32,16,16,2> facc4;
-            CooperativeMatrix<float32,16,16,2> facc5;
-            CooperativeMatrix<float32,16,16,2> facc6;
-            CooperativeMatrix<float32,16,16,2> facc7;
-            facc0.splat(0.0f);
-            facc1.splat(0.0f);
-            facc2.splat(0.0f);
-            facc3.splat(0.0f);
-            facc4.splat(0.0f);
-            facc5.splat(0.0f);
-            facc6.splat(0.0f);
-            facc7.splat(0.0f);
-
-            int64 b = 0;
-            while (b < blocksPerRow) {
-                if (lane < 16) {
-                    int64 xb = (int64) (t0 + wid * 16 + lane)
-                        * xRowBytes + b * 320L;
-                    float32 xv = Cajeta.bitsToF32(
-                        ((int32) xp[xb + 288L] & 255)
-                        | (((int32) xp[xb + 289L] & 255) << 8)
-                        | (((int32) xp[xb + 290L] & 255) << 16)
-                        | (((int32) xp[xb + 291L] & 255) << 24));
-                    xsAll[wid * 16 + lane] = xv;
-                    int64 ro = myRo + b * 144L;
-                    float32 dv = GgufFile.halfBitsToF32(
-                        ((int32) packed[ro] & 255)
-                        | (((int32) packed[ro + 1L] & 255) << 8));
-                    float32 dmv = GgufFile.halfBitsToF32(
-                        ((int32) packed[ro + 2L] & 255)
-                        | (((int32) packed[ro + 3L] & 255) << 8));
-                    int32 d0 = (int32) packed[ro + 4L] & 255;
-                    int32 d1 = (int32) packed[ro + 5L] & 255;
-                    int32 d2 = (int32) packed[ro + 6L] & 255;
-                    int32 d3 = (int32) packed[ro + 7L] & 255;
-                    int32 m0 = (int32) packed[ro + 8L] & 255;
-                    int32 m1 = (int32) packed[ro + 9L] & 255;
-                    int32 m2 = (int32) packed[ro + 10L] & 255;
-                    int32 m3 = (int32) packed[ro + 11L] & 255;
-                    int32 k0 = (int32) packed[ro + 12L] & 255;
-                    int32 k1 = (int32) packed[ro + 13L] & 255;
-                    int32 k2 = (int32) packed[ro + 14L] & 255;
-                    int32 k3 = (int32) packed[ro + 15L] & 255;
-                    uint32 cb = (wid * 16 + lane) * 8;
-                    cfAll[cb] = dv * (float32) (d0 & 63);
-                    cfAll[cb + 1] = dv * (float32) (d1 & 63);
-                    cfAll[cb + 2] = dv * (float32) (d2 & 63);
-                    cfAll[cb + 3] = dv * (float32) (d3 & 63);
-                    cfAll[cb + 4] = dv
-                        * (float32) ((k0 & 15) | ((d0 >> 2) & 48));
-                    cfAll[cb + 5] = dv
-                        * (float32) ((k1 & 15) | ((d1 >> 2) & 48));
-                    cfAll[cb + 6] = dv
-                        * (float32) ((k2 & 15) | ((d2 >> 2) & 48));
-                    cfAll[cb + 7] = dv
-                        * (float32) ((k3 & 15) | ((d3 >> 2) & 48));
-                    cgAll[cb] = 0.0f - dmv * (float32) (m0 & 63);
-                    cgAll[cb + 1] = 0.0f - dmv * (float32) (m1 & 63);
-                    cgAll[cb + 2] = 0.0f - dmv * (float32) (m2 & 63);
-                    cgAll[cb + 3] = 0.0f - dmv * (float32) (m3 & 63);
-                    cgAll[cb + 4] = 0.0f - dmv
-                        * (float32) ((k0 >> 4) | ((m0 >> 2) & 48));
-                    cgAll[cb + 5] = 0.0f - dmv
-                        * (float32) ((k1 >> 4) | ((m1 >> 2) & 48));
-                    cgAll[cb + 6] = 0.0f - dmv
-                        * (float32) ((k2 >> 4) | ((m2 >> 2) & 48));
-                    cgAll[cb + 7] = 0.0f - dmv
-                        * (float32) ((k3 >> 4) | ((m3 >> 2) & 48));
-                } else {
-                    uint32 tk = lane - 16;
-                    if (tk < 16) {
-                        int64 xb = (int64) (t0 + wid * 16 + tk)
-                            * xRowBytes + b * 320L;
-                        float32 xv = Cajeta.bitsToF32(
-                            ((int32) xp[xb + 288L] & 255)
-                            | (((int32) xp[xb + 289L] & 255) << 8)
-                            | (((int32) xp[xb + 290L] & 255) << 16)
-                            | (((int32) xp[xb + 291L] & 255) << 24));
-                        uint32 sbi = 0;
-                        while (sbi < 8) {
-                            int64 at = xb + 256L + (int64) (sbi * 4);
-                            int32 ps = ((int32) xp[at] & 255)
-                                | (((int32) xp[at + 1L] & 255) << 8)
-                                | (((int32) xp[at + 2L] & 255) << 16)
-                                | (((int32) xp[at + 3L] & 255) << 24);
-                            rgAll[(wid * 8 + sbi) * 16 + tk] =
-                                xv * (float32) ps;
-                            sbi = sbi + 1;
-                        }
-                    }
-                }
-
-                uint32 H = 0;
-                while (H < 2) {
-                    // Cooperative A staging: the whole workgroup copies
-                    // this K-half's 128-token x 128-k int8 activation
-                    // sub-block out of xp (the quant payload is the
-                    // first 256 B of each 320-B block, so half H is the
-                    // 128 bytes at +128H) into `aTile`. 1024 16-byte
-                    // chunks, eight per token row, so eight consecutive
-                    // threads cover one row's 128 contiguous bytes and
-                    // the global reads stay coalesced along k.
-                    uint32 c = tid;
-                    while (c < 1024) {
-                        uint32 row = c / 8;
-                        uint32 chunk = c % 8;
-                        int64 src = (int64) (t0 + row) * xRowBytes
-                            + b * 320L
-                            + (int64) (128 * H + chunk * 16);
-                        aTile.vstore((int64) (row * 144 + chunk * 16),
-                            xp.vload<16>(src));
-                        c = c + nThreads;
-                    }
-                    Barrier.workgroup();
-
-                    uint32 gg = 0;
-                    while (gg < 2) {
-                        uint32 g = 2 * H + gg;
-                        // ONE 32-byte read of each column tile's weight
-                        // row serves FOUR B fragments: sub-blocks j = 2g
-                        // (low nibbles) and j = 2g+1 (high), each in two
-                        // K-halves. Words 0-3 are half 0, 4-7 half 1;
-                        // both j re-extract them from REGISTERS.
-                        int64 nb = (wRo0 + b * 144L + 16L
-                            + (int64) (32 * g)) / 4L;
-                        int64 nbB = (wRo1 + b * 144L + 16L
-                            + (int64) (32 * g)) / 4L;
-                        Vector<int32,4> wlo = packedW.vload<4>(nb);
-                        Vector<int32,4> whi = packedW.vload<4>(nb + 4L);
-                        Vector<int32,4> wloB = packedW.vload<4>(nbB);
-                        Vector<int32,4> whiB = packedW.vload<4>(nbB + 4L);
-                        int32 w0 = wlo[0];
-                        int32 w1 = wlo[1];
-                        int32 w2 = wlo[2];
-                        int32 w3 = wlo[3];
-                        int32 w4 = whi[0];
-                        int32 w5 = whi[1];
-                        int32 w6 = whi[2];
-                        int32 w7 = whi[3];
-                        int32 w8 = wloB[0];
-                        int32 w9 = wloB[1];
-                        int32 w10 = wloB[2];
-                        int32 w11 = wloB[3];
-                        int32 w12 = whiB[0];
-                        int32 w13 = whiB[1];
-                        int32 w14 = whiB[2];
-                        int32 w15 = whiB[3];
-                        uint32 jj = 0;
-                        while (jj < 2) {
-                            uint32 j = 2 * g + jj;
-                            int32 sh = (int32) (jj * 4);
-                            // One (cf, cg) pair per column tile; the
-                            // rg/xs slices are per token tile.
-                            uint32 cbase = (32 * wc + lane16) * 8 + j;
-                            WaveVector<float32, 16> cfv0 = WaveVector.ofSlice(cfAll, cbase - lane16 * 8, 8);
-                            WaveVector<float32, 16> cfv1 = WaveVector.ofSlice(cfAll, cbase + 128 - lane16 * 8, 8);
-                            WaveVector<float32, 16> cgv0 = WaveVector.ofSlice(cgAll, cbase - lane16 * 8, 8);
-                            WaveVector<float32, 16> cgv1 = WaveVector.ofSlice(cgAll, cbase + 128 - lane16 * 8, 8);
-                            uint32 rbase = (32 * wr + j) * 16;
-                            uint32 xbase = 64 * wr;
-                            // A from LDS: this half's local k for
-                            // sub-block j, the two 16-k steps. Row base
-                            // is the token tile: tt * 16 * 144.
-                            uint32 kL0 = 32 * (2 * gg + jj);
-                            uint32 kL1 = kL0 + 16;
-                            mc0.splat(0);
-                            mc1.splat(0);
-                            mc2.splat(0);
-                            mc3.splat(0);
-                            mc4.splat(0);
-                            mc5.splat(0);
-                            mc6.splat(0);
-                            mc7.splat(0);
-                            // Half 0: both column tiles unpacked once,
-                            // then four A loads, each serving two mmas.
-                            int32 q0 = (w0 >> sh) & 252645135;
-                            int32 q1 = (w1 >> sh) & 252645135;
-                            int32 q2 = (w2 >> sh) & 252645135;
-                            int32 q3 = (w3 >> sh) & 252645135;
-                            mbA.fromWords(q0, q1, q2, q3);
-                            q0 = (w8 >> sh) & 252645135;
-                            q1 = (w9 >> sh) & 252645135;
-                            q2 = (w10 >> sh) & 252645135;
-                            q3 = (w11 >> sh) & 252645135;
-                            mbB.fromWords(q0, q1, q2, q3);
-                            ma.load(aTile, aBase + kL0, 0, 144);
-                            mc0.mma(ma, mbA);
-                            mc4.mma(ma, mbB);
-                            ma.load(aTile, aBase + 2304 + kL0, 0, 144);
-                            mc1.mma(ma, mbA);
-                            mc5.mma(ma, mbB);
-                            ma.load(aTile, aBase + 4608 + kL0, 0, 144);
-                            mc2.mma(ma, mbA);
-                            mc6.mma(ma, mbB);
-                            ma.load(aTile, aBase + 6912 + kL0, 0, 144);
-                            mc3.mma(ma, mbA);
-                            mc7.mma(ma, mbB);
-                            // Half 1: the words are already resident, so
-                            // this re-extracts from registers.
-                            q0 = (w4 >> sh) & 252645135;
-                            q1 = (w5 >> sh) & 252645135;
-                            q2 = (w6 >> sh) & 252645135;
-                            q3 = (w7 >> sh) & 252645135;
-                            mbA.fromWords(q0, q1, q2, q3);
-                            q0 = (w12 >> sh) & 252645135;
-                            q1 = (w13 >> sh) & 252645135;
-                            q2 = (w14 >> sh) & 252645135;
-                            q3 = (w15 >> sh) & 252645135;
-                            mbB.fromWords(q0, q1, q2, q3);
-                            ma.load(aTile, aBase + kL1, 0, 144);
-                            mc0.mma(ma, mbA);
-                            mc4.mma(ma, mbB);
-                            ma.load(aTile, aBase + 2304 + kL1, 0, 144);
-                            mc1.mma(ma, mbA);
-                            mc5.mma(ma, mbB);
-                            ma.load(aTile, aBase + 4608 + kL1, 0, 144);
-                            mc2.mma(ma, mbA);
-                            mc6.mma(ma, mbB);
-                            ma.load(aTile, aBase + 6912 + kL1, 0, 144);
-                            mc3.mma(ma, mbA);
-                            mc7.mma(ma, mbB);
-                            mc0.scaledAccumInto2(facc0, xsAll[xbase],
-                                cfv0, rgAll[rbase], cgv0);
-                            mc1.scaledAccumInto2(facc1,
-                                xsAll[xbase + 16], cfv0,
-                                rgAll[rbase + 128], cgv0);
-                            mc2.scaledAccumInto2(facc2,
-                                xsAll[xbase + 32], cfv0,
-                                rgAll[rbase + 256], cgv0);
-                            mc3.scaledAccumInto2(facc3,
-                                xsAll[xbase + 48], cfv0,
-                                rgAll[rbase + 384], cgv0);
-                            mc4.scaledAccumInto2(facc4, xsAll[xbase],
-                                cfv1, rgAll[rbase], cgv1);
-                            mc5.scaledAccumInto2(facc5,
-                                xsAll[xbase + 16], cfv1,
-                                rgAll[rbase + 128], cgv1);
-                            mc6.scaledAccumInto2(facc6,
-                                xsAll[xbase + 32], cfv1,
-                                rgAll[rbase + 256], cgv1);
-                            mc7.scaledAccumInto2(facc7,
-                                xsAll[xbase + 48], cfv1,
-                                rgAll[rbase + 384], cgv1);
-                            jj = jj + 1;
-                        }
-                        gg = gg + 1;
-                    }
-                    Barrier.workgroup();
-                    H = H + 1;
-                }
-                b = b + 1;
-            }
-
-            facc0.store(y, (uint32) ((int64) tw * (int64) outDim
-                + (int64) cw), 0, outDim);
-            facc1.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
-                + (int64) cw), 0, outDim);
-            facc2.store(y, (uint32) ((int64) (tw + 32) * (int64) outDim
-                + (int64) cw), 0, outDim);
-            facc3.store(y, (uint32) ((int64) (tw + 48) * (int64) outDim
-                + (int64) cw), 0, outDim);
-            facc4.store(y, (uint32) ((int64) tw * (int64) outDim
-                + (int64) (cw + 16)), 0, outDim);
-            facc5.store(y, (uint32) ((int64) (tw + 16) * (int64) outDim
-                + (int64) (cw + 16)), 0, outDim);
-            facc6.store(y, (uint32) ((int64) (tw + 32) * (int64) outDim
-                + (int64) (cw + 16)), 0, outDim);
-            facc7.store(y, (uint32) ((int64) (tw + 48) * (int64) outDim
-                + (int64) (cw + 16)), 0, outDim);
-        }
-    }
-
-    // Profile-resolved launch geometry for q4kWmmaMwKernel, latched once.
+    // The 8-wave Mw geometry, latched once off the family's default member.
     // 0 means "not yet resolved".
     static int32 mwBlock = 0;
     static int32 mwLds = 0;
@@ -2072,7 +1703,7 @@ public final class WmmaKernel {
         // cpu backend at its host SIMD width), and Device.waveSize() would
         // launch 8 host waves where the kernel expects 8 tile waves
         // (xpu-kernel-adaptor Unit 9, the launch-side width, 2026-09-29).
-        int32 wave = Group.laneBlockOf("q4kWmmaMwKernel");
+        int32 wave = Group.laneBlockOf(WmmaKernel.MW_KERNEL);
         // The kernel is structurally 8 waves per workgroup and derives wg,
         // wid and lane from Group.width(), so the launched block MUST be
         // 8 * the wave width — any other block mis-maps the tiles. The
@@ -2082,7 +1713,7 @@ public final class WmmaKernel {
         // measured literal 256 when there is no device to ask.
         int32 reqBlock = wave > 0 ? 8 * wave : 256;
         int32 block = reqBlock;
-        KernelManifest m #= KernelManifest.of("q4kWmmaMwKernel");
+        KernelManifest m #= KernelManifest.of(WmmaKernel.MW_KERNEL);
         if (m != null) {
             Optional<int32> ld = m.ldsStaticBytes();
             if (ld.isPresent()) { WmmaKernel.mwLds = ld.get(); }
@@ -2104,6 +1735,12 @@ public final class WmmaKernel {
         return WmmaKernel.mwBlock;
     }
 
+    /** The default member's static LDS bytes, as its manifest states them. */
+    public static int32 mwLaunchLds() {
+        WmmaKernel.resolveMwGeom();
+        return WmmaKernel.mwLds;
+    }
+
     /**
      * Route one packed multi-wave slice through the scheduler seam: the
      * kernel is named and its buffers bound in parameter order, so
@@ -2111,13 +1748,13 @@ public final class WmmaKernel {
      * refuses a restatement that disagrees; the caller launches with the
      * descriptor's geometry.
      */
-    public static #KernelResourceDescriptor mwSubmit(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int32> packedW,
+    public static #KernelResourceDescriptor mwSubmit(String kernel, int32 lds,
+            KernelBuffer<float32> y, KernelBuffer<int8> packed, KernelBuffer<int32> packedW,
             KernelBuffer<int8> xp, int32 gridBlocks, int32 blockThreads) {
         KernelSubmission sub = heap KernelSubmission(gridBlocks, blockThreads);
-        sub.kernel = "q4kWmmaMwKernel";
+        sub.kernel #= kernel.clone();
         sub.character = ArithmeticCharacter.ComputeBound;
-        sub.ldsBytes = WmmaKernel.mwLds;
+        sub.ldsBytes = lds;
         sub.bind(y.handle());
         sub.bind(packed.handle());
         sub.bind(packedW.handle());
@@ -2125,48 +1762,52 @@ public final class WmmaKernel {
         return Scheduler.submit(sub);
     }
 
-    /**
-     * Profile-driven launch for q4kWmmaMwKernel: block from the kernel
-     * manifest's feasibleBlocks (8 * wave-width fallback), grid swept in
-     * rowBase slices of `sliceWgsFor` WGs — the device's resident-group
-     * capacity, the measured 32-WG window when no profile is readable.
-     * A 6.2.2 note: the per-slice launch is where Scheduler.submit() would
-     * record the submission (geometry + packed/xp read set, y write set)
-     * and bind() validate it; kept a direct launch here until the bit-gate
-     * passes.
-     */
+    // The Mw GEMM as a family (xpu-tile-shape-selection 4.8.1): one object
+    // per MwTile instantiation, and the recent choices by problem.
+    public static final String MW_FAMILY = "q4kWmmaMw";
+    /** The family's default member, today's 128x128 tile over 64x32 wave tiles. */
+    public static final String MW_KERNEL = "MwTile_128_128_64_32_128_q4kQ8";
+    static TileFamily mwFam;
+
+    public static TileFamily mwFamily() {
+        if (WmmaKernel.mwFam == null) {
+            WmmaKernel.mwFam #= heap TileFamily(WmmaKernel.MW_FAMILY, "Q4_K Mw");
+            WmmaKernel.mwFam.add(#heap MwTile<128, 128, 64, 32, 128>());
+            WmmaKernel.mwFam.add(#heap MwTile<64, 64, 32, 32, 128>());
+        }
+        return WmmaKernel.mwFam;
+    }
+
+    /** Drop the Mw family's remembered choices. */
+    public static void forgetMwShapes() { WmmaKernel.mwFamily().forget(); }
+
+    /** Whether some listed Mw shape covers the problem. */
+    public static boolean fitsMw(int64 rows, int64 outDim, int64 cols) {
+        return WmmaKernel.mwFamily().fits(rows, outDim, cols);
+    }
+
+    /** The shape filter's verdict on the Mw member `kernel`: "" when it survives. */
+    public static #String mwPruneReason(String kernel, int64 rows, int64 outDim, int64 cols) {
+        return WmmaKernel.mwFamily().pruneReason(kernel, rows, outDim, cols);
+    }
+
+    /** The Mw member the last family launch ran, or "". */
+    public static #String lastMwKernel() { return WmmaKernel.mwFamily().lastKernel(); }
+
+    /** The packed multi-wave Q4_K GEMM: the family's chosen member over the
+     *  whole problem. The caller has checked {@link #fitsMw}. */
     public static void q4kWmmaMwLaunch(KernelBuffer<float32> y,
-            KernelBuffer<int8> packed, KernelBuffer<int32> packedW,
-            KernelBuffer<int8> xp, int64 rows, int64 outDim, int64 cols) {
-        WmmaKernel.resolveMwGeom();
-        int64 tilesM8 = rows / 128L;
-        int64 tilesN8 = outDim / 128L;
-        uint32 blk = (uint32) WmmaKernel.mwBlock;
-        if (WmmaKernel.mwSlice <= 0L) {
-            WmmaKernel.mwSlice = WmmaKernel.sliceWgsFor("q4kWmmaMwKernel",
-                (int64) WmmaKernel.mwBlock);
-        }
-        int64 sliceN8 = WmmaKernel.mwSlice / tilesM8;
-        if (sliceN8 < 1L) { sliceN8 = 1L; }
-        KernelStream s = QuantKernel.stream();
-        int64 base = 0L;
-        while (base < tilesN8) {
-            int64 n8 = sliceN8;
-            if (base + n8 > tilesN8) { n8 = tilesN8 - base; }
-            KernelResourceDescriptor d #= WmmaKernel.mwSubmit(y, packed,
-                packedW, xp, (int32) (tilesM8 * n8), (int32) blk);
-            q4kWmmaMwKernel.launch(s,
-                grid: [(uint32) d.gridX], block: [(uint32) d.blockX])
-                (y, packed, packedW, xp, (uint32) rows, (uint32) outDim,
-                 (uint32) n8, cols / 256L, (uint32) (base * 128L));
-            base = base + n8;
-        }
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp, int64 rows,
+            int64 outDim, int64 cols) {
+        TileFamily fam = WmmaKernel.mwFamily();
+        int32 idx = fam.chooseIndex(TcTile.shapeDir, packed, xp, rows, outDim, cols);
+        fam.shapes().get(idx).launchAs(y, packed, xp, rows, outDim, cols, TcTile.part, 1L, (uint32) 0);
         return;
     }
 
     /**
      * Unit 10.2: the id-GEMM at the dense kernel's tile -- 128 tokens x
-     * 128 rows per workgroup, q4kWmmaMwKernel's 4x2 wave tiling and
+     * 128 rows per workgroup, the dense MwTile default's 4x2 wave tiling and
      * packed-direct B feed -- indirected through a 128-row chunk map
      * (expert, row base, ragged end; `meta[1]` holds the count). Tiles
      * wholly below the end store from the fragment, the ragged one
@@ -5346,7 +4987,9 @@ public final class WmmaKernel {
     // a fifth of the CUs. `partw N` overrides it for a sweep.
     static int64 partWgs = 32L;
     static int64 partWgsOverride = 0L;
-    static int64 mwSlice = 0L;
+    // Bumped when the partition width or the tune dir changes, so each Mw
+    // member re-reads its slice.
+    static int64 mwSliceEpoch = 0L;
     static int64 deqMwSlice = 0L;
     static int64 q6DeqMwSlice = 0L;
     // Where tuned values for THIS machine live; empty = tuning off. The
@@ -5354,7 +4997,7 @@ public final class WmmaKernel {
     static String tuneDir = "";
     public static void setTuneDir(String d) {
         WmmaKernel.tuneDir #= d.clone();
-        WmmaKernel.mwSlice = 0L;
+        WmmaKernel.mwSliceEpoch = WmmaKernel.mwSliceEpoch + 1L;
         WmmaKernel.deqMwSlice = 0L;
         WmmaKernel.q6DeqMwSlice = 0L;
     }
@@ -5364,14 +5007,14 @@ public final class WmmaKernel {
     public static void setPartWgs(int64 n) {
         WmmaKernel.partWgs = n;
         WmmaKernel.partWgsOverride = n;
-        WmmaKernel.mwSlice = 0L;
+        WmmaKernel.mwSliceEpoch = WmmaKernel.mwSliceEpoch + 1L;
         WmmaKernel.deqMwSlice = 0L;
         WmmaKernel.q6DeqMwSlice = 0L;
     }
     public static void resetPartWgs() {
         WmmaKernel.partWgs = 32L;
         WmmaKernel.partWgsOverride = 0L;
-        WmmaKernel.mwSlice = 0L;
+        WmmaKernel.mwSliceEpoch = WmmaKernel.mwSliceEpoch + 1L;
         WmmaKernel.deqMwSlice = 0L;
         WmmaKernel.q6DeqMwSlice = 0L;
     }

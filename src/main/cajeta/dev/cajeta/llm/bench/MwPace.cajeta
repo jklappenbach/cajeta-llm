@@ -1,0 +1,97 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.time.Clock;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.ShapeChoice;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+
+/** Each MwTile member at the engine's prefill problems, members interleaved round by round,
+ *  sixteen launches a sample, min and median of nine samples, in ns a launch. */
+public class MwPace {
+    static final int32 MEMBERS = 2;
+
+    static int64 burst(String member, KernelBuffer<float32> y, KernelBuffer<int8> wD,
+            KernelBuffer<int8> xp, int64 rows, int64 out, int64 cols) {
+        ShapeChoice.setShapeOverride(WmmaKernel.MW_FAMILY, member);
+        WmmaKernel.forgetMwShapes();
+        WmmaKernel.q4kWmmaMwLaunch(y, wD, xp, rows, out, cols);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 16) {
+            WmmaKernel.q4kWmmaMwLaunch(y, wD, xp, rows, out, cols);
+            k = k + 1;
+        }
+        s.sync();
+        int64 t = (Clock.nanoTime() - t0) / 16L;
+        ShapeChoice.clearShapeOverride(WmmaKernel.MW_FAMILY);
+        WmmaKernel.forgetMwShapes();
+        return t;
+    }
+
+    static int64 median(int64[] v, int32 n) {
+        int32 i = 1;
+        while (i < n) {
+            int64 x = v[i];
+            int32 j = i - 1;
+            while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j = j - 1; }
+            v[j + 1] = x;
+            i = i + 1;
+        }
+        return v[n / 2];
+    }
+
+    static void pace(String[] members, int64 rows, int64 out, int64 cols) {
+        int64 nb = out * (cols / 256L) * 144L;
+        int8[] raw #= heap int8[nb];
+        int64 z = 0;
+        while (z < nb) { raw[z] = (int8) ((z * 31L + 35L) % 251L); z = z + 1; }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) nb);
+        wD.upload(raw);
+        float32[] x #= heap float32[rows * cols];
+        int64 i = 0;
+        while (i < rows * cols) { x[i] = (float32) ((i % 97L) - 48L) * 0.01f; i = i + 1; }
+        KernelBuffer<float32> xD #= heap KernelBuffer<float32>((uint64) (rows * cols));
+        xD.upload(x);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) (rows * Quant.q8kPackedBytes(cols)));
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) (rows * out));
+        QuantKernel.q8kPackRowsLaunchNoSync(xp, xD, rows, cols, cols);
+        int64[] t #= heap int64[MwPace.MEMBERS * 9];
+        int32 r = 0;
+        while (r < 9) {
+            int32 m = 0;
+            while (m < MwPace.MEMBERS) {
+                int32 at = (r % 2 == 0) ? m : MwPace.MEMBERS - 1 - m;
+                t[at * 9 + r] = MwPace.burst(members[at], y, wD, xp, rows, out, cols);
+                m = m + 1;
+            }
+            r = r + 1;
+        }
+        int32 m = 0;
+        while (m < MwPace.MEMBERS) {
+            int64[] v #= heap int64[9];
+            int32 k = 0;
+            while (k < 9) { v[k] = t[m * 9 + k]; k = k + 1; }
+            int64 med = MwPace.median(v, 9);
+            System.stdout.println("mw\t" + rows + "x" + out + "x" + cols + "\t" + members[m]
+                + "\tmin " + v[0] + "\tmed " + med);
+            m = m + 1;
+        }
+    }
+
+    public static int32 run(String[] args) {
+        String[] members #= heap String[MwPace.MEMBERS];
+        members[0] #= WmmaKernel.MW_KERNEL.clone();
+        members[1] #= "MwTile_64_64_32_32_128_q4kQ8";
+        MwPace.pace(members, 512L, 1024L, 4096L);
+        MwPace.pace(members, 512L, 4096L, 4096L);
+        MwPace.pace(members, 512L, 28672L, 4096L);
+        MwPace.pace(members, 512L, 4096L, 14336L);
+        return 0;
+    }
+}
