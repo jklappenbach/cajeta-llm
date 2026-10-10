@@ -1,0 +1,172 @@
+package dev.cajeta.llm.io;
+
+import cajeta.collection.ArrayList;
+import cajeta.lang.String;
+import cajeta.xpu.DeviceFacts;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelFacts;
+import cajeta.xpu.ShapeCandidate;
+import cajeta.xpu.ShapeChoice;
+import cajeta.xpu.ShapeFilter;
+import cajeta.xpu.ShapeResult;
+import cajeta.xpu.XpuLaunchException;
+import dev.cajeta.llm.Diag;
+
+/**
+ * One tile family's run-time state (xpu-tile-shape-selection §3, §4, §6):
+ * its name in the shape store, its listed shapes (one object per
+ * instantiation of the family's class template), and the recent choices by
+ * problem. TcTile keeps one for Q4_K (QkTile) and one for Q6_K (Q6Tile).
+ */
+public final class TileFamily {
+    String name;
+    String quant;
+    ArrayList<Q4TileShape> list;
+    // The recent choices, by problem: the store is asked once per problem.
+    // A prefill layer cycles five problems (q, k/v, o, gate|up, down), so
+    // a one-entry memo missed on every launch.
+    static final int32 MEMO = 16;
+    int64[] memoRows;
+    int64[] memoOut;
+    int64[] memoCols;
+    int32[] memoIdx;
+    int32 memoNext = 0;
+    // The choice the last launch used, for the route record.
+    int32 memoLast = -1;
+
+    public TileFamily(String name, String quant) {
+        this.name #= name.clone();
+        this.quant #= quant.clone();
+        this.list #= heap ArrayList<Q4TileShape>();
+        this.forget();
+    }
+
+    public void add(#Q4TileShape sh) {
+        this.list.add(#sh);
+    }
+
+    public ArrayList<Q4TileShape> shapes() { return this.list; }
+
+    /** Drop the remembered choices. */
+    public void forget() {
+        this.memoRows #= heap int64[TileFamily.MEMO];
+        this.memoOut #= heap int64[TileFamily.MEMO];
+        this.memoCols #= heap int64[TileFamily.MEMO];
+        this.memoIdx #= heap int32[TileFamily.MEMO];
+        int32 i = 0;
+        while (i < TileFamily.MEMO) {
+            this.memoRows[i] = -1L;
+            this.memoIdx[i] = -1;
+            i = i + 1;
+        }
+        this.memoNext = 0;
+        this.memoLast = -1;
+    }
+
+    /** The registered kernel of the shape the last launch ran, or "". */
+    public #String lastKernel() {
+        if (this.memoLast < 0) { return ""; }
+        return this.list.get(this.memoLast).kernel();
+    }
+
+    /** The index of the shape registered as `kernel`, or -1. */
+    public int32 indexOf(String kernel) {
+        int32 n = (int32) this.list.count();
+        int32 i = 0;
+        while (i < n) {
+            String k #= this.list.get(i).kernel();
+            if (k.equals(kernel)) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /** Whether some listed shape covers the problem. */
+    public boolean fits(int64 rows, int64 outDim, int64 cols) {
+        int32 n = (int32) this.list.count();
+        int32 i = 0;
+        while (i < n) {
+            if (this.list.get(i).fits(rows, outDim, cols)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /** The filter's verdict on the member `kernel` at this problem: "" when
+     *  it survives, else the pruned verdict's text. */
+    public #String pruneReason(String kernel, int64 rows, int64 outDim, int64 cols) {
+        int32 i = this.indexOf(kernel);
+        if (i < 0) {
+            return kernel + " is not a listed member of the " + this.quant + " tile family";
+        }
+        Q4TileShape sh = this.list.get(i);
+        if (!sh.fits(rows, outDim, cols)) {
+            return kernel + " does not fit " + rows + "x" + outDim + "x" + cols;
+        }
+        ShapeFilter f #= heap ShapeFilter(this.name, DeviceFacts.current(), rows, outDim, cols);
+        String kn #= sh.kernel();
+        KernelFacts kf #= KernelFacts.measured(kn, 0);
+        f.consider(#heap ShapeCandidate(#kn, sh.tileM(), sh.tileN(), sh.threads(), 256, 8), #kf);
+        if (f.survivorCount() > 0) { return ""; }
+        return f.pruned(0).text();
+    }
+
+    /** The shape the family runs at this problem: the listed shapes that fit
+     *  go through the feasibility filter at the device's facts, the choice
+     *  times the survivors at first use and remembers the winner under the
+     *  device, the build and the exact problem; an override on the family
+     *  wins. No survivor is a refusal by name. */
+    public int32 chooseIndex(String shapeDir, KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 outDim, int64 cols) {
+        int32 m = 0;
+        while (m < TileFamily.MEMO) {
+            if (this.memoIdx[m] >= 0 && this.memoRows[m] == rows
+                    && this.memoOut[m] == outDim && this.memoCols[m] == cols) {
+                this.memoLast = this.memoIdx[m];
+                return this.memoLast;
+            }
+            m = m + 1;
+        }
+        ShapeFilter f #= heap ShapeFilter(this.name, DeviceFacts.current(), rows, outDim, cols);
+        int32 n = (int32) this.list.count();
+        int32 i = 0;
+        while (i < n) {
+            Q4TileShape sh = this.list.get(i);
+            if (sh.fits(rows, outDim, cols)) {
+                String kn #= sh.kernel();
+                KernelFacts kf #= KernelFacts.measured(kn, 0);
+                f.consider(#heap ShapeCandidate(#kn, sh.tileM(), sh.tileN(), sh.threads(), 256, 8), #kf);
+            }
+            i = i + 1;
+        }
+        if (f.survivorCount() == 0) {
+            String why #= f.refusal();
+            throw heap XpuLaunchException(#why);
+        }
+        Q4ShapeProbe probe #= heap Q4ShapeProbe(this, f, packed, xp, rows, outDim, cols);
+        ShapeResult r #= ShapeChoice.choose(shapeDir, f, probe);
+        if (r.survivor < 0) {
+            String why #= r.refusal.clone();
+            throw heap XpuLaunchException(#why);
+        }
+        // The choice record: the problem, the shape, its margin over the
+        // runner-up in per mille, and whether it came from the store (1)
+        // or was timed here (0). The route tap prints it.
+        Diag.emit("tile-choice", 0 - 1, r.kernel, rows, outDim, cols,
+            (int64) r.marginPerMille, r.fromCache ? 1L : 0L, r.timed ? 1L : 0L);
+        int32 idx = this.indexOf(r.kernel);
+        if (idx < 0) {
+            String why #= "the shape choice named " + r.kernel
+                + ", which the " + this.quant + " tile family does not list";
+            throw heap XpuLaunchException(#why);
+        }
+        int32 slot = this.memoNext;
+        this.memoNext = (this.memoNext + 1) % TileFamily.MEMO;
+        this.memoRows[slot] = rows;
+        this.memoOut[slot] = outDim;
+        this.memoCols[slot] = cols;
+        this.memoIdx[slot] = idx;
+        this.memoLast = idx;
+        return idx;
+    }
+}
