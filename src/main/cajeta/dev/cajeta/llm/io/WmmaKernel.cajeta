@@ -1,6 +1,8 @@
 package dev.cajeta.llm.io;
 
+import cajeta.collection.ArrayList;
 import cajeta.lang.Optional;
+import cajeta.time.Clock;
 import cajeta.lang.Cajeta;
 import cajeta.xpu.Barrier;
 import cajeta.xpu.CooperativeMatrix;
@@ -1770,6 +1772,8 @@ public final class WmmaKernel {
     public static final String ID_WIDE_KERNEL = "IdTile_128_128_64_32_128_q4kId";
     static TileFamily<IdShape> idFam;
     static IdTile<128, 128, 64, 32, 128> idWide;
+    static ArrayList<IdTrial> idTrialList;
+    static int64 idTrialCount = 0L;
 
     public static TileFamily<IdShape> idFamily() {
         if (WmmaKernel.idFam == null) {
@@ -1797,8 +1801,12 @@ public final class WmmaKernel {
         return;
     }
 
-    /** Drop the Id family's remembered choices. */
-    public static void forgetIdShapes() { WmmaKernel.idFamily().forget(); }
+    /** Drop the Id family's remembered choices and its unfinished trials. */
+    public static void forgetIdShapes() {
+        WmmaKernel.idFamily().forget();
+        WmmaKernel.idTrials().clear();
+        return;
+    }
 
     /** The family's verdict on the Id member `kernel` at a batch of `np` expert
      *  rows: "" when it is a candidate here. */
@@ -1825,22 +1833,72 @@ public final class WmmaKernel {
         return WmmaKernel.idFamily().serves(WmmaKernel.idBucket(np), outDim, cols);
     }
 
+    /** Launches the engine has timed in place for the Id family's choices. */
+    public static int64 idTrialLaunches() { return WmmaKernel.idTrialCount; }
+
+    /** Drop the stored Id choice for a batch of `np` expert rows. */
+    public static void forgetIdStore(int64 np, int64 outDim, int64 cols) {
+        Autotune.invalidate(TcTile.shapeDir, "shape." + WmmaKernel.ID_FAMILY + "."
+            + WmmaKernel.idBucket(np) + "x" + outDim + "x" + cols);
+        return;
+    }
+
+    static ArrayList<IdTrial> idTrials() {
+        if (WmmaKernel.idTrialList == null) {
+            WmmaKernel.idTrialList #= heap ArrayList<IdTrial>();
+        }
+        return WmmaKernel.idTrialList;
+    }
+
+    static int32 idTrialAt(int64 m, int64 outDim, int64 cols) {
+        int32 n = (int32) WmmaKernel.idTrials().count();
+        int32 i = 0;
+        while (i < n) {
+            if (WmmaKernel.idTrials().get(i).isFor(m, outDim, cols)) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
     /** The MoE Id GEMM over a batch: the family's chosen member, its own chunk
-     *  map, one launch on the quant stream. A first choice at this problem
-     *  times the survivors into `y` itself, whose rows the winner then writes
-     *  once more. */
+     *  map, one launch on the quant stream; an undecided problem's launch is a trial sample. */
     public static void q4kIdLaunchNoSync(KernelBuffer<float32> y, KernelBuffer<int8> slab,
             KernelBuffer<int32> slabW, IdBatch b, int64 outDim, int64 cols, int64 rowsPerExpert) {
         TileFamily<IdShape> fam = WmmaKernel.idFamily();
         int64 m = WmmaKernel.idBucket(b.expertRows());
         int32 idx = fam.remembered(m, outDim, cols);
-        if (idx < 0) {
-            ShapeFilter f #= fam.filterFor(m, outDim, cols);
-            IdShapeProbe probe #= heap IdShapeProbe(fam, y, slab, slabW, b, outDim, cols, rowsPerExpert);
-            probe.bind(f);
-            idx = fam.chooseWith(TcTile.shapeDir, f, probe, m, outDim, cols);
+        if (idx >= 0) {
+            fam.shapes().get(idx).launch(y, slab, slabW, b, outDim, cols, rowsPerExpert);
+            return;
         }
-        fam.shapes().get(idx).launch(y, slab, slabW, b, outDim, cols, rowsPerExpert);
+        int32 at = WmmaKernel.idTrialAt(m, outDim, cols);
+        if (at < 0) {
+            ShapeFilter f #= fam.filterFor(m, outDim, cols);
+            IdTrial fresh #= heap IdTrial(m, outDim, cols, #f);
+            idx = fam.chooseUntimed(TcTile.shapeDir, fresh.filter(), fresh, m, outDim, cols);
+            if (idx >= 0) {
+                fam.shapes().get(idx).launch(y, slab, slabW, b, outDim, cols, rowsPerExpert);
+                return;
+            }
+            WmmaKernel.idTrials().add(#fresh);
+            at = WmmaKernel.idTrialAt(m, outDim, cols);
+        }
+        IdTrial t = WmmaKernel.idTrials().get(at);
+        int32 i = t.next();
+        int32 member = fam.indexOf(t.filter().survivor(i).candidate.kernel);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int64 t0 = Clock.nanoTime();
+        fam.shapes().get(member).launch(y, slab, slabW, b, outDim, cols, rowsPerExpert);
+        s.sync();
+        t.keep(i, Clock.nanoTime() - t0);
+        fam.markLast(member);
+        WmmaKernel.idTrialCount = WmmaKernel.idTrialCount + 1L;
+        if (t.complete()) {
+            fam.chooseWith(TcTile.shapeDir, t.filter(), t, m, outDim, cols);
+            fam.markLast(member);
+            IdTrial done #= WmmaKernel.idTrials().removeAt(at);
+        }
         return;
     }
 

@@ -6,8 +6,15 @@ import cajeta.lang.System;
 import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
+import cajeta.xpu.Autotune;
+import cajeta.xpu.DeviceFacts;
+import cajeta.xpu.KernelFacts;
+import cajeta.xpu.ShapeCandidate;
 import cajeta.xpu.ShapeChoice;
+import cajeta.xpu.ShapeFilter;
+import cajeta.xpu.ShapeResult;
 import dev.cajeta.llm.io.IdBatch;
+import dev.cajeta.llm.io.IdTrial;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
 import dev.cajeta.llm.io.Quant;
@@ -854,10 +861,8 @@ public class MoeIdMw8Test {
         ValueCheck.credit(vc);
     }
 
-    /** The timed choice itself (xpu-tile-shape-selection 4.8.1.4.4): with no
-     *  override, the family times its survivors over the batch's own maps, a
-     *  single launch a sample at the small batch and a burst at the wide one,
-     *  launches the winner, and the output matches the host. */
+    /** The choice's first launch (xpu-tile-shape-selection 4.8.1.4.4, 4.8.1.6): with
+     *  no override a fresh problem launches a listed member, and it matches the host. */
     @Test
     public void q4kTheIdChoiceLaunchesAListedMemberThatMatchesTheHost() {
         if (!CensusReachTest.deviceHere()) { return; }
@@ -898,5 +903,198 @@ public class MoeIdMw8Test {
             ValueCheck.credit(vc);
             layout = layout + 1;
         }
+    }
+
+    /** The members with device code that the family keeps at `np` expert rows. */
+    static int32 idSurvivors(int64 np) {
+        int32 n = (int32) WmmaKernel.idFamily().shapes().count();
+        int32 kept = 0;
+        int32 i = 0;
+        while (i < n) {
+            String name #= WmmaKernel.idFamily().shapes().get(i).kernel();
+            String why #= WmmaKernel.idPruneReason(name, np, (int64) MoeIdMw8Test.ROWS_E,
+                (int64) MoeIdMw8Test.COLS);
+            if (why.count() == 0L) { kept = kept + 1; }
+            i = i + 1;
+        }
+        return kept;
+    }
+
+    /** One family launch over layout 0's batch, checked against the host; the member it ran. */
+    static #String launchChecked(int8[] raw, KernelBuffer<int8> slab, KernelBuffer<int32> slabW,
+            String label) {
+        float32[] xv #= MoeIdMw8Test.actsL(0);
+        float32[] want #= MoeIdMw8Test.hostIdGemmL(0, raw, xv);
+        IdBatch b #= MoeIdMw8Test.idBatchL(0);
+        int64 outDim = (int64) MoeIdMw8Test.ROWS_E;
+        int64 np = (int64) MoeIdMw8Test.npOf(0);
+        int64 nAll = (np + 128L) * outDim;
+        float32[] zero = heap float32[nAll];
+        KernelBuffer<float32> y = heap KernelBuffer<float32>((uint64) nAll);
+        y.upload(zero, nAll);
+        WmmaKernel.q4kIdLaunchNoSync(y, slab, slabW, b, outDim,
+            (int64) MoeIdMw8Test.COLS, (int64) MoeIdMw8Test.ROWS_E);
+        QuantKernel.stream().sync();
+        String ran #= WmmaKernel.lastIdKernel();
+        float32[] got = heap float32[nAll];
+        y.download(got, nAll);
+        CensusReachTest.nearOnePercent(want, got, np * outDim, label + " (" + ran + ") vs host");
+        return #ran;
+    }
+
+    /** The in-place choice (xpu-tile-shape-selection 4.8.1.6): at a problem with
+     *  no stored answer the first launches are the trial, every survivor in turn
+     *  and each one the real work; after rounds x survivors launches the family
+     *  remembers one member, and once forgotten it reads that member back from
+     *  the store with no second trial. */
+    @Test
+    public void q4kAFreshIdProblemTimesEverySurvivorInPlace() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (be.equals("vulkan")) { DeviceSkip.noRoute("packed WMMA id route", be); return; }
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        int64 np = (int64) MoeIdMw8Test.npOf(0);
+        int64 outDim = (int64) MoeIdMw8Test.ROWS_E;
+        int64 cols = (int64) MoeIdMw8Test.COLS;
+        int32 survivors = MoeIdMw8Test.idSurvivors(np);
+        if (survivors < 2) {
+            DeviceSkip.tracked("the Id family keeps " + survivors + " member here, so nothing is timed",
+                "xpu-tile-shape-selection 4.9.1");
+            return;
+        }
+        int8[] raw #= MoeIdMw8Test.q4kSlabBytes();
+        KernelBuffer<int8> slab #= MoeIdMw8Test.q4kSlab();
+        KernelBuffer<int32> slabW #= slab.wordView();
+        ShapeChoice.clearShapeOverride(WmmaKernel.ID_FAMILY);
+        ShapeChoice.foreignLoadOverride = 0;
+        WmmaKernel.forgetIdShapes();
+        WmmaKernel.forgetIdStore(np, outDim, cols);
+        int64[] vc #= ValueCheck.mark();
+        int32 trial = survivors * ShapeChoice.rounds;
+        int64 before = WmmaKernel.idTrialLaunches();
+        String[] firstRound #= heap String[survivors];
+        int32 k = 0;
+        while (k < trial) {
+            String ran #= MoeIdMw8Test.launchChecked(raw, slab, slabW, "trial launch " + k);
+            if (k < survivors) { firstRound[k] #= ran.clone(); }
+            k = k + 1;
+        }
+        int64 timed = WmmaKernel.idTrialLaunches() - before;
+        String chosen #= MoeIdMw8Test.launchChecked(raw, slab, slabW, "the launch after the trial");
+        int64 timedAfter = WmmaKernel.idTrialLaunches() - before;
+        WmmaKernel.forgetIdShapes();
+        String stored #= MoeIdMw8Test.launchChecked(raw, slab, slabW, "the launch after forgetting");
+        int64 timedStored = WmmaKernel.idTrialLaunches() - before;
+        ShapeChoice.foreignLoadOverride = 0 - 2;
+        WmmaKernel.forgetIdShapes();
+        System.stdout.println("   in-place trial of " + trial + " launches over " + survivors
+            + " survivors chose " + chosen);
+        Assert.equals((int64) trial, timed);
+        Assert.equals((int64) trial, timedAfter);
+        Assert.equals((int64) trial, timedStored);
+        int32 i = 0;
+        while (i < survivors) {
+            int32 j = i + 1;
+            while (j < survivors) {
+                if (firstRound[i].equals(firstRound[j])) {
+                    Assert.fail("the trial's first round ran " + firstRound[i] + " twice");
+                    return;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        Assert.isTrue(stored.equals(chosen));
+        ValueCheck.credit(vc);
+    }
+
+    /** An override is not a trial (xpu-tile-shape-selection 4.8.1.6): it
+     *  launches its member from the first launch with no timed launch. */
+    @Test
+    public void q4kAnOverriddenIdProblemRunsNoTrial() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (be.equals("vulkan")) { DeviceSkip.noRoute("packed WMMA id route", be); return; }
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        int64 np = (int64) MoeIdMw8Test.npOf(0);
+        String hand #= "q4kWmmaIdMwKernel".clone();
+        String why #= WmmaKernel.idPruneReason(hand, np, (int64) MoeIdMw8Test.ROWS_E,
+            (int64) MoeIdMw8Test.COLS);
+        if (why.count() > 0L) {
+            DeviceSkip.tracked(why, "xpu-tile-shape-selection 4.9.1");
+            return;
+        }
+        int8[] raw #= MoeIdMw8Test.q4kSlabBytes();
+        KernelBuffer<int8> slab #= MoeIdMw8Test.q4kSlab();
+        KernelBuffer<int32> slabW #= slab.wordView();
+        WmmaKernel.forgetIdShapes();
+        WmmaKernel.forgetIdStore(np, (int64) MoeIdMw8Test.ROWS_E, (int64) MoeIdMw8Test.COLS);
+        ShapeChoice.setShapeOverride(WmmaKernel.ID_FAMILY, hand);
+        int64[] vc #= ValueCheck.mark();
+        int64 before = WmmaKernel.idTrialLaunches();
+        String first #= MoeIdMw8Test.launchChecked(raw, slab, slabW, "the first overridden launch");
+        String second #= MoeIdMw8Test.launchChecked(raw, slab, slabW, "the second overridden launch");
+        int64 timed = WmmaKernel.idTrialLaunches() - before;
+        ShapeChoice.clearShapeOverride(WmmaKernel.ID_FAMILY);
+        WmmaKernel.forgetIdShapes();
+        Assert.equals(0L, timed);
+        Assert.isTrue(first.equals(hand));
+        Assert.isTrue(second.equals(hand));
+        ValueCheck.credit(vc);
+    }
+
+    static final String PICK_FAMILY = "idTrialPick";
+
+    static void considerNamed(ShapeFilter f, String name) {
+        String kn #= name.clone();
+        KernelFacts kf #= KernelFacts.measured(kn, 0);
+        f.consider(#heap ShapeCandidate(#kn, 64, 128, 256, 256, 8), #kf);
+    }
+
+    /** The trial's pick (xpu-tile-shape-selection 4.8.1.6): an incomplete trial
+     *  decides nothing; replayed samples choose the lowest median, not the
+     *  fastest first sample; a lone survivor is chosen without asking. */
+    @Test
+    public void theIdTrialReplaysItsSamplesToTheChoice() {
+        ShapeChoice.clearShapeOverride(MoeIdMw8Test.PICK_FAMILY);
+        ShapeChoice.foreignLoadOverride = 0;
+        Autotune.invalidate("", "shape." + MoeIdMw8Test.PICK_FAMILY + ".1024x768x2048");
+        Autotune.invalidate("", "shape." + MoeIdMw8Test.PICK_FAMILY + ".64x768x2048");
+        ShapeFilter f #= heap ShapeFilter(MoeIdMw8Test.PICK_FAMILY, DeviceFacts.current(),
+            1024L, 768L, 2048L);
+        MoeIdMw8Test.considerNamed(f, "pickA");
+        MoeIdMw8Test.considerNamed(f, "pickB");
+        MoeIdMw8Test.considerNamed(f, "pickC");
+        Assert.equals(3L, (int64) f.survivorCount());
+        IdTrial t #= heap IdTrial(1024L, 768L, 2048L, #f);
+        ShapeResult early #= ShapeChoice.choose("", t.filter(), t);
+        Assert.isTrue(early.survivor < 0);
+        Assert.isTrue(early.timed);
+        int32 seenA = 0;
+        while (!t.complete()) {
+            int32 i = t.next();
+            String k = t.filter().survivor(i).candidate.kernel;
+            int64 ns = 700L;
+            if (k.equals("pickA")) {
+                ns = 900L;
+                if (seenA == 0) { ns = 100L; }
+                seenA = seenA + 1;
+            }
+            if (k.equals("pickB")) { ns = 500L; }
+            t.keep(i, ns);
+        }
+        Assert.equals((int64) ShapeChoice.rounds, (int64) seenA);
+        ShapeResult r #= ShapeChoice.choose("", t.filter(), t);
+        ShapeFilter lone #= heap ShapeFilter(MoeIdMw8Test.PICK_FAMILY, DeviceFacts.current(),
+            64L, 768L, 2048L);
+        MoeIdMw8Test.considerNamed(lone, "pickOnly");
+        IdTrial t1 #= heap IdTrial(64L, 768L, 2048L, #lone);
+        ShapeResult r1 #= ShapeChoice.choose("", t1.filter(), t1);
+        ShapeChoice.foreignLoadOverride = 0 - 2;
+        Assert.isTrue(r.kernel.equals("pickB"));
+        Assert.isTrue(r.timed);
+        Assert.equals(0L, (int64) r1.survivor);
+        Assert.isTrue(!r1.timed);
+        Assert.equals(0L, (int64) t1.asked());
     }
 }
