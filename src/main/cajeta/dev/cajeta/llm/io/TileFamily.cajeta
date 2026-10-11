@@ -4,29 +4,32 @@ import cajeta.collection.ArrayList;
 import cajeta.lang.String;
 import cajeta.xpu.Device;
 import cajeta.xpu.DeviceFacts;
-import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelFacts;
 import cajeta.xpu.ShapeCandidate;
 import cajeta.xpu.ShapeChoice;
 import cajeta.xpu.ShapeFilter;
+import cajeta.xpu.ShapeProbe;
 import cajeta.xpu.ShapeResult;
 import cajeta.xpu.XpuLaunchException;
 import dev.cajeta.llm.Diag;
 
 /**
- * One tile family's run-time state (xpu-tile-shape-selection §3, §4, §6):
- * its name in the shape store, its listed shapes (one object per
- * instantiation of the family's class template), and the recent choices by
- * problem. TcTile keeps one for Q4_K (QkTile) and one for Q6_K (Q6Tile).
+ * One kernel family's run-time state (xpu-tile-shape-selection §3, §4, §6):
+ * its name in the shape store, its listed members (one object per member,
+ * an instantiation of a class template or a hand kernel at a shape), and the
+ * recent choices by problem. TcTile keeps one for Q4_K and one for Q6_K,
+ * WmmaKernel one for the Mw GEMM and one for the MoE Id GEMM. S answers
+ * kernel, tileM, tileN, threads and fits, as {@link Q4TileShape} and
+ * {@link IdShape} do; the bound is unwritten (a compiler finding, 2026-10-11).
  */
-public final class TileFamily {
+public final class TileFamily<S> {
     String name;
     String quant;
-    ArrayList<Q4TileShape> list;
+    ArrayList<S> list;
     // The recent choices, by problem: the store is asked once per problem.
     // A prefill layer cycles five problems (q, k/v, o, gate|up, down), so
     // a one-entry memo missed on every launch.
-    static final int32 MEMO = 16;
+    int32 memoN = 16;
     int64[] memoRows;
     int64[] memoOut;
     int64[] memoCols;
@@ -38,24 +41,24 @@ public final class TileFamily {
     public TileFamily(String name, String quant) {
         this.name #= name.clone();
         this.quant #= quant.clone();
-        this.list #= heap ArrayList<Q4TileShape>();
+        this.list #= heap ArrayList<S>();
         this.forget();
     }
 
-    public void add(#Q4TileShape sh) {
+    public void add(#S sh) {
         this.list.add(#sh);
     }
 
-    public ArrayList<Q4TileShape> shapes() { return this.list; }
+    public ArrayList<S> shapes() { return this.list; }
 
     /** Drop the remembered choices. */
     public void forget() {
-        this.memoRows #= heap int64[TileFamily.MEMO];
-        this.memoOut #= heap int64[TileFamily.MEMO];
-        this.memoCols #= heap int64[TileFamily.MEMO];
-        this.memoIdx #= heap int32[TileFamily.MEMO];
+        this.memoRows #= heap int64[this.memoN];
+        this.memoOut #= heap int64[this.memoN];
+        this.memoCols #= heap int64[this.memoN];
+        this.memoIdx #= heap int32[this.memoN];
         int32 i = 0;
-        while (i < TileFamily.MEMO) {
+        while (i < this.memoN) {
             this.memoRows[i] = -1L;
             this.memoIdx[i] = -1;
             i = i + 1;
@@ -64,13 +67,13 @@ public final class TileFamily {
         this.memoLast = -1;
     }
 
-    /** The registered kernel of the shape the last launch ran, or "". */
+    /** The registered kernel of the member the last launch ran, or "". */
     public #String lastKernel() {
         if (this.memoLast < 0) { return ""; }
         return this.list.get(this.memoLast).kernel();
     }
 
-    /** The index of the shape registered as `kernel`, or -1. */
+    /** The index of the member registered as `kernel`, or -1. */
     public int32 indexOf(String kernel) {
         int32 n = (int32) this.list.count();
         int32 i = 0;
@@ -82,7 +85,7 @@ public final class TileFamily {
         return -1;
     }
 
-    /** Whether some listed shape covers the problem. */
+    /** Whether some listed member covers the problem. */
     public boolean fits(int64 rows, int64 outDim, int64 cols) {
         int32 n = (int32) this.list.count();
         int32 i = 0;
@@ -93,14 +96,15 @@ public final class TileFamily {
         return false;
     }
 
-    /** The filter's verdict on the member `kernel` at this problem: "" when
-     *  it survives, else the pruned verdict's text. */
+    /** The family's verdict on the member `kernel` at this problem: "" when it
+     *  is a candidate here, else why not (no device code on this backend, does
+     *  not fit, or the filter's pruned verdict). */
     public #String pruneReason(String kernel, int64 rows, int64 outDim, int64 cols) {
         int32 i = this.indexOf(kernel);
         if (i < 0) {
             return kernel + " is not a listed member of the " + this.quant + " tile family";
         }
-        Q4TileShape sh = this.list.get(i);
+        S sh = this.list.get(i);
         if (!sh.fits(rows, outDim, cols)) {
             return kernel + " does not fit " + rows + "x" + outDim + "x" + cols;
         }
@@ -115,15 +119,11 @@ public final class TileFamily {
         return f.pruned(0).text();
     }
 
-    /** The shape the family runs at this problem: the listed shapes that fit
-     *  go through the feasibility filter at the device's facts, the choice
-     *  times the survivors at first use and remembers the winner under the
-     *  device, the build and the exact problem; an override on the family
-     *  wins. No survivor is a refusal by name. */
-    public int32 chooseIndex(String shapeDir, KernelBuffer<int8> packed, KernelBuffer<int8> xp,
-            int64 rows, int64 outDim, int64 cols) {
+    /** The remembered member for this problem, or -1. A hit is recorded as the
+     *  last launch. */
+    public int32 remembered(int64 rows, int64 outDim, int64 cols) {
         int32 m = 0;
-        while (m < TileFamily.MEMO) {
+        while (m < this.memoN) {
             if (this.memoIdx[m] >= 0 && this.memoRows[m] == rows
                     && this.memoOut[m] == outDim && this.memoCols[m] == cols) {
                 this.memoLast = this.memoIdx[m];
@@ -131,11 +131,17 @@ public final class TileFamily {
             }
             m = m + 1;
         }
+        return -1;
+    }
+
+    /** The feasibility filter over the listed members that fit and have device
+     *  code here, at the device's facts. No survivor is a refusal by name. */
+    public #ShapeFilter filterFor(int64 rows, int64 outDim, int64 cols) {
         ShapeFilter f #= heap ShapeFilter(this.name, DeviceFacts.current(), rows, outDim, cols);
         int32 n = (int32) this.list.count();
         int32 i = 0;
         while (i < n) {
-            Q4TileShape sh = this.list.get(i);
+            S sh = this.list.get(i);
             String kn #= sh.kernel();
             if (sh.fits(rows, outDim, cols) && Device.kernelAvailable(kn)) {
                 KernelFacts kf #= KernelFacts.measured(kn, 0);
@@ -147,13 +153,21 @@ public final class TileFamily {
             String why #= f.refusal();
             throw heap XpuLaunchException(#why);
         }
-        Q4ShapeProbe probe #= heap Q4ShapeProbe(this, f, packed, xp, rows, outDim, cols);
+        return #f;
+    }
+
+    /** The member the family runs at this problem: the choice times `f`'s
+     *  survivors through `probe`, bound to `f` by the caller, at first use and
+     *  remembers the winner under the device, the build and the problem; an
+     *  override on the family wins. */
+    public int32 chooseWith(String shapeDir, ShapeFilter f, ShapeProbe probe, int64 rows,
+            int64 outDim, int64 cols) {
         ShapeResult r #= ShapeChoice.choose(shapeDir, f, probe);
         if (r.survivor < 0) {
             String why #= r.refusal.clone();
             throw heap XpuLaunchException(#why);
         }
-        // The choice record: the problem, the shape, its margin over the
+        // The choice record: the problem, the member, its margin over the
         // runner-up in per mille, and whether it came from the store (1)
         // or was timed here (0). The route tap prints it.
         Diag.emit("tile-choice", 0 - 1, r.kernel, rows, outDim, cols,
@@ -165,7 +179,7 @@ public final class TileFamily {
             throw heap XpuLaunchException(#why);
         }
         int32 slot = this.memoNext;
-        this.memoNext = (this.memoNext + 1) % TileFamily.MEMO;
+        this.memoNext = (this.memoNext + 1) % this.memoN;
         this.memoRows[slot] = rows;
         this.memoOut[slot] = outDim;
         this.memoCols[slot] = cols;

@@ -6,6 +6,8 @@ import cajeta.lang.System;
 import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
+import cajeta.xpu.ShapeChoice;
+import dev.cajeta.llm.io.IdBatch;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
 import dev.cajeta.llm.io.Quant;
@@ -572,5 +574,265 @@ public class MoeIdMw8Test {
         s.sync();
         MoeIdMw8Test.check(y1, y2, outDim, "sym wide widened vs chunk id");
         ValueCheck.credit(vc);
+    }
+
+    // A second batch layout, wide: 160 rows an expert, above one full 128-row
+    // chunk per expert, so the family's sample rule takes the burst form there
+    // and the single-launch form at the 550-token layout (69 rows an expert).
+    static int32 NP_WIDE = 1280;
+    static int32 npOf(int32 layout) {
+        if (layout == 1) { return MoeIdMw8Test.NP_WIDE; }
+        return MoeIdMw8Test.NP;
+    }
+    static int32 gOffL(int32 layout, int32 e) {
+        if (layout == 1) {
+            if (e >= MoeIdMw8Test.E) { return MoeIdMw8Test.NP_WIDE; }
+            return e * 160;
+        }
+        return MoeIdMw8Test.gOff(e);
+    }
+    static #float32[] actsL(int32 layout) {
+        int64 cols = (int64) MoeIdMw8Test.COLS;
+        int64 npp = (int64) MoeIdMw8Test.npOf(layout) + 128L;
+        float32[] xv #= heap float32[npp * cols];
+        int64 i = 0;
+        while (i < npp * cols) {
+            xv[i] = (float32) ((i % 25) - 12) / 64.0f
+                + (float32) ((i / cols) % 13) * 0.02f
+                + (float32) (i % 7) * 0.01f;
+            i = i + 1;
+        }
+        return #xv;
+    }
+    static #KernelBuffer<int8> packActsL(int32 layout) {
+        int64 cols = (int64) MoeIdMw8Test.COLS;
+        int64 npp = (int64) MoeIdMw8Test.npOf(layout) + 128L;
+        float32[] xv #= MoeIdMw8Test.actsL(layout);
+        KernelBuffer<float32> xf = heap KernelBuffer<float32>((uint64) (npp * cols));
+        xf.upload(xv, npp * cols);
+        KernelBuffer<int8> xp = heap KernelBuffer<int8>((uint64) ((npp * cols / 256L) * 320L));
+        QuantKernel.q8kPackLaunchNoSync(xp, xf, npp * cols);
+        QuantKernel.stream().sync();
+        return #xp;
+    }
+    static #float32[] hostIdGemmL(int32 layout, int8[] slab, float32[] xv) {
+        int64 cols = (int64) MoeIdMw8Test.COLS;
+        int64 rows = (int64) MoeIdMw8Test.ROWS_E;
+        int64 bpr = cols / 256L;
+        int64 rowBytes = bpr * 144L;
+        int64 np = (int64) MoeIdMw8Test.npOf(layout);
+        float32[] want #= heap float32[np * rows];
+        float32[] w #= heap float32[rows * cols];
+        int32 e = 0;
+        while (e < MoeIdMw8Test.E) {
+            int64 r = 0;
+            while (r < rows) {
+                int64 ro = ((int64) e * rows + r) * rowBytes;
+                Quant.dequantize(Quant.GG_Q4_K, slab, ro, bpr, w, r * cols);
+                r = r + 1;
+            }
+            int64 t = (int64) MoeIdMw8Test.gOffL(layout, e);
+            int64 tEnd = (int64) MoeIdMw8Test.gOffL(layout, e + 1);
+            while (t < tEnd) {
+                r = 0;
+                while (r < rows) {
+                    float64 acc = 0.0;
+                    int64 c = 0;
+                    while (c < cols) {
+                        acc = acc + (float64) w[r * cols + c]
+                            * (float64) xv[t * cols + c];
+                        c = c + 1;
+                    }
+                    want[t * rows + r] = (float32) acc;
+                    r = r + 1;
+                }
+                t = t + 1;
+            }
+            e = e + 1;
+        }
+        return #want;
+    }
+    static int32 buildMapsL(int32 layout, int32 stride, int32[] mE, int32[] mT0, int32[] mM1) {
+        int32 nT = 0;
+        int32 e = 0;
+        while (e < MoeIdMw8Test.E) {
+            int32 g0 = MoeIdMw8Test.gOffL(layout, e);
+            int32 m = MoeIdMw8Test.gOffL(layout, e + 1) - g0;
+            int32 tw = 0;
+            while (tw * stride < m) {
+                mE[nT] = e;
+                mT0[nT] = g0 + tw * stride;
+                mM1[nT] = g0 + m;
+                nT = nT + 1;
+                tw = tw + 1;
+            }
+            e = e + 1;
+        }
+        return nT;
+    }
+
+    // The batch buffers outlive the IdBatch that views them, as the route's
+    // statics do.
+    static KernelBuffer<int8> idXp;
+    static KernelBuffer<int32> idE64;
+    static KernelBuffer<int32> idT64;
+    static KernelBuffer<int32> idM64;
+    static KernelBuffer<int32> idE8;
+    static KernelBuffer<int32> idT8;
+    static KernelBuffer<int32> idM8;
+    static KernelBuffer<int32> idMeta;
+
+    /** The batch's inputs as the route hands them to the Id family: both chunk
+     *  maps, the meta slots, the packed activations. */
+    static #IdBatch idBatchL(int32 layout) {
+        int32 np = MoeIdMw8Test.npOf(layout);
+        int32 cap = np / 64 + MoeIdMw8Test.E + 1;
+        int32[] mE = heap int32[cap];
+        int32[] mT0 = heap int32[cap];
+        int32[] mM1 = heap int32[cap];
+        int32 n64 = MoeIdMw8Test.buildMapsL(layout, 64, mE, mT0, mM1);
+        MoeIdMw8Test.idE64 #= heap KernelBuffer<int32>((uint64) n64);
+        MoeIdMw8Test.idT64 #= heap KernelBuffer<int32>((uint64) n64);
+        MoeIdMw8Test.idM64 #= heap KernelBuffer<int32>((uint64) n64);
+        MoeIdMw8Test.idE64.upload(mE, (int64) n64);
+        MoeIdMw8Test.idT64.upload(mT0, (int64) n64);
+        MoeIdMw8Test.idM64.upload(mM1, (int64) n64);
+        int32 n8 = MoeIdMw8Test.buildMapsL(layout, 128, mE, mT0, mM1);
+        MoeIdMw8Test.idE8 #= heap KernelBuffer<int32>((uint64) n8);
+        MoeIdMw8Test.idT8 #= heap KernelBuffer<int32>((uint64) n8);
+        MoeIdMw8Test.idM8 #= heap KernelBuffer<int32>((uint64) n8);
+        MoeIdMw8Test.idE8.upload(mE, (int64) n8);
+        MoeIdMw8Test.idT8.upload(mT0, (int64) n8);
+        MoeIdMw8Test.idM8.upload(mM1, (int64) n8);
+        int32[] metaH = heap int32[4];
+        metaH[0] = n64;
+        metaH[1] = n8;
+        MoeIdMw8Test.idMeta #= heap KernelBuffer<int32>((uint64) 4);
+        MoeIdMw8Test.idMeta.upload(metaH, 2L);
+        MoeIdMw8Test.idXp #= MoeIdMw8Test.packActsL(layout);
+        return #heap IdBatch(MoeIdMw8Test.idXp, MoeIdMw8Test.idE64, MoeIdMw8Test.idT64,
+            MoeIdMw8Test.idM64, MoeIdMw8Test.idE8, MoeIdMw8Test.idT8, MoeIdMw8Test.idM8,
+            MoeIdMw8Test.idMeta, (int64) n64 + 3L, (int64) n8 + 3L, (int64) np,
+            (int64) MoeIdMw8Test.E);
+    }
+
+    /** One listed member, forced through the family override, against the host
+     *  id GEMM over the batch's own maps (xpu-tile-shape-selection 4.8.1.1). */
+    static void checkIdMemberAs(String kernel, int32 layout, int8[] raw,
+            KernelBuffer<int8> slab, KernelBuffer<int32> slabW) {
+        float32[] xv #= MoeIdMw8Test.actsL(layout);
+        float32[] want #= MoeIdMw8Test.hostIdGemmL(layout, raw, xv);
+        IdBatch b #= MoeIdMw8Test.idBatchL(layout);
+        int64 outDim = (int64) MoeIdMw8Test.ROWS_E;
+        int64 np = (int64) MoeIdMw8Test.npOf(layout);
+        int64 nAll = (np + 128L) * outDim;
+        float32[] zero = heap float32[nAll];
+        KernelBuffer<float32> y = heap KernelBuffer<float32>((uint64) nAll);
+        y.upload(zero, nAll);
+        int64[] vc #= ValueCheck.mark();
+        ShapeChoice.setShapeOverride(WmmaKernel.ID_FAMILY, kernel);
+        WmmaKernel.forgetIdShapes();
+        WmmaKernel.q4kIdLaunchNoSync(y, slab, slabW, b, outDim,
+            (int64) MoeIdMw8Test.COLS, (int64) MoeIdMw8Test.ROWS_E);
+        QuantKernel.stream().sync();
+        String ran #= WmmaKernel.lastIdKernel();
+        ShapeChoice.clearShapeOverride(WmmaKernel.ID_FAMILY);
+        WmmaKernel.forgetIdShapes();
+        if (!ran.equals(kernel)) {
+            Assert.fail("the Id family launched " + ran + " under an override naming " + kernel);
+            return;
+        }
+        float32[] got = heap float32[nAll];
+        y.download(got, nAll);
+        CensusReachTest.nearOnePercent(want, got, np * outDim,
+            kernel + " vs host at " + np + " expert rows over " + MoeIdMw8Test.E + " experts");
+        ValueCheck.credit(vc);
+    }
+
+    /** The Id GEMM as a family (xpu-tile-shape-selection 4.8.1.1, 7.15): every
+     *  listed member, forced through the override, matches the host id GEMM at
+     *  a small batch (69 rows an expert) and a wide one (160). A member with no
+     *  device code here is a tracked skip, not a missing family. */
+    @Test
+    public void q4kEveryListedIdMemberMatchesTheHost() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (be.equals("vulkan")) { DeviceSkip.noRoute("packed WMMA id route", be); return; }
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        int8[] raw #= MoeIdMw8Test.q4kSlabBytes();
+        KernelBuffer<int8> slab #= MoeIdMw8Test.q4kSlab();
+        KernelBuffer<int32> slabW #= slab.wordView();
+        int32 n = (int32) WmmaKernel.idFamily().shapes().count();
+        int32 checked = 0;
+        int32 layout = 0;
+        while (layout < 2) {
+            int64 np = (int64) MoeIdMw8Test.npOf(layout);
+            int32 i = 0;
+            while (i < n) {
+                String name #= WmmaKernel.idFamily().shapes().get(i).kernel();
+                String why #= WmmaKernel.idPruneReason(name, np, (int64) MoeIdMw8Test.ROWS_E,
+                    (int64) MoeIdMw8Test.COLS);
+                if (why.count() > 0L) {
+                    System.stdout.println("  [device-skip] [tracked: xpu-tile-shape-selection 4.9.1] (skipped: "
+                        + why + " on " + be + ")");
+                } else {
+                    MoeIdMw8Test.checkIdMemberAs(name, layout, raw, slab, slabW);
+                    checked = checked + 1;
+                }
+                i = i + 1;
+            }
+            layout = layout + 1;
+        }
+        if (n == 0) { Assert.fail("the Id family lists no member: the Id GEMM is not a family yet"); }
+        if (checked == 0) {
+            DeviceSkip.tracked("every listed Id member is left out by the family on " + be,
+                "xpu-tile-shape-selection 4.9.1");
+        }
+    }
+
+    /** The timed choice itself (xpu-tile-shape-selection 4.8.1.4.4): with no
+     *  override, the family times its survivors over the batch's own maps, a
+     *  single launch a sample at the small batch and a burst at the wide one,
+     *  launches the winner, and the output matches the host. */
+    @Test
+    public void q4kTheIdChoiceLaunchesAListedMemberThatMatchesTheHost() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (be.equals("vulkan")) { DeviceSkip.noRoute("packed WMMA id route", be); return; }
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        int8[] raw #= MoeIdMw8Test.q4kSlabBytes();
+        KernelBuffer<int8> slab #= MoeIdMw8Test.q4kSlab();
+        KernelBuffer<int32> slabW #= slab.wordView();
+        int32 layout = 0;
+        while (layout < 2) {
+            float32[] xv #= MoeIdMw8Test.actsL(layout);
+            float32[] want #= MoeIdMw8Test.hostIdGemmL(layout, raw, xv);
+            IdBatch b #= MoeIdMw8Test.idBatchL(layout);
+            int64 outDim = (int64) MoeIdMw8Test.ROWS_E;
+            int64 np = (int64) MoeIdMw8Test.npOf(layout);
+            int64 nAll = (np + 128L) * outDim;
+            float32[] zero = heap float32[nAll];
+            KernelBuffer<float32> y = heap KernelBuffer<float32>((uint64) nAll);
+            y.upload(zero, nAll);
+            ShapeChoice.clearShapeOverride(WmmaKernel.ID_FAMILY);
+            WmmaKernel.forgetIdShapes();
+            int64[] vc #= ValueCheck.mark();
+            WmmaKernel.q4kIdLaunchNoSync(y, slab, slabW, b, outDim,
+                (int64) MoeIdMw8Test.COLS, (int64) MoeIdMw8Test.ROWS_E);
+            QuantKernel.stream().sync();
+            String ran #= WmmaKernel.lastIdKernel();
+            if (WmmaKernel.idFamily().indexOf(ran) < 0) {
+                Assert.fail("the Id choice launched " + ran + ", which the family does not list");
+                return;
+            }
+            System.stdout.println("   id choice at " + np + " expert rows over " + MoeIdMw8Test.E
+                + " experts: " + ran);
+            float32[] got = heap float32[nAll];
+            y.download(got, nAll);
+            CensusReachTest.nearOnePercent(want, got, np * outDim,
+                "the Id choice (" + ran + ") vs host at " + np + " expert rows");
+            ValueCheck.credit(vc);
+            layout = layout + 1;
+        }
     }
 }

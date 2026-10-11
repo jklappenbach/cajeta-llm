@@ -16,6 +16,7 @@ import cajeta.xpu.KernelSubmission;
 import cajeta.xpu.KernelResourceDescriptor;
 import cajeta.xpu.Scheduler;
 import cajeta.xpu.ArithmeticCharacter;
+import cajeta.xpu.ShapeFilter;
 import cajeta.xpu.Shared;
 import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.io.GgufFile;
@@ -1762,16 +1763,68 @@ public final class WmmaKernel {
         return Scheduler.submit(sub);
     }
 
+    // The MoE Id GEMM as a family (xpu-tile-shape-selection 7.15): the members
+    // read different chunk maps, so each owns its map and its launch.
+    public static final String ID_FAMILY = "q4kIdMw";
+    static TileFamily<IdShape> idFam;
+
+    public static TileFamily<IdShape> idFamily() {
+        if (WmmaKernel.idFam == null) {
+            WmmaKernel.idFam #= heap TileFamily<IdShape>(WmmaKernel.ID_FAMILY, "Q4_K Id");
+            WmmaKernel.idFam.add(#heap IdHandTile(64));
+            WmmaKernel.idFam.add(#heap IdHandTile(128));
+        }
+        return WmmaKernel.idFam;
+    }
+
+    /** Drop the Id family's remembered choices. */
+    public static void forgetIdShapes() { WmmaKernel.idFamily().forget(); }
+
+    /** The family's verdict on the Id member `kernel` at a batch of `np` expert
+     *  rows: "" when it is a candidate here. */
+    public static #String idPruneReason(String kernel, int64 np, int64 outDim, int64 cols) {
+        return WmmaKernel.idFamily().pruneReason(kernel, WmmaKernel.idBucket(np), outDim, cols);
+    }
+
+    /** The Id member the last family launch ran, or "". */
+    public static #String lastIdKernel() { return WmmaKernel.idFamily().lastKernel(); }
+
+    /** The problem's M for the Id family: the 128-row chunk count rounded up
+     *  to a power of two, in rows (spec §4, §7.12). */
+    static int64 idBucket(int64 np) {
+        int64 chunks = (np + 127L) / 128L;
+        int64 p = 1L;
+        while (p < chunks) { p = p * 2L; }
+        return p * 128L;
+    }
+
+    /** The MoE Id GEMM over a batch: the family's chosen member, its own chunk
+     *  map, one launch on the quant stream. */
+    public static void q4kIdLaunchNoSync(KernelBuffer<float32> y, KernelBuffer<int8> slab,
+            KernelBuffer<int32> slabW, IdBatch b, int64 outDim, int64 cols, int64 rowsPerExpert) {
+        TileFamily<IdShape> fam = WmmaKernel.idFamily();
+        int64 m = WmmaKernel.idBucket(b.expertRows());
+        int32 idx = fam.remembered(m, outDim, cols);
+        if (idx < 0) {
+            ShapeFilter f #= fam.filterFor(m, outDim, cols);
+            IdShapeProbe probe #= heap IdShapeProbe(fam, slab, slabW, b, outDim, cols, rowsPerExpert);
+            probe.bind(f);
+            idx = fam.chooseWith(TcTile.shapeDir, f, probe, m, outDim, cols);
+        }
+        fam.shapes().get(idx).launch(y, slab, slabW, b, outDim, cols, rowsPerExpert);
+        return;
+    }
+
     // The Mw GEMM as a family (xpu-tile-shape-selection 4.8.1): one object
     // per MwTile instantiation, and the recent choices by problem.
     public static final String MW_FAMILY = "q4kWmmaMw";
     /** The family's default member, today's 128x128 tile over 64x32 wave tiles. */
     public static final String MW_KERNEL = "MwTile_128_128_64_32_128_q4kQ8";
-    static TileFamily mwFam;
+    static TileFamily<Q4TileShape> mwFam;
 
-    public static TileFamily mwFamily() {
+    public static TileFamily<Q4TileShape> mwFamily() {
         if (WmmaKernel.mwFam == null) {
-            WmmaKernel.mwFam #= heap TileFamily(WmmaKernel.MW_FAMILY, "Q4_K Mw");
+            WmmaKernel.mwFam #= heap TileFamily<Q4TileShape>(WmmaKernel.MW_FAMILY, "Q4_K Mw");
             WmmaKernel.mwFam.add(#heap MwTile<128, 128, 64, 32, 128>());
             WmmaKernel.mwFam.add(#heap MwTile<64, 64, 32, 32, 128>());
         }
@@ -1799,8 +1852,8 @@ public final class WmmaKernel {
     public static void q4kWmmaMwLaunch(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp, int64 rows,
             int64 outDim, int64 cols) {
-        TileFamily fam = WmmaKernel.mwFamily();
-        int32 idx = fam.chooseIndex(TcTile.shapeDir, packed, xp, rows, outDim, cols);
+        TileFamily<Q4TileShape> fam = WmmaKernel.mwFamily();
+        int32 idx = TcTile.chooseIn(fam, packed, xp, rows, outDim, cols);
         fam.shapes().get(idx).launchAs(y, packed, xp, rows, outDim, cols, TcTile.part, 1L, (uint32) 0);
         return;
     }
