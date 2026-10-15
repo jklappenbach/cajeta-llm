@@ -1,7 +1,9 @@
 package dev.cajeta.llm.selftest;
 
+import cajeta.lang.Cajeta;
 import cajeta.lang.Math;
 import cajeta.lang.String;
+import cajeta.lang.System;
 import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import dev.cajeta.unit.Assert;
@@ -22,7 +24,8 @@ import dev.cajeta.llm.model.KernelCap;
  *   attention scores        rel 1e-4, abs 2e-5 (32 lane partials, scaled)
  *   router logits           rel 1e-4, abs 1e-3 (the host bar of ScalarGeometryTest)
  *   router top-k picks      exact, weights rel 1e-3, abs 1e-6
- *   down-combine tail norm  rel 1e-5, abs 1e-6; packed bytes within one count
+ *   down-combine tail norm  rel 1e-5, abs 1e-6; packed quants and sums within
+ *                           one count, the block scales rel 1e-5
  */
 public class TreeSiteReferenceTest {
 
@@ -209,23 +212,14 @@ public class TreeSiteReferenceTest {
 
     // ── the router: 256 lanes per expert row ────────────────────────────
 
+    /** Non-dyadic fixtures, so the sums depend on their order and the bar measures something. */
     static #float32[] routerW(int64 experts, int64 cols) {
-        float32[] w #= heap float32[experts * cols];
-        int64 i = 0;
-        while (i < experts * cols) {
-            w[i] = (float32) ((i * 37L + 11L) % 101L - 50L) * 0.015625f;
-            i = i + 1;
-        }
+        float32[] w #= TreeSiteReferenceTest.spread(experts * cols, 7);
         return #w;
     }
 
     static #float32[] routerX(int64 cols) {
-        float32[] x #= heap float32[cols];
-        int64 i = 0;
-        while (i < cols) {
-            x[i] = (float32) ((i * 13L + 5L) % 29L - 14L) * 0.0625f;
-            i = i + 1;
-        }
+        float32[] x #= TreeSiteReferenceTest.spread(cols, 11);
         return #x;
     }
 
@@ -308,6 +302,82 @@ public class TreeSiteReferenceTest {
     // ── the IQ4_NL down-combine tail: 256 lanes norm the residual row ───
 
     /**
+     * The q8_K pack within its bars: each 320-byte block holds 256 quants,
+     * held within one count, sixteen int16 sums of 32 quants, held within
+     * two, then the float32 block scale, held to rel 1e-5. Prints the
+     * largest differences seen.
+     */
+    static boolean packedWithin(String kernel, float32[] ref, float32[] got, int64 pb) {
+        int64 blocks = pb / 320L;
+        float32 maxCount = 0.0f;
+        float32 maxScale = 0.0f;
+        int64 b = 0;
+        while (b < blocks) {
+            int64 ob = b * 320L;
+            int64 i = 0;
+            while (i < 256L) {
+                float32 d = got[ob + i] - ref[ob + i];
+                if (d < 0.0f) { d = 0.0f - d; }
+                if (Close.outside(d, 1.0f)) {
+                    Assert.fail(kernel + " tail-packed: quant " + (ob + i) + " is outside its bar: got "
+                        + got[ob + i] + " against the reference " + ref[ob + i]);
+                    return false;
+                }
+                if (d > maxCount) { maxCount = d; }
+                i = i + 1;
+            }
+            i = 0;
+            while (i < 16L) {
+                float32 d = (float32) (TreeSiteReferenceTest.sumAt(got, ob + 256L + i * 2L)
+                    - TreeSiteReferenceTest.sumAt(ref, ob + 256L + i * 2L));
+                if (d < 0.0f) { d = 0.0f - d; }
+                if (Close.outside(d, 2.0f)) {
+                    Assert.fail(kernel + " tail-packed: block " + b + " sum " + i + " is outside its bar: got "
+                        + TreeSiteReferenceTest.sumAt(got, ob + 256L + i * 2L) + " against the reference "
+                        + TreeSiteReferenceTest.sumAt(ref, ob + 256L + i * 2L));
+                    return false;
+                }
+                if (d > maxCount) { maxCount = d; }
+                i = i + 1;
+            }
+            float32 sg = TreeSiteReferenceTest.scaleAt(got, ob + 288L);
+            float32 sr = TreeSiteReferenceTest.scaleAt(ref, ob + 288L);
+            float32 ds = sg - sr;
+            if (ds < 0.0f) { ds = 0.0f - ds; }
+            float32 m = sr < 0.0f ? 0.0f - sr : sr;
+            if (Close.outside(ds, m * 1.0e-5f)) {
+                Assert.fail(kernel + " tail-packed: block " + b + " scale " + sg
+                    + " against the reference " + sr);
+                return false;
+            }
+            if (m > 0.0f && ds / m > maxScale) { maxScale = ds / m; }
+            b = b + 1;
+        }
+        System.stdout.println("  [tree-reference] " + Device.activeBackend() + " " + kernel
+            + " tail-packed n=" + pb + ": max count |d| " + maxCount + ", max scale rel " + maxScale
+            + " (bar one count, sums two, scale rel 1e-5)");
+        return true;
+    }
+
+    /** The int16 at `at` of a byte array stored as float values. */
+    static int32 sumAt(float32[] bytes, int64 at) {
+        int32 b0 = (int32) bytes[at];
+        int32 b1 = (int32) bytes[at + 1L];
+        int32 v = (b0 & 255) | ((b1 & 255) << 8);
+        if (v >= 32768) { v = v - 65536; }
+        return v;
+    }
+
+    /** The float32 at `at` of a byte array stored as float values. */
+    static float32 scaleAt(float32[] bytes, int64 at) {
+        int32 b0 = (int32) bytes[at];
+        int32 b1 = (int32) bytes[at + 1L];
+        int32 b2 = (int32) bytes[at + 2L];
+        int32 b3 = (int32) bytes[at + 3L];
+        return Cajeta.bitsToF32((b0 & 255) | ((b1 & 255) << 8) | ((b2 & 255) << 16) | ((b3 & 255) << 24));
+    }
+
+    /**
      * One `iq4nlQ8IdDownCombineKernel` launch with its norm and pack tail
      * at dim 2048, as WorkgroupReduceGoldenTest.tail: the combine weight
      * and the slab are zero, so the residual stays the seed and the tail
@@ -319,11 +389,10 @@ public class TreeSiteReferenceTest {
         if (!TreeSiteReferenceTest.have(kernel)) { return; }
         int64 rows = 2048L;
         int64 cols = 768L;
-        float32[] seed = heap float32[rows];
+        float32[] seed #= TreeSiteReferenceTest.spread(rows, 13);
         float32[] nwh = heap float32[rows];
         int64 j = 0;
         while (j < rows) {
-            seed[j] = (float32) (((j * 37L) % 101L) - 50L) / 32.0f;
             nwh[j] = 0.8f + (float32) (j % 3L) * 0.1f;
             j = j + 1;
         }
@@ -358,7 +427,13 @@ public class TreeSiteReferenceTest {
         j = 0;
         while (j < pb) { pf[j] = (float32) packed[j]; j = j + 1; }
         boolean a = WaveGolden.checkWithin(kernel, "tail-normed", normed, rows, 1.0e-5f, 1.0e-6f);
-        boolean b = WaveGolden.checkWithin(kernel, "tail-packed", pf, pb, 0.0f, 1.0f);
+        float32[] ref #= heap float32[pb];
+        boolean b = false;
+        if (WaveGolden.recordedInto(kernel, "tail-packed", pb, ref) == 1) {
+            b = TreeSiteReferenceTest.packedWithin(kernel, ref, pf, pb);
+        } else {
+            b = WaveGolden.checkWithin(kernel, "tail-packed", pf, pb, 0.0f, 1.0f);
+        }
         if (a && b) { ValueCheck.credit(vc); }
     }
 }
