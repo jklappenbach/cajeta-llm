@@ -1,0 +1,364 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.AttnKernel;
+import dev.cajeta.llm.model.KernelCap;
+
+/**
+ * workgroup-reduce 7.1.1: the six tree sites at the engine's shapes, each
+ * held to a stated tolerance against the row recorded on the hand-written
+ * tree (spec 5.3, 5.4.1). A tree adds in pairs and a wave or workgroup
+ * reduce adds in the butterfly order, so a moved site's float output may
+ * change in the last bits; the bar per site is the reassociation bound
+ * for the fixture's magnitudes, with room:
+ *
+ *   attention scores        rel 1e-4, abs 2e-5 (32 lane partials, scaled)
+ *   router logits           rel 1e-4, abs 1e-3 (the host bar of ScalarGeometryTest)
+ *   router top-k picks      exact, weights rel 1e-3, abs 1e-6
+ *   down-combine tail norm  rel 1e-5, abs 1e-6; packed bytes within one count
+ */
+public class TreeSiteReferenceTest {
+
+    static final int32 NH = 32;
+    static final int32 NKV = 4;
+    static final int32 HD = 128;
+    static final float32 ATTN_REL = 1.0e-4f;
+    static final float32 ATTN_ABS = 2.0e-5f;
+    static final float32 ROUTER_REL = 1.0e-4f;
+    static final float32 ROUTER_ABS = 1.0e-3f;
+
+    public TreeSiteReferenceTest() { return; }
+
+    static boolean have(String kernel) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return false; }
+        if (!KernelCap.usable(kernel)) { DeviceSkip.noKernel(kernel, be); return false; }
+        return true;
+    }
+
+    /** Mixed signs and magnitudes, as AttnKernelTest.spread. */
+    static #float32[] spread(int64 n, int32 seed) {
+        float32[] x #= heap float32[n];
+        int64 i = 0;
+        int32 s = seed;
+        while (i < n) {
+            s = s * 1103515245 + 12345;
+            if (s < 0) { s = 0 - s; }
+            int32 m = s % 2000;
+            x[i] = ((float32) m - 1000.0f) / 700.0f;
+            i = i + 1;
+        }
+        return #x;
+    }
+
+    static #KernelBuffer<float32> floats(float32[] h, int64 n) {
+        KernelBuffer<float32> b #= heap KernelBuffer<float32>((uint64) n);
+        b.upload(h, n);
+        return #b;
+    }
+
+    static #KernelBuffer<float16> halves(float32[] h, int64 n) {
+        float16[] hh #= AttnKernel.halfOf(h, n);
+        KernelBuffer<float16> b #= heap KernelBuffer<float16>((uint64) n);
+        b.upload(hh, n);
+        return #b;
+    }
+
+    static #KernelBuffer<int8> zeros(int64 n) {
+        int8[] h = heap int8[n];
+        KernelBuffer<int8> b #= heap KernelBuffer<int8>((uint64) n);
+        b.upload(h, n);
+        return #b;
+    }
+
+    static void assertLive(float32[] v, int64 n, String what) {
+        int64 i = 0;
+        while (i < n) {
+            if (v[i] != 0.0f) { return; }
+            i = i + 1;
+        }
+        Assert.fail(what + ": every value is zero, which is what a kernel that never ran produces");
+    }
+
+    // ── attention: one 32-lane wave per score ───────────────────────────
+
+    /** The decode score kernel behind the flash decode: nH 32, nKv 4, hd 128, 256 positions. */
+    @Test
+    public void attnScoreKernelStaysWithinItsBar() {
+        String kernel #= "attnScoreKernel";
+        if (!TreeSiteReferenceTest.have(kernel)) { return; }
+        if (!TreeSiteReferenceTest.have("attnCombineKernel")) { return; }
+        int32 nH = TreeSiteReferenceTest.NH;
+        int32 nKv = TreeSiteReferenceTest.NKV;
+        int32 hd = TreeSiteReferenceTest.HD;
+        int32 count = 256;
+        int32 stride = count;
+        int64 kvDim = (int64) (nKv * hd);
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        float32[] qh #= TreeSiteReferenceTest.spread((int64) (nH * hd), 3);
+        float32[] kh #= TreeSiteReferenceTest.spread((int64) count * kvDim, 5);
+        float32[] vh #= TreeSiteReferenceTest.spread((int64) count * kvDim, 9);
+        KernelBuffer<float32> q #= TreeSiteReferenceTest.floats(qh, (int64) (nH * hd));
+        KernelBuffer<float16> kPool #= TreeSiteReferenceTest.halves(kh, (int64) count * kvDim);
+        KernelBuffer<float16> vPool #= TreeSiteReferenceTest.halves(vh, (int64) count * kvDim);
+        int64 sn = (int64) nH * (int64) stride;
+        KernelBuffer<float32> scores #= heap KernelBuffer<float32>((uint64) sn);
+        KernelBuffer<float32> out #= heap KernelBuffer<float32>((uint64) (nH * hd));
+        AttnKernel.setFlashDecode(false);
+        int64[] vc #= ValueCheck.mark();
+        AttnKernel.attendDecodeLaunchNoSync(out, scores, q, kPool, vPool, nH, nKv, hd,
+            count, 0, stride, scale);
+        QuantKernel.stream().sync();
+        AttnKernel.setFlashDecode(true);
+        float32[] s #= heap float32[sn];
+        scores.download(s, sn);
+        TreeSiteReferenceTest.assertLive(s, sn, kernel);
+        if (WaveGolden.checkWithin(kernel, "h32kv4d128c256", s, sn,
+                TreeSiteReferenceTest.ATTN_REL, TreeSiteReferenceTest.ATTN_ABS)) {
+            ValueCheck.credit(vc);
+        }
+    }
+
+    /**
+     * The two prefill score kernels behind the v2 pair, selected by the
+     * row-score switch: 4 rows at positions 60..63 of a 64-deep context,
+     * nH 32, nKv 4, hd 128. Only the causal entries are compared.
+     */
+    static void prefill(String kernel, boolean rowScore, String tag) {
+        if (!TreeSiteReferenceTest.have(kernel)) { return; }
+        if (!TreeSiteReferenceTest.have("attnCombinePrefillKernel")) { return; }
+        int32 rows = 4;
+        int32 nH = TreeSiteReferenceTest.NH;
+        int32 nKv = TreeSiteReferenceTest.NKV;
+        int32 hd = TreeSiteReferenceTest.HD;
+        int32 startPos = 60;
+        int32 tMax = startPos + rows;
+        int32 stride = tMax;
+        int64 kvDim = (int64) (nKv * hd);
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        float32[] qh #= TreeSiteReferenceTest.spread(qn, 61);
+        float32[] kh #= TreeSiteReferenceTest.spread((int64) tMax * kvDim, 63);
+        float32[] vh #= TreeSiteReferenceTest.spread((int64) tMax * kvDim, 67);
+        KernelBuffer<float32> q #= TreeSiteReferenceTest.floats(qh, qn);
+        KernelBuffer<float16> kPool #= TreeSiteReferenceTest.halves(kh, (int64) tMax * kvDim);
+        KernelBuffer<float16> vPool #= TreeSiteReferenceTest.halves(vh, (int64) tMax * kvDim);
+        int64 sn = (int64) rows * (int64) nH * (int64) stride;
+        KernelBuffer<float32> scores #= heap KernelBuffer<float32>((uint64) sn);
+        KernelBuffer<float32> out #= heap KernelBuffer<float32>((uint64) qn);
+        boolean tileWas = AttnKernel.prefillTileOn();
+        AttnKernel.setPrefillTile(false);
+        AttnKernel.setAttnFlash(false);
+        AttnKernel.setAttnV2(false);
+        AttnKernel.setRowScore(rowScore);
+        int64[] vc #= ValueCheck.mark();
+        AttnKernel.attendPrefillLaunchNoSync(out, scores, q, kPool, vPool, rows, nH, nKv,
+            hd, startPos, stride, scale);
+        QuantKernel.stream().sync();
+        AttnKernel.setRowScore(true);
+        AttnKernel.setAttnV2(true);
+        AttnKernel.setAttnFlash(true);
+        AttnKernel.setPrefillTile(tileWas);
+        float32[] s #= heap float32[sn];
+        scores.download(s, sn);
+        int64 packed = 0;
+        int32 r = 0;
+        while (r < rows) {
+            packed = packed + (int64) (startPos + r + 1) * (int64) nH;
+            r = r + 1;
+        }
+        float32[] causal #= heap float32[packed];
+        int64 at = 0;
+        r = 0;
+        while (r < rows) {
+            int32 h = 0;
+            while (h < nH) {
+                int32 t = 0;
+                while (t <= startPos + r) {
+                    causal[at] = s[(int64) (r * nH + h) * (int64) stride + (int64) t];
+                    at = at + 1;
+                    t = t + 1;
+                }
+                h = h + 1;
+            }
+            r = r + 1;
+        }
+        TreeSiteReferenceTest.assertLive(causal, packed, kernel);
+        if (WaveGolden.checkWithin(kernel, tag, causal, packed,
+                TreeSiteReferenceTest.ATTN_REL, TreeSiteReferenceTest.ATTN_ABS)) {
+            ValueCheck.credit(vc);
+        }
+    }
+
+    @Test
+    public void attnScorePrefillRowKernelStaysWithinItsBar() {
+        TreeSiteReferenceTest.prefill("attnScorePrefillRowKernel", true, "r4h32kv4d128p60");
+    }
+
+    @Test
+    public void attnScorePrefillKernelStaysWithinItsBar() {
+        TreeSiteReferenceTest.prefill("attnScorePrefillKernel", false, "r4h32kv4d128p60");
+    }
+
+    // ── the router: 256 lanes per expert row ────────────────────────────
+
+    static #float32[] routerW(int64 experts, int64 cols) {
+        float32[] w #= heap float32[experts * cols];
+        int64 i = 0;
+        while (i < experts * cols) {
+            w[i] = (float32) ((i * 37L + 11L) % 101L - 50L) * 0.015625f;
+            i = i + 1;
+        }
+        return #w;
+    }
+
+    static #float32[] routerX(int64 cols) {
+        float32[] x #= heap float32[cols];
+        int64 i = 0;
+        while (i < cols) {
+            x[i] = (float32) ((i * 13L + 5L) % 29L - 14L) * 0.0625f;
+            i = i + 1;
+        }
+        return #x;
+    }
+
+    /** `routerF32MatVecKernel` at E experts of H columns. */
+    static void router(int64 experts, int64 cols, String tag) {
+        String kernel #= "routerF32MatVecKernel";
+        if (!TreeSiteReferenceTest.have(kernel)) { return; }
+        float32[] w #= TreeSiteReferenceTest.routerW(experts, cols);
+        float32[] x #= TreeSiteReferenceTest.routerX(cols);
+        KernelBuffer<float32> wD #= TreeSiteReferenceTest.floats(w, experts * cols);
+        KernelBuffer<float32> xD #= TreeSiteReferenceTest.floats(x, cols);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) experts);
+        int64[] vc #= ValueCheck.mark();
+        QuantKernel.routerF32MatVecLaunchNoSync(yD, wD, xD, experts, cols);
+        QuantKernel.stream().sync();
+        float32[] got #= heap float32[experts];
+        yD.download(got, experts);
+        TreeSiteReferenceTest.assertLive(got, experts, kernel);
+        if (WaveGolden.checkWithin(kernel, tag, got, experts,
+                TreeSiteReferenceTest.ROUTER_REL, TreeSiteReferenceTest.ROUTER_ABS)) {
+            ValueCheck.credit(vc);
+        }
+    }
+
+    /** The 128-expert, 2048-wide router of the 30B MoE. */
+    @Test
+    public void routerMatVecAt128x2048StaysWithinItsBar() {
+        TreeSiteReferenceTest.router(128L, 2048L, "e128h2048");
+    }
+
+    /** The 60-expert router of Qwen1.5-MoE. */
+    @Test
+    public void routerMatVecAt60x2048StaysWithinItsBar() {
+        TreeSiteReferenceTest.router(60L, 2048L, "e60h2048");
+    }
+
+    /** `routerTopKKernel`: the same logits, then the top-8 of 128 selected by the last block. */
+    @Test
+    public void routerTopKKernelStaysWithinItsBar() {
+        String kernel #= "routerTopKKernel";
+        if (!TreeSiteReferenceTest.have(kernel)) { return; }
+        int64 experts = 128L;
+        int64 cols = 2048L;
+        int64 used = 8L;
+        float32[] w #= TreeSiteReferenceTest.routerW(experts, cols);
+        float32[] x #= TreeSiteReferenceTest.routerX(cols);
+        KernelBuffer<float32> wD #= TreeSiteReferenceTest.floats(w, experts * cols);
+        KernelBuffer<float32> xD #= TreeSiteReferenceTest.floats(x, cols);
+        KernelBuffer<float32> logits #= heap KernelBuffer<float32>((uint64) experts);
+        KernelBuffer<int32> sel #= heap KernelBuffer<int32>((uint64) used);
+        KernelBuffer<float32> wOut #= heap KernelBuffer<float32>((uint64) used);
+        int32[] z = heap int32[4];
+        KernelBuffer<int32> counter #= heap KernelBuffer<int32>((uint64) 4);
+        counter.upload(z, 4L);
+        int64[] vc #= ValueCheck.mark();
+        QuantKernel.routerTopKLaunchNoSync(sel, wOut, logits, wD, xD, counter, experts,
+            cols, used, true, 0.0f);
+        QuantKernel.stream().sync();
+        float32[] lg #= heap float32[experts];
+        logits.download(lg, experts);
+        int32[] si = heap int32[used];
+        sel.download(si, used);
+        float32[] sf #= heap float32[used];
+        int64 k = 0;
+        while (k < used) { sf[k] = (float32) si[k]; k = k + 1; }
+        float32[] wf #= heap float32[used];
+        wOut.download(wf, used);
+        TreeSiteReferenceTest.assertLive(lg, experts, kernel);
+        TreeSiteReferenceTest.assertLive(wf, used, kernel + " weights");
+        boolean a = WaveGolden.checkWithin(kernel, "e128h2048k8-logits", lg, experts,
+            TreeSiteReferenceTest.ROUTER_REL, TreeSiteReferenceTest.ROUTER_ABS);
+        boolean b = WaveGolden.checkWithin(kernel, "e128h2048k8-sel", sf, used, 0.0f, 0.0f);
+        boolean c = WaveGolden.checkWithin(kernel, "e128h2048k8-w", wf, used, 1.0e-3f, 1.0e-6f);
+        int32[] cnt = heap int32[4];
+        counter.download(cnt, 4L);
+        Assert.equals(0L, (int64) cnt[0]);
+        if (a && b && c) { ValueCheck.credit(vc); }
+    }
+
+    // ── the IQ4_NL down-combine tail: 256 lanes norm the residual row ───
+
+    /**
+     * One `iq4nlQ8IdDownCombineKernel` launch with its norm and pack tail
+     * at dim 2048, as WorkgroupReduceGoldenTest.tail: the combine weight
+     * and the slab are zero, so the residual stays the seed and the tail
+     * norms known values.
+     */
+    @Test
+    public void iq4nlDownCombineTailStaysWithinItsBar() {
+        String kernel #= "iq4nlQ8IdDownCombineKernel";
+        if (!TreeSiteReferenceTest.have(kernel)) { return; }
+        int64 rows = 2048L;
+        int64 cols = 768L;
+        float32[] seed = heap float32[rows];
+        float32[] nwh = heap float32[rows];
+        int64 j = 0;
+        while (j < rows) {
+            seed[j] = (float32) (((j * 37L) % 101L) - 50L) / 32.0f;
+            nwh[j] = 0.8f + (float32) (j % 3L) * 0.1f;
+            j = j + 1;
+        }
+        KernelBuffer<float32> hs #= TreeSiteReferenceTest.floats(seed, rows);
+        KernelBuffer<float32> nw #= TreeSiteReferenceTest.floats(nwh, rows);
+        float32[] w0 = heap float32[1];
+        KernelBuffer<float32> wSel #= TreeSiteReferenceTest.floats(w0, 1L);
+        int32[] s0 = heap int32[1];
+        KernelBuffer<int32> sel #= heap KernelBuffer<int32>((uint64) 1);
+        sel.upload(s0, 1L);
+        int32[] c0 = heap int32[4];
+        KernelBuffer<int32> counter #= heap KernelBuffer<int32>((uint64) 4);
+        counter.upload(c0, 4L);
+        int64 xRowBlocks = cols / 256L;
+        KernelBuffer<int8> xp #= TreeSiteReferenceTest.zeros(xRowBlocks * 320L + 64L);
+        int64 bpr = cols / 32L;
+        int64 rowBytes = ((bpr * 2L + 3L) / 4L) * 4L + bpr * 16L;
+        KernelBuffer<int8> slab #= TreeSiteReferenceTest.zeros(rows * rowBytes + 512L);
+        int64 pb = (rows / 256L) * 320L;
+        KernelBuffer<float32> o #= heap KernelBuffer<float32>((uint64) rows);
+        KernelBuffer<int8> p #= TreeSiteReferenceTest.zeros(pb);
+        int64[] vc #= ValueCheck.mark();
+        Assert.isTrue(QuantKernel.idDownCombineTailLaunchNoSync(Quant.GG_IQ4_NL, hs, slab,
+            xp, sel, wSel, 1, rows, cols, xRowBlocks, o, p, nw, rows, 0.00001f, 1, counter));
+        QuantKernel.stream().sync();
+        float32[] normed = heap float32[rows];
+        o.download(normed, rows);
+        TreeSiteReferenceTest.assertLive(normed, rows, kernel);
+        int8[] packed = heap int8[pb];
+        p.download(packed, pb);
+        float32[] pf #= heap float32[pb];
+        j = 0;
+        while (j < pb) { pf[j] = (float32) packed[j]; j = j + 1; }
+        boolean a = WaveGolden.checkWithin(kernel, "tail-normed", normed, rows, 1.0e-5f, 1.0e-6f);
+        boolean b = WaveGolden.checkWithin(kernel, "tail-packed", pf, pb, 0.0f, 1.0f);
+        if (a && b) { ValueCheck.credit(vc); }
+    }
+}

@@ -33,11 +33,14 @@ public final class PplProbe {
         if ((int32) args.count() < 2) {
             System.stdout.println(
                 "usage: pplprobe <model.gguf> <text> [pre=N] [eval=N]"
-                + " [nocoop] [nommq] [hostmoe]");
+                + " [nocoop] [nommq] [hostmoe] [nofd] [nov2] [norowscore]"
+                + " [nofusedrouter] [norouterwave] [pinrec=<path>|pinreplay=<path>]");
             return 2;
         }
         int32 pre = 512;
         int32 eval = 256;
+        int32 pinMode = 0;
+        String pinPath #= "";
         int32 ai = 2;
         while (ai < (int32) args.count()) {
             if (args[ai].startsWith("pre=")) {
@@ -72,6 +75,28 @@ public final class PplProbe {
             if (args[ai].equals("attnjitter")) { AttnKernel.setJitter(true); }
             if (args[ai].equals("noqkv")) { Linear.setFusedQkv(false); }
             if (args[ai].equals("nofd")) { AttnKernel.setFlashDecode(false); }
+            if (args[ai].equals("nov2")) {
+                AttnKernel.setPrefillTile(false);
+                AttnKernel.setAttnFlash(false);
+                AttnKernel.setAttnV2(false);
+            }
+            if (args[ai].equals("norowscore")) { AttnKernel.setRowScore(false); }
+            if (args[ai].equals("nofusedrouter")) {
+                MoeFfn.setFusedRouter(false);
+                MoeFfn.setFusedNormRouter(false);
+            }
+            if (args[ai].equals("norouterwave")) {
+                MoeFfn.setRouterWave(false);
+                MoeFfn.setFusedNormRouter(false);
+            }
+            if (args[ai].startsWith("pinrec=")) {
+                pinPath #= args[ai].substring(7, args[ai].byteLength());
+                pinMode = 1;
+            }
+            if (args[ai].startsWith("pinreplay=")) {
+                pinPath #= args[ai].substring(10, args[ai].byteLength());
+                pinMode = 2;
+            }
             ai = ai + 1;
         }
 
@@ -79,6 +104,8 @@ public final class PplProbe {
         int32 rawN = (int32) raw.count();
         Checkpoint ck #= Checkpoint.open(args[0]);
         ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        int32 layers = cfg.numLayers;
+        int32 used = cfg.expertUsedCount;
         Tokenizer tok #= ck.gguf().tokenizer();
         int32[] body #= tok.encodeBytes(raw, rawN);
         int32[] ids #= PplProbe.prependBos(tok, #body);
@@ -105,6 +132,15 @@ public final class PplProbe {
         m.prefill(ids, pre);
         System.stdout.println("prefill ms: "
             + ((float64) (Clock.nanoTime() - t0) / 1000000.0));
+        int32 cap = eval + 8;
+        int64 cells = pinMode == 0 ? 1L : (int64) cap * (int64) layers * (int64) used;
+        int32[] pin #= heap int32[cells];
+        if (pinMode != 0 && used <= 0) {
+            System.stdout.println("pplprobe: not an MoE model, no route pin");
+            pinMode = 0;
+        }
+        if (pinMode == 2 && !PplProbe.readPin(pinPath, pin, cells)) { return 2; }
+        if (pinMode != 0) { MoeFfn.setRoutePin(pinMode, pin, layers, used, cap); }
 
         int32 vocab = m.vocabSize();
         float32[] row #= heap float32[vocab];
@@ -132,6 +168,22 @@ public final class PplProbe {
             + ((float64) (Clock.nanoTime() - t0) / 1000000.0));
         System.stdout.println("positions: " + ppl.positions()
             + "  meanNll: " + ppl.meanNll() + "  ppl: " + ppl.ppl());
+        System.stdout.println("launches: attnScoreKernel "
+            + Device.kernelLaunchCount("attnScoreKernel") + "  attnScorePrefillRowKernel "
+            + Device.kernelLaunchCount("attnScorePrefillRowKernel") + "  attnScorePrefillKernel "
+            + Device.kernelLaunchCount("attnScorePrefillKernel") + "  routerF32MatVecKernel "
+            + Device.kernelLaunchCount("routerF32MatVecKernel") + "  routerTopKKernel "
+            + Device.kernelLaunchCount("routerTopKKernel") + "  routerTopKWaveKernel "
+            + Device.kernelLaunchCount("routerTopKWaveKernel") + "  rmsnormRouterTopKKernel "
+            + Device.kernelLaunchCount("rmsnormRouterTopKKernel") + "  iq4nlQ8IdDownCombineKernel "
+            + Device.kernelLaunchCount("iq4nlQ8IdDownCombineKernel"));
+        if (pinMode != 0) {
+            System.stdout.println("route pin: rows " + MoeFfn.routePinRows() + "  flips "
+                + MoeFfn.routePinFlips() + "  flip gap max " + MoeFfn.routePinFlipGapMax()
+                + "  overflow " + MoeFfn.routePinOverflow());
+            if (pinMode == 1) { PplProbe.writePin(pinPath, pin, cells); }
+            MoeFfn.setRoutePin(0, pin, layers, used, cap);
+        }
         return 0;
     }
 
@@ -150,5 +202,37 @@ public final class PplProbe {
             i = i + 1;
         }
         return #out;
+    }
+    /** `cells` expert picks to `path`, little-endian int32s. */
+    static void writePin(String path, int32[] pin, int64 cells) {
+        int8[] b #= heap int8[cells * 4L];
+        int64 i = 0;
+        while (i < cells) {
+            int32 v = pin[i];
+            b[i * 4L] = (int8) (v & 255);
+            b[i * 4L + 1L] = (int8) ((v >> 8) & 255);
+            b[i * 4L + 2L] = (int8) ((v >> 16) & 255);
+            b[i * 4L + 3L] = (int8) ((v >> 24) & 255);
+            i = i + 1;
+        }
+        File.writeAllBytes(path, b, cells * 4L);
+    }
+
+    /** The picks `writePin` wrote, or a message and nothing read. */
+    static boolean readPin(String path, int32[] pin, int64 cells) {
+        int8[] b #= File.readAllBytes(path);
+        if (b == null || (int64) b.count() < cells * 4L) {
+            System.stdout.println("pplprobe: pin file " + path + " is missing or short");
+            return false;
+        }
+        int64 i = 0;
+        while (i < cells) {
+            pin[i] = ((int32) b[i * 4L] & 255)
+                | (((int32) b[i * 4L + 1L] & 255) << 8)
+                | (((int32) b[i * 4L + 2L] & 255) << 16)
+                | (((int32) b[i * 4L + 3L] & 255) << 24);
+            i = i + 1;
+        }
+        return true;
     }
 }
