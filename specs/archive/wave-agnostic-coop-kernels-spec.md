@@ -1,3 +1,5 @@
+> **SUPERSEDED 2026-10-16** by `wave-row-geometry-spec.md` (2026-09-18), whose Unit 2 did the conversion. The kernels it left declare `@Wave(width = 32)` (wave-row-geometry 2.2.4), which this spec had rejected while the annotation was informational only.
+
 # Wave-width-agnostic coop kernels — determination & conversion checklist
 
 Status: **draft**. The compiler-side keystone is landed and validated on wave32
