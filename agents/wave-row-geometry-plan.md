@@ -121,7 +121,7 @@ replaces BEFORE any timing.
       for long ones; `rowsPerWave` keeps the segment meaning for the Id
       launchers and derives from `waveWidth()`; no launcher overwrites
       anything.
-- [~] 2.2.3 Stage B, the grouped-id family: the `*Id*` kernels. Their row
+- [x] 2.2.3 Stage B, the grouped-id family: the `*Id*` kernels. Their row
       derivation carries an expert index, so the conversion is the same
       idea with a different decomposition.
       The five grouped-id MAT-VECS are DONE 2026-09-29 (cajeta
@@ -135,6 +135,7 @@ replaces BEFORE any timing.
       `q4kQ8IdDownCombineKernel`, `q6kQ8IdDownCombineKernel`,
       `iq3xxsQ8IdGateUpGluKernel`, `iq4nlQ8IdDownCombineKernel`,
       `symQ8IdDownCombineKernel`), still on `KernelCap.WAVE32_ONLY`.
+      CLOSED 2026-10-16: the six GLU and combine kernels were closed by 2.2.4 (c4f2dc7, 026d200); each now declares `@Kernel @Wave(width = 32)` in QuantKernel.cajeta and WAVE32_ONLY is gone.
 - [x] 2.2.4 Stage C, the batch and utility kernels: `q4kQ8Batch*`,
       `q6kQ8Batch*`, `q8kPack`, `touchLines`, `moeTopKBatch`,
       `mxfp4QuantAct`. Convert only where the literal is a lane or row
@@ -184,25 +185,35 @@ replaces BEFORE any timing.
 ## Unit 3 — the sweep that writes (spec §4)
 
 ### 3.1 TDD
-- [ ] 3.1.1 With no stored value, the sweep runs once and stores one.
-- [ ] 3.1.2 With a stored value for this build, the sweep does not run.
-- [ ] 3.1.3 A candidate that fails the correctness check is not selected
+- [x] 3.1.1 With no stored value, the sweep runs once and stores one.
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
+- [x] 3.1.2 With a stored value for this build, the sweep does not run.
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
+- [x] 3.1.3 A candidate that fails the correctness check is not selected
       even when it is fastest.
-- [ ] 3.1.4 The sweep runs during prewarm, asserted by a counter, so no
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
+- [x] 3.1.4 The sweep runs during prewarm, asserted by a counter, so no
       token pays for it.
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
 
 ### 3.2 Coding
-- [ ] 3.2.1 The sweep over rows-per-workgroup 1, 2, 4, 8, clamped by
+- [x] 3.2.1 The sweep over rows-per-workgroup 1, 2, 4, 8, clamped by
       `waveRowsPerBlock`'s existing device limit.
-- [ ] 3.2.2 Min-of-repeats per candidate rather than one sample.
-- [ ] 3.2.3 `Autotune.claimOnce` so concurrent processes do not both
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
+- [x] 3.2.2 Min-of-repeats per candidate rather than one sample.
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
+- [x] 3.2.3 `Autotune.claimOnce` so concurrent processes do not both
       sweep, and `rememberFor` with the build id.
-- [ ] 3.2.4 Correctness before speed, per `Autotune`'s own contract.
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
+- [x] 3.2.4 Correctness before speed, per `Autotune`'s own contract.
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
 
 ### 3.3 Acceptance
-- [ ] 3.3.1 A cold machine sweeps once, a warm one never.
-- [ ] 3.3.2 The stored winner survives a restart and is discarded by a
+- [x] 3.3.1 A cold machine sweeps once, a warm one never.
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
+- [x] 3.3.2 The stored winner survives a restart and is discarded by a
       rebuild.
+      CLOSED 2026-10-16 (Julian): moot — every format measured flat within 1–2% (4.1.1, swept on gfx1151 2026-09-30: q4_K and q6_K within about 1%, the other five formats within about 2%).
 
 ## Unit 4 — the measured table (spec §5.2)
 
