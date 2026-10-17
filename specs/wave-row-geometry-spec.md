@@ -114,3 +114,69 @@ recall.
   is the evidence the adaptor's cost model would be fitted to, and it
   answers whether four rows per wave generalizes past the two formats
   where it was found by hand.
+
+### 5.3 Measured
+
+Waves per workgroup against kernel time, `bench/ParityLeg
+--rows-per-block N` on real weights, min of three, in us. One wave per
+workgroup is the default for every format, and Unit 3's sweep was closed
+as moot on these numbers (Julian 2026-10-16).
+
+gfx1151 (proton), 2026-09-30, the 8B Q4_K_M's own tensors:
+
+| shape | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| q4_K 1024x4096 | 16.75 | 16.91 | 16.67 | 16.68 |
+| q6_K 1024x4096 | 21.56 | 21.50 | 21.15 | 21.64 |
+| q4_K 4096x4096 | 47.15 | 47.63 | 47.47 | 47.24 |
+| q4_K 14336x4096 | 148.1 | 148.1 | 148.9 | 149.2 |
+| q4_K 4096x14336 | 158.4 | 158.9 | 159.3 | 159.7 |
+| q6_K 4096x14336 | 223.6 | 222.0 | 222.1 | 222.6 |
+| q6_K head | 1907 | 1908 | 1911 | 1927 |
+
+gfx1151, 2026-09-30, `ParityLeg --by-type` on the 8B in Q8_0, Q6_K,
+Q5_K_M, Q3_K_M and Q2_K, arm order rotated:
+
+| shape | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| q8_0 1024x4096 | 25.3 | 26.8 | 27.7 | 27.2 |
+| q8_0 4096x4096 | 84.0 | 84.4 | 85.8 | 86.8 |
+| q8_0 14336x4096 | 279.6 | 280.9 | 280.8 | 281.4 |
+| q8_0 4096x14336 | 286.5 | 284.2 | 285.5 | 291.3 |
+| q8_0 head | 2448 | 2471 | 2445 | 2448 |
+| q6_K 4096x4096 | 68.0 | 67.9 | 67.6 | 67.4 |
+| q6_K 14336x4096 | 221.9 | 221.7 | 221.9 | 223.3 |
+| q5_K 4096x4096 | 59.8 | 61.3 | 60.9 | 60.7 |
+| q5_K 14336x4096 | 186.0 | 188.3 | 189.2 | 188.4 |
+| q5_K 4096x14336 | 196.6 | 198.0 | 197.3 | 193.1 |
+| q3_K 4096x4096 | 40.9 | 41.0 | 40.6 | 41.2 |
+| q3_K 14336x4096 | 118.6 | 119.0 | 118.8 | 120.9 |
+| q3_K 4096x14336 | 125.0 | 126.7 | 124.9 | 125.0 |
+| q2_K 4096x4096 | 33.5 | 34.5 | 34.3 | 34.3 |
+| q2_K 14336x4096 | 100.8 | 100.1 | 100.9 | 98.8 |
+
+- No format prefers more than one wave by more than about 2% at any cold
+  shape. q8_0 1024x4096 prefers one wave by 6 to 9%.
+- At one wave the large shapes stream 192 to 228 GB/s of weight, 75 to
+  89% of the part's 256 GB/s. Four rows per wave, the q4_K and q6_K
+  layout, has nothing left to win at decode on this part.
+- The one shape where four waves pays is a weight that stays in the 32 MB
+  MALL (q4_K 4096x14336 repeated, 45.5 us at one wave and 41.8 at four).
+  A decode never reads a weight that way.
+
+sm_89 (RTX 4090), 2026-09-29, one wave against four only (cajeta
+xpu-kernel-adaptor 9.3.3):
+
+| shape | 1 | 4 |
+|---|---|---|
+| q4_K 1024x4096 | 26.2 | 25.1 |
+| q6_K 1024x4096 | 19.8 | 25.3 |
+| q4_K 4096x4096 | 19.1 | 28.3 |
+| q4_K 14336x4096 | 48.3 | 48.8 |
+| q4_K 4096x14336 | 43.6 | 44.3 |
+| q6_K 4096x14336 | 58.0 | 58.0 |
+| q6_K head | 429.7 | 439.4 |
+
+Single samples on that box swing by up to 3x, so only the min of repeats
+is a result. The other formats and the two and eight wave columns are not
+measured there yet (plan 4.1.2).

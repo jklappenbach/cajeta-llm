@@ -176,8 +176,15 @@ replaces BEFORE any timing.
 ### 2.3 Acceptance
 - [x] 2.3.1 Bit gate passes per kernel before any speed number is quoted.
       DONE 2026-09-29, see 2.1.1.
-- [ ] 2.3.2 Legs flat on the recorded files. This is a refactor, and a
+- [x] 2.3.2 Legs flat on the recorded files. This is a refactor, and a
       change in either direction is a geometry change to explain.
+      DONE, measured 2026-09-29/30 under cajeta xpu-kernel-adaptor 9.3.2 and
+      9.3.4 and ticked here 2026-10-17. sm_89: flat or better at all seven
+      decode shapes (q6_K 1024x4096 26.5 -> 19.8 us, the rest within noise
+      or better). gfx1151: all seven within 0.4% (e02e01b against 1d03e9d),
+      and end to end prefill 1201 -> 1199 tok/s, decode 44.07 -> 44.06.
+      The MALL-resident control row was 2 to 3% slower at one wave, which
+      is no engine shape (adaptor 9.3.5).
 - [x] 2.3.3 Filtered suite green at each stage, not only at the end.
       DONE 2026-09-29: the whole nvptx suite, not a filter, after each
       stage (605/0 and 606/0).
@@ -277,3 +284,5 @@ replaces BEFORE any timing.
       different everything else.
 - [ ] 4.1.3 Record the table in the spec, where the adaptor draft can
       read it.
+      gfx1151 recorded 2026-10-17 as spec §5.3, with the sm_89 one-against-
+      four rows from adaptor 9.3.3. Closes when 4.1.2's rows join it.
