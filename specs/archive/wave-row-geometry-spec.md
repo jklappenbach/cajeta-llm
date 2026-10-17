@@ -1,6 +1,6 @@
 # Wave row geometry — spec
 
-Status: **draft** 2026-09-18. Registered in [INDEX.md](INDEX.md).
+Status: **closed** 2026-10-17, archived. Drafted 2026-09-18.
 Package: cajeta-llm. Touches `io/QuantKernel.cajeta` and the launchers
 beside it.
 
@@ -178,5 +178,55 @@ xpu-kernel-adaptor 9.3.3):
 | q6_K head | 429.7 | 439.4 |
 
 Single samples on that box swing by up to 3x, so only the min of repeats
-is a result. The other formats and the two and eight wave columns are not
-measured there yet (plan 4.1.2).
+is a result.
+
+sm_89, 2026-10-17, all four columns, cajeta-llm 9a0c8cb on cajeta aea90673
+(the v0.43.1 tree), min of three with the arm order rotated (72 arms, raw
+rows in `tmp/rpb-sweep/` on the RTX 4090 box). The 8B Q4_K_M's own tensors:
+
+| shape | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| q4_K 1024x4096 | 13.6 | 21.3 | 21.5 | 15.9 |
+| q4_K 4096x4096 | 26.7 | 20.3 | 19.4 | 18.9 |
+| q4_K 14336x4096 | 37.4 | 37.6 | 37.6 | 37.6 |
+| q4_K 4096x14336 | 37.4 | 37.5 | 37.6 | 37.4 |
+| q4_K 4096x14336 (hot control) | 20.1 | 22.0 | 21.3 | 19.4 |
+| q6_K 1024x4096 | 20.2 | 14.5 | 13.0 | 13.1 |
+| q6_K 4096x14336 | 52.2 | 52.3 | 52.4 | 52.6 |
+| q6_K head | 417.6 | 417.9 | 417.6 | 417.8 |
+
+`ParityLeg --by-type` on the 8B in Q8_0, Q6_K, Q5_K_M, Q3_K_M and Q2_K,
+each model's own format:
+
+| shape | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| q8_0 1024x4096 | 24.7 | 25.1 | 25.1 | 13.6 |
+| q8_0 4096x4096 | 31.0 | 22.3 | 22.9 | 28.5 |
+| q8_0 14336x4096 | 64.1 | 64.2 | 64.1 | 64.2 |
+| q8_0 4096x14336 | 67.1 | 64.9 | 64.8 | 64.8 |
+| q8_0 head | 535.8 | 536.9 | 536.6 | 536.6 |
+| q6_K 1024x4096 | 13.6 | 14.7 | 17.0 | 16.3 |
+| q6_K 4096x4096 | 20.1 | 20.5 | 20.5 | 20.1 |
+| q6_K 14336x4096 | 54.2 | 53.2 | 54.7 | 54.5 |
+| q6_K 4096x14336 | 54.5 | 53.1 | 54.7 | 55.1 |
+| q6_K head | 435.1 | 424.6 | 438.0 | 439.9 |
+| q5_K 1024x4096 | 19.9 | 20.8 | 15.1 | 13.4 |
+| q5_K 4096x4096 | 29.6 | 30.3 | 30.1 | 18.8 |
+| q5_K 14336x4096 | 45.0 | 45.6 | 46.6 | 45.9 |
+| q5_K 4096x14336 | 48.7 | 46.9 | 47.5 | 47.4 |
+| q3_K 1024x4096 | 15.8 | 12.9 | 15.2 | 20.7 |
+| q3_K 4096x4096 | 29.3 | 19.1 | 17.9 | 18.4 |
+| q3_K 14336x4096 | 32.0 | 32.4 | 31.9 | 32.0 |
+| q2_K 1024x4096 | 13.7 | 17.0 | 22.5 | 13.1 |
+| q2_K 4096x4096 | 17.1 | 15.6 | 26.2 | 15.1 |
+| q2_K 14336x4096 | 25.7 | 25.9 | 27.7 | 29.9 |
+
+- Every large shape (14336x4096, 4096x14336 and the head) is flat across
+  one to eight waves to within about 1%, as on gfx1151. The width does not
+  move a bandwidth-bound row.
+- The 1024x4096 and 4096x4096 rows and the hot control sit near the
+  launch floor and swing 13 to 30 us with no direction that holds across
+  formats. That is the box's known noise at that size, so no winner is
+  read off them without interleaved rounds.
+- One wave per workgroup stays the default on sm_89 as well. Four rows per
+  wave has nothing to win at decode on either part.

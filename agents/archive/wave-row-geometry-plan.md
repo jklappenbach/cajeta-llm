@@ -1,6 +1,6 @@
 # wave-row-geometry — plan
 
-Implements [`specs/wave-row-geometry-spec.md`](../specs/wave-row-geometry-spec.md).
+Implements [`specs/wave-row-geometry-spec.md`](../../specs/archive/wave-row-geometry-spec.md).
 Unit numbers trace to spec sections as *(spec §x.y)*.
 
 ## Description
@@ -280,9 +280,14 @@ replaces BEFORE any timing.
       to 217, q3_K 202 to 213, q2_K 192), the same band as q4_K and q6_K
       (200 to 226) and 75 to 89% of the 256 GB/s peak. The small shapes
       are lower for every format alike, which is the fixed launch cost.
-- [ ] 4.1.2 The same on the NVIDIA box, which is a wave-32 part with
+- [x] 4.1.2 The same on the NVIDIA box, which is a wave-32 part with
       different everything else.
-- [ ] 4.1.3 Record the table in the spec, where the adaptor draft can
+      DONE 2026-10-17 on the RTX 4090 (run by the Phoenix session, 12:38 to
+      12:49, 72 arms, every exit 0): the Q4_K_M table and `--by-type` over
+      the five other 8B quants, one to eight waves, min of three with the
+      arm order rotated. Every large shape is flat within about 1%. The
+      small shapes swing at the launch floor with no consistent direction.
+      One wave per workgroup stays the default. Tables in spec §5.3.
+- [x] 4.1.3 Record the table in the spec, where the adaptor draft can
       read it.
-      gfx1151 recorded 2026-10-17 as spec §5.3, with the sm_89 one-against-
-      four rows from adaptor 9.3.3. Closes when 4.1.2's rows join it.
+      DONE 2026-10-17: spec §5.3 holds the gfx1151 and sm_89 sweeps.
