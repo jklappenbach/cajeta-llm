@@ -16,6 +16,7 @@ import cajeta.xpu.Workgroup;
 import cajeta.xpu.Vector;
 import cajeta.xpu.Wave;
 import cajeta.xpu.MemoryOrder;
+import cajeta.time.Clock;
 
 /**
  * The DECODE attention tail on the device (plan 10.11): RoPE, the KV
@@ -2797,6 +2798,109 @@ public final class AttnKernel {
 
     static boolean attnTileOn = true;
     public static void setPrefillTile(boolean on) { AttnKernel.attnTileOn = on; }
+
+    // ── does the prefill tile pay on this device? ──────────────────
+    // 0 = not measured yet, 1 = the tile, 2 = the wave kernels.
+    static int32 tilePay = 0;
+    static int64 tileProbeNs = 0L;
+    static int64 waveProbeNs = 0L;
+
+    /** Pin the answer of {@link #prefillTilePays} (1 = the tile, 2 = the wave
+     *  kernels), or 0 to measure again. */
+    public static void setPrefillTilePays(int32 v) { AttnKernel.tilePay = v; }
+    /** The pinned or measured answer: 0 = not measured, 1 = the tile, 2 = the waves. */
+    public static int32 prefillTilePaysState() { return AttnKernel.tilePay; }
+
+    /** The probe's per-launch times, ns (0 before it has run). */
+    public static int64 prefillTileProbeNs() { return AttnKernel.tileProbeNs; }
+    public static int64 prefillWaveProbeNs() { return AttnKernel.waveProbeNs; }
+
+    /**
+     * Is the prefill tile faster HERE than the wave kernels on the same
+     * attend? Measured once per process, the first time a prefill asks, on
+     * the model's heads at the last 128-row chunk of a 512-token prompt. No
+     * backend is named: on Vulkan the tile's matrix ops are emulated and it
+     * lost by about 17x (2026-10-20), where on sm_89 it is the fast route.
+     */
+    public static boolean prefillTilePays(int32 nH, int32 nKv, int32 hd) {
+        if (AttnKernel.tilePay == 0) {
+            AttnKernel.tilePay = 1;
+            boolean pays = AttnKernel.probePrefillTile(nH, nKv, hd);
+            AttnKernel.tilePay = 2;
+            if (pays) { AttnKernel.tilePay = 1; }
+        }
+        return AttnKernel.tilePay == 1;
+    }
+
+    static boolean probePrefillTile(int32 nH, int32 nKv, int32 hd) {
+        int32 rows = 128;
+        int32 startPos = 384;
+        int32 tMax = startPos + rows;
+        int64 qn = (int64) rows * (int64) nH * (int64) hd;
+        int64 kvn = (int64) tMax * (int64) nKv * (int64) hd;
+        float32[] qh #= heap float32[qn];
+        int64 z = 0;
+        while (z < qn) {
+            qh[z] = 0.02f * (float32) ((z % 11L) - 5L);
+            z = z + 1;
+        }
+        float16[] kvh #= heap float16[kvn];
+        KernelBuffer<float32> q #= heap KernelBuffer<float32>((uint64) qn);
+        q.upload(qh);
+        KernelBuffer<float16> kp #= heap KernelBuffer<float16>((uint64) kvn);
+        kp.upload(kvh);
+        KernelBuffer<float16> vp #= heap KernelBuffer<float16>((uint64) kvn);
+        vp.upload(kvh);
+        KernelBuffer<float32> out #= heap KernelBuffer<float32>((uint64) qn);
+        KernelBuffer<float32> scores #= heap KernelBuffer<float32>(
+            (uint64) ((int64) rows * (int64) nH * (int64) tMax));
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        KernelStream s = QuantKernel.stream();
+        int64 tBest = 0L - 1L;
+        int64 wBest = 0L - 1L;
+        int32 warm = 1;
+        int32 rounds = warm + 3;
+        int32 burst = 2;
+        int32 round = 0;
+        while (round < rounds) {
+            int32 n = 1;
+            if (round >= warm) { n = burst; }
+            AttnKernel.tilePay = 1;
+            int64 t0 = Clock.nanoTime();
+            int32 k = 0;
+            while (k < n) {
+                AttnKernel.attendPrefillLaunchNoSync(out, scores, q, kp, vp, rows,
+                    nH, nKv, hd, startPos, tMax, scale);
+                k = k + 1;
+            }
+            s.sync();
+            int64 t1 = Clock.nanoTime();
+            AttnKernel.tilePay = 2;
+            k = 0;
+            while (k < n) {
+                AttnKernel.attendPrefillLaunchNoSync(out, scores, q, kp, vp, rows,
+                    nH, nKv, hd, startPos, tMax, scale);
+                k = k + 1;
+            }
+            s.sync();
+            int64 t2 = Clock.nanoTime();
+            if (round == 0 && t1 - t0 > 10L * (t2 - t1)) {
+                AttnKernel.tileProbeNs = t1 - t0;
+                AttnKernel.waveProbeNs = t2 - t1;
+                return false;
+            }
+            if (round >= warm) {
+                int64 tt = (t1 - t0) / (int64) n;
+                int64 wt = (t2 - t1) / (int64) n;
+                if (tBest < 0L || tt < tBest) { tBest = tt; }
+                if (wBest < 0L || wt < wBest) { wBest = wt; }
+            }
+            round = round + 1;
+        }
+        AttnKernel.tileProbeNs = tBest;
+        AttnKernel.waveProbeNs = wBest;
+        return tBest <= wBest;
+    }
     static boolean floorCheckOn = false;
     static int32 floorChecks = 0;
     public static void setFloorCheck(boolean on) { AttnKernel.floorCheckOn = on; }
@@ -2973,13 +3077,15 @@ public final class AttnKernel {
         // governs both (the online switch picks the variant).
         if (AttnKernel.attnTileOn && AttnKernel.attnOnlineOn
                 && AttnKernel.tileServes(nH, nKv, hd)
-                && KernelCap.usable("attnFlashPrefillOnlineKernel")) {
+                && KernelCap.usable("attnFlashPrefillOnlineKernel")
+                && AttnKernel.prefillTilePays(nH, nKv, hd)) {
             AttnKernel.flashPrefillOnlineLaunchNoSync(out, q, kPool, vPool,
                 rows, nH, nKv, startPos, scale);
             return;
         }
         if (AttnKernel.attnTileOn && AttnKernel.tileServes(nH, nKv, hd)
-                && KernelCap.usable("attnFlashPrefillTileKernel")) {
+                && KernelCap.usable("attnFlashPrefillTileKernel")
+                && AttnKernel.prefillTilePays(nH, nKv, hd)) {
             AttnKernel.flashPrefillTileLaunchNoSync(out, q, kPool, vPool,
                 rows, nH, nKv, startPos, scale);
             if (AttnKernel.floorCheckOn && AttnKernel.floorChecks < 200) {
