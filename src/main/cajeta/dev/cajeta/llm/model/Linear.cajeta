@@ -8,7 +8,9 @@ import cajeta.time.Clock;
 import cajeta.xpu.Device;
 import cajeta.xpu.MemoryKind;
 import cajeta.math.Tensor;
+import cajeta.io.file.File;
 import cajeta.io.file.MappedFile;
+import cajeta.io.file.OpenMode;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import dev.cajeta.llm.LlmException;
@@ -1784,7 +1786,7 @@ public final class Linear extends InfModule {
         int64 pb = Quant.q8kPackedBytes(Quant.q8kPadCols((int64) wn));
         // An in-flight NoSync GEMM may still read the old btXp.
         QuantKernel.stream().sync();
-        Linear.btXph #= heap int8[(int64) wr * pb];
+        Linear.btXph = null;
         Linear.btXp #= heap KernelBuffer<int8>((uint64) ((int64) wr * pb));
         Linear.btXpW #= Linear.btXp.wordView();
         Linear.btCap = wr;
@@ -1883,6 +1885,11 @@ public final class Linear extends InfModule {
             Linear.btUploadNs = Linear.btUploadNs + (t2 - t1);
         } else {
             int64 t0 = Clock.nanoTime();
+            // 15.2.16.7: the host side of the pack exists only when the host packs.
+            if (Linear.btXph == null) {
+                Linear.btXph #= heap int8[(int64) Linear.btCap
+                    * Quant.q8kPackedBytes(Quant.q8kPadCols((int64) Linear.btDim))];
+            }
             int64 r = 0;
             while (r < (int64) rows) {
                 Quant.q8kPackPad(sb, base + r * (int64) n, (int64) n,
@@ -3498,6 +3505,29 @@ public final class Linear extends InfModule {
     /** Device bytes ever allocated for batch outputs, for tests and benches. */
     public static int64 batchOutAllocBytes() { return Linear.batchOutBytes; }
 
+    /** Drop the batch activation stage so a test starts from none. */
+    public static void resetBatchStageForTest() {
+        QuantKernel.stream().sync();
+        Linear.btXph = null;
+        Linear.btXpW = null;
+        Linear.btXp = null;
+        Linear.btCap = 0;
+        Linear.btDim = 0;
+        return;
+    }
+
+    static int64 mapStreamBytes = 0L;
+    static int64 readStreamBytes = 0L;
+
+    /** Weight bytes uploaded by reading a mapping, since process start. */
+    public static int64 streamedByMapBytes() { return Linear.mapStreamBytes; }
+
+    /** Weight bytes uploaded through read(2), since process start. */
+    public static int64 streamedByReadBytes() { return Linear.readStreamBytes; }
+
+    /** Host bytes of the batch activation pack's host side (0 when the device packs). */
+    public static int64 batchHostPackBytes() { return Linear.btXph == null ? 0L : (int64) Linear.btXph.count(); }
+
     static final int32 ROLES = 7;
     static KernelBuffer<float32>[] roleY;
     static int64[] roleYCap;
@@ -4050,6 +4080,18 @@ public final class Linear extends InfModule {
                 + "packed weight at all and should never have reached the "
                 + "packed upload path)");
         }
+        if (this.srcPath != null) {
+            File f #= File.open(this.srcPath, OpenMode.READ);
+            if (Quant.splitOn(this.packedTy)) {
+                Linear.splitStreamFrom(null, f, this.mapOff, this.packedBytes,
+                    this.packedTy, this.blocksPerRow(), this.payloadDev);
+            } else {
+                Linear.streamFileTo(f, this.mapOff, this.packedBytes,
+                    Linear.chunkFor(this.packedTy), this.payloadDev);
+            }
+            f.close();
+            return;
+        }
         if (Quant.splitOn(this.packedTy)) {
             Linear.splitStreamFromMap(this.srcMap, this.mapOff,
                 this.packedBytes, this.packedTy, this.blocksPerRow(),
@@ -4072,7 +4114,40 @@ public final class Linear extends InfModule {
             KernelBuffer<int8> sl #= this.payloadDev.slice((uint64) off,
                 (uint64) n);
             sl.upload(stage, n);
+            Linear.mapStreamBytes = Linear.mapStreamBytes + n;
             off = off + n;
+        }
+        return;
+    }
+
+    /** Read exactly `n` bytes at `off` of `f` into `dst`; read(2) keeps the file's pages out of RSS. */
+    static void readAt(File f, int64 off, int8[] dst, int64 n) {
+        f.seek(off);
+        int64 got = 0L;
+        while (got < n) {
+            int64 r = f.read(dst, got, n - got);
+            if (r <= 0L) {
+                throw heap LlmException("weight upload: short read at " + (off + got));
+            }
+            got = got + r;
+        }
+        return;
+    }
+
+    /** Upload `n` bytes at `off` of `f` into `dst` in chunks of `chunk` bytes. */
+    static void streamFileTo(File f, int64 off, int64 n, int64 chunk, KernelBuffer<int8> dst) {
+        int64 c = chunk;
+        if (c > n) { c = n; }
+        int8[] stage #= heap int8[c];
+        int64 at = 0L;
+        while (at < n) {
+            int64 m = c;
+            if (at + m > n) { m = n - at; }
+            Linear.readAt(f, off + at, stage, m);
+            KernelBuffer<int8> sl #= dst.slice((uint64) at, (uint64) m);
+            sl.upload(stage, m);
+            Linear.readStreamBytes = Linear.readStreamBytes + m;
+            at = at + m;
         }
         return;
     }
@@ -4082,6 +4157,13 @@ public final class Linear extends InfModule {
      *  array `dst`: no host array of the tensor ever exists. */
     static void splitStreamFromMap(MappedFile map, int64 mapOff, int64 n,
             int32 ty, int64 bpr, KernelBuffer<int8> dst) {
+        Linear.splitStreamFrom(map, null, mapOff, n, ty, bpr, dst);
+        return;
+    }
+
+    /** The split upload from `map`, or with read(2) from `f` when `map` is null. */
+    static void splitStreamFrom(MappedFile map, File f, int64 mapOff, int64 n,
+            int32 ty, int64 bpr, KernelBuffer<int8> dst) {
         int64 chunk = Linear.chunkFor(ty);
         if (chunk > n) { chunk = n; }
         int8[] stage #= heap int8[chunk];
@@ -4090,10 +4172,16 @@ public final class Linear extends InfModule {
         while (off < n) {
             int64 m = chunk;
             if (off + m > n) { m = n - off; }
-            int64 got = map.read(mapOff + off, stage, 0L, m);
-            if (got != m) {
-                throw heap LlmException("split upload: short read at "
-                    + (mapOff + off) + " - wanted " + m + ", got " + got);
+            if (map == null) {
+                Linear.readAt(f, mapOff + off, stage, m);
+                Linear.readStreamBytes = Linear.readStreamBytes + m;
+            } else {
+                int64 got = map.read(mapOff + off, stage, 0L, m);
+                if (got != m) {
+                    throw heap LlmException("split upload: short read at "
+                        + (mapOff + off) + " - wanted " + m + ", got " + got);
+                }
+                Linear.mapStreamBytes = Linear.mapStreamBytes + m;
             }
             Linear.putChunk(stage, m, off / bb, ty, bpr, dst);
             off = off + m;
