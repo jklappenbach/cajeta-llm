@@ -19,6 +19,8 @@ import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.io.TcTile;
+import dev.cajeta.llm.io.TileFamily;
+import dev.cajeta.llm.io.Q4TileShape;
 import dev.cajeta.llm.io.WmmaKernel;
 
 /**
@@ -1976,10 +1978,27 @@ public final class Linear extends InfModule {
     static boolean avQ4MwPacked;   // the multi-wave packed Q4_K GEMM (6.2.1)
     static boolean avQ4Tc;         // the tensor-core prefill tile (1.8.3)
     static boolean avQ6Tc;         // its Q6_K twin
+    /** Whether some listed Q4_K tile member can be launched here. */
+    public static boolean q4TileUsable() { return Linear.familyUsable(TcTile.q4()); }
+
+    /** Whether some listed Q6_K tile member can be launched here. */
+    public static boolean q6TileUsable() { return Linear.familyUsable(TcTile.q6()); }
+
+    static boolean familyUsable(TileFamily<Q4TileShape> fam) {
+        int32 n = (int32) fam.shapes().count();
+        int32 i = 0;
+        while (i < n) {
+            String k #= fam.shapes().get(i).kernel();
+            if (KernelCap.usable(k)) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
     static void ensureKernelAvail() {
         if (Linear.kAvailSet) { return; }
-        Linear.avQ4Tc = KernelCap.usable(TcTile.Q4_KERNEL);
-        Linear.avQ6Tc = KernelCap.usable(TcTile.Q6_KERNEL);
+        Linear.avQ4Tc = Linear.q4TileUsable();
+        Linear.avQ6Tc = Linear.q6TileUsable();
         // usable, not merely registered: a kernel written for another wave
         // width, or one measured wrong on this backend, must not be routed
         // (KernelCap.WAVE32_ONLY, KernelCap.WRONG_HERE).
@@ -2299,8 +2318,128 @@ public final class Linear extends InfModule {
         return Linear.mcPay == 1;
     }
 
+    static int32 tbdPay = 0;
+    static int64 tbdTileNs = 0L;
+    static int64 tbdDeqNs = 0L;
+
+    /** Pin the answer of {@link #tileBeatsDeq} (1 = tile, 2 = int8 GEMM), or 0 to measure again. */
+    public static void setTileBeatsDeq(int32 v) { Linear.tbdPay = v; }
+
+    /** The tile-versus-int8 probe's two times, ns per launch (0 before it has run). */
+    public static int64 tileProbeTileNs() { return Linear.tbdTileNs; }
+    public static int64 tileProbeDeqNs() { return Linear.tbdDeqNs; }
+
+    /** Whether the Q4_K tile beats the int8 GEMM here at a 512-row chunk of an 8B's gate projection, timed once per process. */
+    public static boolean tileBeatsDeq() {
+        if (Linear.tbdPay == 0) {
+            if (Linear.probeTileVersusDeq()) {
+                Linear.tbdPay = 1;
+            } else {
+                Linear.tbdPay = 2;
+            }
+        }
+        return Linear.tbdPay == 1;
+    }
+
+    /** Whether the tile may take a projection: always outside the auto policy, else where it beats the int8 GEMM. */
+    static boolean tilePreferred() {
+        if (!Linear.deqAuto) { return true; }
+        return Linear.tileBeatsDeq();
+    }
+
+    /** A synthetic Q4_K weight of `nBlocks` blocks with finite scales, for the probes. */
+    static #int8[] probeQ4Weight(int64 nBlocks) {
+        int8[] raw #= heap int8[nBlocks * 144L];
+        int64 nb = (int64) raw.count();
+        int64 z = 0;
+        while (z < nb) {
+            raw[z] = (int8) ((z * 31L + 35L) % 251L);
+            z = z + 1;
+        }
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 o = b * 144L;
+            raw[o] = (int8) (b % 16L);
+            raw[o + 1L] = (int8) 60;
+            raw[o + 2L] = (int8) (b % 16L);
+            raw[o + 3L] = (int8) 56;
+            b = b + 1;
+        }
+        return #raw;
+    }
+
+    static boolean probeTileVersusDeq() {
+        if (!Linear.q4TileUsable() || !KernelCap.usable("q4kWmmaDeqMw8Kernel")
+                || !KernelCap.usable("q8kPackKernel")) {
+            return true;
+        }
+        int64 rows = 512L;
+        int64 out = 14336L;
+        int64 cols = 4096L;
+        int8[] raw #= Linear.probeQ4Weight(out * (cols / 256L));
+        float32[] x #= heap float32[rows * cols];
+        int64 z = 0;
+        while (z < rows * cols) {
+            x[z] = 0.02f * (float32) ((z % 11L) - 5L);
+            z = z + 1;
+        }
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+        wD.upload(raw);
+        KernelBuffer<int8> deq #= heap KernelBuffer<int8>((uint64) (out * cols));
+        KernelBuffer<float32> xD #= heap KernelBuffer<float32>((uint64) (rows * cols));
+        xD.upload(x);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>(
+            (uint64) (rows * Quant.q8kPackedBytes(cols)));
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) (rows * out));
+        KernelStream s = QuantKernel.stream();
+        QuantKernel.q8kPackRowsLaunchNoSync(xp, xD, rows, cols, cols);
+        WmmaKernel.q4kWidenLaunch(deq, wD, out, cols);
+        TcTile.prewarmQ4(wD, xp, rows, out, cols);
+        s.sync();
+        int64 tBest = 0L - 1L;
+        int64 dBest = 0L - 1L;
+        int32 warm = 2;
+        int32 rounds = warm + 6;
+        int32 burst = 4;
+        int32 round = 0;
+        while (round < rounds) {
+            int32 n = 1;
+            if (round >= warm) { n = burst; }
+            int64 t0 = Clock.nanoTime();
+            int32 k = 0;
+            while (k < n) {
+                TcTile.q4kQ8TcTileLaunchNoSync(y, wD, xp, rows, out, cols);
+                k = k + 1;
+            }
+            s.sync();
+            int64 t1 = Clock.nanoTime();
+            k = 0;
+            while (k < n) {
+                if (Linear.part32On) {
+                    WmmaKernel.q4kWmmaDeqMw8PartLaunch(y, wD, deq, xp, rows, out, cols);
+                } else {
+                    WmmaKernel.q4kWmmaDeqMw8Launch(y, wD, deq, xp, rows, out, cols);
+                }
+                k = k + 1;
+            }
+            s.sync();
+            int64 t2 = Clock.nanoTime();
+            if (round >= warm) {
+                int64 tt = (t1 - t0) / (int64) n;
+                int64 dt = (t2 - t1) / (int64) n;
+                if (tBest < 0L || tt < tBest) { tBest = tt; }
+                if (dBest < 0L || dt < dBest) { dBest = dt; }
+            }
+            round = round + 1;
+        }
+        Linear.tbdTileNs = tBest;
+        Linear.tbdDeqNs = dBest;
+        Diag.emit("tile-probe", 0 - 1, tBest < dBest ? "tile" : "int8", tBest, dBest, rows, out, cols, 0L);
+        return tBest < dBest;
+    }
+
     static boolean probeMatrixCores() {
-        boolean tile = KernelCap.usable(TcTile.Q4_KERNEL);
+        boolean tile = Linear.q4TileUsable();
         if ((!tile && !KernelCap.usable("q4kWmmaKernel"))
                 || !KernelCap.usable("q4kQ8BatchMatMulKernel")
                 || !KernelCap.usable("q8kPackKernel")) {
@@ -2314,26 +2453,10 @@ public final class Linear extends InfModule {
         int64 cols = 4096L;
         int64 bpr = cols / 256L;
         int64 nBlocks = out * bpr;
-        int8[] raw #= heap int8[nBlocks * 144L];
-        int64 z = 0;
+        int8[] raw #= Linear.probeQ4Weight(nBlocks);
         int64 nb = (int64) raw.count();
-        while (z < nb) {
-            raw[z] = (int8) ((z * 31L + 35L) % 251L);
-            z = z + 1;
-        }
-        // Real scales: arbitrary bytes in the two f16 fields decode to NaN
-        // or Inf, and NaN arithmetic is not the work a GEMM does.
-        int64 b = 0;
-        while (b < nBlocks) {
-            int64 o = b * 144L;
-            raw[o] = (int8) (b % 16L);
-            raw[o + 1L] = (int8) 60;
-            raw[o + 2L] = (int8) (b % 16L);
-            raw[o + 3L] = (int8) 56;
-            b = b + 1;
-        }
         float32[] x #= heap float32[mcRows * cols];
-        z = 0;
+        int64 z = 0;
         while (z < mcRows * cols) {
             x[z] = 0.02f * (float32) ((z % 11L) - 5L);
             z = z + 1;
@@ -2510,7 +2633,7 @@ public final class Linear extends InfModule {
         boolean tcShape = Linear.wmmaOn && Linear.tcOn
             && !Linear.backendIsVulkan()
             && !this.slotMode && this.winStage == null
-            && Linear.matrixCoresPay();
+            && Linear.matrixCoresPay() && Linear.tilePreferred();
         boolean useTc = tcShape && Linear.avQ4Tc
             && this.packedTy == Quant.GG_Q4_K
             && TcTile.fits(mw8RowsTc, (int64) this.outDim, (int64) this.inDim);
@@ -2528,7 +2651,7 @@ public final class Linear extends InfModule {
             this.sayRoute(q4 ? 2199023255552L : 4398046511104L,
                 (q4 ? "q4" : "q6") + " tcTile refused: avail="
                 + (q4 ? Linear.avQ4Tc : Linear.avQ6Tc) + " slot=" + this.slotMode
-                + " window=" + (this.winStage != null) + " ragged="
+                + " window=" + (this.winStage != null) + " int8Faster=" + (Linear.tbdPay == 2) + " ragged="
                 + (mw8RowsTc != (int64) rows) + " fits="
                 + (q4 ? TcTile.fits(mw8RowsTc, (int64) this.outDim, (int64) this.inDim)
                     : TcTile.fits6(mw8RowsTc, (int64) this.outDim, (int64) this.inDim)));
@@ -3076,14 +3199,40 @@ public final class Linear extends InfModule {
      *  return of interior state). */
     public KernelBuffer<float32> fusedBatchOut() { return this.fusedYBatch; }
 
+    /** Lends the fused output, one buffer for every fused group, grown to the largest `rows * fusedOut` asked. */
     void ensureFusedY(int32 rows) {
-        if (this.fusedYBatch != null && this.fusedYRows >= rows) {
-            return;
+        int64 n = (int64) rows * this.fusedOut;
+        if (Linear.sharedFusedYCap < n) {
+            QuantKernel.stream().sync();
+            Linear.sharedFusedY #= heap KernelBuffer<float32>((uint64) n);
+            Linear.sharedFusedYCap = n;
+            Linear.fusedYBytes = Linear.fusedYBytes + n * 4L;
         }
-        this.fusedYBatch #= heap KernelBuffer<float32>(
-            (uint64) ((int64) rows * this.fusedOut));
+        this.fusedYBatch = Linear.sharedFusedY;
         this.fusedYRows = rows;
         return;
+    }
+
+    static KernelBuffer<float32> sharedFusedY;
+    static int64 sharedFusedYCap;
+    static int64 fusedYBytes;
+
+    /** Device bytes ever allocated for fused outputs, for tests and benches. */
+    public static int64 fusedYAllocBytes() { return Linear.fusedYBytes; }
+
+    /** Drop the shared fused output so a test starts from none. */
+    public static void resetSharedFusedY() {
+        QuantKernel.stream().sync();
+        Linear.sharedFusedY = null;
+        Linear.sharedFusedYCap = 0L;
+    }
+
+    /** The device address of this projection's packed payload, for tests. */
+    public int64 payloadHandleForTest() { return this.payloadDev.handle(); }
+
+    /** The device address of the pair's concatenated payload, or 0 before the fusion. */
+    public int64 fusedPackedHandleForTest() {
+        return this.fusedPackedDev == null ? 0L : this.fusedPackedDev.handle();
     }
 
     /** The shared launch tail: the group's fused buffers exist and
@@ -3124,6 +3273,13 @@ public final class Linear extends InfModule {
             an, 0L);
         WmmaKernel.concatI8Launch(this.fusedPackedDev, b.payloadDev,
             bn, an);
+        QuantKernel.stream().sync();
+        this.packedW = null;
+        this.coopW = null;
+        b.packedW = null;
+        b.coopW = null;
+        this.payloadDev #= this.fusedPackedDev.slice((uint64) 0, (uint64) an);
+        b.payloadDev #= this.fusedPackedDev.slice((uint64) an, (uint64) bn);
         return;
     }
 
@@ -3136,7 +3292,7 @@ public final class Linear extends InfModule {
         return Linear.wmmaOn && Linear.tcOn && Linear.avQ4Tc
             && !Linear.backendIsVulkan()
             && !this.slotMode && this.winStage == null
-            && Linear.matrixCoresPay();
+            && Linear.matrixCoresPay() && Linear.tilePreferred();
     }
 
     /** Fused gate|up on the tensor-core tile (1.8.3): ONE launch over the

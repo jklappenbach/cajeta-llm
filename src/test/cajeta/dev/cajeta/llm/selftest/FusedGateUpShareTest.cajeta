@@ -1,0 +1,133 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.Linear;
+import cajeta.math.Tensor;
+import cajeta.xpu.Device;
+
+/** cajeta-llm 15.2.16.2.1 and .2: the fused gate|up tile keeps one output for every layer and one copy of its weights. */
+public class FusedGateUpShareTest {
+
+    public FusedGateUpShareTest() { return; }
+
+    static final int32 ROWS = 256;
+
+    /** Whether the fused tile can run here; skips by name when it cannot. */
+    static boolean tileRuns() {
+        if (!TcTileTest.matrixCoresHere("QkTile_64_64_32_32_128_q4kQ8")) { return false; }
+        if (!Linear.q4TileUsable()) {
+            DeviceSkip.tracked("backend " + Device.activeBackend()
+                + " has no usable Q4_K tile member", "cajeta-llm 15.2.16.2.3");
+            return false;
+        }
+        return true;
+    }
+
+    /** A gate of CO rows and an up of 2 CO rows over the Q4_K fixture. */
+    static #Linear gate() {
+        return LinearKernelRouteTest.tiled(Quant.GG_Q4_K, "q4_k.bin");
+    }
+
+    static #Linear up() {
+        return LinearKernelRouteTest.tiledAt(Quant.GG_Q4_K, "q4_k.bin",
+            LinearKernelRouteTest.CI, 2 * LinearKernelRouteTest.CO);
+    }
+
+    /** Runs the fused gate|up launch on the pair with the tile pinned on. */
+    static boolean fuse(Linear a, Linear b) {
+        Tensor<float32> x #= LinearKernelRouteTest.ramp(
+            (int64) ROWS * (int64) LinearKernelRouteTest.CI, 0L);
+        QuantKernel.setRoutingEnabled(true);
+        boolean tcWas = Linear.tcEnabled();
+        Linear.setTc(true);
+        Linear.setTileBeatsDeq(1);
+        Linear.setMatrixCoresPay(1);
+        Linear.stageBatch(x, 0L, ROWS, LinearKernelRouteTest.CI, Linear.nextStageTag());
+        boolean took = a.fusedPairBatchKeep(b, ROWS);
+        QuantKernel.stream().sync();
+        Linear.setMatrixCoresPay(0);
+        Linear.setTc(tcWas);
+        Linear.setTileBeatsDeq(0);
+        return took;
+    }
+
+    /** The projection's batched output with the tile off, so it reads its own payload. */
+    static #Tensor<float32> plainOut(Linear l, int64 outDim) {
+        Tensor<float32> x #= LinearKernelRouteTest.ramp(
+            (int64) ROWS * (int64) LinearKernelRouteTest.CI, 0L);
+        Tensor<float32> y #= LinearKernelRouteTest.ramp(0L, (int64) ROWS * outDim);
+        QuantKernel.setRoutingEnabled(true);
+        boolean tcWas = Linear.tcEnabled();
+        Linear.setTc(false);
+        Linear.stageBatch(x, 0L, ROWS, LinearKernelRouteTest.CI, Linear.nextStageTag());
+        l.matmulInto(ROWS, y, 0L);
+        Linear.setTc(tcWas);
+        Linear.setTileBeatsDeq(0);
+        return #y;
+    }
+
+    /** A second layer's fused launch allocates no output bytes of its own. */
+    @Test
+    public void theFusedOutputDoesNotGrowWithTheLayerCount() {
+        if (!FusedGateUpShareTest.tileRuns()) { return; }
+        Linear.resetSharedFusedY();
+        Linear a1 #= FusedGateUpShareTest.gate();
+        Linear b1 #= FusedGateUpShareTest.up();
+        Linear a2 #= FusedGateUpShareTest.gate();
+        Linear b2 #= FusedGateUpShareTest.up();
+        int64 f0 = Linear.fusedYAllocBytes();
+        Assert.isTrue(FusedGateUpShareTest.fuse(a1, b1));
+        int64 f1 = Linear.fusedYAllocBytes();
+        Assert.isTrue(FusedGateUpShareTest.fuse(a2, b2));
+        int64 f2 = Linear.fusedYAllocBytes();
+        Assert.isTrue(f1 > f0);
+        Assert.equals(f1, f2);
+    }
+
+    /** After the fused launch, gate and up are the two halves of the fused buffer. */
+    @Test
+    public void theFusedPairKeepsOneCopyOfItsWeights() {
+        if (!FusedGateUpShareTest.tileRuns()) { return; }
+        Linear a #= FusedGateUpShareTest.gate();
+        Linear b #= FusedGateUpShareTest.up();
+        Assert.isTrue(FusedGateUpShareTest.fuse(a, b));
+        int64 gateBytes = (int64) Quant.blockBytes(Quant.GG_Q4_K)
+            * (int64) LinearKernelRouteTest.CO * (int64) LinearKernelRouteTest.CI / 256L;
+        Assert.equals(a.fusedPackedHandleForTest(), a.payloadHandleForTest());
+        Assert.equals(a.fusedPackedHandleForTest() + gateBytes, b.payloadHandleForTest());
+    }
+
+    /** Both projections compute the same outputs from their payloads after the fusion as before it. */
+    @Test
+    public void theProjectionsReadTheSameWeightsAfterTheFusion() {
+        if (!FusedGateUpShareTest.tileRuns()) { return; }
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        Linear a #= FusedGateUpShareTest.gate();
+        Linear b #= FusedGateUpShareTest.up();
+        Tensor<float32> a0 #= FusedGateUpShareTest.plainOut(a, co);
+        Tensor<float32> b0 #= FusedGateUpShareTest.plainOut(b, 2L * co);
+        Assert.isTrue(FusedGateUpShareTest.fuse(a, b));
+        Tensor<float32> a1 #= FusedGateUpShareTest.plainOut(a, co);
+        Tensor<float32> b1 #= FusedGateUpShareTest.plainOut(b, 2L * co);
+        LinearKernelRouteTest.assertLive(a0, (int64) ROWS * co, "gate before");
+        int64 i = 0;
+        while (i < (int64) ROWS * co) {
+            if (a0.flatGet(i) != a1.flatGet(i)) {
+                Assert.fail("gate element " + i + ": " + a1.flatGet(i) + " after, " + a0.flatGet(i) + " before");
+                return;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < (int64) ROWS * 2L * co) {
+            if (b0.flatGet(i) != b1.flatGet(i)) {
+                Assert.fail("up element " + i + ": " + b1.flatGet(i) + " after, " + b0.flatGet(i) + " before");
+                return;
+            }
+            i = i + 1;
+        }
+    }
+}
