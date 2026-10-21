@@ -64,12 +64,16 @@ public final class Scheduler {
     Tokenizer tok;            // borrow; null = stop strings inert (8.7)
     int32[] tailIds;          // stop-string window scratch (16 ids)
 
+    ChunkPolicy policy;
+    int32 lastChunk;
+
     public Scheduler(CausalLM model, int32 chunk) {
         // 21.2.5: launch failures BEFORE this scheduler existed are not
         // its steps' to report.
         this.lfSeen = Device.launchFailures();
         this.model #= model;   // deliberate non-owning alias: `#=` records the borrow
         this.chunk = chunk;
+        this.policy = heap ChunkPolicy(chunk, 150000000L, CausalLM.CHUNK_MAX);
         this.maxSeqs = model.maxSequences();
         this.reqs = heap ArrayList<Request>();
         this.slotReq = heap int32[this.maxSeqs];
@@ -308,13 +312,27 @@ public final class Scheduler {
             this.bTok = heap int32[CausalLM.DECODE_BATCH_MAX];
             this.bOut = heap int32[CausalLM.DECODE_BATCH_MAX];
         }
+        boolean loaded = this.pipeInFlight;
+        int32 prompts = 0;
+        int32 j = 0;
+        while (j < this.reqs.count()) {
+            Request q = this.reqs.get(j);
+            if (q.state == Request.RUNNING) {
+                if (q.totalLen - q.cachedLen <= 1) { loaded = true; } else { prompts = prompts + 1; }
+            }
+            j = j + 1;
+        }
+        int32 cap = this.policy.chunkForShare(loaded, prompts);
+        this.lastChunk = cap;
+        int32 fullChunks = 0;
+        boolean partial = false;
         int32 i = 0;
         while (i < this.reqs.count()) {
             Request r = this.reqs.get(i);
             if (r.state == Request.RUNNING) {
                 int32 n = r.totalLen - r.cachedLen;
-                if (n > this.chunk) {
-                    n = this.chunk;
+                if (n > cap) {
+                    n = cap;
                 }
                 // Per-item headroom: preempt YOUNGER requests until this
                 // item fits; if this request is itself the youngest, it
@@ -357,6 +375,9 @@ public final class Scheduler {
                 } else {
                     if (this.pipeInFlight) { this.finishPipe(); }
                     Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
+                    if (n > 1) {
+                        if (n == cap) { fullChunks = fullChunks + 1; } else { partial = true; }
+                    }
                     int64 tm0 = Clock.nanoTime();
                     int32 ret = this.model.stepSeq(r.slot, r.all, r.cachedLen, n);
                     tso = Clock.nanoTime();
@@ -384,11 +405,20 @@ public final class Scheduler {
             }
             this.lfSeen = lfNow;
         }
+        if (fullChunks > 0 && !partial) {
+            this.policy.observe(cap, loaded, (Clock.nanoTime() - tTrace0) / (int64) fullChunks);
+        }
         boolean more = !this.allDone();
         Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
         Scheduler.traceTotalNs = Clock.nanoTime() - tTrace0;
         return more;
     }
+
+    /** The pause budget a step may take while other sequences decode (spec 13.14). */
+    public void setChunkBudgetNs(int64 ns) { this.policy.setBudgetNs(ns); }
+
+    /** The chunk cap the last step used. */
+    public int32 lastChunk() { return this.lastChunk; }
 
     // ── 12.2.11: the pipelined greedy decode ───────────────────────────
     // One running request, greedy, in the decode regime: step N+1 is queued

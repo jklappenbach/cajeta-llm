@@ -1,0 +1,129 @@
+package dev.cajeta.llm.sched;
+
+/**
+ * Picks each step's prefill chunk (spec 13.14): a learned size when no other
+ * sequence is decoding, the largest that fits the pause budget when one is.
+ */
+public class ChunkPolicy {
+    static final int32 SIZES = 5;
+    static final int32 START = 128;
+
+    int32 pinned;
+    int64 budgetNs;
+    int32 maxChunk;
+    int64[] idleNs;
+    int64[] loadedNs;
+    boolean anyLoaded;
+
+    /** pinned > 0 fixes the chunk; budgetNs bounds a step while others decode. */
+    public ChunkPolicy(int32 pinned, int64 budgetNs, int32 maxChunk) {
+        this.pinned = pinned;
+        this.budgetNs = budgetNs;
+        this.maxChunk = maxChunk;
+        this.idleNs = heap int64[ChunkPolicy.SIZES];
+        this.loadedNs = heap int64[ChunkPolicy.SIZES];
+        this.anyLoaded = false;
+    }
+
+    static int32 sizeAt(int32 k) { return 32 << k; }
+
+    static int64 rowsAt(int32 k) { return (int64) (32 << k); }
+
+    /** Index of a learnable size (32..512), or -1 for a partial chunk. */
+    static int32 indexOf(int32 rows) {
+        int32 k = 0;
+        while (k < ChunkPolicy.SIZES) {
+            if (ChunkPolicy.sizeAt(k) == rows) { return k; }
+            k = k + 1;
+        }
+        return 0 - 1;
+    }
+
+    int32 top() {
+        int32 k = 0;
+        while (k + 1 < ChunkPolicy.SIZES && ChunkPolicy.sizeAt(k + 1) <= this.maxChunk) { k = k + 1; }
+        return k;
+    }
+
+    /** Records one step that ran `rows` prefill rows in `ns`. */
+    public void observe(int32 rows, boolean loaded, int64 ns) {
+        int32 k = ChunkPolicy.indexOf(rows);
+        if (this.pinned > 0 || k < 0 || ns <= 0L) { return; }
+        if (loaded) { this.loadedNs[k] = ns; this.anyLoaded = true; }
+        else { this.idleNs[k] = ns; }
+    }
+
+    /** The chunk for the next step; `loaded` when another sequence is decoding. */
+    public int32 chunkFor(boolean loaded) { return this.chunkForShare(loaded, 1); }
+
+    /** The chunk for each of `prompts` prefills that run in one step. */
+    public int32 chunkForShare(boolean loaded, int32 prompts) {
+        if (this.pinned > 0) { return this.pinned; }
+        int32 start = ChunkPolicy.indexOf(ChunkPolicy.START);
+        if (start > this.top()) { start = this.top(); }
+        if (loaded) {
+            int32 k = prompts;
+            if (k < 1) { k = 1; }
+            return this.withinBudget(start, this.budgetNs / (int64) k);
+        }
+        return this.idleChoice(start);
+    }
+
+    /** Replaces the pause budget a step may take while others decode. */
+    public void setBudgetNs(int64 ns) { this.budgetNs = ns; }
+
+    int32 idleChoice(int32 start) {
+        int32 best = 0 - 1;
+        int32 largest = 0 - 1;
+        int32 k = 0;
+        while (k <= this.top()) {
+            if (this.idleNs[k] > 0L) {
+                largest = k;
+                if (best < 0 || this.idleNs[k] * ChunkPolicy.rowsAt(best) < this.idleNs[best] * ChunkPolicy.rowsAt(k)) { best = k; }
+            }
+            k = k + 1;
+        }
+        if (best < 0) { return ChunkPolicy.sizeAt(start); }
+        int32 pick = 0;
+        while (pick < best) {
+            if (this.idleNs[pick] > 0L
+                    && this.idleNs[pick] * ChunkPolicy.rowsAt(best) * 100L <= this.idleNs[best] * ChunkPolicy.rowsAt(pick) * 105L) {
+                break;
+            }
+            pick = pick + 1;
+        }
+        if (pick == largest && pick < this.top()) { return ChunkPolicy.sizeAt(pick + 1); }
+        return ChunkPolicy.sizeAt(pick);
+    }
+
+    /** The largest size predicted to fit `budget`; the smallest before anything is measured. */
+    int32 withinBudget(int32 start, int64 budget) {
+        int64[] t = this.idleNs;
+        if (this.anyLoaded) { t = this.loadedNs; }
+        int32 pick = 0;
+        boolean seen = false;
+        int32 k = 0;
+        while (k <= this.top()) {
+            int64 est = ChunkPolicy.predict(t, k, this.top());
+            if (est > 0L) {
+                seen = true;
+                if (est <= budget) { pick = k; }
+            }
+            k = k + 1;
+        }
+        if (!seen) { return ChunkPolicy.sizeAt(0); }
+        return ChunkPolicy.sizeAt(pick);
+    }
+
+    /** The measured step at size k, else scaled by rows from the nearest measured size. */
+    static int64 predict(int64[] t, int32 k, int32 top) {
+        if (t[k] > 0L) { return t[k]; }
+        int32 d = 1;
+        while (d <= top) {
+            if (k - d >= 0 && t[k - d] > 0L) { return t[k - d] * ChunkPolicy.rowsAt(k) / ChunkPolicy.rowsAt(k - d); }
+            if (k + d <= top && t[k + d] > 0L) { return t[k + d] * ChunkPolicy.rowsAt(k) / ChunkPolicy.rowsAt(k + d); }
+            d = d + 1;
+        }
+        return 0L;
+    }
+}
