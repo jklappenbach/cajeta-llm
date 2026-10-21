@@ -1,0 +1,137 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+import cajeta.io.file.Path;
+
+/** cajeta-llm 15.2.16.3: a rope-permuted q/k weight keeps no host copy once it is on the device. */
+public class HostWeightCopyTest {
+
+    public HostWeightCopyTest() { return; }
+
+    /** After the prewarm uploads it, layer 0's q_proj holds no host bytes. */
+    @Test
+    public void aDeviceResidentPermutedWeightKeepsNoHostCopy() {
+        CausalLM m #= RoutableFixtureTest.mk(1);
+        if (!RoutableFixtureTest.gemmHere(m)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        Linear q = m.qProjOf(0);
+        Assert.isTrue(q.ropePermuted());
+        Assert.isTrue(q.hostPackedBytes() > 0L);
+        m.prewarmPrefillWeights();
+        Assert.equals(0L, q.hostPackedBytes());
+    }
+
+    /** After the upload, a projection holds no mapping of the file either: its touched
+     *  pages would otherwise stay in the process's resident set (4 GB on the 8B). */
+    @Test
+    public void aDeviceResidentWeightHoldsNoFileMapping() {
+        CausalLM m #= RoutableFixtureTest.mk(1);
+        if (!RoutableFixtureTest.gemmHere(m)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        Linear q = m.qProjOf(0);
+        Assert.isTrue(q.holdsSourceMapping());
+        m.prewarmPrefillWeights();
+        Assert.isFalse(q.holdsSourceMapping());
+    }
+
+    /** The host fallback rebuilds the permuted bytes exactly as the checkpoint gives them. */
+    @Test
+    public void theHostFallbackRebuildsThePermutedBytes() {
+        CausalLM m #= RoutableFixtureTest.mk(1);
+        if (!RoutableFixtureTest.gemmHere(m)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        m.prewarmPrefillWeights();
+        Checkpoint ck #= Checkpoint.open(RoutableFixtureTest.FIX);
+        int8[] want #= ck.loadPacked("model.layers.0.self_attn.q_proj.weight");
+        ck.close();
+        int8[] got #= m.qProjOf(0).hostPackedCopyForTest();
+        Assert.equals((int64) want.count(), (int64) got.count());
+        int64 i = 0L;
+        while (i < (int64) want.count()) {
+            if (want[i] != got[i]) {
+                Assert.fail("byte " + i + " differs: " + want[i] + " vs " + got[i]);
+                return;
+            }
+            i = i + 1L;
+        }
+    }
+
+    /** The 8B witness, whose embedding is Q4_K; null when it is not on this box. */
+    static #CausalLM mk8B() {
+        Path mp #= Path.of(LinearKernelRouteTest.M8B);
+        if (!mp.exists()) { return null; }
+        Checkpoint ck #= Checkpoint.open(LinearKernelRouteTest.M8B);
+        ModelConfig cfg #= ModelConfig.fromGguf(ck.gguf());
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        m.bind(ck, false);
+        ck.close();
+        return #m;
+    }
+
+    static #int8[] fileEmbedding() {
+        Checkpoint ck #= Checkpoint.open(LinearKernelRouteTest.M8B);
+        int8[] raw #= ck.loadPacked("model.embed_tokens.weight");
+        ck.close();
+        return #raw;
+    }
+
+    /** The packed embedding table is read through the file, never copied to the heap. */
+    @Test
+    public void thePackedEmbeddingKeepsNoHostCopy() {
+        CausalLM m #= HostWeightCopyTest.mk8B();
+        if (m == null) { DeviceSkip.cannot("8B witness not on this box"); return; }
+        Assert.isTrue(m.embedPackedType() >= 0);
+        Assert.equals(0L, m.embedHostBytes());
+    }
+
+    /** A host row lookup decodes the same values as the checkpoint's bytes. */
+    @Test
+    public void anEmbeddingRowMatchesTheCheckpoint() {
+        CausalLM m #= HostWeightCopyTest.mk8B();
+        if (m == null) { DeviceSkip.cannot("8B witness not on this box"); return; }
+        int32 ty = m.embedPackedType();
+        int8[] raw #= HostWeightCopyTest.fileEmbedding();
+        int32 dim = m.cfg.hiddenSize;
+        int64 bpr = (int64) dim / (int64) Quant.blockElems(ty);
+        float32[] want #= heap float32[dim];
+        Quant.dequantize(ty, raw, 7L * bpr * (int64) Quant.blockBytes(ty), bpr, want, 0L);
+        float32[] got #= m.embedRowForTest(7);
+        int32 i = 0;
+        while (i < dim) {
+            if (want[i] != got[i]) { Assert.fail("element " + i); return; }
+            i = i + 1;
+        }
+    }
+
+    /** The device table, streamed from the file, holds the file's bytes. */
+    @Test
+    public void theDeviceEmbeddingHoldsTheFileBytes() {
+        CausalLM m #= HostWeightCopyTest.mk8B();
+        if (m == null) { DeviceSkip.cannot("8B witness not on this box"); return; }
+        if (!m.deviceEmbedReady()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int8[] raw #= HostWeightCopyTest.fileEmbedding();
+        int8[] dev #= m.embedDeviceBytesForTest();
+        Assert.equals((int64) raw.count(), (int64) dev.count());
+        int64 i = 0L;
+        while (i < (int64) raw.count()) {
+            if (raw[i] != dev[i]) { Assert.fail("byte " + i); return; }
+            i = i + 1L;
+        }
+        Assert.equals(0L, m.embedHostBytes());
+    }
+}

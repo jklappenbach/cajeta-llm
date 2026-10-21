@@ -1,7 +1,9 @@
 package dev.cajeta.llm.model;
 
+import cajeta.io.file.MappedFile;
 import cajeta.lang.String;
 import cajeta.math.Tensor;
+import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.Checkpoint;
 import dev.cajeta.llm.io.Quant;
@@ -17,8 +19,13 @@ import dev.cajeta.llm.io.Quant;
  */
 public final class Embedding extends InfModule {
     Tensor<float32> weight;
-    int8[] packed;          // block form; null when held as f32
+    int8[] packed;          // block form held on the host; null when read through srcMap
     int32 packedTy;
+    MappedFile srcMap;      // 15.2.16.3: the packed table, read a row at a time
+    String srcPath;
+    int64 mapOff;
+    int64 packedLen;
+    int8[] rowScratch;
     int32 vocab;
     int32 dim;
 
@@ -26,6 +33,11 @@ public final class Embedding extends InfModule {
         this.weight = null;
         this.packed = null;
         this.packedTy = -1;
+        this.srcMap = null;
+        this.srcPath = null;
+        this.mapOff = 0L;
+        this.packedLen = 0L;
+        this.rowScratch = null;
         this.vocab = vocab;
         this.dim = dim;
     }
@@ -56,15 +68,56 @@ public final class Embedding extends InfModule {
     /** The packed table's bytes and format, for a device decoder
      *  (EmbedKernel); null / -1 when the table is held as f32. */
     public int8[] packedBytes() { return this.packed; }
+
+    /** Bytes of the packed table, wherever it is held. */
+    public int64 packedLength() {
+        return this.packed != null ? (int64) this.packed.count() : this.packedLen;
+    }
+
+    /** Streams the packed table into `dev` in chunks through a mapping closed afterwards. */
+    public void uploadPackedTo(KernelBuffer<int8> dev) {
+        if (this.packed != null) {
+            dev.upload(this.packed);
+            return;
+        }
+        MappedFile mm #= heap MappedFile(this.srcPath);
+        int64 chunk = 16777216L;
+        if (chunk > this.packedLen) { chunk = this.packedLen; }
+        int8[] stage #= heap int8[chunk];
+        int64 off = 0L;
+        while (off < this.packedLen) {
+            int64 n = chunk;
+            if (off + n > this.packedLen) { n = this.packedLen - off; }
+            if (mm.read(this.mapOff + off, stage, 0L, n) != n) {
+                throw heap LlmException("embedding: short read at " + (this.mapOff + off));
+            }
+            KernelBuffer<int8> sl #= dev.slice((uint64) off, (uint64) n);
+            sl.upload(stage, n);
+            off = off + n;
+        }
+        mm.close();
+    }
+
+    /** Host bytes held for the packed table (0 when none). */
+    public int64 hostPackedBytes() { return this.packed == null ? 0L : (int64) this.packed.count(); }
     public int32 packedType() { return this.packedTy; }
 
     void rowInto(int32 token, float32[] dst, int64 dstOff) {
         int64 be = (int64) Quant.blockElems(this.packedTy);
         int64 blocksPerRow = (int64) this.dim / be;
-        int64 rawOff = (int64) token * blocksPerRow
-            * (int64) Quant.blockBytes(this.packedTy);
-        Quant.dequantize(this.packedTy, this.packed, rawOff, blocksPerRow,
-            dst, dstOff);
+        int64 rowBytes = blocksPerRow * (int64) Quant.blockBytes(this.packedTy);
+        int64 rawOff = (int64) token * rowBytes;
+        if (this.packed != null) {
+            Quant.dequantize(this.packedTy, this.packed, rawOff, blocksPerRow,
+                dst, dstOff);
+            return;
+        }
+        if (this.rowScratch == null) { this.rowScratch = heap int8[rowBytes]; }
+        int64 got = this.srcMap.read(this.mapOff + rawOff, this.rowScratch, 0L, rowBytes);
+        if (got != rowBytes) {
+            throw heap LlmException("embedding: short read of row " + token);
+        }
+        Quant.dequantize(this.packedTy, this.rowScratch, 0L, blocksPerRow, dst, dstOff);
     }
 
     void bind(Checkpoint ckpt, String name, boolean toDevice) {
@@ -82,12 +135,17 @@ public final class Embedding extends InfModule {
                     + "' does not match embedding shape [" + this.vocab
                     + ", " + this.dim + "]");
             }
-            int8[] p #= ckpt.loadPacked(name);
             int64 want = (int64) this.vocab
                 * ((int64) this.dim / (int64) Quant.blockElems(pty))
                 * (int64) Quant.blockBytes(pty);
-            if ((int64) p.count() == want) {
-                this.packed #= p;
+            String sp #= ckpt.shardPathOf(name);
+            int64 fo = ckpt.packedFileOffsetOf(name);
+            MappedFile mm #= heap MappedFile(sp);
+            if (mm.size() >= fo + want) {
+                this.srcMap #= mm;
+                this.srcPath #= sp;
+                this.mapOff = fo;
+                this.packedLen = want;
                 this.packedTy = pty;
                 return;
             }

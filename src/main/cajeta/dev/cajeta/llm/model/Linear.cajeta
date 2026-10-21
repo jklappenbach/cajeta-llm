@@ -38,7 +38,9 @@ public final class Linear extends InfModule {
     // loadPacked defeats. Set by the checkpoint bind; null for a test
     // that hands over bytes directly.
     MappedFile srcMap;
+    String srcPath;             // the shard srcMap maps, kept to reopen it after the upload
     int64 mapOff;
+    int32 permuteHeads;         // > 0: the file bytes are rope-permuted by this many heads
     // Projection bias (spec 4.12) — Qwen2's q/k/v carry one, Llama's carry
     // none. Always f32 in the file, never quantized. `biasDev` is its
     // device copy, uploaded with the weight.
@@ -766,7 +768,9 @@ public final class Linear extends InfModule {
         this.packed = null;
         this.packedBytes = 0L;
         this.srcMap = null;
+        this.srcPath = null;
         this.mapOff = 0L;
+        this.permuteHeads = 0;
         this.packedTy = -1;
         this.inDim = inDim;
         this.outDim = outDim;
@@ -940,6 +944,11 @@ public final class Linear extends InfModule {
             // — self-consistency at two chunk sizes had passed, because
             // both arms were equally wrong.
             if (ckpt.packedIsTransformed(name)) {
+                // 15.2.16.3: the mapping lets the host copy go once the device holds it.
+                this.srcPath #= ckpt.shardPathOf(name);
+                this.srcMap #= heap MappedFile(this.srcPath);
+                this.mapOff = ckpt.packedFileOffsetOf(name);
+                this.permuteHeads = ckpt.ropePermuteHeads(name);
                 int8[] p #= ckpt.loadPacked(name);
                 if ((int64) p.count() != want) {
                     throw heap LlmException("weight binding: '" + name
@@ -965,6 +974,7 @@ public final class Linear extends InfModule {
                     + " but '" + sp + "' holds " + mm.size());
             }
             this.srcMap #= mm;
+            this.srcPath #= sp;
             this.mapOff = fo;
             this.packedBytes = want;
             this.packedTy = pty;
@@ -4212,12 +4222,33 @@ public final class Linear extends InfModule {
         return this.payloadDev;
     }
 
+    /** Host bytes this projection holds for its packed weight (0 when none). */
+    public int64 hostPackedBytes() { return this.packed == null ? 0L : (int64) this.packed.count(); }
+
+    /** Whether this projection holds an open mapping of its checkpoint file. */
+    public boolean holdsSourceMapping() { return this.srcMap != null; }
+
+    /** Whether the checkpoint rope-permutes this weight (llama q/k). */
+    public boolean ropePermuted() { return this.permuteHeads > 0; }
+
+    /** A copy of the host bytes the host mat-vec would read, for tests. */
+    public #int8[] hostPackedCopyForTest() {
+        this.ensureHostPacked();
+        int8[] c #= heap int8[(int64) this.packed.count()];
+        int64 i = 0L;
+        while (i < (int64) this.packed.count()) { c[i] = this.packed[i]; i = i + 1L; }
+        return #c;
+    }
+
     /** The host mat-vec needs the bytes themselves. Under a streamed
      *  bind there is no host array, so materialize one ON DEMAND — the
      *  fallback then costs memory only if something actually takes it,
      *  instead of every model paying for a path it never uses. */
     void ensureHostPacked() {
         if (this.packed != null) { return; }
+        if (this.srcMap == null && this.srcPath != null) {
+            this.srcMap #= heap MappedFile(this.srcPath);
+        }
         if (this.srcMap == null) {
             throw heap LlmException("matvecInto: no host bytes and no "
                 + "source mapping for packed type " + this.packedTy);
@@ -4227,6 +4258,13 @@ public final class Linear extends InfModule {
         if (got != this.packedBytes) {
             throw heap LlmException("matvecInto: short read - wanted "
                 + this.packedBytes + ", got " + got);
+        }
+        if (this.permuteHeads > 0) {
+            int8[] u #= heap int8[this.packedBytes];
+            Checkpoint.unpermuteRows(p, u, (int64) this.outDim,
+                this.packedBytes / (int64) this.outDim, this.permuteHeads);
+            this.packed #= u;
+            return;
         }
         this.packed #= p;
         return;
@@ -4242,8 +4280,14 @@ public final class Linear extends InfModule {
             this.devWBytes = this.devWBytes + this.allocResident(this.packedBytes);
             if (this.packed != null) {
                 this.uploadSplit(this.packed, this.packedBytes);
+                if (this.srcPath != null) { this.packed = null; }
             } else {
                 this.streamPackedFromMap();
+            }
+            // 15.2.16.3: the device holds the weight now; unmapping drops its file pages from RSS.
+            if (this.srcMap != null) {
+                this.srcMap.close();
+                this.srcMap = null;
             }
             // Only the OUTPUT is per-Linear now; the activation side is
             // shared (see ensureStage), because that is the half that is
