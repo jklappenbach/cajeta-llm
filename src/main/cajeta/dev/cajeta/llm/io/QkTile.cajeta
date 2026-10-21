@@ -30,15 +30,13 @@ import cajeta.xpu.WaveVector;
  * the block, and KS is the Q4_K half block. A listed shape outside it is
  * refused at instantiation by name (spec §2.4), never miscompiled.
  *
- * Shared memory, in TM / 64 buffers: the 64x64 member is single-buffered
- * behind a barrier per half (25 KB, room for more workgroups on a 64 KB
- * part), the 128x128 one double-buffered (100 KB). Each buffer is
- * a TM x 144 and a TN x 144 int8 half-block tile for
+ * Shared memory, single-buffered behind a barrier per half so both members
+ * fit 64 KB (25 and 50 KB): a TM x 144 and a TN x 144 int8 half-block tile for
  * the activation and the weight (144 = 128 payload + 16 pad, so a 16x16
- * fragment's rows never share a bank), and a set of per-block panels:
- * {@code xsAll[buf*TM + token]} the token's q8_K scale, {@code dAll[buf*TN
- * + col]} the column's d, {@code rgAll[buf*TM*8 + (tokenTile*8 + j)*16 +
- * tok] = xs * bsum_j}, {@code scAll[buf*TN*8 + col*8 + j] = sc_j} and
+ * fragment's rows never share a bank), and the per-block panels:
+ * {@code xsAll[token]} the token's q8_K scale, {@code dAll[col]} the column's
+ * d, {@code rgAll[(tokenTile*8 + j)*16 + tok] = xs * bsum_j},
+ * {@code scAll[col*8 + j] = sc_j} and
  * {@code cgAll[...] = -dmin * mn_j}. The arithmetic is the 128x128
  * kernel's, measured bit for bit against it by TcTileTest at every listed
  * shape.
@@ -83,20 +81,18 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
     // tile) and the route asks the measured Linear.matrixCoresPay first.
     @Occupancy(maxThreads = 2 * TN)
     @Kernel @FastMath
-    // The 128x128 member needs 100 KB of shared memory, over gfx1151's 64 KB,
-    // so the hold is per instantiation: the 64x64 member lowers there.
-    @Unlowered(backend = {"amdgpu", "vulkan"}, tracked = "xpu-tile-shape-selection 4.9.1", mayLower = true)
+    @Unlowered(backend = {"vulkan"}, tracked = "xpu-tile-shape-selection 4.9.1", mayLower = true)
     public static void q4kQ8(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp, uint32 rows,
             uint32 outDim, uint32 tilesN, int64 blocksPerRow,
             KernelBuffer<float32> part, uint32 splits, uint32 accum) {
-        Shared<int8> aT = shared int8[(TM / 64) * TM * 144];
-        Shared<int8> bT = shared int8[(TM / 64) * TN * 144];
-        Shared<float32> xsAll = shared float32[(TM / 64) * TM];
-        Shared<float32> dAll = shared float32[(TM / 64) * TN];
-        Shared<float32> rgAll = shared float32[(TM / 64) * TM * 8];
-        Shared<int32> scAll = shared int32[(TM / 64) * TN * 8];
-        Shared<float32> cgAll = shared float32[(TM / 64) * TN * 8];
+        Shared<int8> aT = shared int8[TM * 144];
+        Shared<int8> bT = shared int8[TN * 144];
+        Shared<float32> xsAll = shared float32[TM];
+        Shared<float32> dAll = shared float32[TN];
+        Shared<float32> rgAll = shared float32[TM * 8];
+        Shared<int32> scAll = shared int32[TN * 8];
+        Shared<float32> cgAll = shared float32[TN * 8];
 
         uint32 tid = KernelThread.x();
         uint32 wid = tid / 32;
@@ -183,13 +179,9 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
             uint32 hh = 0;
             while (hh < nh) {
                 uint32 H = hh & 1;
-                uint32 bufA = (H & (TM / 64 - 1)) * (TM * 144);
-                uint32 bufB = (H & (TM / 64 - 1)) * (TN * 144);
-                uint32 pOff = ((hh >> 1) & 1) * (TM / 64 - 1);
-                if (TM == 64) { Barrier.workgroup(); }
-                // Store the prefetched half into its buffer, once every wave
-                // has read what it held: two halves ago, or the last half.
-                int64 aDst = (int64) (bufA + aDst0);
+                Barrier.workgroup();
+                // Store the prefetched half once every wave has read the last one.
+                int64 aDst = (int64) aDst0;
                 aT.vstore(aDst, pa0.asBytes());
                 aT.vstore(aDst + (int64) aDstP, pa1.asBytes());
                 aT.vstore(aDst + (int64) (2 * aDstP), pa2.asBytes());
@@ -198,7 +190,7 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                     // Nibble group sH of the half: low nibbles are k
                     // 64sH..64sH+31 of the staged half, high ones
                     // 64sH+32..64sH+63 (Quant.q4kBlock).
-                    int64 dst = (int64) (bufB + sCol * 144 + 64 * sH);
+                    int64 dst = (int64) (sCol * 144 + 64 * sH);
                     Vector<int32,4> w0 = pb0;
                     Vector<int32,4> w1 = pb1;
                     bT.vstore(dst, (w0 & 252645135).asBytes());
@@ -227,8 +219,8 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                         int32 k1 = (h3 >> 8) & 255;
                         int32 k2 = (h3 >> 16) & 255;
                         int32 k3 = (h3 >> 24) & 255;
-                        uint32 cb = pOff * (TN * 8) + sCol * 8;
-                        dAll[pOff * TN + sCol] = dv;
+                        uint32 cb = sCol * 8;
+                        dAll[sCol] = dv;
                         scAll[cb] = d0 & 63;
                         scAll[cb + 1] = d1 & 63;
                         scAll[cb + 2] = d2 & 63;
@@ -254,8 +246,8 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                         Vector<int32,4> q1 = pq1;
                         Vector<int32,1> xw = px;
                         float32 xv = Cajeta.bitsToF32(xw[0]);
-                        xsAll[pOff * TM + sCol] = xv;
-                        uint32 rb = pOff * (TM * 8) + (sCol >> 4) * 128 + (sCol & 15);
+                        xsAll[sCol] = xv;
+                        uint32 rb = (sCol >> 4) * 128 + (sCol & 15);
                         rgAll[rb] = xv * (float32) q0[0];
                         rgAll[rb + 16] = xv * (float32) q0[1];
                         rgAll[rb + 32] = xv * (float32) q0[2];
@@ -299,10 +291,9 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                         for (uint32 n = 0; n < WN / 16; n = n + 1) { iacc[i][n].splat(0); }
                     }
                 }
-                uint32 cBase = pOff * (TN * 8) + (WN * wc) * 8;
-                uint32 rPanel = pOff * (TM * 8);
-                uint32 aBuf = bufA + (WM * wr) * 144;
-                uint32 bBuf = bufB + (WN * wc) * 144;
+                uint32 cBase = (WN * wc) * 8;
+                uint32 aBuf = (WM * wr) * 144;
+                uint32 bBuf = (WN * wc) * 144;
                 uint32 jj = 0;
                 while (jj < 4) {
                     uint32 j = 4 * H + jj;
@@ -342,7 +333,7 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                     // Four vectors loaded, then the row factor once per row
                     // fragment, then the updates: the hand-written kernel's
                     // load order, which is the order ptxas schedules.
-                    uint32 rbase = rPanel + ((WM / 16) * 8 * wr + j) * 16;
+                    uint32 rbase = ((WM / 16) * 8 * wr + j) * 16;
                     for (uint32 n = 0; n + 3 < WN / 16; n = n + 4) {
                         WaveVector<float32, 16> cgA = WaveVector.ofSlice(cgAll, cBase + n * 128 + j, 8);
                         WaveVector<float32, 16> cgB = WaveVector.ofSlice(cgAll, cBase + n * 128 + 128 + j, 8);
@@ -366,8 +357,8 @@ public final class QkTile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                     jj = jj + 1;
                 }
                 if (H == 1) {
-                    uint32 dbase = pOff * TN + WN * wc;
-                    uint32 xbase = pOff * TM + WM * wr;
+                    uint32 dbase = WN * wc;
+                    uint32 xbase = WM * wr;
                     for (uint32 i = 0; i < WM / 16; i = i + 1) {
                         for (uint32 n = 0; n < WN / 16; n = n + 1) {
                             WaveVector<float32, 16> dcv = WaveVector.ofSlice(dAll, dbase + 16 * n, 1);

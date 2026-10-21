@@ -32,10 +32,9 @@ import cajeta.xpu.WaveVector;
  * granularity: Q6_K scales every 16 values, so the integer fold runs per
  * mma, and there is no min term.
  *
- * Shared memory, in TM / 64 buffers as QkTile's (23 and 92 KB): a TM x 144
- * and a TN x 144 int8 half-block tile (the
- * 16-byte pad keeps a fragment's rows off one bank), {@code xsAll[buf*TM +
- * token]}, {@code dAll[buf*TN + col]}, and {@code scAll[buf*TN*16 + j*TN +
+ * Shared memory, single-buffered behind a barrier per half: a TM x 144 and
+ * a TN x 144 int8 half-block tile (the 16-byte pad keeps a fragment's rows off
+ * one bank), {@code xsAll[token]}, {@code dAll[col]}, and {@code scAll[j*TN +
  * col]}, the block's sixteen scales scale-major so a wave's slice over
  * sixteen columns is a run of consecutive words.
  */
@@ -74,21 +73,19 @@ public final class Q6Tile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
         return;
     }
 
-    // As QkTile.q4kQ8: a literal block of 2 * TN, held on amdgpu and vulkan
-    // where the 128x128 member's shared memory is over 64 KB; the 64x64
-    // member may lower there, so the hold is per instantiation.
+    // As QkTile.q4kQ8: a literal block of 2 * TN, single-buffered (23 and 46 KB).
     @Occupancy(maxThreads = 2 * TN)
     @Kernel @FastMath
-    @Unlowered(backend = {"amdgpu", "vulkan"}, tracked = "xpu-tile-shape-selection 4.9.1", mayLower = true)
+    @Unlowered(backend = {"vulkan"}, tracked = "xpu-tile-shape-selection 4.9.1", mayLower = true)
     public static void q6kQ8(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp, uint32 rows,
             uint32 outDim, uint32 tilesN, int64 blocksPerRow,
             KernelBuffer<float32> part, uint32 splits, uint32 accum) {
-        Shared<int8> aT = shared int8[(TM / 64) * TM * 144];
-        Shared<int8> bT = shared int8[(TM / 64) * TN * 144];
-        Shared<float32> xsAll = shared float32[(TM / 64) * TM];
-        Shared<float32> dAll = shared float32[(TM / 64) * TN];
-        Shared<int32> scAll = shared int32[(TM / 64) * TN * 16];
+        Shared<int8> aT = shared int8[TM * 144];
+        Shared<int8> bT = shared int8[TN * 144];
+        Shared<float32> xsAll = shared float32[TM];
+        Shared<float32> dAll = shared float32[TN];
+        Shared<int32> scAll = shared int32[TN * 16];
 
         uint32 tid = KernelThread.x();
         uint32 wid = tid / 32;
@@ -158,11 +155,8 @@ public final class Q6Tile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
             uint32 hh = 0;
             while (hh < nh) {
                 uint32 H = hh & 1;
-                uint32 bufA = (H & (TM / 64 - 1)) * (TM * 144);
-                uint32 bufB = (H & (TM / 64 - 1)) * (TN * 144);
-                uint32 pOff = ((hh >> 1) & 1) * (TM / 64 - 1);
-                if (TM == 64) { Barrier.workgroup(); }
-                int64 aDst = (int64) (bufA + aDst0);
+                Barrier.workgroup();
+                int64 aDst = (int64) aDst0;
                 aT.vstore(aDst, pa0.asBytes());
                 aT.vstore(aDst + (int64) aDstP, pa1.asBytes());
                 aT.vstore(aDst + (int64) (2 * aDstP), pa2.asBytes());
@@ -171,7 +165,7 @@ public final class Q6Tile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                     // k 32sH..32sH+31 from the low nibbles with qh bits
                     // 2sH..2sH+1, k 64+32sH.. from the high nibbles with
                     // bits 2sH+4..; both biased by 32 (Quant.q6kBlock).
-                    int64 dst = (int64) (bufB + sCol * 144 + 32 * sH);
+                    int64 dst = (int64) (sCol * 144 + 32 * sH);
                     Vector<int32,4> l0 = pl0;
                     Vector<int32,4> l1 = pl1;
                     Vector<int32,4> h0 = ph0 >> shq;
@@ -191,9 +185,9 @@ public final class Q6Tile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                 }
                 if (H == 0) {
                     if (sH == 0) {
-                        dAll[pOff * TN + sCol] = GgufFile.halfBitsToF32(pd);
+                        dAll[sCol] = GgufFile.halfBitsToF32(pd);
                         Vector<int32,4> sw = psc;
-                        uint32 cb = pOff * (TN * 16) + sCol;
+                        uint32 cb = sCol;
                         int32 s0 = sw[0];
                         int32 s1 = sw[1];
                         int32 s2 = sw[2];
@@ -216,7 +210,7 @@ public final class Q6Tile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                         scAll[cb + 15 * TN] = s3 >> 24;
                     } else {
                         Vector<int32,1> xw = px;
-                        xsAll[pOff * TM + sCol] = Cajeta.bitsToF32(xw[0]);
+                        xsAll[sCol] = Cajeta.bitsToF32(xw[0]);
                     }
                 }
                 if (hh + 1 < nh) {
@@ -252,9 +246,9 @@ public final class Q6Tile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                         for (uint32 n = 0; n < WN / 16; n = n + 1) { iacc[i][n].splat(0); }
                     }
                 }
-                uint32 cBase = pOff * (TN * 16) + WN * wc;
-                uint32 aBuf = bufA + (WM * wr) * 144;
-                uint32 bBuf = bufB + (WN * wc) * 144;
+                uint32 cBase = WN * wc;
+                uint32 aBuf = (WM * wr) * 144;
+                uint32 bBuf = (WN * wc) * 144;
                 uint32 jj = 0;
                 while (jj < 8) {
                     uint32 sj = cBase + (8 * H + jj) * TN;
@@ -276,8 +270,8 @@ public final class Q6Tile<uint32 TM, uint32 TN, uint32 WM, uint32 WN, uint32 KS>
                     jj = jj + 1;
                 }
                 if (H == 1) {
-                    uint32 dbase = pOff * TN + WN * wc;
-                    uint32 xbase = pOff * TM + WM * wr;
+                    uint32 dbase = WN * wc;
+                    uint32 xbase = WM * wr;
                     for (uint32 i = 0; i < WM / 16; i = i + 1) {
                         for (uint32 n = 0; n < WN / 16; n = n + 1) {
                             WaveVector<float32, 16> dcv = WaveVector.ofSlice(dAll, dbase + 16 * n, 1);
