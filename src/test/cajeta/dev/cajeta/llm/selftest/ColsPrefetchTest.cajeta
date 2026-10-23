@@ -1,0 +1,183 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.unit.Assert;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import cajeta.lang.String;
+import cajeta.lang.Cajeta;
+
+/** cajeta-llm 15.2.12.3.1: the prefetching Cols mat-vecs match the plain ones bit for bit at every column count, and a probe picks between them. */
+public class ColsPrefetchTest {
+
+    public ColsPrefetchTest() { return; }
+
+    /** Whether the plain and prefetching Cols kernels of `q` ("q4k" or "q6k") run here; skips by name when not. */
+    static boolean both(String q) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return false; }
+        String plain = "q4kQ8WaveMatVecColsKernel";
+        String pf = "q4kQ8WavePfMatVecColsKernel";
+        if (q.equals("q6k")) {
+            plain = "q6kQ8WaveMatVecColsKernel";
+            pf = "q6kQ8WavePfMatVecColsKernel";
+        }
+        if (!KernelCap.usable(plain)) { DeviceSkip.noKernel(plain, be); return false; }
+        if (!KernelCap.usable(pf)) { DeviceSkip.noKernel(pf, be); return false; }
+        return true;
+    }
+
+    /** `ncols` columns of `rows` x `cols` through the Cols launcher of `q`, the variant pinned to `pin`, over a seeded output when `accum`. */
+    static #float32[] run(String q, int64 rows, int64 cols, int32 ncols, boolean accum, int32 pin) {
+        boolean six = q.equals("q6k");
+        int8[] raw #= MatVecPrefetchTest.weight(rows * (cols / 256L));
+        if (six) { raw #= MatVecPrefetchTest.q6Weight(rows, cols); }
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int8[] xp #= heap int8[pb * (int64) ncols];
+        int8[] one #= heap int8[pb];
+        float32[] x #= QuantKernelTest.activations(cols);
+        int32 c = 0;
+        while (c < ncols) {
+            int64 z = 0;
+            while (z < cols) { x[z] = x[z] * -1.25f + 0.01f * (float32) c; z = z + 1; }
+            Quant.q8kPack(x, 0L, cols, one);
+            int64 k = 0;
+            while (k < pb) { xp[(int64) c * pb + k] = one[k]; k = k + 1; }
+            c = c + 1;
+        }
+        KernelBuffer<int8> wb #= heap KernelBuffer<int8>((uint64) raw.count());
+        KernelBuffer<int8> xb #= heap KernelBuffer<int8>((uint64) xp.count());
+        wb.upload(raw);
+        xb.upload(xp);
+        int64 n = rows * (int64) ncols;
+        float32[] seed #= heap float32[n];
+        int64 r = 0;
+        while (r < n) { seed[r] = 0.25f * (float32) ((r % 9L) - 4L); r = r + 1; }
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) n);
+        y.upload(seed, n);
+        if (six) {
+            QuantKernel.setQ6ColsPrefetch(pin);
+            QuantKernel.q6kQ8WaveMatVecColsLaunchNoSync(y, wb, xb, rows, cols, 0L, ncols, rows, pb, accum);
+        } else {
+            QuantKernel.setQ4ColsPrefetch(pin);
+            QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(y, wb, xb, rows, cols, 0L, ncols, rows, pb, accum);
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        QuantKernel.setQ4ColsPrefetch(0);
+        QuantKernel.setQ6ColsPrefetch(0);
+        float32[] got #= heap float32[n];
+        y.download(got, n);
+        return #got;
+    }
+
+    /** Fails naming the first output where the two variants of `q` differ. */
+    static void same(String q, int64 rows, int64 cols, int32 ncols, boolean accum) {
+        float32[] plain #= ColsPrefetchTest.run(q, rows, cols, ncols, accum, 2);
+        float32[] pf #= ColsPrefetchTest.run(q, rows, cols, ncols, accum, 1);
+        QuantKernelTest.assertLive(plain, "plain " + q + " cols mat-vec");
+        int64 n = rows * (int64) ncols;
+        int64 i = 0;
+        while (i < n) {
+            if (Cajeta.f32ToBits(plain[i]) != Cajeta.f32ToBits(pf[i])) {
+                Assert.fail(q + " " + rows + "x" + cols + " at " + ncols + " columns" + (accum ? " accum" : "")
+                    + ": column " + (i / rows) + " row " + (i % rows) + " is " + pf[i] + " prefetched, " + plain[i] + " plain");
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    /** Every column count from one to the most a launch serves, at a row count that is not a multiple of anything. */
+    static void everyWidth(String q, int64 rows, int64 cols) {
+        ColsPrefetchTest.same(q, rows, cols, 1, false);
+        ColsPrefetchTest.same(q, rows, cols, 2, false);
+        ColsPrefetchTest.same(q, rows, cols, 3, false);
+        ColsPrefetchTest.same(q, rows, cols, 4, false);
+        ColsPrefetchTest.same(q, rows, cols, 5, false);
+        ColsPrefetchTest.same(q, rows, cols, 8, false);
+    }
+
+    @Test
+    public void q4MatchesAtEveryColumnCount() {
+        if (!ColsPrefetchTest.both("q4k")) { return; }
+        ColsPrefetchTest.everyWidth("q4k", 13L, 4096L);
+    }
+
+    @Test
+    public void q4MatchesAtTheDownShapeAndShortRows() {
+        if (!ColsPrefetchTest.both("q4k")) { return; }
+        ColsPrefetchTest.same("q4k", 9L, 14336L, 4, false);
+        ColsPrefetchTest.same("q4k", 11L, 768L, 4, false);
+    }
+
+    @Test
+    public void q4MatchesInTheAccumulateForm() {
+        if (!ColsPrefetchTest.both("q4k")) { return; }
+        ColsPrefetchTest.same("q4k", 19L, 4096L, 4, true);
+    }
+
+    @Test
+    public void q6MatchesAtEveryColumnCount() {
+        if (!ColsPrefetchTest.both("q6k")) { return; }
+        ColsPrefetchTest.everyWidth("q6k", 13L, 4096L);
+    }
+
+    @Test
+    public void q6MatchesAtTheDownShapeAndShortRows() {
+        if (!ColsPrefetchTest.both("q6k")) { return; }
+        ColsPrefetchTest.same("q6k", 9L, 14336L, 4, false);
+        ColsPrefetchTest.same("q6k", 11L, 768L, 4, false);
+    }
+
+    @Test
+    public void q6MatchesInTheAccumulateForm() {
+        if (!ColsPrefetchTest.both("q6k")) { return; }
+        ColsPrefetchTest.same("q6k", 19L, 14336L, 4, true);
+    }
+
+    /** FIRES: pinned to the prefetch variant, each Cols launcher launches it. */
+    @Test
+    public void theLaunchersTakeThePrefetchKernelWhenItIsFaster() {
+        if (!ColsPrefetchTest.both("q4k") || !ColsPrefetchTest.both("q6k")) { return; }
+        int64 b4 = QuantKernel.q4ColsPrefetchLaunches();
+        int64 b6 = QuantKernel.q6ColsPrefetchLaunches();
+        ColsPrefetchTest.run("q4k", 8L, 2048L, 4, false, 1);
+        ColsPrefetchTest.run("q6k", 8L, 2048L, 4, false, 1);
+        Assert.isTrue(QuantKernel.q4ColsPrefetchLaunches() == b4 + 1L);
+        Assert.isTrue(QuantKernel.q6ColsPrefetchLaunches() == b6 + 1L);
+    }
+
+    /** DOES NOT FIRE: pinned to the plain variant, each Cols launcher keeps it. */
+    @Test
+    public void theLaunchersKeepThePlainKernelWhenItIsFaster() {
+        if (!ColsPrefetchTest.both("q4k") || !ColsPrefetchTest.both("q6k")) { return; }
+        int64 b4 = QuantKernel.q4ColsPrefetchLaunches();
+        int64 b6 = QuantKernel.q6ColsPrefetchLaunches();
+        ColsPrefetchTest.run("q4k", 8L, 2048L, 4, false, 2);
+        ColsPrefetchTest.run("q6k", 8L, 2048L, 4, false, 2);
+        Assert.isTrue(QuantKernel.q4ColsPrefetchLaunches() == b4);
+        Assert.isTrue(QuantKernel.q6ColsPrefetchLaunches() == b6);
+    }
+
+    /** The two Cols probes time both variants each and keep the faster, apart from the one-column probes. */
+    @Test
+    public void theProbesTimeBothVariants() {
+        if (!ColsPrefetchTest.both("q4k") || !ColsPrefetchTest.both("q6k")) { return; }
+        QuantKernel.setQ4ColsPrefetch(0);
+        QuantKernel.setQ6ColsPrefetch(0);
+        boolean v4 = QuantKernel.q4ColsPrefetchPays();
+        boolean v6 = QuantKernel.q6ColsPrefetchPays();
+        Assert.isTrue(QuantKernel.q4ColsPrefetchProbePfNs() > 0L);
+        Assert.isTrue(QuantKernel.q4ColsPrefetchProbePlainNs() > 0L);
+        Assert.isTrue(QuantKernel.q6ColsPrefetchProbePfNs() > 0L);
+        Assert.isTrue(QuantKernel.q6ColsPrefetchProbePlainNs() > 0L);
+        Assert.isTrue(v4 == (QuantKernel.q4ColsPrefetchProbePfNs() < QuantKernel.q4ColsPrefetchProbePlainNs()));
+        Assert.isTrue(v6 == (QuantKernel.q6ColsPrefetchProbePfNs() < QuantKernel.q6ColsPrefetchProbePlainNs()));
+        QuantKernel.setQ4ColsPrefetch(0);
+        QuantKernel.setQ6ColsPrefetch(0);
+    }
+}
