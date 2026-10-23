@@ -1,0 +1,155 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.EngineOptions;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.model.KvPool;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/** cajeta-llm 15.2.12.3.2.1: decode slots' K/V planes are slices of one pool per layer, grown on demand without losing a byte. */
+public class KvPoolTest {
+
+    static final int64 PLANE = 1000L;
+
+    public KvPoolTest() { return; }
+
+    static boolean device() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return false; }
+        return true;
+    }
+
+    /** A plane's worth of halves unique to (layer, slot, plane kind). */
+    static #float16[] pattern(int32 li, int32 slot, int32 kind) {
+        float16[] h #= heap float16[KvPoolTest.PLANE];
+        int64 i = 0;
+        while (i < KvPoolTest.PLANE) {
+            h[i] = (float16) (float32) ((i % 97L) + 100L * (int64) slot + 1000L * (int64) li + 7L * (int64) kind);
+            i = i + 1;
+        }
+        return #h;
+    }
+
+    static void write(KvPool p, int32 li, int32 slot) {
+        float16[] k #= KvPoolTest.pattern(li, slot, 0);
+        float16[] v #= KvPoolTest.pattern(li, slot, 1);
+        KernelBuffer<float16> ks #= p.kSlice(li, slot);
+        KernelBuffer<float16> vs #= p.vSlice(li, slot);
+        ks.upload(k);
+        vs.upload(v);
+    }
+
+    /** Fails naming the first element of (layer, slot) that lost its pattern. */
+    static void holds(KvPool p, int32 li, int32 slot, String when) {
+        float16[] k #= heap float16[KvPoolTest.PLANE];
+        float16[] v #= heap float16[KvPoolTest.PLANE];
+        KernelBuffer<float16> ks #= p.kSlice(li, slot);
+        KernelBuffer<float16> vs #= p.vSlice(li, slot);
+        ks.download(k);
+        vs.download(v);
+        float16[] wk #= KvPoolTest.pattern(li, slot, 0);
+        float16[] wv #= KvPoolTest.pattern(li, slot, 1);
+        int64 i = 0;
+        while (i < KvPoolTest.PLANE) {
+            if ((float32) k[i] != (float32) wk[i] || (float32) v[i] != (float32) wv[i]) {
+                Assert.fail(when + ": layer " + li + " slot " + slot + " element " + i
+                    + " is k " + (float32) k[i] + " v " + (float32) v[i]
+                    + ", wrote k " + (float32) wk[i] + " v " + (float32) wv[i]);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    @Test
+    public void growingKeepsEveryByteOfTheEarlierSlots() {
+        if (!KvPoolTest.device()) { return; }
+        KvPool p #= heap KvPool(2, KvPoolTest.PLANE);
+        p.ensureSlots(1);
+        KvPoolTest.write(p, 0, 0);
+        KvPoolTest.write(p, 1, 0);
+        int64[] vc #= ValueCheck.mark();
+        p.ensureSlots(2);
+        KvPoolTest.write(p, 0, 1);
+        KvPoolTest.write(p, 1, 1);
+        p.ensureSlots(3);
+        Assert.equals(3L, (int64) p.slots());
+        KvPoolTest.holds(p, 0, 0, "after growing to 3");
+        KvPoolTest.holds(p, 1, 0, "after growing to 3");
+        KvPoolTest.holds(p, 0, 1, "after growing to 3");
+        KvPoolTest.holds(p, 1, 1, "after growing to 3");
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void aSlotsSliceTouchesOnlyThatSlot() {
+        if (!KvPoolTest.device()) { return; }
+        KvPool p #= heap KvPool(1, KvPoolTest.PLANE);
+        p.ensureSlots(3);
+        KvPoolTest.write(p, 0, 0);
+        KvPoolTest.write(p, 0, 2);
+        KvPoolTest.write(p, 0, 1);
+        KvPoolTest.holds(p, 0, 0, "after writing slot 1");
+        KvPoolTest.holds(p, 0, 2, "after writing slot 1");
+        Assert.equals(KvPoolTest.PLANE, p.slotBase(1));
+        Assert.equals(2L * KvPoolTest.PLANE, p.slotBase(2));
+    }
+
+    @Test
+    public void aPoolPastTwoGibibytesIsRefused() {
+        KvPool p #= heap KvPool(1, 1L << 28);
+        Assert.isTrue(p.fits(3));
+        Assert.isTrue(!p.fits(5));
+    }
+
+    static #LlmEngine engine(int32 seqs) {
+        EngineOptions o #= heap EngineOptions(RoutableFixtureTest.FIX);
+        o.ctx = 128;
+        o.maxSeqs = seqs;
+        o.blockTokens = 16;
+        o.chunk = 64;
+        LlmEngine e #= LlmEngine.load(#o);
+        return #e;
+    }
+
+    /** One sequence on a four-slot engine holds one slot, so a lone stream's memory is what it was; four hold four. */
+    /** Engine load sets the process-wide prefill-weight policy; put it back for the tests after this one. */
+    @Test
+    public void slotsAreAllocatedOnlyForSequencesThatDecode() {
+        if (!KvPoolTest.device()) { return; }
+        boolean autoWas = Linear.deqAutoOn();
+        boolean deqWas = Linear.deqPrefillOn();
+        KvPoolTest.slotCounts();
+        Linear.setDeqAuto(autoWas);
+        Linear.setDeqPrefill(deqWas);
+    }
+
+    static void slotCounts() {
+        LlmEngine one #= KvPoolTest.engine(4);
+        int32[] p #= RoutableFixtureTest.promptOf(20, 5);
+        one.submitTokens(p, 20, 8, #heap SampleParams(0.0f, 41L));
+        one.runAll(200);
+        if (one.model().deviceKvSlotsActive() == 0) {
+            one.close();
+            DeviceSkip.tracked("the fixture decodes on the host here", "15.2.12.3.2.1");
+            return;
+        }
+        Assert.equals(1L, (int64) one.model().kvPoolSlots());
+        one.close();
+        LlmEngine four #= KvPoolTest.engine(4);
+        int32 q = 0;
+        while (q < 4) {
+            int32[] pq #= RoutableFixtureTest.promptOf(20 + 3 * q, 5 + 11 * q);
+            four.submitTokens(pq, 20 + 3 * q, 8, #heap SampleParams(0.0f, (int64) (41 + q)));
+            q = q + 1;
+        }
+        four.runAll(400);
+        Assert.equals(4L, (int64) four.model().kvPoolSlots());
+        four.close();
+    }
+}

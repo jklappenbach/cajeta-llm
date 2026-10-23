@@ -1,0 +1,103 @@
+package dev.cajeta.llm.model;
+
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelThread;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * The decode slots' K/V planes, one K and one V buffer per layer, slot s at
+ * element `s * plane` (cajeta-llm 15.2.12.3.2.1). A kernel handed the whole
+ * buffer reaches every slot, so the batch's attention is one launch.
+ */
+public final class KvPool {
+    KernelBuffer<float16>[] k;
+    KernelBuffer<float16>[] v;
+    int32 layers;
+    int64 plane;
+    int32 nSlots;
+
+    /** A pool of `layers` K and V buffers of `plane` halves a slot; holds no slot until {@link #ensureSlots}. */
+    public KvPool(int32 layers, int64 plane) {
+        this.layers = layers;
+        this.plane = plane;
+        this.nSlots = 0;
+        this.k #= heap KernelBuffer<float16>[(int64) layers];
+        this.v #= heap KernelBuffer<float16>[(int64) layers];
+    }
+
+    /** Slots the buffers hold. */
+    public int32 slots() { return this.nSlots; }
+
+    /** Halves a slot's plane takes. */
+    public int64 planeElements() { return this.plane; }
+
+    /** Whether `n` slots fit one buffer under 2 GiB. */
+    public boolean fits(int32 n) {
+        return (int64) n * this.plane * 2L < (1L << 31);
+    }
+
+    /** Slot `slot`'s first element in a layer's buffer. */
+    public int64 slotBase(int32 slot) { return (int64) slot * this.plane; }
+
+    /** Layer `li`'s K buffer, every slot: a BORROW, replaced by a growth. */
+    public KernelBuffer<float16> kAll(int32 li) { return this.k[(int64) li]; }
+
+    /** Layer `li`'s V buffer, every slot: a BORROW, replaced by a growth. */
+    public KernelBuffer<float16> vAll(int32 li) { return this.v[(int64) li]; }
+
+    /** Slot `slot`'s K plane in layer `li`, a view that a growth invalidates. */
+    public #KernelBuffer<float16> kSlice(int32 li, int32 slot) {
+        KernelBuffer<float16> s #= this.k[(int64) li].slice((uint64) this.slotBase(slot), (uint64) this.plane);
+        return #s;
+    }
+
+    /** Slot `slot`'s V plane in layer `li`, a view that a growth invalidates. */
+    public #KernelBuffer<float16> vSlice(int32 li, int32 slot) {
+        KernelBuffer<float16> s #= this.v[(int64) li].slice((uint64) this.slotBase(slot), (uint64) this.plane);
+        return #s;
+    }
+
+    /** Grow to at least `n` slots, copying the slots already held; every earlier slice is stale afterwards. */
+    public void ensureSlots(int32 n) {
+        if (n <= this.nSlots) { return; }
+        uint64 count = (uint64) ((int64) n * this.plane);
+        int64 keep = (int64) this.nSlots * this.plane;
+        int32 l = 0;
+        while (l < this.layers) {
+            KernelBuffer<float16> nk #= heap KernelBuffer<float16>(count);
+            KernelBuffer<float16> nv #= heap KernelBuffer<float16>(count);
+            if (keep > 0L) {
+                KvPool.copyLaunchNoSync(nk, this.k[(int64) l], keep);
+                KvPool.copyLaunchNoSync(nv, this.v[(int64) l], keep);
+                KernelStream s = QuantKernel.stream();
+                s.sync();
+            }
+            this.k[(int64) l] #= nk;
+            this.v[(int64) l] #= nv;
+            l = l + 1;
+        }
+        this.nSlots = n;
+        return;
+    }
+
+    /** `dst[i] = src[i]` for i < n, grid-stride over `stride` threads. */
+    @Kernel
+    public static void copyF16Kernel(KernelBuffer<float16> dst, KernelBuffer<float16> src,
+            uint32 n, uint32 stride) {
+        uint32 i = KernelThread.globalIdX();
+        while (i < n) {
+            dst[(int64) i] = src[(int64) i];
+            i = i + stride;
+        }
+    }
+
+    static void copyLaunchNoSync(KernelBuffer<float16> dst, KernelBuffer<float16> src, int64 n) {
+        int64 groups = (n + 255L) / 256L;
+        if (groups > 4096L) { groups = 4096L; }
+        KernelStream s = QuantKernel.stream();
+        copyF16Kernel.launch(s, grid: [(uint32) groups], block: [256])
+            (dst, src, (uint32) n, (uint32) (groups * 256L));
+        return;
+    }
+}
