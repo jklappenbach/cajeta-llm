@@ -1,0 +1,218 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.Cajeta;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.AttnKernel;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.KvPool;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/** cajeta-llm 15.2.12.3.2.2: one prep, flash and reduce-pack launch for a whole decode batch gives each row exactly what its own three launches give. */
+public class AttnBatchDecodeTest {
+
+    static final int32 NH = 8;
+    static final int32 NKV = 2;
+    static final int32 HD = 128;
+    static final int32 CAP = 704;
+
+    public AttnBatchDecodeTest() { return; }
+
+    static boolean kernels() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return false; }
+        if (!KernelCap.usable("qkPrepBatchKernel")) { DeviceSkip.noKernel("qkPrepBatchKernel", be); return false; }
+        if (!KernelCap.usable("attnFlashDecodeGqa4BatchKernel")) { DeviceSkip.noKernel("attnFlashDecodeGqa4BatchKernel", be); return false; }
+        if (!KernelCap.usable("attnReducePackQ8BatchKernel")) { DeviceSkip.noKernel("attnReducePackQ8BatchKernel", be); return false; }
+        return true;
+    }
+
+    /** Positions of the rows: lengths 1, 3, 16, 100, 513 and 700, cycled. */
+    static int32 posOf(int32 r) {
+        int32 m = r % 6;
+        if (m == 0) { return 0; }
+        if (m == 1) { return 2; }
+        if (m == 2) { return 15; }
+        if (m == 3) { return 99; }
+        if (m == 4) { return 512; }
+        return 699;
+    }
+
+    /** A pool of `n` slots whose earlier positions hold spread halves. */
+    static #KvPool pool(int32 n) {
+        int64 kvDim = (int64) (AttnBatchDecodeTest.NKV * AttnBatchDecodeTest.HD);
+        KvPool p #= heap KvPool(1, (int64) AttnBatchDecodeTest.CAP * kvDim);
+        p.ensureSlots(n);
+        int32 s = 0;
+        while (s < n) {
+            float32[] k #= AttnKernelTest.spread(p.planeElements(), 5 + s);
+            float32[] v #= AttnKernelTest.spread(p.planeElements(), 9 + s);
+            float16[] kh #= heap float16[p.planeElements()];
+            float16[] vh #= heap float16[p.planeElements()];
+            int64 i = 0;
+            while (i < p.planeElements()) { kh[i] = (float16) k[i]; vh[i] = (float16) v[i]; i = i + 1; }
+            KernelBuffer<float16> ks #= p.kSlice(0, s);
+            KernelBuffer<float16> vs #= p.vSlice(0, s);
+            ks.upload(kh);
+            vs.upload(vh);
+            s = s + 1;
+        }
+        return #p;
+    }
+
+    /** Runs `n` rows through the batched launches when `batch`, else each row's own; returns the packed rows then the pool's K and V as bytes. */
+    static #int8[] run(int32 n, boolean batch, boolean norm) {
+        int32 nH = AttnBatchDecodeTest.NH;
+        int32 nKv = AttnBatchDecodeTest.NKV;
+        int32 hd = AttnBatchDecodeTest.HD;
+        int64 qd = (int64) (nH * hd);
+        int64 kvd = (int64) (nKv * hd);
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        KvPool p #= AttnBatchDecodeTest.pool(n);
+        float32[] q #= AttnKernelTest.spread(qd * (int64) n, 3);
+        float32[] k #= AttnKernelTest.spread(kvd * (int64) n, 4);
+        float32[] v #= AttnKernelTest.spread(kvd * (int64) n, 6);
+        float32[] w #= AttnKernelTest.spread((int64) hd, 7);
+        float32[] inv #= heap float32[(int64) (hd / 2)];
+        int64 i = 0;
+        while (i < (int64) (hd / 2)) { inv[i] = 1.0f / Math.pow(10000.0f, (float32) (2L * i) / (float32) hd); i = i + 1; }
+        KernelBuffer<float32> qb #= heap KernelBuffer<float32>((uint64) q.count());
+        KernelBuffer<float32> kb #= heap KernelBuffer<float32>((uint64) k.count());
+        KernelBuffer<float32> vb #= heap KernelBuffer<float32>((uint64) v.count());
+        KernelBuffer<float32> wb #= heap KernelBuffer<float32>((uint64) hd);
+        KernelBuffer<float32> ib #= heap KernelBuffer<float32>((uint64) (hd / 2));
+        qb.upload(q);
+        kb.upload(k);
+        vb.upload(v);
+        wb.upload(w);
+        ib.upload(inv);
+        int64 pb = Quant.q8kPackedBytes(qd);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) (pb * (int64) n));
+        KernelBuffer<float32> qw = ib;
+        if (norm) { qw = wb; }
+        if (batch) {
+            int32[] slots #= heap int32[(int64) n];
+            int32[] pos #= heap int32[(int64) n];
+            int32 r = 0;
+            while (r < n) { slots[(int64) r] = (int32) p.slotBase(r); pos[(int64) r] = AttnBatchDecodeTest.posOf(r); r = r + 1; }
+            KernelBuffer<int32> tab #= heap KernelBuffer<int32>((uint64) (4 * n));
+            int32 maxSplits = AttnKernel.decodeRowTable(slots, pos, n, tab);
+            AttnKernel.attendDecodeBatchLaunchNoSync(xp, qb, kb, vb, p.kAll(0), p.vAll(0), qw, qw, ib,
+                nH, nKv, hd, norm, 1.0e-5f, 0, tab, n, maxSplits, pb, scale);
+        } else {
+            int32 r = 0;
+            while (r < n) {
+                int32 ps = AttnBatchDecodeTest.posOf(r);
+                KernelBuffer<float32> qr #= qb.slice((uint64) ((int64) r * qd), (uint64) qd);
+                KernelBuffer<float32> kr #= kb.slice((uint64) ((int64) r * kvd), (uint64) kvd);
+                KernelBuffer<float32> vr #= vb.slice((uint64) ((int64) r * kvd), (uint64) kvd);
+                KernelBuffer<float16> ks #= p.kSlice(0, r);
+                KernelBuffer<float16> vs #= p.vSlice(0, r);
+                KernelBuffer<int8> xr #= xp.slice((uint64) ((int64) r * pb), (uint64) pb);
+                AttnKernel.qkPrepLaunchNoSync(qr, kr, vr, ks, vs, qw, qw, ib, nH, nKv, hd,
+                    norm, 1.0e-5f, 0, ps, ps);
+                Assert.isTrue(AttnKernel.attendDecodePartialsLaunchNoSync(qr, ks, vs, nH, nKv, hd,
+                    ps + 1, 0, scale));
+                AttnKernel.reducePackLaunchNoSync(xr, nH);
+                r = r + 1;
+            }
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int64 plane = p.planeElements() * (int64) n;
+        int8[] out #= heap int8[pb * (int64) n + 4L * plane];
+        int8[] xh #= heap int8[pb * (int64) n];
+        xp.download(xh);
+        float16[] kh #= heap float16[plane];
+        float16[] vh #= heap float16[plane];
+        KernelBuffer<float16> ka = p.kAll(0);
+        KernelBuffer<float16> va = p.vAll(0);
+        ka.download(kh);
+        va.download(vh);
+        int64 j = 0;
+        while (j < pb * (int64) n) { out[j] = xh[j]; j = j + 1; }
+        int64 o = pb * (int64) n;
+        j = 0;
+        while (j < plane) {
+            int32 kb2 = Cajeta.f32ToBits((float32) kh[j]);
+            int32 vb2 = Cajeta.f32ToBits((float32) vh[j]);
+            out[o + 4L * j] = (int8) (kb2 & 255);
+            out[o + 4L * j + 1L] = (int8) ((kb2 >> 8) & 255);
+            out[o + 4L * j + 2L] = (int8) (vb2 & 255);
+            out[o + 4L * j + 3L] = (int8) ((vb2 >> 8) & 255);
+            j = j + 1;
+        }
+        return #out;
+    }
+
+    /** Holds the batched launches byte-equal to each row's own, which AttnKernelTest holds to the host floor. */
+    static void same(int32 n, boolean norm) {
+        int8[] want #= AttnBatchDecodeTest.run(n, false, norm);
+        int64[] vc #= ValueCheck.mark();
+        int8[] got #= AttnBatchDecodeTest.run(n, true, norm);
+        int64 qd = (int64) (AttnBatchDecodeTest.NH * AttnBatchDecodeTest.HD);
+        int64 pbAll = Quant.q8kPackedBytes(qd) * (int64) n;
+        Assert.equals((int64) want.count(), (int64) got.count());
+        int64 i = 0;
+        while (i < (int64) want.count()) {
+            if (want[i] != got[i]) {
+                String where = "packed attention byte " + i;
+                if (i >= pbAll) { where = "K/V pool element " + ((i - pbAll) / 4L); }
+                Assert.fail(n + " rows" + (norm ? " with qk-norm" : "") + ": " + where
+                    + " is " + (int32) got[i] + " batched, " + (int32) want[i] + " row by row");
+                return;
+            }
+            i = i + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void oneRowMatchesItsOwnLaunches() {
+        if (!AttnBatchDecodeTest.kernels()) { return; }
+        AttnBatchDecodeTest.same(1, false);
+    }
+
+    @Test
+    public void twoAndFourRowsOfMixedLengthsMatchTheirOwnLaunches() {
+        if (!AttnBatchDecodeTest.kernels()) { return; }
+        AttnBatchDecodeTest.same(2, false);
+        AttnBatchDecodeTest.same(4, false);
+    }
+
+    @Test
+    public void eightRowsMatchTheirOwnLaunches() {
+        if (!AttnBatchDecodeTest.kernels()) { return; }
+        AttnBatchDecodeTest.same(8, false);
+    }
+
+    @Test
+    public void rowsWithQkNormMatchTheirOwnLaunches() {
+        if (!AttnBatchDecodeTest.kernels()) { return; }
+        AttnBatchDecodeTest.same(4, true);
+    }
+
+    /** FIRES for GQA x4 at head 128, DOES NOT for x8 or another head size. */
+    @Test
+    public void theBatchedRouteServesOnlyGqaFourAtHead128() {
+        Assert.isTrue(AttnKernel.batchDecodeServes(8, 2, 128));
+        Assert.isTrue(AttnKernel.batchDecodeServes(32, 8, 128));
+        Assert.isTrue(!AttnKernel.batchDecodeServes(16, 2, 128));
+        Assert.isTrue(!AttnKernel.batchDecodeServes(8, 2, 64));
+        Assert.isTrue(!AttnKernel.batchDecodeServes(8, 8, 128));
+    }
+
+    /** The launcher counts each batched launch set, which BatchDecodeTest reads. */
+    @Test
+    public void theLauncherCountsEachBatchedLayer() {
+        if (!AttnBatchDecodeTest.kernels()) { return; }
+        int64 before = AttnKernel.batchDecodeCalls();
+        AttnBatchDecodeTest.run(2, true, false);
+        Assert.equals(before + 1L, AttnKernel.batchDecodeCalls());
+    }
+}

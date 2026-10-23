@@ -1412,6 +1412,8 @@ public final class CausalLM extends InfModule {
     DeviceKv[] dkvs;
     /** The slots' K/V planes in one buffer per layer (15.2.12.3.2.1); null until a slot is made. */
     KvPool kvPool;
+    /** The batched decode attention's row table, `4 * DECODE_BATCH_MAX` ints. */
+    KernelBuffer<int32> bdRowTab;
 
     /**
      * This slot's planes, or null when the device attend must not run.
@@ -1472,6 +1474,21 @@ public final class CausalLM extends InfModule {
             i = i + 1;
         }
         return;
+    }
+
+    /** Whether this step's attention can take the batched launches: a served head shape and every row's planes in the pool. */
+    boolean batchAttnReady(int32[] seqs, int32 n) {
+        if (this.kvPool == null || AttnKernel.skipForMeasurement() != 0) { return false; }
+        if (!AttnKernel.batchDecodeServes(this.cfg.numHeads, this.cfg.numKvHeads, this.cfg.headDim)) {
+            return false;
+        }
+        int32 b = 0;
+        while (b < n) {
+            DeviceKv dkv = this.dkvOf(seqs[(int64) b]);
+            if (dkv == null || dkv.poolSlot() < 0) { return false; }
+            b = b + 1;
+        }
+        return true;
     }
 
     /** Slots the shared K/V pool holds (15.2.12.3.2.1). */
@@ -3304,6 +3321,22 @@ public final class CausalLM extends InfModule {
             b = b + 1;
         }
         this.bdHs.upload(this.bdHsHost, (int64) n * (int64) h);
+        boolean bAttn = this.batchAttnReady(seqs, n);
+        int32 maxSplits = 1;
+        if (bAttn) {
+            int32[] slots #= heap int32[(int64) n];
+            int32[] poss #= heap int32[(int64) n];
+            b = 0;
+            while (b < n) {
+                slots[(int64) b] = (int32) this.kvPool.slotBase(this.dkvOf(seqs[(int64) b]).poolSlot());
+                poss[(int64) b] = this.bdPos[(int64) b];
+                b = b + 1;
+            }
+            if (this.bdRowTab == null) {
+                this.bdRowTab #= heap KernelBuffer<int32>((uint64) (4 * CausalLM.DECODE_BATCH_MAX));
+            }
+            maxSplits = AttnKernel.decodeRowTable(slots, poss, n, this.bdRowTab);
+        }
         int32 li = 0;
         while (li < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[li];
@@ -3321,7 +3354,18 @@ public final class CausalLM extends InfModule {
                 knw = a.kNorm.deviceWeight();
                 qnEps = a.qNorm.eps;
             }
+            if (bAttn) {
+                DeviceKv d0 = this.dkvOf(seqs[0L]);
+                KernelBuffer<float32> qwv = qnw;
+                KernelBuffer<float32> kwv = knw;
+                if (qnw == null) { qwv = d0.inv(li); kwv = qwv; }
+                AttnKernel.attendDecodeBatchLaunchNoSync(this.bdXp, this.bdQ, this.bdK, this.bdV,
+                    this.kvPool.kAll(li), this.kvPool.vAll(li), qwv, kwv, d0.inv(li),
+                    nH, nKv, hd, qnw != null, qnEps, d.normForm, this.bdRowTab, n,
+                    maxSplits, pbQd, a.scale);
+            }
             b = 0;
+            if (bAttn) { b = n; }
             while (b < n) {
                 int64 r = (int64) b;
                 DeviceKv dkv = this.dkvOf(seqs[r]);

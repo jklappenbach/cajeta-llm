@@ -3367,6 +3367,484 @@ public final class AttnKernel {
         }
     }
 
+    /** {@link #qkPrepKernel} for every row of a decode batch in one launch: workgroup
+     *  `r * (nH + nKv) + head`, row r's slot base and position from `rowTab[4r]` and `[4r + 1]`. */
+    @Kernel @Wave(width = 32)
+    public static void qkPrepBatchKernel(KernelBuffer<float32> q,
+            KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool,
+            KernelBuffer<float32> qw, KernelBuffer<float32> kw,
+            KernelBuffer<float32> invFreq, uint32 nH, uint32 nKv,
+            uint32 hd, uint32 norm, float32 eps, int32 form,
+            KernelBuffer<int32> rowTab, uint32 qStride, uint32 kvStride) {
+        uint32 lane = KernelThread.x();
+        uint32 r = Workgroup.x() / (nH + nKv);
+        uint32 head = Workgroup.x() % (nH + nKv);
+        uint32 slotBase = (uint32) rowTab[(int64) (r * 4)];
+        uint32 row = (uint32) rowTab[(int64) (r * 4 + 1)];
+        float32 pos = (float32) rowTab[(int64) (r * 4 + 1)];
+        boolean isQ = head < nH;
+        uint32 kh = head - nH;
+        uint32 base = 0;
+        if (isQ) { base = r * qStride + head * hd; } else { base = r * kvStride + kh * hd; }
+        uint32 half = hd / 2;
+        if (norm != 0) {
+            float32 ss = 0.0f;
+            uint32 i = lane;
+            while (i < hd) {
+                float32 x = 0.0f;
+                if (isQ) { x = q[(int64) (base + i)]; }
+                else { x = k[(int64) (base + i)]; }
+                ss = ss + x * x;
+                i = i + 128;
+            }
+            float32 tot = Workgroup.reduce(GroupOp.Add, ss);
+            float32 scale = 1.0f
+                / Math.sqrt(tot / (float32) hd + eps);
+            uint32 j = lane;
+            while (j < hd) {
+                float32 wi = 0.0f;
+                if (isQ) { wi = qw[(int64) j]; } else { wi = kw[(int64) j]; }
+                if (form == 1) { wi = 1.0f + wi; }
+                if (isQ) {
+                    q[(int64) (base + j)] = q[(int64) (base + j)]
+                        * scale * wi;
+                } else {
+                    k[(int64) (base + j)] = k[(int64) (base + j)]
+                        * scale * wi;
+                }
+                j = j + 128;
+            }
+            Barrier.workgroup();
+        }
+        uint32 d = lane;
+        while (d < half) {
+            float32 ang = pos * invFreq[(int64) d];
+            float32 c = Math.cos(ang);
+            float32 sn = Math.sin(ang);
+            float32 a = 0.0f;
+            float32 b = 0.0f;
+            if (isQ) {
+                a = q[(int64) (base + d)];
+                b = q[(int64) (base + d + half)];
+                q[(int64) (base + d)] = a * c - b * sn;
+                q[(int64) (base + d + half)] = a * sn + b * c;
+            } else {
+                a = k[(int64) (base + d)];
+                b = k[(int64) (base + d + half)];
+                float32 ra = a * c - b * sn;
+                float32 rb = a * sn + b * c;
+                k[(int64) (base + d)] = ra;
+                k[(int64) (base + d + half)] = rb;
+                uint32 o = slotBase + row * (nKv * hd) + kh * hd;
+                kPool[(int64) (o + d)] = (float16) ra;
+                kPool[(int64) (o + d + half)] = (float16) rb;
+            }
+            d = d + 128;
+        }
+        if (!isQ) {
+            uint32 o2 = slotBase + row * (nKv * hd) + kh * hd;
+            uint32 e = lane;
+            while (e < hd) {
+                vPool[(int64) (o2 + e)] = (float16) v[(int64) (base + e)];
+                e = e + 128;
+            }
+        }
+    }
+
+    /** {@link #attnFlashDecodeGqa4Kernel} for every row of a decode batch in one launch:
+     *  workgroup `r * nKv * maxSplits + w`, row r's slot base, length and splits from `rowTab[4r]`. */
+    @Kernel @FastMath @Wave(width = 32)
+    public static void attnFlashDecodeGqa4BatchKernel(KernelBuffer<float32> part,
+            KernelBuffer<float32> q, KernelBuffer<float16> kPool,
+            KernelBuffer<float16> vPool, uint32 nKv, KernelBuffer<int32> rowTab,
+            uint32 maxSplits, uint32 qStride, uint32 partStride, float32 scale) {
+        uint32 lane = KernelThread.x();
+        uint32 r = Workgroup.x() / (nKv * maxSplits);
+        uint32 wv = Workgroup.x() % (nKv * maxSplits);
+        uint32 from = 0;
+        uint32 slotBase = (uint32) rowTab[(int64) (r * 4)];
+        uint32 count = (uint32) rowTab[(int64) (r * 4 + 2)];
+        uint32 splits = (uint32) rowTab[(int64) (r * 4 + 3)];
+        uint32 qOff = r * qStride;
+        uint32 pOff = r * partStride;
+        if (wv < nKv * splits) {
+            uint32 kvh = wv / splits;
+            uint32 sp = wv % splits;
+            uint32 chunk = (count + splits - 1) / splits;
+            uint32 t0 = sp * chunk;
+            uint32 t1 = t0 + chunk;
+            if (t1 > count) { t1 = count; }
+            uint32 kvDim = nKv * 128;
+            uint32 h0 = kvh * 4;
+            uint32 qRow = qOff + h0 * 128 + lane * 4;
+            float32 qa0 = q[qRow];
+            float32 qa1 = q[qRow + 1];
+            float32 qa2 = q[qRow + 2];
+            float32 qa3 = q[qRow + 3];
+            float32 qb0 = q[qRow + 128];
+            float32 qb1 = q[qRow + 129];
+            float32 qb2 = q[qRow + 130];
+            float32 qb3 = q[qRow + 131];
+            float32 qc0 = q[qRow + 256];
+            float32 qc1 = q[qRow + 257];
+            float32 qc2 = q[qRow + 258];
+            float32 qc3 = q[qRow + 259];
+            float32 qd0 = q[qRow + 384];
+            float32 qd1 = q[qRow + 385];
+            float32 qd2 = q[qRow + 386];
+            float32 qd3 = q[qRow + 387];
+            uint32 kBase = slotBase + kvh * 128 + lane * 4;
+            float32 mA = 0.0f - 3.0e38f;
+            float32 mB = 0.0f - 3.0e38f;
+            float32 mC = 0.0f - 3.0e38f;
+            float32 mD = 0.0f - 3.0e38f;
+            float32 lA = 0.0f;
+            float32 lB = 0.0f;
+            float32 lC = 0.0f;
+            float32 lD = 0.0f;
+            float32 aa0 = 0.0f;
+            float32 aa1 = 0.0f;
+            float32 aa2 = 0.0f;
+            float32 aa3 = 0.0f;
+            float32 ab0 = 0.0f;
+            float32 ab1 = 0.0f;
+            float32 ab2 = 0.0f;
+            float32 ab3 = 0.0f;
+            float32 ac0 = 0.0f;
+            float32 ac1 = 0.0f;
+            float32 ac2 = 0.0f;
+            float32 ac3 = 0.0f;
+            float32 ad0 = 0.0f;
+            float32 ad1 = 0.0f;
+            float32 ad2 = 0.0f;
+            float32 ad3 = 0.0f;
+            if (t0 < t1) {
+                uint32 kRow0 = (from + t0) * kvDim + kBase;
+                float32 k0 = (float32) kPool[kRow0];
+                float32 k1 = (float32) kPool[kRow0 + 1];
+                float32 k2 = (float32) kPool[kRow0 + 2];
+                float32 k3 = (float32) kPool[kRow0 + 3];
+                mA = Wave.reduceSumF32(
+                    qa0 * k0 + qa1 * k1 + qa2 * k2 + qa3 * k3) * scale;
+                mB = Wave.reduceSumF32(
+                    qb0 * k0 + qb1 * k1 + qb2 * k2 + qb3 * k3) * scale;
+                mC = Wave.reduceSumF32(
+                    qc0 * k0 + qc1 * k1 + qc2 * k2 + qc3 * k3) * scale;
+                mD = Wave.reduceSumF32(
+                    qd0 * k0 + qd1 * k1 + qd2 * k2 + qd3 * k3) * scale;
+                lA = 1.0f;
+                lB = 1.0f;
+                lC = 1.0f;
+                lD = 1.0f;
+                float32 v0 = (float32) vPool[kRow0];
+                float32 v1 = (float32) vPool[kRow0 + 1];
+                float32 v2 = (float32) vPool[kRow0 + 2];
+                float32 v3 = (float32) vPool[kRow0 + 3];
+                aa0 = v0;
+                aa1 = v1;
+                aa2 = v2;
+                aa3 = v3;
+                ab0 = v0;
+                ab1 = v1;
+                ab2 = v2;
+                ab3 = v3;
+                ac0 = v0;
+                ac1 = v1;
+                ac2 = v2;
+                ac3 = v3;
+                ad0 = v0;
+                ad1 = v1;
+                ad2 = v2;
+                ad3 = v3;
+                uint32 t = t0 + 1;
+                while (t < t1) {
+                    uint32 kRow = (from + t) * kvDim + kBase;
+                    k0 = (float32) kPool[kRow];
+                    k1 = (float32) kPool[kRow + 1];
+                    k2 = (float32) kPool[kRow + 2];
+                    k3 = (float32) kPool[kRow + 3];
+                    float32 uA = Wave.reduceSumF32(
+                        qa0 * k0 + qa1 * k1 + qa2 * k2 + qa3 * k3) * scale;
+                    float32 uB = Wave.reduceSumF32(
+                        qb0 * k0 + qb1 * k1 + qb2 * k2 + qb3 * k3) * scale;
+                    float32 uC = Wave.reduceSumF32(
+                        qc0 * k0 + qc1 * k1 + qc2 * k2 + qc3 * k3) * scale;
+                    float32 uD = Wave.reduceSumF32(
+                        qd0 * k0 + qd1 * k1 + qd2 * k2 + qd3 * k3) * scale;
+                    float32 v0t = (float32) vPool[kRow];
+                    float32 v1t = (float32) vPool[kRow + 1];
+                    float32 v2t = (float32) vPool[kRow + 2];
+                    float32 v3t = (float32) vPool[kRow + 3];
+                    if (uA > mA) {
+                        float32 c = Math.exp(mA - uA);
+                        aa0 = aa0 * c + v0t;
+                        aa1 = aa1 * c + v1t;
+                        aa2 = aa2 * c + v2t;
+                        aa3 = aa3 * c + v3t;
+                        lA = lA * c + 1.0f;
+                        mA = uA;
+                    } else {
+                        float32 w = Math.exp(uA - mA);
+                        aa0 = aa0 + w * v0t;
+                        aa1 = aa1 + w * v1t;
+                        aa2 = aa2 + w * v2t;
+                        aa3 = aa3 + w * v3t;
+                        lA = lA + w;
+                    }
+                    if (uB > mB) {
+                        float32 c = Math.exp(mB - uB);
+                        ab0 = ab0 * c + v0t;
+                        ab1 = ab1 * c + v1t;
+                        ab2 = ab2 * c + v2t;
+                        ab3 = ab3 * c + v3t;
+                        lB = lB * c + 1.0f;
+                        mB = uB;
+                    } else {
+                        float32 w = Math.exp(uB - mB);
+                        ab0 = ab0 + w * v0t;
+                        ab1 = ab1 + w * v1t;
+                        ab2 = ab2 + w * v2t;
+                        ab3 = ab3 + w * v3t;
+                        lB = lB + w;
+                    }
+                    if (uC > mC) {
+                        float32 c = Math.exp(mC - uC);
+                        ac0 = ac0 * c + v0t;
+                        ac1 = ac1 * c + v1t;
+                        ac2 = ac2 * c + v2t;
+                        ac3 = ac3 * c + v3t;
+                        lC = lC * c + 1.0f;
+                        mC = uC;
+                    } else {
+                        float32 w = Math.exp(uC - mC);
+                        ac0 = ac0 + w * v0t;
+                        ac1 = ac1 + w * v1t;
+                        ac2 = ac2 + w * v2t;
+                        ac3 = ac3 + w * v3t;
+                        lC = lC + w;
+                    }
+                    if (uD > mD) {
+                        float32 c = Math.exp(mD - uD);
+                        ad0 = ad0 * c + v0t;
+                        ad1 = ad1 * c + v1t;
+                        ad2 = ad2 * c + v2t;
+                        ad3 = ad3 * c + v3t;
+                        lD = lD * c + 1.0f;
+                        mD = uD;
+                    } else {
+                        float32 w = Math.exp(uD - mD);
+                        ad0 = ad0 + w * v0t;
+                        ad1 = ad1 + w * v1t;
+                        ad2 = ad2 + w * v2t;
+                        ad3 = ad3 + w * v3t;
+                        lD = lD + w;
+                    }
+                    t = t + 1;
+                }
+            }
+            uint32 pA = pOff + ((h0) * splits + sp) * 130 + lane * 4;
+            uint32 pB = pOff + ((h0 + 1) * splits + sp) * 130 + lane * 4;
+            uint32 pC = pOff + ((h0 + 2) * splits + sp) * 130 + lane * 4;
+            uint32 pD = pOff + ((h0 + 3) * splits + sp) * 130 + lane * 4;
+            part[pA] = aa0;
+            part[pA + 1] = aa1;
+            part[pA + 2] = aa2;
+            part[pA + 3] = aa3;
+            part[pB] = ab0;
+            part[pB + 1] = ab1;
+            part[pB + 2] = ab2;
+            part[pB + 3] = ab3;
+            part[pC] = ac0;
+            part[pC + 1] = ac1;
+            part[pC + 2] = ac2;
+            part[pC + 3] = ac3;
+            part[pD] = ad0;
+            part[pD + 1] = ad1;
+            part[pD + 2] = ad2;
+            part[pD + 3] = ad3;
+            if (lane == 0) {
+                uint32 mBase = pOff + (h0 * splits + sp) * 130 + 128;
+                part[mBase] = mA;
+                part[mBase + 1] = lA;
+                uint32 mB2 = pOff + ((h0 + 1) * splits + sp) * 130 + 128;
+                part[mB2] = mB;
+                part[mB2 + 1] = lB;
+                uint32 mC2 = pOff + ((h0 + 2) * splits + sp) * 130 + 128;
+                part[mC2] = mC;
+                part[mC2 + 1] = lC;
+                uint32 mD2 = pOff + ((h0 + 3) * splits + sp) * 130 + 128;
+                part[mD2] = mD;
+                part[mD2 + 1] = lD;
+            }
+        }
+    }
+
+    /** {@link #attnReducePackQ8Kernel} for every row of a decode batch in one launch:
+     *  workgroup `r * (nH / 2) + blk`, row r's splits from `rowTab[4r + 3]`, its packed row at `r * packStride`. */
+    @Kernel @Wave(width = 32)
+    public static void attnReducePackQ8BatchKernel(KernelBuffer<int8> packed,
+            KernelBuffer<float32> part, uint32 nH, KernelBuffer<int32> rowTab,
+            uint32 partStride, uint32 packStride) {
+        Shared<float32> vals = shared float32[1024];
+        Shared<float32> gls = shared float32[8];
+        uint32 tid = KernelThread.x();
+        uint32 r = Workgroup.x() / (nH / 2);
+        uint32 blk = Workgroup.x() % (nH / 2);
+        uint32 splits = (uint32) rowTab[(int64) (r * 4 + 3)];
+        uint32 pOff = r * partStride;
+        if (blk * 2 + 1 >= nH + 1) { return; }
+        uint32 w = tid / 32;
+        uint32 lane = tid % 32;
+        uint32 hl = w / 4;
+        uint32 sub = w % 4;
+        uint32 h = blk * 2 + hl;
+        uint32 base = pOff + h * splits * 130;
+        float32 mm = 0.0f - 3.0e38f;
+        if (lane < splits) { mm = part[base + lane * 130 + 128]; }
+        if (lane + 32 < splits) {
+            float32 m2 = part[base + (lane + 32) * 130 + 128];
+            if (m2 > mm) { mm = m2; }
+        }
+        float32 gm = Wave.reduceMaxF32(mm);
+        float32 gl = 0.0f;
+        float32 a0 = 0.0f; float32 a1 = 0.0f; float32 a2 = 0.0f; float32 a3 = 0.0f;
+        uint32 d0 = lane * 4;
+        uint32 sp = sub;
+        while (sp < splits) {
+            uint32 pb = base + sp * 130;
+            float32 ls = part[pb + 129];
+            if (ls > 0.0f) {
+                float32 wt = Math.exp(part[pb + 128] - gm);
+                gl = gl + wt * ls;
+                uint32 d = pb + d0;
+                a0 = a0 + wt * part[d];
+                a1 = a1 + wt * part[d + 1];
+                a2 = a2 + wt * part[d + 2];
+                a3 = a3 + wt * part[d + 3];
+            }
+            sp = sp + 4;
+        }
+        uint32 vb = w * 128 + d0;
+        vals[vb] = a0;
+        vals[vb + 1] = a1;
+        vals[vb + 2] = a2;
+        vals[vb + 3] = a3;
+        if (lane == 0) { gls[w] = gl; }
+        Barrier.workgroup();
+        uint32 hl2 = tid / 128;
+        uint32 dm = tid % 128;
+        uint32 g0 = hl2 * 4;
+        float32 g = gls[g0] + gls[g0 + 1] + gls[g0 + 2] + gls[g0 + 3];
+        float32 rs = 1.0f / g;
+        float32 x = (vals[g0 * 128 + dm] + vals[(g0 + 1) * 128 + dm]
+            + vals[(g0 + 2) * 128 + dm] + vals[(g0 + 3) * 128 + dm]) * rs;
+        float32 ax = x;
+        if (x < 0.0f) { ax = 0.0f - x; }
+        float32 bmax = Workgroup.reduce(GroupOp.Max, ax);
+        float32 inv = 0.0f;
+        if (bmax > 0.0f) { inv = 127.0f / bmax; }
+        int32 qi = (int32) Math.round(x * inv);
+        int64 ob = (int64) r * (int64) packStride + (int64) blk * 320L;
+        packed[ob + (int64) tid] = (int8) qi;
+        int32 tot = (int32) Wave.reduceSum((uint32) qi);
+        if (lane == 0) {
+            int64 so = ob + 256L + (int64) (w * 4);
+            int32 b0 = tot & 255;
+            int32 b1 = (tot >> 8) & 255;
+            int32 b2 = (tot >> 16) & 255;
+            int32 b3 = (tot >> 24) & 255;
+            if (b0 > 127) { b0 = b0 - 256; }
+            if (b1 > 127) { b1 = b1 - 256; }
+            if (b2 > 127) { b2 = b2 - 256; }
+            if (b3 > 127) { b3 = b3 - 256; }
+            packed[so] = (int8) b0;
+            packed[so + 1L] = (int8) b1;
+            packed[so + 2L] = (int8) b2;
+            packed[so + 3L] = (int8) b3;
+        }
+        if (tid == 0) {
+            float32 dsc = bmax / 127.0f;
+            int32 db = Cajeta.f32ToBits(dsc);
+            int32 e1 = db & 255;
+            int32 e2 = (db >> 8) & 255;
+            int32 e3 = (db >> 16) & 255;
+            int32 e4 = (db >> 24) & 255;
+            if (e1 > 127) { e1 = e1 - 256; }
+            if (e2 > 127) { e2 = e2 - 256; }
+            if (e3 > 127) { e3 = e3 - 256; }
+            if (e4 > 127) { e4 = e4 - 256; }
+            packed[ob + 288L] = (int8) e1;
+            packed[ob + 289L] = (int8) e2;
+            packed[ob + 290L] = (int8) e3;
+            packed[ob + 291L] = (int8) e4;
+        }
+    }
+
+    static int64 batchCalls = 0L;
+    static KernelBuffer<float32> fdPartBatch;
+    static int64 fdPartBatchCap = 0L;
+
+    /** Whether {@link #attendDecodeBatchLaunchNoSync} serves this head shape: GQA x4 at head 128, the flash route on. */
+    public static boolean batchDecodeServes(int32 nH, int32 nKv, int32 hd) {
+        return AttnKernel.flashDecOn && AttnKernel.reducePackOn && hd == 128
+            && nKv > 0 && nH == 4 * nKv && nH % 2 == 0;
+    }
+
+    /** How many layers took the batched decode attention. */
+    public static int64 batchDecodeCalls() { return AttnKernel.batchCalls; }
+
+    /** Fills `tab` with each row's slot base, position, length and the split count the per-sequence route uses; returns the largest split count. */
+    public static int32 decodeRowTable(int32[] slotBase, int32[] pos, int32 n, KernelBuffer<int32> tab) {
+        int32[] h #= heap int32[(int64) (4 * n)];
+        int32 maxS = 1;
+        int32 r = 0;
+        while (r < n) {
+            int32 count = pos[(int64) r] + 1;
+            int32 splits = (count + AttnKernel.fdChunk - 1) / AttnKernel.fdChunk;
+            if (splits > 64) { splits = 64; }
+            if (splits < 1) { splits = 1; }
+            if (splits > maxS) { maxS = splits; }
+            h[(int64) (4 * r)] = slotBase[(int64) r];
+            h[(int64) (4 * r + 1)] = pos[(int64) r];
+            h[(int64) (4 * r + 2)] = count;
+            h[(int64) (4 * r + 3)] = splits;
+            r = r + 1;
+        }
+        tab.upload(h, (int64) (4 * n));
+        return maxS;
+    }
+
+    /** Prep, flash decode and reduce-pack for `n` rows in three launches: row r's q, k and v at r * (nH * hd) and r * (nKv * hd), its planes at its slot base in `kPool`/`vPool`, its packed output at r * packStride. */
+    public static void attendDecodeBatchLaunchNoSync(KernelBuffer<int8> packed,
+            KernelBuffer<float32> q, KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool,
+            KernelBuffer<float32> qw, KernelBuffer<float32> kw, KernelBuffer<float32> invFreq,
+            int32 nH, int32 nKv, int32 hd, boolean norm, float32 eps, int32 form,
+            KernelBuffer<int32> rowTab, int32 n, int32 maxSplits, int64 packStride,
+            float32 scale) {
+        KernelStream s = QuantKernel.stream();
+        uint32 nn = 0;
+        if (norm) { nn = 1; }
+        qkPrepBatchKernel.launch(s, grid: [(uint32) ((nH + nKv) * n)], block: [128])
+            (q, k, v, kPool, vPool, qw, kw, invFreq, (uint32) nH, (uint32) nKv,
+             (uint32) hd, nn, eps, form, rowTab, (uint32) (nH * hd), (uint32) (nKv * hd));
+        int64 partStride = (int64) nH * 64L * 130L;
+        int64 need = partStride * (int64) n;
+        if (AttnKernel.fdPartBatch == null || AttnKernel.fdPartBatchCap < need) {
+            AttnKernel.fdPartBatch #= heap KernelBuffer<float32>((uint64) need);
+            AttnKernel.fdPartBatchCap = need;
+        }
+        attnFlashDecodeGqa4BatchKernel.launch(s, grid: [(uint32) (n * nKv * maxSplits)], block: [32])
+            (AttnKernel.fdPartBatch, q, kPool, vPool, (uint32) nKv, rowTab,
+             (uint32) maxSplits, (uint32) (nH * hd), (uint32) partStride, scale);
+        attnReducePackQ8BatchKernel.launch(s, grid: [(uint32) (n * (nH / 2))], block: [256])
+            (packed, AttnKernel.fdPartBatch, (uint32) nH, rowTab, (uint32) partStride,
+             (uint32) packStride);
+        AttnKernel.batchCalls = AttnKernel.batchCalls + 1L;
+        return;
+    }
+
     public static void reducePackLaunchNoSync(KernelBuffer<int8> packed,
             int32 nH) {
         AttnKernel.reducePackFromLaunchNoSync(packed, AttnKernel.fdPart, nH,
