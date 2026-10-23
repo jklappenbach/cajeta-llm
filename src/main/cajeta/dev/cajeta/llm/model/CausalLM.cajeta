@@ -1412,6 +1412,8 @@ public final class CausalLM extends InfModule {
     DeviceKv[] dkvs;
     /** The slots' K/V planes in one buffer per layer (15.2.12.3.2.1); null until a slot is made. */
     KvPool kvPool;
+    /** Pool slots handed to a DeviceKv; the pool may hold more, reserved. */
+    int32 kvPoolUsed;
     /** The batched decode attention's row table, `4 * DECODE_BATCH_MAX` ints. */
     KernelBuffer<int32> bdRowTab;
 
@@ -1449,10 +1451,13 @@ public final class CausalLM extends InfModule {
                 this.kvPool #= heap KvPool(this.cfg.numLayers,
                     (int64) this.maxSeq * (int64) this.cfg.kvDim());
             }
-            int32 slot = this.kvPool.slots();
+            int32 slot = this.kvPoolUsed;
             if (this.kvPool.fits(slot + 1)) {
-                this.kvPool.ensureSlots(slot + 1);
-                this.rebindPooled();
+                if (slot + 1 > this.kvPool.slots()) {
+                    this.kvPool.ensureSlots(slot + 1);
+                    this.rebindPooled();
+                }
+                this.kvPoolUsed = this.kvPoolUsed + 1;
                 DeviceKv d #= heap DeviceKv(this.cfg, this.maxSeq, this.kvPool, slot);
                 d.bindRope(this.model);
                 this.dkvs[(int64) seq] #= d;
@@ -1467,6 +1472,7 @@ public final class CausalLM extends InfModule {
 
     /** Point every pooled slot at the pool's current buffers. */
     void rebindPooled() {
+        if (this.dkvs == null) { return; }
         int32 i = 0;
         while (i < this.maxSeqsN) {
             DeviceKv d = this.dkvs[(int64) i];
@@ -1489,6 +1495,42 @@ public final class CausalLM extends InfModule {
             b = b + 1;
         }
         return true;
+    }
+
+    /** Whether {@link #reserveDeviceKvSlots} for `n` would reallocate the pool, freeing buffers that in-flight work may still read. */
+    public boolean deviceKvReserveGrows(int32 n) {
+        if (!CausalLM.devAttnOn || !KernelCap.attendHere()
+                || !DeviceKv.supports(this.cfg) || !this.residentRouted()) {
+            return false;
+        }
+        int32 want = n;
+        if (want > this.maxSeqsN) { want = this.maxSeqsN; }
+        int32 have = 0;
+        if (this.kvPool != null) {
+            have = this.kvPool.slots();
+            if (!this.kvPool.fits(want)) { return false; }
+        }
+        return want > have;
+    }
+
+    /** Grow the K/V pool to hold `n` sequences at once, in one reallocation, when they will take device planes; a scheduler calls it after admission, with no step in flight. */
+    public void reserveDeviceKvSlots(int32 n) {
+        if (!this.deviceKvReserveGrows(n)) { return; }
+        int32 want = n;
+        if (want > this.maxSeqsN) { want = this.maxSeqsN; }
+        if (this.kvPool == null) {
+            this.kvPool #= heap KvPool(this.cfg.numLayers,
+                (int64) this.maxSeq * (int64) this.cfg.kvDim());
+        }
+        this.kvPool.ensureSlots(want);
+        this.rebindPooled();
+        return;
+    }
+
+    /** How many times the K/V pool reallocated (15.2.15.1). */
+    public int32 kvPoolGrowths() {
+        if (this.kvPool == null) { return 0; }
+        return this.kvPool.growths();
     }
 
     /** Slots the shared K/V pool holds (15.2.12.3.2.1). */
