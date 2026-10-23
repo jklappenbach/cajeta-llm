@@ -8,8 +8,9 @@ import cajeta.xpu.KernelStream;
 import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 import cajeta.lang.String;
+import cajeta.lang.Cajeta;
 
-/** cajeta-llm 15.2.12.2.1: the prefetching Q4_K mat-vec matches the plain one bit for bit, and a probe picks between them. */
+/** cajeta-llm 15.2.12.2.1 and .2.5: the prefetching Q4_K and Q6_K mat-vecs match the plain ones bit for bit, and a probe picks between them. */
 public class MatVecPrefetchTest {
 
     public MatVecPrefetchTest() { return; }
@@ -150,5 +151,144 @@ public class MatVecPrefetchTest {
         Assert.isTrue(QuantKernel.q4PrefetchProbePlainNs() > 0L);
         Assert.isTrue(v == (QuantKernel.q4PrefetchProbePfNs() < QuantKernel.q4PrefetchProbePlainNs()));
         QuantKernel.setQ4Prefetch(0);
+    }
+
+    /** Whether both Q6_K kernels run here; skips by name when not. */
+    static boolean bothQ6Kernels() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return false; }
+        if (!KernelCap.usable("q6kQ8WaveMatVecKernel")) {
+            DeviceSkip.noKernel("q6kQ8WaveMatVecKernel", be);
+            return false;
+        }
+        if (!KernelCap.usable("q6kQ8WavePfMatVecKernel")) {
+            DeviceSkip.noKernel("q6kQ8WavePfMatVecKernel", be);
+            return false;
+        }
+        return true;
+    }
+
+    /** A Q6_K weight of `rows` x `cols` in the resident split layout, with finite, varied scales. */
+    static #int8[] q6Weight(int64 rows, int64 cols) {
+        int64 bpr = cols / 256L;
+        int64 blocks = rows * bpr;
+        int8[] raw #= heap int8[blocks * 210L];
+        int64 n = (int64) raw.count();
+        int64 z = 0;
+        while (z < n) {
+            raw[z] = (int8) ((z * 37L + 11L) % 253L);
+            z = z + 1;
+        }
+        int64 b = 0;
+        while (b < blocks) {
+            raw[b * 210L + 208L] = (int8) (b % 23L);
+            raw[b * 210L + 209L] = (int8) (36L + b % 7L);
+            b = b + 1;
+        }
+        int8[] res #= heap int8[rows * Quant.rowResidentBytes(Quant.GG_Q6_K, bpr)];
+        Quant.splitInto(Quant.GG_Q6_K, raw, 0L, rows, bpr, res, 0L);
+        return #res;
+    }
+
+    /** `rows` x `cols` Q6_K through the launcher with the variant pinned to `pin`. */
+    static #float32[] runQ6(int64 rows, int64 cols, boolean accum, int32 pin) {
+        int8[] raw #= MatVecPrefetchTest.q6Weight(rows, cols);
+        float32[] x #= QuantKernelTest.activations(cols);
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, 0L, cols, xp);
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>((uint64) raw.count());
+        KernelBuffer<int8> xpb #= heap KernelBuffer<int8>((uint64) xp.count());
+        pb.upload(raw);
+        xpb.upload(xp);
+        float32[] seed #= heap float32[rows];
+        int64 r = 0;
+        while (r < rows) {
+            seed[r] = 0.25f * (float32) ((r % 9L) - 4L);
+            r = r + 1;
+        }
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) rows);
+        y.upload(seed, rows);
+        QuantKernel.setQ6Prefetch(pin);
+        if (accum) {
+            QuantKernel.q6kQ8WaveMatVecAccumLaunchNoSync(y, pb, xpb, rows, cols, 0L);
+        } else {
+            QuantKernel.q6kQ8WaveMatVecLaunchNoSync(y, pb, xpb, rows, cols, 0L);
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        QuantKernel.setQ6Prefetch(0);
+        float32[] got #= heap float32[rows];
+        y.download(got, rows);
+        return #got;
+    }
+
+    /** Fails naming the first row where the two Q6_K variants differ at `rows` x `cols`. */
+    static void sameQ6Output(int64 rows, int64 cols, boolean accum) {
+        float32[] plain #= MatVecPrefetchTest.runQ6(rows, cols, accum, 2);
+        float32[] pf #= MatVecPrefetchTest.runQ6(rows, cols, accum, 1);
+        QuantKernelTest.assertLive(plain, "plain q6k mat-vec");
+        int64 r = 0;
+        while (r < rows) {
+            if (Cajeta.f32ToBits(plain[r]) != Cajeta.f32ToBits(pf[r])) {
+                Assert.fail("q6k " + rows + "x" + cols + (accum ? " accum" : "") + " row " + r
+                    + ": prefetch " + pf[r] + " vs plain " + plain[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    @Test
+    public void q6MatchesAtEightBlocksAndRowsNotAMultipleOfFour() {
+        if (!MatVecPrefetchTest.bothQ6Kernels()) { return; }
+        MatVecPrefetchTest.sameQ6Output(13L, 2048L, false);
+    }
+
+    @Test
+    public void q6MatchesAtTheDecodeDownAndHeadShapes() {
+        if (!MatVecPrefetchTest.bothQ6Kernels()) { return; }
+        MatVecPrefetchTest.sameQ6Output(37L, 14336L, false);
+        MatVecPrefetchTest.sameQ6Output(64L, 4096L, false);
+    }
+
+    @Test
+    public void q6MatchesOnShortRowsThatShareAWave() {
+        if (!MatVecPrefetchTest.bothQ6Kernels()) { return; }
+        MatVecPrefetchTest.sameQ6Output(21L, 768L, false);
+    }
+
+    @Test
+    public void q6MatchesInTheAccumulateForm() {
+        if (!MatVecPrefetchTest.bothQ6Kernels()) { return; }
+        MatVecPrefetchTest.sameQ6Output(19L, 14336L, true);
+    }
+
+    /** FIRES: pinned to the prefetch variant, the Q6_K launcher launches it. */
+    @Test
+    public void theQ6LauncherTakesThePrefetchKernelWhenItIsFaster() {
+        if (!MatVecPrefetchTest.bothQ6Kernels()) { return; }
+        int64 before = QuantKernel.q6PrefetchLaunches();
+        MatVecPrefetchTest.runQ6(8L, 2048L, false, 1);
+        Assert.isTrue(QuantKernel.q6PrefetchLaunches() == before + 1L);
+    }
+
+    /** DOES NOT FIRE: pinned to the plain variant, the Q6_K launcher keeps it. */
+    @Test
+    public void theQ6LauncherKeepsThePlainKernelWhenItIsFaster() {
+        if (!MatVecPrefetchTest.bothQ6Kernels()) { return; }
+        int64 before = QuantKernel.q6PrefetchLaunches();
+        MatVecPrefetchTest.runQ6(8L, 2048L, false, 2);
+        Assert.isTrue(QuantKernel.q6PrefetchLaunches() == before);
+    }
+
+    /** The Q6_K probe times both variants and keeps the faster, apart from the Q4_K probe. */
+    @Test
+    public void theQ6ProbeTimesBothVariants() {
+        if (!MatVecPrefetchTest.bothQ6Kernels()) { return; }
+        QuantKernel.setQ6Prefetch(0);
+        boolean v = QuantKernel.q6PrefetchPays();
+        Assert.isTrue(QuantKernel.q6PrefetchProbePfNs() > 0L);
+        Assert.isTrue(QuantKernel.q6PrefetchProbePlainNs() > 0L);
+        Assert.isTrue(v == (QuantKernel.q6PrefetchProbePfNs() < QuantKernel.q6PrefetchProbePlainNs()));
+        QuantKernel.setQ6Prefetch(0);
     }
 }
