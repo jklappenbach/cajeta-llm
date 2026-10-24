@@ -5,6 +5,7 @@ import cajeta.lang.Optional;
 import cajeta.lang.String;
 import cajeta.time.Clock;
 import cajeta.xpu.Autotune;
+import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import cajeta.xpu.KernelTimer;
@@ -340,5 +341,75 @@ public final class ColsSegProbe {
         QuantKernel.q4kQ8WaveMatVecColsSegLaunchNoSync(y, y1, y2, w0, w1, w2, xp, rows0, rows1, rows2,
             cols, nc, total, total, total, pb, false, variant);
         return;
+    }
+
+    static int64 abRunsN = 0L;
+    /** How many in-situ A/Bs were timed, this process. */
+    public static int64 abRuns() { return ColsSegProbe.abRunsN; }
+    static final int32 AB_ROUNDS = 3;
+    static final int32 AB_STEPS = 4;
+
+    /** 1 fused, 2 separate: fused must beat separate by the tie margin. */
+    public static int32 abVerdictOf(int64 fusedNs, int64 sepNs) {
+        return ColsSegProbe.segPays(fusedNs, sepNs) ? 1 : 2;
+    }
+
+    static #String abKnob(String shape, int32 n) {
+        String k #= "colsSegAb-n" + n + "-" + shape;
+        return #k;
+    }
+
+    /**
+     * The in-situ A/B (15.2.12.3.7.4): batched decode steps on `m`'s real weights at `n`
+     * rows, the fused and separate launches interleaved; the faster past the tie margin
+     * becomes the verdict (QuantKernel.setColsSegVerdict), remembered per device, build
+     * and model shape. Returns the verdict, 0 when a pin or the backend answers instead.
+     */
+    public static int32 abAtLoad(CausalLM m, int32 n) {
+        if (QuantKernel.colsSegPinned()) {
+            Diag.emit("colsseg-ab", 0 - 1, "pinned", (int64) n, 0L, 0L, (int64) QuantKernel.colsSegMode(), 0L, 0L);
+            return 0;
+        }
+        String be #= Device.activeBackend();
+        if (n < 2 || be.equals("cpu") || !m.decodeBatchReady()
+                || !KernelCap.usable("q4kQ8WaveMatVecColsSegPlainKernel")
+                || !KernelCap.usable("q4kQ8WaveMatVecColsSegPfKernel")) {
+            QuantKernel.setColsSegVerdict(2);
+            Diag.emit("colsseg-ab", 0 - 1, "skipped", (int64) n, 0L, 0L, 2L, 0L, 0L);
+            return 0;
+        }
+        String shape #= m.colsSegShapeKey();
+        String bid #= ColsSegProbe.buildId();
+        String k #= ColsSegProbe.abKnob(shape, n);
+        if (ColsSegProbe.tuneDir.byteLength() > 0) {
+            Optional<int32> t = Autotune.recallFor(ColsSegProbe.tuneDir, k, bid);
+            if (t.isPresent() && (t.get() == 1 || t.get() == 2)) {
+                QuantKernel.setColsSegVerdict(t.get());
+                Diag.emit("colsseg-ab", 0 - 1, "stored", (int64) n, 0L, 0L, (int64) t.get(), 0L, 0L);
+                return t.get();
+            }
+        }
+        int64 t0 = Clock.nanoTime();
+        int64 fBest = 0L;
+        int64 sBest = 0L;
+        int32 r = 0;
+        while (r < ColsSegProbe.AB_ROUNDS) {
+            QuantKernel.setColsSegVerdict(1);
+            int64 f = m.timeDecodeBatch(n, ColsSegProbe.AB_STEPS);
+            if (fBest == 0L || f < fBest) { fBest = f; }
+            QuantKernel.setColsSegVerdict(2);
+            int64 sp = m.timeDecodeBatch(n, ColsSegProbe.AB_STEPS);
+            if (sBest == 0L || sp < sBest) { sBest = sp; }
+            r = r + 1;
+        }
+        int32 v = ColsSegProbe.abVerdictOf(fBest, sBest);
+        QuantKernel.setColsSegVerdict(v);
+        ColsSegProbe.abRunsN = ColsSegProbe.abRunsN + 1L;
+        if (ColsSegProbe.tuneDir.byteLength() > 0) {
+            Autotune.rememberFor(ColsSegProbe.tuneDir, k, v, bid);
+        }
+        Diag.emit("colsseg-ab", 0 - 1, v == 1 ? "fused" : "separate", (int64) n, fBest, sBest,
+            (int64) v, Clock.nanoTime() - t0, 0L);
+        return v;
     }
 }

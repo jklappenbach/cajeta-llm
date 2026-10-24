@@ -1,0 +1,158 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.EngineOptions;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.ColsSegProbe;
+import dev.cajeta.llm.model.KernelCap;
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.ShapeChoice;
+
+/**
+ * The in-situ fusion A/B (cajeta-llm 15.2.12.3.7.4): at load the engine runs a few
+ * batched decode steps on its real weights at its batch width with the q|k|v and
+ * gate|up Cols launches fused and separate, keeps the faster past the tie margin,
+ * and remembers the verdict per device, build and model shape.
+ */
+public class ColsSegAbTest {
+
+    public ColsSegAbTest() { return; }
+
+    static boolean here() {
+        if (!CensusReachTest.deviceHere()) { return false; }
+        String be #= Device.activeBackend();
+        if (be.equals("cpu")) {
+            DeviceSkip.tracked("the cpu lowering of the fused Cols kernels computes NaN", "cajeta-llm 15.2.12.3.7.1");
+            return false;
+        }
+        if (!KernelCap.usable("q4kQ8WaveMatVecColsSegPlainKernel")) { DeviceSkip.noKernel("q4kQ8WaveMatVecColsSegPlainKernel", be); return false; }
+        if (!KernelCap.usable("q4kQ8WaveMatVecColsSegPfKernel")) { DeviceSkip.noKernel("q4kQ8WaveMatVecColsSegPfKernel", be); return false; }
+        return true;
+    }
+
+    static #EngineOptions opts(int32 seqs) {
+        EngineOptions o #= heap EngineOptions(RoutableFixtureTest.FIX);
+        o.ctx = 128;
+        o.maxSeqs = seqs;
+        o.blockTokens = 16;
+        o.chunk = 64;
+        o.tuneDir = "off";
+        return #o;
+    }
+
+    /** Load with a Diag tap on; null when the backend does not route batched decode (skipped). */
+    static #LlmEngine loadTapped(#EngineOptions o, PrefillTap cap) {
+        Diag.register(cap);
+        LlmEngine e #= LlmEngine.load(#o);
+        Diag.register(null);
+        if (!e.model().decodeBatchReady()) {
+            String be #= Device.activeBackend();
+            e.close();
+            DeviceSkip.tracked("backend " + be + " does not route batched decode: "
+                + cap.namesOf("decode-batch"), "xpu-kernel-adaptor 13B");
+            return null;
+        }
+        return #e;
+    }
+
+    /** Fused wins only past the tie margin; no measurement is separate. */
+    @Test
+    public void theVerdictFollowsTheTieMargin() {
+        int64 m = (int64) ShapeChoice.tiePerMille;
+        Assert.equals(1L, (int64) ColsSegProbe.abVerdictOf(1000L - m, 1000L));
+        Assert.equals(2L, (int64) ColsSegProbe.abVerdictOf(1000L - m + 1L, 1000L));
+        Assert.equals(2L, (int64) ColsSegProbe.abVerdictOf(1000L, 1000L - m));
+        Assert.equals(2L, (int64) ColsSegProbe.abVerdictOf(0L, 1000L));
+    }
+
+    @Test
+    public void theEngineTimesBothArmsAtItsBatchWidthAndKeepsTheVerdict() {
+        if (!ColsSegAbTest.here()) { return; }
+        QuantKernel.setColsSeg(0 - 1);
+        PrefillTap cap = heap PrefillTap();
+        LlmEngine e #= ColsSegAbTest.loadTapped(#ColsSegAbTest.opts(4), cap);
+        if (e == null) { return; }
+        Assert.equals(1L, (int64) cap.countOf("colsseg-ab"));
+        boolean fused = cap.saw("colsseg-ab", "fused");
+        boolean sep = cap.saw("colsseg-ab", "separate");
+        Assert.isTrue(fused || sep);
+        Assert.equals(4L, cap.valueOf("colsseg-ab", 0, 0));
+        Assert.isTrue(cap.valueOf("colsseg-ab", 0, 1) > 0L);
+        Assert.isTrue(cap.valueOf("colsseg-ab", 0, 2) > 0L);
+        Assert.equals(fused ? 1L : 2L, cap.valueOf("colsseg-ab", 0, 3));
+        Assert.equals(fused ? 1L : 2L, (int64) QuantKernel.colsSegMode());
+        Assert.isTrue(!QuantKernel.colsSegPinned());
+        e.close();
+        QuantKernel.setColsSegVerdict(2);
+    }
+
+    /** DOES NOT FIRE: a pinned lever (bench colsseg=N) is the answer; nothing is timed. */
+    @Test
+    public void aPinnedLeverSkipsTheAb() {
+        if (!ColsSegAbTest.here()) { return; }
+        QuantKernel.setColsSeg(2);
+        PrefillTap cap = heap PrefillTap();
+        LlmEngine e #= ColsSegAbTest.loadTapped(#ColsSegAbTest.opts(4), cap);
+        QuantKernel.setColsSeg(0 - 1);
+        if (e == null) { return; }
+        Assert.equals(1L, (int64) cap.countOf("colsseg-ab"));
+        Assert.isTrue(cap.saw("colsseg-ab", "pinned"));
+        Assert.equals(0L, cap.valueOf("colsseg-ab", 0, 1));
+        Assert.equals(2L, (int64) QuantKernel.colsSegMode());
+        e.close();
+        QuantKernel.setColsSegVerdict(2);
+    }
+
+    /** DOES NOT FIRE: one sequence has no batched step to fuse. */
+    @Test
+    public void oneSequenceSkipsTheAb() {
+        if (!ColsSegAbTest.here()) { return; }
+        QuantKernel.setColsSeg(0 - 1);
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        LlmEngine e #= LlmEngine.load(#ColsSegAbTest.opts(1));
+        Diag.register(null);
+        Assert.equals(0L, (int64) cap.countOf("colsseg-ab"));
+        e.close();
+        QuantKernel.setColsSegVerdict(2);
+    }
+
+    /** The verdict is remembered in the tune dir per device, build and shape: a second
+     *  load with the same build reads it back and times nothing. */
+    @Test
+    public void aStoredVerdictIsReusedWithoutTiming() {
+        if (!ColsSegAbTest.here()) { return; }
+        QuantKernel.setColsSeg(0 - 1);
+        Path dir #= Path.of("tmp/colsseg-ab-tune");
+        dir.mkdirs();
+        String bid #= "ab-test-" + Clock.nanoTime();
+        ColsSegProbe.setBuildIdForTest(bid);
+        int64 runs0 = ColsSegProbe.abRuns();
+        PrefillTap cap = heap PrefillTap();
+        EngineOptions o1 #= ColsSegAbTest.opts(4);
+        o1.tuneDir = "tmp/colsseg-ab-tune";
+        LlmEngine e1 #= ColsSegAbTest.loadTapped(#o1, cap);
+        if (e1 == null) { ColsSegProbe.setBuildIdForTest(""); return; }
+        Assert.equals(runs0 + 1L, ColsSegProbe.abRuns());
+        int64 verdict = cap.valueOf("colsseg-ab", 0, 3);
+        e1.close();
+        EngineOptions o2 #= ColsSegAbTest.opts(4);
+        o2.tuneDir = "tmp/colsseg-ab-tune";
+        LlmEngine e2 #= ColsSegAbTest.loadTapped(#o2, cap);
+        ColsSegProbe.setBuildIdForTest("");
+        if (e2 == null) { return; }
+        Assert.equals(runs0 + 1L, ColsSegProbe.abRuns());
+        Assert.equals(2L, (int64) cap.countOf("colsseg-ab"));
+        Assert.isTrue(cap.saw("colsseg-ab", "stored"));
+        Assert.equals(verdict, cap.valueOf("colsseg-ab", 1, 3));
+        Assert.equals(verdict, (int64) QuantKernel.colsSegMode());
+        e2.close();
+        QuantKernel.setColsSegVerdict(2);
+    }
+}
