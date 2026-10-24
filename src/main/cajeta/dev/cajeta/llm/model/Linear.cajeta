@@ -1388,8 +1388,22 @@ public final class Linear extends InfModule {
         return Linear.coopOn
             && !Linear.backendIsVulkan()
             && !QuantKernel.hasBatchKernel(this.packedTy)
+            && !this.q5TileRoute()
             && QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)
             && (int64) this.outDim % 128L == 0L;
+    }
+
+    /** Whether this Q5_K weight's batched route is its tensor-core tile
+     *  (15.2.15.3.4) rather than the coop GEMM: the shape is asked at the
+     *  launch, this is the format, the device and the measured preference.
+     *  It is asked BEFORE the stage: the coop route stages f16 and never
+     *  packs the int8 stage the tile reads — the first Q5 tile run read an
+     *  unfilled stage and agreed with llama.cpp on 0 of 64 greedy tokens
+     *  (2026-10-24 15:59). */
+    boolean q5TileRoute() {
+        return this.packedTy == Quant.GG_Q5_K && Linear.avQ5Tc
+            && Linear.wmmaOn && Linear.tcOn && !Linear.backendIsVulkan()
+            && !this.slotMode && this.winStage == null;
     }
     // f16 twin of the staged batch activations, converted LAZILY on the
     // first coop consumer of a staging (the pack above serves the dp4a
@@ -1979,11 +1993,15 @@ public final class Linear extends InfModule {
     static boolean avQ4MwPacked;   // the multi-wave packed Q4_K GEMM (6.2.1)
     static boolean avQ4Tc;         // the tensor-core prefill tile (1.8.3)
     static boolean avQ6Tc;         // its Q6_K twin
+    static boolean avQ5Tc;         // its Q5_K twin (15.2.15.3.4)
     /** Whether some listed Q4_K tile member can be launched here. */
     public static boolean q4TileUsable() { return Linear.familyUsable(TcTile.q4()); }
 
     /** Whether some listed Q6_K tile member can be launched here. */
     public static boolean q6TileUsable() { return Linear.familyUsable(TcTile.q6()); }
+
+    /** Whether some listed Q5_K tile member can be launched here. */
+    public static boolean q5TileUsable() { return Linear.familyUsable(TcTile.q5()); }
 
     static boolean familyUsable(TileFamily<Q4TileShape> fam) {
         int32 n = (int32) fam.shapes().count();
@@ -2000,6 +2018,7 @@ public final class Linear extends InfModule {
         if (Linear.kAvailSet) { return; }
         Linear.avQ4Tc = Linear.q4TileUsable();
         Linear.avQ6Tc = Linear.q6TileUsable();
+        Linear.avQ5Tc = Linear.q5TileUsable();
         // usable, not merely registered: a kernel written for another wave
         // width, or one measured wrong on this backend, must not be routed
         // (KernelCap.WAVE32_ONLY, KernelCap.WRONG_HERE).
@@ -2137,6 +2156,9 @@ public final class Linear extends InfModule {
         }
         if (!Linear.wmmaBackend()) { return "no batch GEMM kernels on this backend"; }
         if (this.isBatchRouted()) { return null; }
+        // A Q5_K weight the tensor-core tile serves is batch-routed by it
+        // (15.2.15.3.4); the coop classification below says no for it.
+        if (this.q5TileRoute()) { return null; }
         if (Linear.backendIsVulkan()) {
             return "vulkan: coop tile does not divide cols/outDim and no batch kernel";
         }
@@ -2555,8 +2577,16 @@ public final class Linear extends InfModule {
         // Every route below the coop pair reads the int8 activations, so
         // this is where the lazy pack comes due — one predicate covering
         // the whole else-if chain rather than a call in each arm.
-        boolean coopHere = Linear.coopOn
-            && (Linear.backendIsVulkan() || this.coopRoutedHere())
+        // The Q5_K tile's decision, BEFORE the stage: the coop route stages
+        // f16 and never packs the int8 stage the tile reads (15.2.15.3.4).
+        // Where the tile does not pay or fit, Q5_K keeps its coop route.
+        int64 q5Rows = ((int64) rows + 127L) / 128L * 128L;
+        boolean q5Tile = this.q5TileRoute() && Linear.matrixCoresPay()
+            && Linear.tilePreferred()
+            && TcTile.fits5(q5Rows, (int64) this.outDim, (int64) this.inDim);
+        boolean coopHere = Linear.coopOn && !q5Tile
+            && (Linear.backendIsVulkan() || this.coopRoutedHere()
+                || (this.packedTy == Quant.GG_Q5_K && Linear.avQ5Tc))
             && Linear.btXhSrc != null
             && QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)
             && (int64) this.outDim % 128L == 0L;
@@ -2593,7 +2623,8 @@ public final class Linear extends InfModule {
         // fallback it always had ({@link #matrixCoresPay}).
         int64 tRows = (int64) rows;
         if (tRows % 16L != 0L && Linear.wmmaOn && !Linear.backendIsVulkan()
-                && (this.packedTy == Quant.GG_Q4_K || this.packedTy == Quant.GG_Q6_K)
+                && (this.packedTy == Quant.GG_Q4_K || this.packedTy == Quant.GG_Q6_K
+                    || this.q5TileRoute())
                 && (int64) this.outDim % 16L == 0L
                 && Linear.matrixCoresPay()) {
             tRows = ((int64) rows + 15L) / 16L * 16L;
@@ -2642,6 +2673,15 @@ public final class Linear extends InfModule {
         boolean useTc6 = tcShape && Linear.avQ6Tc
             && this.packedTy == Quant.GG_Q6_K
             && TcTile.fits6(mw8RowsTc, (int64) this.outDim, (int64) this.inDim);
+        // The Q5_K member reads the raw 176-byte blocks (15.2.15.3.4).
+        boolean useTc5 = q5Tile && tcShape;
+        if (!useTc5 && Linear.tcOn && this.packedTy == Quant.GG_Q5_K
+                && !Linear.backendIsVulkan()) {
+            this.sayRoute(281474976710656L, "q5 tcTile refused: avail=" + Linear.avQ5Tc
+                + " slot=" + this.slotMode + " window=" + (this.winStage != null)
+                + " int8Faster=" + (Linear.tbdPay == 2) + " ragged=" + (mw8RowsTc != (int64) rows)
+                + " fits=" + TcTile.fits5(mw8RowsTc, (int64) this.outDim, (int64) this.inDim));
+        }
         if (!useTc && !useTc6 && Linear.tcOn
                 && (this.packedTy == Quant.GG_Q4_K || this.packedTy == Quant.GG_Q6_K)
                 && !Linear.backendIsVulkan()) {
@@ -2676,7 +2716,7 @@ public final class Linear extends InfModule {
         // only pad output rows read the pad rows, and matmulInto reads
         // back `rows`.
         int64 mw8Rows = ((int64) rows + 127L) / 128L * 128L;
-        boolean useDeq5 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
+        boolean useDeq5 = Linear.deqFor(this.packedTy) && Linear.wmmaOn && !useTc5
             && this.packedTy == Quant.GG_Q5_K && Linear.avQ5Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
             && this.deqAdmitted();
@@ -2708,6 +2748,12 @@ public final class Linear extends InfModule {
             this.ensureBatchOut((int32) mw8RowsTc);
             this.sayRoute(8796093022208L, "q6 tcTile");
             TcTile.q6kQ8TcTileLaunchNoSync(this.yBatch, this.payloadDev,
+                Linear.btXp, mw8RowsTc, (int64) this.outDim,
+                (int64) this.inDim);
+        } else if (useTc5) {
+            this.ensureBatchOut((int32) mw8RowsTc);
+            this.sayRoute(140737488355328L, "q5 tcTile");
+            TcTile.q5kQ8TcTileLaunchNoSync(this.yBatch, this.payloadDev,
                 Linear.btXp, mw8RowsTc, (int64) this.outDim,
                 (int64) this.inDim);
         } else if (useDeq) {
@@ -2914,12 +2960,7 @@ public final class Linear extends InfModule {
                     mw8Rows, (int64) this.outDim,
                     (int64) this.inDim);
             }
-        } else if (Linear.coopOn
-                && (Linear.backendIsVulkan() || this.coopRoutedHere())
-                && Linear.btXhSrc != null
-                && QuantKernel.coopColsOk(this.packedTy,
-                    (int64) this.inDim)
-                && (int64) this.outDim % 128L == 0L) {
+        } else if (coopHere) {
             // The f16 COOPMAT GEMM (matrix cores; llama.cpp's own
             // architecture), now for EVERY quantization the engine
             // supports: the compute half is format-blind, so each type
@@ -3330,11 +3371,16 @@ public final class Linear extends InfModule {
             && TcTile.fits(padRows, (int64) this.outDim, (int64) this.inDim);
         boolean q6 = this.packedTy == Quant.GG_Q6_K && Linear.avQ6Tc
             && TcTile.fits6(padRows, (int64) this.outDim, (int64) this.inDim);
-        if (!q4 && !q6) { return false; }
+        boolean q5 = this.packedTy == Quant.GG_Q5_K && Linear.avQ5Tc
+            && TcTile.fits5(padRows, (int64) this.outDim, (int64) this.inDim);
+        if (!q4 && !q6 && !q5) { return false; }
         this.ensureDevice();
         Linear.ensureBatchStage((int32) padRows, this.inDim);
         if (q4) {
             TcTile.prewarmQ4(this.payloadDev, Linear.btXp, padRows,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (q5) {
+            TcTile.prewarmQ5(this.payloadDev, Linear.btXp, padRows,
                 (int64) this.outDim, (int64) this.inDim);
         } else {
             TcTile.prewarmQ6(this.payloadDev, Linear.btXp, padRows,
