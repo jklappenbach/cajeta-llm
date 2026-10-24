@@ -1,0 +1,133 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.ColsProbe;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * `Linear.matvecCols` launches the column kernel OF THE WEIGHT'S FORMAT,
+ * and so does its per-column fallback (cajeta-llm 15.2.15.3).
+ *
+ * The Cols twins for Q5_K, Q8_0, Q2_K and Q3_K made `colsReady` admit those
+ * formats to the decode batch, but the dispatch under it still knew two
+ * kernels: Q4_K, else Q6_K. A Q8_0 head or a Q5_K projection was read by the
+ * Q6_K kernel, every logit came out NaN, and the batched greedy stream was
+ * token 0 after the first, on every model carrying one of the four formats
+ * (the 4-sequence runs of 2026-10-24 printed `greedy stream: 77 0 0 0 ...`).
+ * The kernel tests could not see it: they launch the kernels by name. This
+ * one goes through the Linear, with the probe pinned both ways so both
+ * branches of the dispatch answer.
+ */
+public class LinearColsDispatchTest {
+
+    public LinearColsDispatchTest() { return; }
+
+    static void check(int32 ty, String fixture, String cols, String single,
+            int64 out, int64 width) {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        if (!KernelCap.usable(cols)) { DeviceSkip.noKernel(cols, be); return; }
+        if (!KernelCap.usable(single)) { DeviceSkip.noKernel(single, be); return; }
+        int32 nc = 3;
+        int64 bpr = width / (int64) Quant.blockElems(ty);
+        int64 nBlocks = out * bpr;
+        int8[] raw #= CensusReachTest.tiled(ty, fixture, nBlocks);
+        float32[] x #= heap float32[(int64) nc * width];
+        int64 i = 0;
+        while (i < (int64) nc * width) {
+            x[i] = (float32) ((i * 37L + (i / width) * 11L + 5L) % 67L - 33L) * 0.0625f;
+            i = i + 1;
+        }
+        float32[] want #= CensusReachTest.hostGemm(ty, raw, nBlocks, x, (int64) nc, out, width);
+        Linear lin #= heap Linear((int32) width, (int32) out);
+        lin.bindPacked(#raw, ty);
+        Assert.isTrue(lin.isPacked());
+        if (!lin.colsReady()) {
+            Assert.fail(cols + " lowers on " + be + " but the Linear does not take "
+                + "the column route for format " + ty);
+            return;
+        }
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, (int64) nc, width);
+        int64 pb = Quant.q8kPackedBytes(width);
+        float32[] got #= heap float32[(int64) nc * out];
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) ((int64) nc * out));
+        // Both branches: the column kernel (the probe says it pays), then
+        // the per-column fallback (the probe says it does not).
+        int32 pin = 1;
+        while (pin <= 2) {
+            ColsProbe.setPays(ty, pin);
+            int64 k = 0;
+            while (k < (int64) nc * out) { got[k] = -1.0f; k = k + 1; }
+            yD.upload(got);
+            lin.matvecCols(xp, pb, nc, yD, out, false);
+            QuantKernel.stream().sync();
+            yD.download(got);
+            String branch #= "the column kernel";
+            if (pin == 2) { branch #= "the per-column fallback"; }
+            CensusReachTest.nearOnePercent(want, got, (int64) nc * out,
+                "Linear.matvecCols for format " + ty + " through " + branch
+                + " at " + out + "x" + width);
+            // Accumulating, as o_proj and down_proj call it: y starts at a
+            // known value and the product is added to it.
+            k = 0;
+            while (k < (int64) nc * out) { got[k] = 0.5f; k = k + 1; }
+            yD.upload(got);
+            lin.matvecCols(xp, pb, nc, yD, out, true);
+            QuantKernel.stream().sync();
+            yD.download(got);
+            k = 0;
+            while (k < (int64) nc * out) { got[k] = got[k] - 0.5f; k = k + 1; }
+            CensusReachTest.nearOnePercent(want, got, (int64) nc * out,
+                "Linear.matvecCols accumulating for format " + ty + " through "
+                + branch + " at " + out + "x" + width);
+            pin = pin + 1;
+        }
+        ColsProbe.setPays(ty, 0);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void q4kLinearColumnsMatchTheHost() {
+        LinearColsDispatchTest.check(Quant.GG_Q4_K, "q4_k.bin",
+            "q4kQ8WaveMatVecColsKernel", "q4kQ8WaveMatVecKernel", 96L, 4096L);
+    }
+
+    @Test
+    public void q6kLinearColumnsMatchTheHost() {
+        LinearColsDispatchTest.check(Quant.GG_Q6_K, "q6_k.bin",
+            "q6kQ8WaveMatVecColsKernel", "q6kQ8WaveMatVecKernel", 96L, 4096L);
+    }
+
+    @Test
+    public void q5kLinearColumnsMatchTheHost() {
+        LinearColsDispatchTest.check(Quant.GG_Q5_K, "q5_k.bin",
+            "q5kQ8WaveMatVecColsKernel", "q5kQ8WaveMatVecKernel", 96L, 4096L);
+    }
+
+    @Test
+    public void q80LinearColumnsMatchTheHost() {
+        LinearColsDispatchTest.check(Quant.GG_Q8_0, "q8_0.bin",
+            "q80Q8WaveMatVecColsKernel", "q80Q8WaveMatVecKernel", 96L, 4096L);
+    }
+
+    @Test
+    public void q2kLinearColumnsMatchTheHost() {
+        LinearColsDispatchTest.check(Quant.GG_Q2_K, "q2_k.bin",
+            "q2kQ8WaveMatVecColsKernel", "q2kQ8WaveMatVecKernel", 96L, 4096L);
+    }
+
+    @Test
+    public void q3kLinearColumnsMatchTheHost() {
+        LinearColsDispatchTest.check(Quant.GG_Q3_K, "q3_k.bin",
+            "q3kQ8WaveMatVecColsKernel", "q3kQ8WaveMatVecKernel", 96L, 4096L);
+    }
+}
