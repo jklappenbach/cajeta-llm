@@ -3,6 +3,7 @@ package dev.cajeta.llm.sched;
 import cajeta.collection.ArrayList;
 import cajeta.lang.String;
 import cajeta.time.Clock;
+import cajeta.math.Tensor;
 import cajeta.xpu.Device;
 import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.LlmException;
@@ -11,6 +12,7 @@ import dev.cajeta.llm.gen.Sampler;
 import dev.cajeta.llm.gen.TokenSink;
 import dev.cajeta.llm.tok.Tokenizer;
 import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.HostOps;
 import dev.cajeta.llm.model.PagedKvCache;
 import dev.cajeta.llm.store.BlockKeys;
 import dev.cajeta.llm.store.BlockStore;
@@ -97,6 +99,28 @@ public final class Scheduler {
         this.sink = null;
         this.tok = null;
         this.tailIds #= heap int32[16];
+        this.logitsHashSteps = 0;
+    }
+
+    /** Fingerprint each request's logits bit for bit for its first `steps` steps
+     *  (`Request.logitsHashAt`); 0 turns it off. Those steps fetch the
+     *  logits and run unpipelined, so this is an instrument, not a mode. */
+    public void setLogitsHash(int32 steps) {
+        this.logitsHashSteps = steps;
+    }
+    int32 logitsHashSteps;
+
+    boolean hashesStep(Request r) {
+        return this.logitsHashSteps > 0 && r.genCount < this.logitsHashSteps;
+    }
+
+    void recordLogitsHash(Request r) {
+        int64 v = (int64) this.model.vocabSize();
+        Tensor<float32> t = this.model.logits();
+        if (r.logitsHashes == null) { r.logitsHashes = heap int64[this.logitsHashSteps]; }
+        r.logitsHashes[r.logitsHashN] = HostOps.bitFingerprint(t.hostBuffer(), t.hostBase(), v);
+        r.logitsHashN = r.logitsHashN + 1;
+        return;
     }
 
     /** Streaming sink (spec 8.8): every emitted token is delivered within
@@ -453,6 +477,7 @@ public final class Scheduler {
         if (n != 1) { return false; }
         if (r.cachedLen != r.totalLen - 1) { return false; }
         if (r.sampler != null && !r.sampler.isGreedy()) { return false; }
+        if (this.hashesStep(r)) { return false; }
         if (this.soleRunning() != i) { return false; }
         return this.model.pipelineReady(r.slot);
     }
@@ -541,6 +566,7 @@ public final class Scheduler {
                 tok = r.sampler.sample(this.model.logits(), r.all,
                     r.promptLen, r.genCount);
             }
+            if (this.hashesStep(r)) { this.recordLogitsHash(r); }
             r.all[r.totalLen] = tok;
             r.totalLen = r.totalLen + 1;
             r.genCount = r.genCount + 1;
@@ -609,7 +635,7 @@ public final class Scheduler {
         k = 0;
         while (k < m) {
             Request rk = this.reqs.get(this.bIdx[k]);
-            if (rk.sampler != null) { this.model.selectBatchLogits(k); }
+            if (rk.sampler != null || this.hashesStep(rk)) { this.model.selectBatchLogits(k); }
             this.consume(this.bIdx[k], rk, this.bOut[k], 1);
             k = k + 1;
         }
