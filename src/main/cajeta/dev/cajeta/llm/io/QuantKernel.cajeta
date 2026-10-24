@@ -18188,6 +18188,54 @@ public final class QuantKernel {
         return;
     }
 
+    /**
+     * The decode batch's router (cajeta-llm 15.2.15.4.1): one block per
+     * expert, as routerF32MatVecKernel, computing that expert's logit for
+     * EVERY row of the batch — W[e] is read once per row from L1 after
+     * the first, lanes stride the columns so the reads coalesce, and each
+     * row's sum is the one-row kernel's operation for operation (the same
+     * lane striding and Workgroup.reduce), so a batched row's logits are
+     * its solo logits bit for bit. The thread-per-expert
+     * routerBatchF32Kernel is the prefill's shape: 512 rows hide its
+     * serial column loop, four do not (109 us a layer on the 4090, 39% of
+     * the 4-sequence step).
+     */
+    @Kernel @Wave(width = 32)
+    public static void routerRowsF32Kernel(KernelBuffer<float32> y,
+            KernelBuffer<float32> w, KernelBuffer<float32> x,
+            uint32 rows, uint32 experts, uint32 cols) {
+        uint32 lane = KernelThread.x();
+        uint32 e = Workgroup.x();
+        uint32 r = 0;
+        while (r < rows) {
+            float32 acc = 0.0f;
+            if (e < experts) {
+                int64 xb = (int64) r * (int64) cols;
+                uint32 j = lane;
+                while (j < cols) {
+                    acc = acc + w[(int64) e * (int64) cols + (int64) j]
+                        * x[xb + (int64) j];
+                    j = j + 256;
+                }
+            }
+            float32 tot = Workgroup.reduce(GroupOp.Add, acc);
+            if (lane == 0 && e < experts) {
+                y[(int64) r * (int64) experts + (int64) e] = tot;
+            }
+            r = r + 1;
+        }
+    }
+
+    public static void routerRowsF32LaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<float32> w, KernelBuffer<float32> x,
+            int64 rows, int64 experts, int64 cols) {
+        uint32 ue = (uint32) experts;
+        KernelStream s = QuantKernel.stream();
+        routerRowsF32Kernel.launch(s, grid: [ue], block: [256])
+            (y, w, x, (uint32) rows, ue, (uint32) cols);
+        return;
+    }
+
     public static void routerF32MatVecLaunchNoSync(KernelBuffer<float32> y,
             KernelBuffer<float32> w, KernelBuffer<float32> x,
             int64 experts, int64 cols) {

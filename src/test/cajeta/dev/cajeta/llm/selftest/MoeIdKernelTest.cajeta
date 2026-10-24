@@ -1141,4 +1141,74 @@ public class MoeIdKernelTest {
         ExpertBank.setResidencyBudget(0L);
         ExpertBank.resetResidency();
     }
+
+    /**
+     * cajeta-llm 15.2.15.4.1: the decode batch's router over n rows is one
+     * block per expert reading W[e] once for every row, and each row's logit
+     * is bit-identical to routerF32MatVecKernel's for that row. The
+     * thread-per-expert routerBatchF32Kernel the batch used first was shaped
+     * for 512 prefill rows and took 109 us a layer at four rows on the 4090
+     * (39% of the step, llama.cpp's router 8 us; tally of 2026-10-24 14:08).
+     */
+    @Test
+    public void batchedRouterRowsMatchThePerRowKernel() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        if (!KernelCap.usable("routerRowsF32Kernel")) {
+            DeviceSkip.noKernel("routerRowsF32Kernel", Device.activeBackend());
+            return;
+        }
+        if (!KernelCap.usable("routerF32MatVecKernel")) {
+            DeviceSkip.noKernel("routerF32MatVecKernel", Device.activeBackend());
+            return;
+        }
+        int32 E = 128;
+        int32 H = 2048;
+        int32 N = 4;
+        float32[] wr = heap float32[E * H];
+        float32[] xh = heap float32[N * H];
+        int32 i = 0;
+        while (i < N * H) {
+            xh[i] = (float32) ((i % 17) - 8 + (i / H)) / 8.0f;
+            i = i + 1;
+        }
+        int32 e2 = 0;
+        while (e2 < E) {
+            i = 0;
+            while (i < H) {
+                wr[e2 * H + i] = (float32) (((e2 * 31 + i * 7) % 11) - 5) * 0.01f;
+                i = i + 1;
+            }
+            e2 = e2 + 1;
+        }
+        KernelBuffer<float32> wDev #= heap KernelBuffer<float32>((uint64) (E * H));
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) (N * H));
+        wDev.upload(wr, (int64) (E * H));
+        x.upload(xh, (int64) (N * H));
+        KernelBuffer<float32> one #= heap KernelBuffer<float32>((uint64) (N * E));
+        KernelBuffer<float32> rows #= heap KernelBuffer<float32>((uint64) (N * E));
+        KernelStream s = QuantKernel.stream();
+        int32 r = 0;
+        while (r < N) {
+            KernelBuffer<float32> xr #= x.slice((uint64) (r * H), (uint64) H);
+            KernelBuffer<float32> yr #= one.slice((uint64) (r * E), (uint64) E);
+            QuantKernel.routerF32MatVecLaunchNoSync(yr, wDev, xr, (int64) E, (int64) H);
+            r = r + 1;
+        }
+        int64[] vc #= ValueCheck.mark();
+        QuantKernel.routerRowsF32LaunchNoSync(rows, wDev, x, (int64) N, (int64) E, (int64) H);
+        s.sync();
+        float32[] a = heap float32[N * E];
+        float32[] b = heap float32[N * E];
+        one.download(a, (int64) (N * E));
+        rows.download(b, (int64) (N * E));
+        i = 0;
+        while (i < N * E) {
+            if (Cajeta.f32ToBits(a[i]) != Cajeta.f32ToBits(b[i])) {
+                Assert.fail("row " + (i / E) + " expert " + (i % E) + ": per-row "
+                    + a[i] + ", rows kernel " + b[i]);
+            }
+            i = i + 1;
+        }
+        ValueCheck.credit(vc);
+    }
 }
