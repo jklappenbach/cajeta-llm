@@ -512,6 +512,9 @@ fi
 # some unrelated test had run first (ResidentMoeDecodeTest's capped arm,
 # xpu-kernel-adaptor 12.2.10). CAJETA_XPU_POISON=0 is the control.
 export CAJETA_XPU_POISON="${CAJETA_XPU_POISON:-1}"
+# The engine's tuned choices persist per user by default; a test run keeps none,
+# so no earlier run's verdict reaches a test (cajeta-llm 15.2.12.2.1.1.1).
+export CAJETA_LLM_TUNE_DIR="${CAJETA_LLM_TUNE_DIR:-off}"
 echo ">> device buffers: CAJETA_XPU_POISON=${CAJETA_XPU_POISON}"
 "$CAJETA" --emit=exe --profile=test --xpu-backend="${XPU_BACKEND:-cpu}" \
     --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja,$logging_cja" \
