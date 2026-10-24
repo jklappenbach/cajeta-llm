@@ -7,6 +7,7 @@ import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.io.WmmaKernel;
 
@@ -346,5 +347,136 @@ public class WmmaIdTileTest {
         if (WmmaIdTileTest.skip(true, 1)) { return; }
         KernelBuffer<int8> slab #= WmmaIdTileTest.q6kSlab();
         WmmaIdTileTest.run(slab, true, 1);
+    }
+
+    /** A Q5_K slab: 176-byte blocks (Q4_K's header and nibbles, a 32-byte
+     *  fifth-bit plane at +16), finite half scales, deterministic noise. */
+    static #KernelBuffer<int8> q5kSlab() {
+        int32 rowBytes = (WmmaIdTileTest.COLS / 256) * 176;
+        int64 total = (int64) WmmaIdTileTest.E
+            * (int64) WmmaIdTileTest.ROWS_E * (int64) rowBytes;
+        int8[] raw = heap int8[total];
+        int64 i = 0;
+        while (i < total) {
+            int64 blk = i / 176L;
+            int64 off = i % 176L;
+            if (off == 1L) {
+                raw[i] = (int8) 44;
+            } else if (off == 3L) {
+                raw[i] = (int8) 40;
+            } else if (off == 0L || off == 2L) {
+                raw[i] = (int8) ((blk * 37L + off * 11L) % 256L);
+            } else {
+                raw[i] = (int8) ((i * 131L + 17L) % 256L);
+            }
+            i = i + 1;
+        }
+        KernelBuffer<int8> slab #= heap KernelBuffer<int8>((uint64) (total + 4L));
+        slab.upload(raw, total);
+        return #slab;
+    }
+
+    static boolean skip5() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return true; }
+        if (be.equals("vulkan")) { DeviceSkip.noRoute("packed WMMA id route", be); return true; }
+        if (!KernelCap.usable("q5kQ8IdMatVecKernel")) { DeviceSkip.noKernel("q5kQ8IdMatVecKernel", be); return true; }
+        if (!KernelCap.usable("q5kWmmaIdMwKernel")) { DeviceSkip.noKernel("q5kWmmaIdMwKernel", be); return true; }
+        return false;
+    }
+
+    /**
+     * cajeta-llm 15.2.15.4.2: the Q5_K multi-wave id GEMM against the Q5_K id
+     * mat-vec run token by token (itself bit-identical to the one-column
+     * Q5_K wave kernel, MoeIdKernelTest), same slab bytes, same packed
+     * activations, at the reassociation bar; every output row live. Before
+     * this kernel a Q5_K expert bank's prefill ran one coop GEMM per expert
+     * group: 32,672 six-block launches of 111 us for 2048 tokens of the 30B
+     * (tally of 2026-10-24 14:55), 341 tok/s against llama.cpp's 4405.
+     */
+    @Test
+    public void q5kMwIdAgreesWithTheIdMatVec() {
+        if (WmmaIdTileTest.skip5()) { return; }
+        KernelBuffer<int8> slab #= WmmaIdTileTest.q5kSlab();
+        KernelBuffer<int8> xp #= WmmaIdTileTest.packActs();
+        int32 cap = WmmaIdTileTest.NP / 16 + WmmaIdTileTest.E + 1;
+        int32[] mE = heap int32[cap];
+        int32[] mT0 = heap int32[cap];
+        int32[] mM1 = heap int32[cap];
+        int32 n64 = WmmaIdTileTest.buildMaps64(mE, mT0, mM1);
+        KernelBuffer<int32> e64 #= heap KernelBuffer<int32>((uint64) n64);
+        KernelBuffer<int32> t64 #= heap KernelBuffer<int32>((uint64) n64);
+        KernelBuffer<int32> m64 #= heap KernelBuffer<int32>((uint64) n64);
+        e64.upload(mE, (int64) n64);
+        t64.upload(mT0, (int64) n64);
+        m64.upload(mM1, (int64) n64);
+        int32[] metaH = heap int32[4];
+        metaH[0] = n64;
+        KernelBuffer<int32> meta #= heap KernelBuffer<int32>((uint64) 4);
+        meta.upload(metaH, 1L);
+        int64 nMax = (int64) n64 + 3L;
+        int64 outDim = (int64) WmmaIdTileTest.ROWS_E;
+        int64 np = (int64) WmmaIdTileTest.NP;
+        int64 nOut = np * outDim;
+        // The oracle: every token's expert through the id mat-vec.
+        int32[] selH = heap int32[np];
+        int32 e = 0;
+        while (e < WmmaIdTileTest.E) {
+            int32 t = WmmaIdTileTest.gOff(e);
+            while (t < WmmaIdTileTest.gOff(e + 1)) { selH[(int64) t] = e; t = t + 1; }
+            e = e + 1;
+        }
+        KernelBuffer<int32> sel #= heap KernelBuffer<int32>((uint64) np);
+        sel.upload(selH, np);
+        KernelBuffer<float32> y1 #= heap KernelBuffer<float32>((uint64) nOut);
+        KernelBuffer<float32> y2 #= heap KernelBuffer<float32>((uint64) nOut);
+        Assert.isTrue(QuantKernel.idMatVecLaunchNoSync(Quant.GG_Q5_K, y1, slab, xp, sel,
+            WmmaIdTileTest.NP, outDim, (int64) WmmaIdTileTest.COLS,
+            (int64) (WmmaIdTileTest.COLS / 256)));
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<int32> slabW #= slab.wordView();
+        WmmaKernel.q5kWmmaIdMwLaunchNoSync(y2, slab, slabW, xp, e64, t64, m64, meta,
+            nMax, outDim, (int64) WmmaIdTileTest.COLS, (int64) WmmaIdTileTest.ROWS_E);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a = heap float32[nOut];
+        float32[] b = heap float32[nOut];
+        y1.download(a, nOut);
+        y2.download(b, nOut);
+        int64 bad = 0;
+        String first = "";
+        boolean nz = false;
+        int64 i = 0;
+        while (i < nOut) {
+            float32 d = a[i] - b[i];
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 mag = a[i] < 0.0f ? 0.0f - a[i] : a[i];
+            if (d > mag * 0.002f + 0.002f) {
+                bad = bad + 1;
+                if (bad <= 4L) {
+                    first = first + " [" + i + " t" + (i / outDim) + " r" + (i % outDim)
+                        + ": " + b[i] + " vs " + a[i] + "]";
+                }
+            }
+            if (a[i] != 0.0f) { nz = true; }
+            i = i + 1;
+        }
+        if (bad > 0L) {
+            Assert.fail("q5k Mw id vs id mat-vec: " + bad + " of " + nOut
+                + " elements further apart than reassociation explains, first:" + first);
+        }
+        Assert.isTrue(nz);
+        int64 t2 = 0;
+        while (t2 < np) {
+            boolean live = false;
+            int64 c2 = 0;
+            while (c2 < outDim) {
+                if (b[t2 * outDim + c2] != 0.0f) { live = true; }
+                c2 = c2 + 1;
+            }
+            Assert.isTrue(live);
+            t2 = t2 + 1;
+        }
+        ValueCheck.credit(vc);
     }
 }
