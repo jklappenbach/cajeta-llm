@@ -1,0 +1,260 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.ColsProbe;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.Linear;
+import cajeta.lang.Cajeta;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+
+/**
+ * cajeta-llm 15.2.12.3.7: three Q4_K projections (q, k, v) or two (gate, up) in ONE
+ * Cols launch. Each segment's wave runs the chosen variant's row body, so every output
+ * is bit-identical to the separate launches; what changes is the launch count
+ * (Vulkan's floor is ~10 us a launch, hip's 4).
+ */
+public class ColsSegTest {
+
+    public ColsSegTest() { return; }
+
+    static boolean here() {
+        if (!CensusReachTest.deviceHere()) { return false; }
+        String be #= Device.activeBackend();
+        if (be.equals("cpu")) {
+            DeviceSkip.tracked("the cpu lowering of the fused Cols kernels computes NaN", "cajeta-llm 15.2.12.3.7.1");
+            return false;
+        }
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return false; }
+        if (!KernelCap.usable("q4kQ8WaveMatVecColsSegPlainKernel")) { DeviceSkip.noKernel("q4kQ8WaveMatVecColsSegPlainKernel", be); return false; }
+        if (!KernelCap.usable("q4kQ8WaveMatVecColsSegPfKernel")) { DeviceSkip.noKernel("q4kQ8WaveMatVecColsSegPfKernel", be); return false; }
+        return true;
+    }
+
+    static #KernelBuffer<int8> weight(int64 rows, int64 cols) {
+        int8[] raw #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", rows * (cols / 256L));
+        KernelBuffer<int8> w #= heap KernelBuffer<int8>((uint64) raw.count());
+        w.upload(raw);
+        return #w;
+    }
+
+    static #KernelBuffer<int8> activations(int32 nc, int64 cols) {
+        float32[] x #= heap float32[(int64) nc * cols];
+        int64 i = 0;
+        while (i < (int64) nc * cols) {
+            x[i] = (float32) ((i * 37L + (i / cols) * 11L + 5L) % 67L - 33L) * 0.0625f;
+            i = i + 1;
+        }
+        return CensusReachTest.packedActivations(x, (int64) nc, cols);
+    }
+
+    static void sameBits(float32[] a, float32[] b, int64 n, String what) {
+        int64 i = 0;
+        while (i < n) {
+            if (Cajeta.f32ToBits(a[i]) != Cajeta.f32ToBits(b[i])) {
+                Assert.fail(what + ": element " + i + " is " + b[i] + " fused, " + a[i] + " separate");
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    /** Three segments of odd row counts against the three separate launches, both variants. */
+    static void threeSegments(int32 variant) {
+        int64 cols = 4096L;
+        int32 nc = 4;
+        int64 rq = 97L;
+        int64 rk = 33L;
+        int64 rv = 31L;
+        KernelBuffer<int8> wq #= ColsSegTest.weight(rq, cols);
+        KernelBuffer<int8> wk #= ColsSegTest.weight(rk, cols);
+        KernelBuffer<int8> wv #= ColsSegTest.weight(rv, cols);
+        KernelBuffer<int8> xp #= ColsSegTest.activations(nc, cols);
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<float32> yq #= heap KernelBuffer<float32>((uint64) ((int64) nc * rq));
+        KernelBuffer<float32> yk #= heap KernelBuffer<float32>((uint64) ((int64) nc * rk));
+        KernelBuffer<float32> yv #= heap KernelBuffer<float32>((uint64) ((int64) nc * rv));
+        QuantKernel.setQ4ColsPrefetch(variant);
+        QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(yq, wq, xp, rq, cols, 0L, nc, rq, pb, false);
+        QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(yk, wk, xp, rk, cols, 0L, nc, rk, pb, false);
+        QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(yv, wv, xp, rv, cols, 0L, nc, rv, pb, false);
+        QuantKernel.setQ4ColsPrefetch(0);
+        KernelBuffer<float32> fq #= heap KernelBuffer<float32>((uint64) ((int64) nc * rq));
+        KernelBuffer<float32> fk #= heap KernelBuffer<float32>((uint64) ((int64) nc * rk));
+        KernelBuffer<float32> fv #= heap KernelBuffer<float32>((uint64) ((int64) nc * rv));
+        int64 before = QuantKernel.colsSegLaunches();
+        QuantKernel.q4kQ8WaveMatVecColsSegLaunchNoSync(fq, fk, fv, wq, wk, wv, xp, rq, rk, rv,
+            cols, nc, rq, rk, rv, pb, false, variant);
+        Assert.equals(before + 1L, QuantKernel.colsSegLaunches());
+        QuantKernel.stream().sync();
+        float32[] a #= heap float32[(int64) nc * rq];
+        float32[] b #= heap float32[(int64) nc * rq];
+        yq.download(a); fq.download(b);
+        ColsSegTest.sameBits(a, b, (int64) nc * rq, "q segment, variant " + variant);
+        float32[] c #= heap float32[(int64) nc * rk];
+        float32[] d #= heap float32[(int64) nc * rk];
+        yk.download(c); fk.download(d);
+        ColsSegTest.sameBits(c, d, (int64) nc * rk, "k segment, variant " + variant);
+        float32[] e #= heap float32[(int64) nc * rv];
+        float32[] f #= heap float32[(int64) nc * rv];
+        yv.download(e); fv.download(f);
+        ColsSegTest.sameBits(e, f, (int64) nc * rv, "v segment, variant " + variant);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void threePlainSegmentsEqualTheSeparateLaunches() {
+        if (!ColsSegTest.here()) { return; }
+        ColsSegTest.threeSegments(2);
+    }
+
+    @Test
+    public void threePrefetchSegmentsEqualTheSeparateLaunches() {
+        if (!ColsSegTest.here()) { return; }
+        ColsSegTest.threeSegments(1);
+    }
+
+    /** Two segments (gate and up): the third is empty. */
+    @Test
+    public void twoSegmentsServeGateAndUp() {
+        if (!ColsSegTest.here()) { return; }
+        int64 cols = 4096L;
+        int32 nc = 3;
+        int64 r = 96L;
+        KernelBuffer<int8> wg #= ColsSegTest.weight(r, cols);
+        KernelBuffer<int8> wu #= ColsSegTest.weight(r + 32L, cols);
+        KernelBuffer<int8> xp #= ColsSegTest.activations(nc, cols);
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<float32> yg #= heap KernelBuffer<float32>((uint64) ((int64) nc * r));
+        KernelBuffer<float32> yu #= heap KernelBuffer<float32>((uint64) ((int64) nc * (r + 32L)));
+        QuantKernel.setQ4ColsPrefetch(2);
+        QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(yg, wg, xp, r, cols, 0L, nc, r, pb, false);
+        QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(yu, wu, xp, r + 32L, cols, 0L, nc, r + 32L, pb, false);
+        QuantKernel.setQ4ColsPrefetch(0);
+        KernelBuffer<float32> fg #= heap KernelBuffer<float32>((uint64) ((int64) nc * r));
+        KernelBuffer<float32> fu #= heap KernelBuffer<float32>((uint64) ((int64) nc * (r + 32L)));
+        QuantKernel.q4kQ8WaveMatVecColsSegLaunchNoSync(fg, fu, fg, wg, wu, wg, xp, r, r + 32L, 0L,
+            cols, nc, r, r + 32L, r, pb, false, 2);
+        QuantKernel.stream().sync();
+        float32[] a #= heap float32[(int64) nc * r];
+        float32[] b #= heap float32[(int64) nc * r];
+        yg.download(a); fg.download(b);
+        ColsSegTest.sameBits(a, b, (int64) nc * r, "gate segment");
+        float32[] c #= heap float32[(int64) nc * (r + 32L)];
+        float32[] d #= heap float32[(int64) nc * (r + 32L)];
+        yu.download(c); fu.download(d);
+        ColsSegTest.sameBits(c, d, (int64) nc * (r + 32L), "up segment");
+        ValueCheck.credit(vc);
+    }
+
+    /** The Linear route: three Q4_K projections take one launch; a Q6_K v leaves q|k fused
+     *  and v on its own; the outputs equal matvecCols' bit for bit. */
+    @Test
+    public void theRouteFusesWhatIsQ4KAndMatchesMatvecCols() {
+        if (!ColsSegTest.here()) { return; }
+        int64 cols = 4096L;
+        int32 nc = 4;
+        int64 rq = 96L;
+        int64 rk = 32L;
+        int8[] q #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", rq * (cols / 256L));
+        int8[] k #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", rk * (cols / 256L));
+        int8[] v #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", rk * (cols / 256L));
+        int8[] v6 #= CensusReachTest.tiled(Quant.GG_Q6_K, "q6_k.bin", rk * (cols / 256L));
+        Linear lq #= heap Linear((int32) cols, (int32) rq);
+        Linear lk #= heap Linear((int32) cols, (int32) rk);
+        Linear lv #= heap Linear((int32) cols, (int32) rk);
+        Linear lv6 #= heap Linear((int32) cols, (int32) rk);
+        lq.bindPacked(#q, Quant.GG_Q4_K);
+        lk.bindPacked(#k, Quant.GG_Q4_K);
+        lv.bindPacked(#v, Quant.GG_Q4_K);
+        lv6.bindPacked(#v6, Quant.GG_Q6_K);
+        Assert.isTrue(lq.colsReady() && lk.colsReady() && lv.colsReady() && lv6.colsReady());
+        KernelBuffer<int8> xp #= ColsSegTest.activations(nc, cols);
+        int64 pb = Quant.q8kPackedBytes(cols);
+        ColsProbe.setPays(Quant.GG_Q4_K, 1);
+        ColsProbe.setPays(Quant.GG_Q6_K, 1);
+        QuantKernel.setColsSeg(1);
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<float32> yq #= heap KernelBuffer<float32>((uint64) ((int64) nc * rq));
+        KernelBuffer<float32> yk #= heap KernelBuffer<float32>((uint64) ((int64) nc * rk));
+        KernelBuffer<float32> yv #= heap KernelBuffer<float32>((uint64) ((int64) nc * rk));
+        lq.matvecCols(xp, pb, nc, yq, rq, false);
+        lk.matvecCols(xp, pb, nc, yk, rk, false);
+        lv.matvecCols(xp, pb, nc, yv, rk, false);
+        KernelBuffer<float32> fq #= heap KernelBuffer<float32>((uint64) ((int64) nc * rq));
+        KernelBuffer<float32> fk #= heap KernelBuffer<float32>((uint64) ((int64) nc * rk));
+        KernelBuffer<float32> fv #= heap KernelBuffer<float32>((uint64) ((int64) nc * rk));
+        int64 before = QuantKernel.colsSegLaunches();
+        Linear.matvecQkvCols(lq, lk, lv, xp, pb, nc, fq, fk, fv, rq, rk);
+        Assert.equals(before + 1L, QuantKernel.colsSegLaunches());
+        QuantKernel.stream().sync();
+        float32[] a #= heap float32[(int64) nc * rq];
+        float32[] b #= heap float32[(int64) nc * rq];
+        yq.download(a); fq.download(b);
+        ColsSegTest.sameBits(a, b, (int64) nc * rq, "route q");
+        float32[] c #= heap float32[(int64) nc * rk];
+        float32[] d #= heap float32[(int64) nc * rk];
+        yk.download(c); fk.download(d);
+        ColsSegTest.sameBits(c, d, (int64) nc * rk, "route k");
+        yv.download(c); fv.download(d);
+        ColsSegTest.sameBits(c, d, (int64) nc * rk, "route v");
+        // a Q6_K v: q|k fused (one seg launch), v on its own
+        KernelBuffer<float32> y6 #= heap KernelBuffer<float32>((uint64) ((int64) nc * rk));
+        lv6.matvecCols(xp, pb, nc, y6, rk, false);
+        KernelBuffer<float32> f6 #= heap KernelBuffer<float32>((uint64) ((int64) nc * rk));
+        before = QuantKernel.colsSegLaunches();
+        Linear.matvecQkvCols(lq, lk, lv6, xp, pb, nc, fq, fk, f6, rq, rk);
+        Assert.equals(before + 1L, QuantKernel.colsSegLaunches());
+        QuantKernel.stream().sync();
+        y6.download(c); f6.download(d);
+        ColsSegTest.sameBits(c, d, (int64) nc * rk, "route v (Q6_K, separate)");
+        fq.download(b);
+        ColsSegTest.sameBits(a, b, (int64) nc * rq, "route q beside a Q6_K v");
+        ColsProbe.setPays(Quant.GG_Q4_K, 0);
+        ColsProbe.setPays(Quant.GG_Q6_K, 0);
+        QuantKernel.setColsSeg(2);
+        ValueCheck.credit(vc);
+    }
+
+    /** DOES NOT FIRE: with the fusion off (the default), the route takes three separate launches. */
+    @Test
+    public void thePinOffKeepsTheSeparateLaunches() {
+        if (!ColsSegTest.here()) { return; }
+        int64 cols = 4096L;
+        int64 rq = 96L;
+        int64 rk = 32L;
+        int8[] q #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", rq * (cols / 256L));
+        int8[] k #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", rk * (cols / 256L));
+        int8[] v #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", rk * (cols / 256L));
+        Linear lq #= heap Linear((int32) cols, (int32) rq);
+        Linear lk #= heap Linear((int32) cols, (int32) rk);
+        Linear lv #= heap Linear((int32) cols, (int32) rk);
+        lq.bindPacked(#q, Quant.GG_Q4_K);
+        lk.bindPacked(#k, Quant.GG_Q4_K);
+        lv.bindPacked(#v, Quant.GG_Q4_K);
+        Assert.isTrue(lq.colsReady() && lk.colsReady() && lv.colsReady());
+        KernelBuffer<int8> xp #= ColsSegTest.activations(4, cols);
+        int64 pb = Quant.q8kPackedBytes(cols);
+        ColsProbe.setPays(Quant.GG_Q4_K, 1);
+        int64[] vc #= ValueCheck.mark();
+        KernelBuffer<float32> fq #= heap KernelBuffer<float32>((uint64) (4L * rq));
+        KernelBuffer<float32> fk #= heap KernelBuffer<float32>((uint64) (4L * rk));
+        KernelBuffer<float32> fv #= heap KernelBuffer<float32>((uint64) (4L * rk));
+        QuantKernel.setColsSeg(2);
+        int64 before = QuantKernel.colsSegLaunches();
+        int64 launches0 = Linear.launches();
+        Linear.matvecQkvCols(lq, lk, lv, xp, pb, 4, fq, fk, fv, rq, rk);
+        QuantKernel.stream().sync();
+        Assert.equals(before, QuantKernel.colsSegLaunches());
+        Assert.equals(launches0 + 3L, Linear.launches());
+        float32[] b #= heap float32[4L * rq];
+        fq.download(b);
+        ColsProbe.setPays(Quant.GG_Q4_K, 0);
+        ValueCheck.credit(vc);
+    }
+}

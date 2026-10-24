@@ -4016,6 +4016,79 @@ public final class Linear extends InfModule {
         return;
     }
 
+    /** How many mat-vec launches the Linears issued, this process. */
+    public static int64 launches() { return Linear.nLaunches; }
+
+    /** Whether this linear can be a segment of a fused Q4_K Cols launch. */
+    boolean segFusable() {
+        if (this.packedTy != Quant.GG_Q4_K) { return false; }
+        this.ensureDevice();
+        return this.q8 && this.wave && !this.hasEpilogue() && this.packedAct;
+    }
+
+    /** The fused launches serve where their kernels lower and compute right: not the cpu
+     *  backend, whose lowering of the three-arm accumulation is wrong (15.2.12.3.7.1). */
+    static boolean segKernels() {
+        if (!QuantKernel.colsSegEnabled()) { return false; }
+        String be #= Device.activeBackend();
+        if (be.equals("cpu")) { return false; }
+        return KernelCap.usable("q4kQ8WaveMatVecColsSegPlainKernel")
+            && KernelCap.usable("q4kQ8WaveMatVecColsSegPfKernel");
+    }
+
+    /** q, k and v against the same packed columns: one launch when all three are Q4_K wave
+     *  linears, q|k fused and v alone when v is not, else three (15.2.12.3.7). Outputs equal
+     *  matvecCols' bit for bit. */
+    static void matvecQkvCols(Linear q, Linear k, Linear v, KernelBuffer<int8> xp, int64 xpStride,
+            int32 nc, KernelBuffer<float32> yq, KernelBuffer<float32> yk, KernelBuffer<float32> yv,
+            int64 qStride, int64 kvStride) {
+        boolean fuse = nc > 1 && Linear.segKernels() && QuantKernel.colsSegQkvEnabled()
+            && ColsProbe.pays(Quant.GG_Q4_K, nc) && q.segFusable() && k.segFusable()
+            && q.inDim == k.inDim;
+        boolean vToo = fuse && v.segFusable() && v.inDim == q.inDim;
+        if (fuse && QuantKernel.colsSegPin == 0) {
+            fuse = ColsSegProbe.pays(0, nc, (int64) q.outDim, (int64) k.outDim,
+                vToo ? (int64) v.outDim : 0L, (int64) q.inDim);
+        }
+        if (!fuse) {
+            q.matvecCols(xp, xpStride, nc, yq, qStride, false);
+            k.matvecCols(xp, xpStride, nc, yk, kvStride, false);
+            v.matvecCols(xp, xpStride, nc, yv, kvStride, false);
+            return;
+        }
+        int32 variant = QuantKernel.q4ColsVariantFor((int64) q.outDim) == 1 ? 1 : 2;
+        QuantKernel.q4kQ8WaveMatVecColsSegLaunchNoSync(yq, yk, vToo ? yv : yq, q.payloadDev,
+            k.payloadDev, vToo ? v.payloadDev : q.payloadDev, xp, (int64) q.outDim,
+            (int64) k.outDim, vToo ? (int64) v.outDim : 0L, (int64) q.inDim, nc, qStride,
+            kvStride, kvStride, xpStride, false, variant);
+        Linear.nLaunches = Linear.nLaunches + 1L;
+        if (!vToo) { v.matvecCols(xp, xpStride, nc, yv, kvStride, false); }
+        return;
+    }
+
+    /** gate and up against the same packed columns in one launch when both are Q4_K wave
+     *  linears, else two (15.2.12.3.7). */
+    static void matvecGateUpCols(Linear g, Linear u, KernelBuffer<int8> xp, int64 xpStride,
+            int32 nc, KernelBuffer<float32> yg, KernelBuffer<float32> yu, int64 yStride) {
+        boolean fuse = nc > 1 && Linear.segKernels() && QuantKernel.colsSegGateUpEnabled()
+            && ColsProbe.pays(Quant.GG_Q4_K, nc) && g.segFusable() && u.segFusable()
+            && g.inDim == u.inDim && g.outDim == u.outDim;
+        if (fuse && QuantKernel.colsSegPin == 0) {
+            fuse = ColsSegProbe.pays(1, nc, (int64) g.outDim, (int64) u.outDim, 0L, (int64) g.inDim);
+        }
+        if (!fuse) {
+            g.matvecCols(xp, xpStride, nc, yg, yStride, false);
+            u.matvecCols(xp, xpStride, nc, yu, yStride, false);
+            return;
+        }
+        int32 variant = QuantKernel.q4ColsVariantFor((int64) g.outDim) == 1 ? 1 : 2;
+        QuantKernel.q4kQ8WaveMatVecColsSegLaunchNoSync(yg, yu, yg, g.payloadDev, u.payloadDev,
+            g.payloadDev, xp, (int64) g.outDim, (int64) u.outDim, 0L, (int64) g.inDim, nc,
+            yStride, yStride, yStride, xpStride, false, variant);
+        Linear.nLaunches = Linear.nLaunches + 1L;
+        return;
+    }
+
     /** One accumulating column through the format's column kernel. */
     void colsLaunchOne(KernelBuffer<int8> xr, int64 xpStride, KernelBuffer<float32> y,
             int64 yo, int64 yStride) {

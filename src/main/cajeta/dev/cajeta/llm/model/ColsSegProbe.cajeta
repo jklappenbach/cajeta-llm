@@ -1,0 +1,344 @@
+package dev.cajeta.llm.model;
+
+import cajeta.lang.Cajeta;
+import cajeta.lang.Optional;
+import cajeta.lang.String;
+import cajeta.time.Clock;
+import cajeta.xpu.Autotune;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelTimer;
+import cajeta.xpu.ShapeChoice;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/**
+ * Whether one fused Cols launch over q|k|v (kind 0) or gate|up (kind 1) beats the
+ * separate launches on THIS device at the engine's shapes (cajeta-llm 15.2.12.3.7):
+ * measured on gfx1151 the same kernels gain 1.6% under hip and lose 3% under Vulkan.
+ * Both arms run on synthetic Q4_K weights and are held equal before they are timed;
+ * the verdict carries the tie margin and is remembered per device, build and shape.
+ */
+public final class ColsSegProbe {
+    private ColsSegProbe() { }
+
+    static final int32 REPS = 8;
+    static final int32 KINDS = 2;
+    static final int32 WIDTHS = 9;
+    static String tuneDir = "";
+    static String buildIdOverride = "";
+    static int32[] pins;            // [kind * WIDTHS + nc]: 0 none, 1 fused, 2 separate
+    static String[] keys;           // this process's verdicts, by kind, width and shape
+    static int32[] vals;
+    static int32 nKeys = 0;
+    static final int32 MAX_KEYS = 64;
+    static int64 probesN = 0L;
+    static int64 lastFusedNs = 0L;
+    static int64 lastSepNs = 0L;
+    static String lastRefusal = "";
+
+    public static void setTuneDir(String d) { ColsSegProbe.tuneDir #= d.clone(); }
+    public static int64 probes() { return ColsSegProbe.probesN; }
+    public static int64 fusedNs() { return ColsSegProbe.lastFusedNs; }
+    public static int64 separateNs() { return ColsSegProbe.lastSepNs; }
+    public static String lastRefused() { return ColsSegProbe.lastRefusal; }
+    public static void setBuildIdForTest(String id) { ColsSegProbe.buildIdOverride #= id.clone(); }
+
+    static void ensureTables() {
+        if (ColsSegProbe.pins == null) {
+            ColsSegProbe.pins = heap int32[(int64) (ColsSegProbe.KINDS * ColsSegProbe.WIDTHS)];
+            ColsSegProbe.keys = heap String[(int64) ColsSegProbe.MAX_KEYS];
+            ColsSegProbe.vals = heap int32[(int64) ColsSegProbe.MAX_KEYS];
+        }
+        return;
+    }
+
+    static int32 slot(int32 kind, int32 nc) {
+        int32 w = nc;
+        if (w < 0) { w = 0; }
+        if (w >= ColsSegProbe.WIDTHS) { w = ColsSegProbe.WIDTHS - 1; }
+        return kind * ColsSegProbe.WIDTHS + w;
+    }
+
+    /** Pin the verdict for `kind` at `nc` columns, any shape: 1 fused, 2 separate, 0 asks again. */
+    public static void setPays(int32 kind, int32 nc, int32 v) {
+        ColsSegProbe.ensureTables();
+        ColsSegProbe.pins[(int64) ColsSegProbe.slot(kind, nc)] = v;
+        if (v == 0) {
+            // forget this process's verdicts for the kind and width, so the next ask measures
+            int32 i = 0;
+            while (i < ColsSegProbe.nKeys) {
+                String pre #= "" + kind + ":" + nc + ":";
+                if (ColsSegProbe.keys[(int64) i] != null && ColsSegProbe.keys[(int64) i].startsWith(pre)) {
+                    ColsSegProbe.vals[(int64) i] = 0;
+                }
+                i = i + 1;
+            }
+        }
+        return;
+    }
+
+    static int32 remembered(String key) {
+        int32 i = 0;
+        while (i < ColsSegProbe.nKeys) {
+            if (ColsSegProbe.keys[(int64) i] != null && ColsSegProbe.keys[(int64) i].equals(key)) {
+                return ColsSegProbe.vals[(int64) i];
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    static void remember(String key, int32 v) {
+        int32 i = 0;
+        while (i < ColsSegProbe.nKeys) {
+            if (ColsSegProbe.keys[(int64) i] != null && ColsSegProbe.keys[(int64) i].equals(key)) {
+                ColsSegProbe.vals[(int64) i] = v;
+                return;
+            }
+            i = i + 1;
+        }
+        if (ColsSegProbe.nKeys < ColsSegProbe.MAX_KEYS) {
+            ColsSegProbe.keys[(int64) ColsSegProbe.nKeys] #= key.clone();
+            ColsSegProbe.vals[(int64) ColsSegProbe.nKeys] = v;
+            ColsSegProbe.nKeys = ColsSegProbe.nKeys + 1;
+        }
+        return;
+    }
+
+    static #String shapeKey(int64 rows0, int64 rows1, int64 rows2, int64 cols) {
+        String k #= "" + rows0 + "+" + rows1 + "+" + rows2 + "x" + cols;
+        return #k;
+    }
+
+    static #String knob(int32 kind, int32 nc, int64 rows0, int64 rows1, int64 rows2, int64 cols) {
+        String k #= "colsSeg-" + (kind == 0 ? "qkv" : "gateup") + "-"
+            + ColsSegProbe.shapeKey(rows0, rows1, rows2, cols) + "-b" + nc;
+        return #k;
+    }
+
+    /** The fused and separate kernels' manifests, so a rebuilt kernel is measured again. */
+    static #String buildId() {
+        if (ColsSegProbe.buildIdOverride.byteLength() > 0) {
+            String o #= ColsSegProbe.buildIdOverride.clone();
+            return #o;
+        }
+        String id #= ColsProbe.fingerprint("q4kQ8WaveMatVecColsSegPlainKernel") + "/"
+            + ColsProbe.fingerprint("q4kQ8WaveMatVecColsSegPfKernel") + "/"
+            + ColsProbe.fingerprint("q4kQ8WaveMatVecColsKernel") + "/"
+            + ColsProbe.fingerprint("q4kQ8WavePfMatVecColsKernel") + "/"
+            + ColsProbe.fingerprint("q4kQ8WaveR2MatVecColsKernel");
+        return #id;
+    }
+
+    /** Drop the stored verdict (a test's clean slate). */
+    public static void forgetStored(int32 kind, int32 nc, int64 rows0, int64 rows1, int64 rows2, int64 cols) {
+        if (ColsSegProbe.tuneDir.byteLength() == 0) { return; }
+        String k #= ColsSegProbe.knob(kind, nc, rows0, rows1, rows2, cols);
+        Autotune.invalidate(ColsSegProbe.tuneDir, k);
+        return;
+    }
+
+    /** Fused pays only when it beats the separate launches by the tie margin. */
+    public static boolean segPays(int64 fusedNs, int64 sepNs) {
+        if (fusedNs <= 0L || sepNs <= 0L) { return false; }
+        return (sepNs - fusedNs) * 1000L >= (int64) ShapeChoice.tiePerMille * sepNs;
+    }
+
+    /**
+     * Whether the fused launch pays for `kind` at `nc` columns over segments of
+     * `rows0`, `rows1`, `rows2` rows (0 = absent) by `cols`: the pin, else the
+     * in-process verdict at this shape, else the store's, else a measurement.
+     */
+    public static boolean pays(int32 kind, int32 nc, int64 rows0, int64 rows1, int64 rows2, int64 cols) {
+        if (nc < 2) { return false; }
+        if (!KernelCap.usable("q4kQ8WaveMatVecColsSegPlainKernel")
+                || !KernelCap.usable("q4kQ8WaveMatVecColsSegPfKernel")) { return false; }
+        ColsSegProbe.ensureTables();
+        int32 pin = ColsSegProbe.pins[(int64) ColsSegProbe.slot(kind, nc)];
+        if (pin != 0) { return pin == 1; }
+        String key #= "" + kind + ":" + nc + ":" + ColsSegProbe.shapeKey(rows0, rows1, rows2, cols);
+        int32 v = ColsSegProbe.remembered(key);
+        if (v != 0) { return v == 1; }
+        String bid #= ColsSegProbe.buildId();
+        if (ColsSegProbe.tuneDir.byteLength() > 0) {
+            String k #= ColsSegProbe.knob(kind, nc, rows0, rows1, rows2, cols);
+            Optional<int32> t = Autotune.recallFor(ColsSegProbe.tuneDir, k, bid);
+            if (t.isPresent() && (t.get() == 1 || t.get() == 2)) {
+                ColsSegProbe.remember(key, t.get());
+                return t.get() == 1;
+            }
+        }
+        boolean yes = ColsSegProbe.measure(kind, nc, rows0, rows1, rows2, cols);
+        int32 nv = yes ? 1 : 2;
+        ColsSegProbe.remember(key, nv);
+        if (ColsSegProbe.tuneDir.byteLength() > 0) {
+            String k #= ColsSegProbe.knob(kind, nc, rows0, rows1, rows2, cols);
+            Autotune.rememberFor(ColsSegProbe.tuneDir, k, nv, bid);
+        }
+        return yes;
+    }
+
+    /** Verdicts for every batch width at the model's shapes, ahead of the first step;
+     *  `rowsV` 0 = v is not Q4_K (q|k fuse alone), `inter` 0 = no Q4_K gate|up pair. */
+    public static void prewarm(int64 rowsQ, int64 rowsK, int64 rowsV, int64 inter, int64 hidden) {
+        int32 nc = 2;
+        while (nc <= CausalLM.DECODE_BATCH_MAX && nc < ColsSegProbe.WIDTHS) {
+            // both v shapes: a model may carry a Q4_K v in some layers and a Q6_K v in others
+            ColsSegProbe.pays(0, nc, rowsQ, rowsK, 0L, hidden);
+            if (rowsV > 0L) { ColsSegProbe.pays(0, nc, rowsQ, rowsK, rowsV, hidden); }
+            if (inter > 0L) { ColsSegProbe.pays(1, nc, inter, inter, 0L, hidden); }
+            nc = nc + 1;
+        }
+        return;
+    }
+
+    /** A synthetic Q4_K slab of `nBlocks` blocks: d near one, dmin zero, scales 1..12, nibbles 5. */
+    static #int8[] syntheticQ4k(int64 nBlocks) {
+        int8[] raw #= heap int8[nBlocks * 144L];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 o = b * 144L;
+            raw[o] = (int8) (b % 16L);
+            raw[o + 1L] = (int8) 60;
+            raw[o + 2L] = (int8) 0;
+            raw[o + 3L] = (int8) 0;
+            int64 j = 4L;
+            while (j < 16L) { raw[o + j] = (int8) (((b + j) % 12L) + 1L); j = j + 1; }
+            while (j < 144L) { raw[o + j] = (int8) 85; j = j + 1; }
+            b = b + 1;
+        }
+        return #raw;
+    }
+
+    static boolean sameBits(float32[] a, float32[] b, int64 n) {
+        int64 i = 0;
+        while (i < n) {
+            if (Cajeta.f32ToBits(a[i]) != Cajeta.f32ToBits(b[i])) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /** Both arms on synthetic weights at the shape, checked equal, then device-timed. */
+    static boolean measure(int32 kind, int32 nc, int64 rows0, int64 rows1, int64 rows2, int64 cols) {
+        ColsSegProbe.probesN = ColsSegProbe.probesN + 1L;
+        ColsSegProbe.lastRefusal = "";
+        int64 bpr = cols / 256L;
+        int8[] r0 #= ColsSegProbe.syntheticQ4k(rows0 * bpr);
+        int8[] r1 #= ColsSegProbe.syntheticQ4k(rows1 * bpr);
+        int64 n2 = rows2 > 0L ? rows2 : 1L;
+        int8[] r2 #= ColsSegProbe.syntheticQ4k(n2 * bpr);
+        KernelBuffer<int8> w0 #= heap KernelBuffer<int8>((uint64) r0.count());
+        KernelBuffer<int8> w1 #= heap KernelBuffer<int8>((uint64) r1.count());
+        KernelBuffer<int8> w2 #= heap KernelBuffer<int8>((uint64) r2.count());
+        w0.upload(r0);
+        w1.upload(r1);
+        w2.upload(r2);
+        float32[] x #= heap float32[(int64) nc * cols];
+        int64 z = 0;
+        while (z < (int64) nc * cols) {
+            x[z] = 0.01f * (float32) ((z % 11L) + 1L) + 0.002f * (float32) (z / cols);
+            z = z + 1;
+        }
+        KernelBuffer<float32> xD #= heap KernelBuffer<float32>((uint64) ((int64) nc * cols));
+        xD.upload(x);
+        int64 pb = Quant.q8kPackedBytes(cols);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) ((int64) nc * pb));
+        KernelStream s = QuantKernel.stream();
+        QuantKernel.q8kPackLaunchNoSync(xp, xD, (int64) nc * cols);
+        s.sync();
+        int64 total = rows0 + rows1 + rows2;
+        KernelBuffer<float32> ySep #= heap KernelBuffer<float32>((uint64) ((int64) nc * total));
+        KernelBuffer<float32> yFus #= heap KernelBuffer<float32>((uint64) ((int64) nc * total));
+        int32 variant = QuantKernel.q4ColsVariantFor(rows0) == 1 ? 1 : 2;
+        // separate: the production launches (their own variants), outputs stacked by segment
+        ColsSegProbe.launchSeparate(ySep, w0, w1, w2, xp, rows0, rows1, rows2, cols, nc, pb, total);
+        ColsSegProbe.launchFused(yFus, w0, w1, w2, xp, rows0, rows1, rows2, cols, nc, pb, total, variant);
+        s.sync();
+        float32[] a #= heap float32[(int64) nc * total];
+        float32[] b #= heap float32[(int64) nc * total];
+        ySep.download(a);
+        yFus.download(b);
+        if (!ColsSegProbe.sameBits(a, b, (int64) nc * total)) {
+            // the separate launches may have taken the two-row variant; equal within rounding is the bar there
+            int64 i = 0;
+            while (i < (int64) nc * total) {
+                float32 diff = a[i] - b[i];
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = a[i];
+                if (mag < 0.0f) { mag = 0.0f - mag; }
+                if (diff > 1.0e-4f * mag + 1.0e-3f) {
+                    ColsSegProbe.lastRefusal = "the fused Cols launch disagrees with the separate launches at element " + i;
+                    Diag.emit("colsseg-probe", 0 - 1, ColsSegProbe.lastRefusal, (int64) kind, (int64) nc, rows0, rows1, rows2, cols);
+                    return false;
+                }
+                i = i + 1;
+            }
+        }
+        int64 fBest = 0L - 1L;
+        int64 sBest = 0L - 1L;
+        int32 round = 0;
+        while (round < 3) {
+            KernelTimer tf #= KernelTimer.create();
+            int64 t0 = Clock.nanoTime();
+            tf.begin(s);
+            int32 rep = 0;
+            while (rep < ColsSegProbe.REPS) {
+                ColsSegProbe.launchFused(yFus, w0, w1, w2, xp, rows0, rows1, rows2, cols, nc, pb, total, variant);
+                rep = rep + 1;
+            }
+            tf.end(s);
+            s.sync();
+            int64 t1 = Clock.nanoTime();
+            int64 fDev = tf.elapsedNanos();
+            tf.destroy();
+            KernelTimer ts #= KernelTimer.create();
+            ts.begin(s);
+            rep = 0;
+            while (rep < ColsSegProbe.REPS) {
+                ColsSegProbe.launchSeparate(ySep, w0, w1, w2, xp, rows0, rows1, rows2, cols, nc, pb, total);
+                rep = rep + 1;
+            }
+            ts.end(s);
+            s.sync();
+            int64 t2 = Clock.nanoTime();
+            int64 sDev = ts.elapsedNanos();
+            ts.destroy();
+            int64 f = (fDev > 0L && sDev > 0L ? fDev : t1 - t0) / (int64) ColsSegProbe.REPS;
+            int64 sp = (fDev > 0L && sDev > 0L ? sDev : t2 - t1) / (int64) ColsSegProbe.REPS;
+            if (round > 0) {
+                if (fBest < 0L || f < fBest) { fBest = f; }
+                if (sBest < 0L || sp < sBest) { sBest = sp; }
+            }
+            round = round + 1;
+        }
+        ColsSegProbe.lastFusedNs = fBest;
+        ColsSegProbe.lastSepNs = sBest;
+        boolean pays = ColsSegProbe.segPays(fBest, sBest);
+        Diag.emit("colsseg-probe", 0 - 1, pays ? "fused" : "separate", (int64) kind, (int64) nc, fBest, sBest, rows0, cols);
+        return pays;
+    }
+
+    static void launchSeparate(KernelBuffer<float32> y, KernelBuffer<int8> w0, KernelBuffer<int8> w1,
+            KernelBuffer<int8> w2, KernelBuffer<int8> xp, int64 rows0, int64 rows1, int64 rows2,
+            int64 cols, int32 nc, int64 pb, int64 total) {
+        QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(y, w0, xp, rows0, cols, 0L, nc, total, pb, false);
+        QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(y, w1, xp, rows1, cols, rows0, nc, total, pb, false);
+        if (rows2 > 0L) {
+            QuantKernel.q4kQ8WaveMatVecColsLaunchNoSync(y, w2, xp, rows2, cols, rows0 + rows1, nc, total, pb, false);
+        }
+        return;
+    }
+
+    static void launchFused(KernelBuffer<float32> y, KernelBuffer<int8> w0, KernelBuffer<int8> w1,
+            KernelBuffer<int8> w2, KernelBuffer<int8> xp, int64 rows0, int64 rows1, int64 rows2,
+            int64 cols, int32 nc, int64 pb, int64 total, int32 variant) {
+        KernelBuffer<float32> y1 #= y.slice((uint64) rows0, (uint64) ((int64) nc * total - rows0));
+        KernelBuffer<float32> y2 #= y.slice((uint64) (rows0 + rows1), (uint64) ((int64) nc * total - rows0 - rows1));
+        QuantKernel.q4kQ8WaveMatVecColsSegLaunchNoSync(y, y1, y2, w0, w1, w2, xp, rows0, rows1, rows2,
+            cols, nc, total, total, total, pb, false, variant);
+        return;
+    }
+}
