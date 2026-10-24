@@ -3295,12 +3295,10 @@ public final class Linear extends InfModule {
             && Linear.matrixCoresPay() && Linear.tilePreferred();
     }
 
-    /** Fused gate|up on the tensor-core tile (1.8.3): ONE launch over the
-     *  concatenated packed weight, so the two 14336-row grids (448 tiles
-     *  each, 3.5 waves of the part's 128 SMs, the last half empty) become
-     *  one 896-tile grid of seven full waves. The caller's fused GLU
-     *  reads `fusedYBatch` as for the Mw8 fused launch. */
-    boolean fusedPairTc(Linear b, int32 rows) {
+    /** Whether {@link #fusedPairTc} would launch for this pair at `rows`:
+     *  the same predicate, launching nothing, so a prewarm can warm the
+     *  shape the pass will take and not one it will not. */
+    boolean fusedPairTcFits(Linear b, int32 rows) {
         if (this.hasEpilogue() || b.hasEpilogue()) { return false; }
         if (this.packedTy != Quant.GG_Q4_K || b.packedTy != Quant.GG_Q4_K) {
             return false;
@@ -3309,7 +3307,62 @@ public final class Linear extends InfModule {
         if (!this.tcAdmits() || !b.tcAdmits()) { return false; }
         int64 padRows = ((int64) rows + 127L) / 128L * 128L;
         int64 fusedOut = (int64) this.outDim + (int64) b.outDim;
-        if (!TcTile.fits(padRows, fusedOut, (int64) this.inDim)) { return false; }
+        return TcTile.fits(padRows, fusedOut, (int64) this.inDim);
+    }
+
+    /**
+     * Warm the tile family's shape choice at `rows` for this projection's
+     * problem, off the clock (15.2.15.1.4): a cold choice times every
+     * listed shape, ~120 ms a problem on the 4090, and a multi-request
+     * pass meets six problems the chunk-sized warm-up never saw, which
+     * read as 740 ms inside the first batched prefill. The packed
+     * activation buffer is only sized here; the timing reads whatever it
+     * holds. Returns true when a shape was chosen (from the memo, the
+     * store or a timing), false when the tile does not serve this
+     * projection at `rows`.
+     */
+    boolean prewarmTileAt(int32 rows) {
+        if (!this.tcAdmits()) { return false; }
+        int64 padRows = ((int64) rows + 127L) / 128L * 128L;
+        boolean q4 = this.packedTy == Quant.GG_Q4_K && Linear.avQ4Tc
+            && TcTile.fits(padRows, (int64) this.outDim, (int64) this.inDim);
+        boolean q6 = this.packedTy == Quant.GG_Q6_K && Linear.avQ6Tc
+            && TcTile.fits6(padRows, (int64) this.outDim, (int64) this.inDim);
+        if (!q4 && !q6) { return false; }
+        this.ensureDevice();
+        Linear.ensureBatchStage((int32) padRows, this.inDim);
+        if (q4) {
+            TcTile.prewarmQ4(this.payloadDev, Linear.btXp, padRows,
+                (int64) this.outDim, (int64) this.inDim);
+        } else {
+            TcTile.prewarmQ6(this.payloadDev, Linear.btXp, padRows,
+                (int64) this.outDim, (int64) this.inDim);
+        }
+        return true;
+    }
+
+    /** As {@link #prewarmTileAt} for the fused gate|up problem this pair
+     *  takes ({@link #fusedPairTc}); false when the pair would not fuse. */
+    boolean prewarmFusedTileAt(Linear b, int32 rows) {
+        if (!this.fusedPairTcFits(b, rows)) { return false; }
+        int64 padRows = ((int64) rows + 127L) / 128L * 128L;
+        int64 fusedOut = (int64) this.outDim + (int64) b.outDim;
+        this.ensureFusedPacked2(b);
+        Linear.ensureBatchStage((int32) padRows, this.inDim);
+        TcTile.prewarmQ4(this.fusedPackedDev, Linear.btXp, padRows, fusedOut,
+            (int64) this.inDim);
+        return true;
+    }
+
+    /** Fused gate|up on the tensor-core tile (1.8.3): ONE launch over the
+     *  concatenated packed weight, so the two 14336-row grids (448 tiles
+     *  each, 3.5 waves of the part's 128 SMs, the last half empty) become
+     *  one 896-tile grid of seven full waves. The caller's fused GLU
+     *  reads `fusedYBatch` as for the Mw8 fused launch. */
+    boolean fusedPairTc(Linear b, int32 rows) {
+        if (!this.fusedPairTcFits(b, rows)) { return false; }
+        int64 padRows = ((int64) rows + 127L) / 128L * 128L;
+        int64 fusedOut = (int64) this.outDim + (int64) b.outDim;
         this.ensureFusedPacked2(b);
         this.ensureFusedY((int32) padRows);
         Linear.ensureBtXp();

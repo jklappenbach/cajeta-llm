@@ -223,6 +223,49 @@ public final class CausalLM extends InfModule {
         return;
     }
 
+    /** The row count {@link #prewarmBatchShapes} warmed, 0 before any. */
+    public int32 batchShapePrewarmRows() { return this.pfShapeRows; }
+
+    /**
+     * Warm every tile shape a multi-request prefill of `rows` rows would
+     * choose (15.2.15.1.4), at load: the projections of every layer and
+     * the fused gate|up pair where the pass fuses it. The chunk-sized
+     * warm-up prefill warms the chunk's problems; a pass over several
+     * prompts is `maxSeqs` chunks of rows, a problem set of its own, and
+     * its choice was timed inside the first pass a user waited for. The
+     * store answers in microseconds once it holds the shape; a cold store
+     * pays here, as llama.cpp's load does for its warm-up. Returns how
+     * many projections took a shape.
+     */
+    public int32 prewarmBatchShapes(int32 rows) {
+        if (rows <= 0) { return 0; }
+        int32 warmed = 0;
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            if (d.selfAttn.qProj.prewarmTileAt(rows)) { warmed = warmed + 1; }
+            if (d.selfAttn.kProj.prewarmTileAt(rows)) { warmed = warmed + 1; }
+            if (d.selfAttn.vProj.prewarmTileAt(rows)) { warmed = warmed + 1; }
+            if (d.selfAttn.oProj.prewarmTileAt(rows)) { warmed = warmed + 1; }
+            if (d.mlp != null) {
+                if (d.mlp.gateProj.prewarmFusedTileAt(d.mlp.upProj, rows)) {
+                    warmed = warmed + 1;
+                } else {
+                    if (d.mlp.gateProj.prewarmTileAt(rows)) { warmed = warmed + 1; }
+                    if (d.mlp.upProj.prewarmTileAt(rows)) { warmed = warmed + 1; }
+                }
+                if (d.mlp.downProj.prewarmTileAt(rows)) { warmed = warmed + 1; }
+            }
+            l = l + 1;
+        }
+        this.pfShapeRows = rows;
+        if (Diag.on()) {
+            Diag.emit("prewarm-shapes", 0 - 1, null, (int64) rows, (int64) warmed,
+                0L, 0L, 0L, 0L);
+        }
+        return warmed;
+    }
+
     public void prewarmPrefillWeights() {
         boolean deq = Linear.deqPrefillOn();
         // 13.2.1: the batched decode's per-format verdict (ColsProbe) is
@@ -643,7 +686,9 @@ public final class CausalLM extends InfModule {
         int64 kvd = (int64) this.cfg.kvDim();
         int64 inter = (int64) this.cfg.intermediateSize;
         int64 arenaBytes = rows * (h * 4 + qd * 2 + kvd * 2 + inter * 2);
+        int64 tArena0 = Clock.nanoTime();
         PrefillArena arena = heap PrefillArena(arenaBytes);
+        int64 arenaNs = Clock.nanoTime() - tArena0;
         Tensor<float32> hs #= arena.take(rows, h);
         Tensor<float32> xn #= arena.take(rows, h);
         Tensor<float32> proj #= arena.take(rows, h);
@@ -671,13 +716,20 @@ public final class CausalLM extends InfModule {
         this.pfEmbPending = total;
         this.pfBatchHint = 1;
         this.pfSegs.n = m;
-        Diag.emit("prefill-batch", 0 - 1, null, rows, (int64) m, 0L, 0L, 0L, 0L);
+        int64 tPass0 = Clock.nanoTime();
         this.forwardRows(seqs[0], hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
             total, this.pfSegs.start[0]);
+        int64 tPass1 = Clock.nanoTime();
         this.pfSegs.n = 0;
         sg = 0;
         while (sg < m) { out[(int64) sg] = this.pfSegs.out[(int64) sg]; sg = sg + 1; }
-        CausalLM.pfStepNs = CausalLM.pfStepNs + (Clock.nanoTime() - tStep0);
+        int64 tEnd = Clock.nanoTime();
+        // rows, segments, then where the call's time went: the lead-in
+        // before the first layer (of which the arena's host zero-fill),
+        // the pass, the tail (15.2.15.1.4).
+        Diag.emit("prefill-batch", 0 - 1, null, rows, (int64) m,
+            tPass0 - tStep0, tPass1 - tPass0, tEnd - tPass1, arenaNs);
+        CausalLM.pfStepNs = CausalLM.pfStepNs + (tEnd - tStep0);
         return;
     }
 
@@ -1410,6 +1462,8 @@ public final class CausalLM extends InfModule {
     float32[] pfKScr;
     float32[] pfVScr;
     int64 pfKvCap;
+    /** Rows whose tile shapes prewarmBatchShapes warmed, 0 before any. */
+    int32 pfShapeRows;
 
     void ensurePrefillRes(int64 n) {
         if (this.pfHsCap >= n) { return; }
