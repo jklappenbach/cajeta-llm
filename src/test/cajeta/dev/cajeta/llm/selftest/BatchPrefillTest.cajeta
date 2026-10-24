@@ -1,0 +1,99 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.EngineOptions;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.sched.Request;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * Batched prefill across requests (cajeta-llm 15.2.15.1.4): the prompts a
+ * step admits together are prefilled in ONE pass over the weights, as the
+ * decode rows already are. Measured 2026-10-24 on the 4090: four 512-token
+ * prompts ran as four 37.5 ms passes with 11.6 ms of host between them,
+ * where llama.cpp runs one 2048-row pass; the device rate per token was the
+ * same. The pass must not change an answer: every sequence's greedy stream
+ * is held equal to the same prompt prefilled alone.
+ */
+public class BatchPrefillTest {
+    static final int32 SEQS = 4;
+    static final int32 GEN = 8;
+
+    public BatchPrefillTest() { return; }
+
+    static #LlmEngine engine(int32 seqs) {
+        EngineOptions o #= heap EngineOptions(RoutableFixtureTest.FIX);
+        o.ctx = 128;
+        o.maxSeqs = seqs;
+        o.blockTokens = 16;
+        o.chunk = 64;
+        LlmEngine e #= LlmEngine.load(#o);
+        return #e;
+    }
+
+    /** FIRES: four prompts submitted together are prefilled as one pass — the
+     *  engine says so (a `prefill-batch` record carrying the pass's rows and
+     *  sequences) — and each stream equals its solo stream. */
+    @Test
+    public void fourPromptsPrefillInOnePassAndMatchTheirSoloStreams() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        LlmEngine all #= BatchPrefillTest.engine(BatchPrefillTest.SEQS);
+        boolean ready = all.model().decodeBatchReady();
+        if (!ready) {
+            Diag.register(null);
+            all.close();
+            DeviceSkip.tracked("backend " + be + " does not route batched decode: "
+                + cap.namesOf("decode-batch"), "cajeta-llm 15.2.15.1.4");
+            return;
+        }
+        int32[] ids #= heap int32[BatchPrefillTest.SEQS];
+        int32 totalRows = 0;
+        int32 q = 0;
+        while (q < BatchPrefillTest.SEQS) {
+            int32 len = 20 + 3 * q;
+            int32[] p #= RoutableFixtureTest.promptOf(len, 5 + 11 * q);
+            ids[q] = all.submitTokens(p, len, BatchPrefillTest.GEN,
+                #heap SampleParams(0.0f, (int64) (41 + q)));
+            totalRows = totalRows + len;
+            q = q + 1;
+        }
+        all.runAll(400);
+        Diag.register(null);
+        // The mechanism, not a timing: one record for the pass, naming every
+        // prompt row and every sequence.
+        Assert.equals(1L, (int64) cap.countOf("prefill-batch"));
+        Assert.equals((int64) totalRows, cap.valueOf("prefill-batch", 0, 0));
+        Assert.equals((int64) BatchPrefillTest.SEQS, cap.valueOf("prefill-batch", 0, 1));
+        q = 0;
+        while (q < BatchPrefillTest.SEQS) {
+            LlmEngine one #= BatchPrefillTest.engine(1);
+            int32 len = 20 + 3 * q;
+            int32[] p #= RoutableFixtureTest.promptOf(len, 5 + 11 * q);
+            int32 id = one.submitTokens(p, len, BatchPrefillTest.GEN,
+                #heap SampleParams(0.0f, (int64) (41 + q)));
+            one.runAll(400);
+            Request solo = one.request(id);
+            Request inBatch = all.request(ids[q]);
+            Assert.equals((int64) BatchPrefillTest.GEN, (int64) inBatch.generatedCount());
+            Assert.equals((int64) solo.generatedCount(), (int64) inBatch.generatedCount());
+            int32 k = 0;
+            while (k < solo.generatedCount()) {
+                if (solo.generatedAt(k) != inBatch.generatedAt(k)) {
+                    Assert.fail("sequence " + q + " token " + k + ": " + inBatch.generatedAt(k)
+                        + " prefilled in the batch, " + solo.generatedAt(k) + " prefilled alone");
+                }
+                k = k + 1;
+            }
+            one.close();
+            q = q + 1;
+        }
+        all.close();
+    }
+}

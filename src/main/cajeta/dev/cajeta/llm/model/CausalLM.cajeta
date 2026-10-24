@@ -566,6 +566,121 @@ public final class CausalLM extends InfModule {
         return am;
     }
 
+    /** Whether {@link #stepPrefillBatch} serves here: the resident batched
+     *  prefill with device attention, device embedding and the fused device
+     *  tail, under the lazy cache authority. */
+    /** 0 = the batched prefill is off (every chunk its own step); 1 = on;
+     *  2 = collected but run as the serial fallback (a bisect arm). */
+    public static int32 prefillBatchMode = 1;
+    public static void setPrefillBatchMode(int32 m) { CausalLM.prefillBatchMode = m; }
+
+    public boolean prefillBatchReady() {
+        if (CausalLM.prefillBatchMode == 0) { return false; }
+        return Linear.devicePackOn() && CausalLM.devAttnOn && KernelCap.attendHere()
+            && DeviceKv.supports(this.cfg) && !CausalLM.eagerAuthOn
+            && !CausalLM.forceReseed && CausalLM.fuseTail && CausalLM.deviceArgmax
+            && this.lmHead.isDeviceRouted() && this.deviceEmbedReady();
+    }
+
+    /**
+     * The prompt chunks of `m` sequences in ONE pass over the weights
+     * (15.2.15.1.4): segment k is sequence `seqs[k]`, its `ns[k]` tokens at
+     * `toks[offs[k] ..)`, and its argmax lands in `out[k]`. The rows are
+     * concatenated; the GEMMs, norms and MLP run over all of them, RoPE, the
+     * K/V append and the attention per segment over its rows. Where the
+     * batched path refuses (a format the batch GEMM does not take at this
+     * row count, a slot that cannot be resident) each segment takes
+     * {@link #stepSeq} instead. Measured 2026-10-24 on the 4090: four
+     * 512-token prompts ran as four 37.5 ms passes with 11.6 ms of host
+     * between them where llama.cpp runs one 2048-row pass.
+     */
+    public void stepPrefillBatch(int32[] seqs, int32[] toks, int32[] offs,
+            int32[] ns, int32 m, int32[] out) {
+        int32 total = 0;
+        int32 sg = 0;
+        while (sg < m) { total = total + ns[(int64) sg]; sg = sg + 1; }
+        boolean ok = m > 1 && this.prefillBatchReady() && CausalLM.prefillBatchMode != 2;
+        sg = 0;
+        while (ok && sg < m) {
+            if (ns[(int64) sg] < 1
+                    || this.seqLength(seqs[(int64) sg]) + ns[(int64) sg] > this.maxSeq) {
+                ok = false;
+            }
+            sg = sg + 1;
+        }
+        if (ok) {
+            sg = 0;
+            while (sg < m) { this.armRoutes(seqs[(int64) sg]); sg = sg + 1; }
+            ok = this.batchReady(total);
+        }
+        if (!ok) {
+            sg = 0;
+            while (sg < m) {
+                out[(int64) sg] = this.stepSeq(seqs[(int64) sg], toks, offs[(int64) sg], ns[(int64) sg]);
+                sg = sg + 1;
+            }
+            return;
+        }
+        int64 tStep0 = Clock.nanoTime();
+        if (this.pfSegs == null) { this.pfSegs #= heap PrefillSegments(); }
+        if (this.pfSegs.seq == null || (int64) this.pfSegs.seq.count() < (int64) m) {
+            this.pfSegs.seq = heap int32[(int64) m];
+            this.pfSegs.rows = heap int32[(int64) m];
+            this.pfSegs.start = heap int32[(int64) m];
+            this.pfSegs.out = heap int32[(int64) m];
+        }
+        sg = 0;
+        while (sg < m) {
+            this.ensureDkvSlot(seqs[(int64) sg]);
+            this.pfSegs.seq[(int64) sg] = seqs[(int64) sg];
+            this.pfSegs.rows[(int64) sg] = ns[(int64) sg];
+            this.pfSegs.start[(int64) sg] = this.seqLength(seqs[(int64) sg]);
+            sg = sg + 1;
+        }
+        int64 rows = (int64) total;
+        int64 h = (int64) this.cfg.hiddenSize;
+        int64 qd = (int64) this.cfg.qDim();
+        int64 kvd = (int64) this.cfg.kvDim();
+        int64 inter = (int64) this.cfg.intermediateSize;
+        int64 arenaBytes = rows * (h * 4 + qd * 2 + kvd * 2 + inter * 2);
+        PrefillArena arena = heap PrefillArena(arenaBytes);
+        Tensor<float32> hs #= arena.take(rows, h);
+        Tensor<float32> xn #= arena.take(rows, h);
+        Tensor<float32> proj #= arena.take(rows, h);
+        Tensor<float32> mlpOut #= arena.take(rows, h);
+        Tensor<float32> q #= arena.take(rows, qd);
+        Tensor<float32> ao #= arena.take(rows, qd);
+        Tensor<float32> k #= arena.take(rows, kvd);
+        Tensor<float32> v #= arena.take(rows, kvd);
+        Tensor<float32> gate #= arena.take(rows, inter);
+        Tensor<float32> up #= arena.take(rows, inter);
+        // Every segment's tokens, in pass order, decoded on the device.
+        this.ensurePrefillTok(rows);
+        int32 r0 = 0;
+        sg = 0;
+        while (sg < m) {
+            int32 j = 0;
+            while (j < ns[(int64) sg]) {
+                this.pfTokHost[(int64) r0] = toks[(int64) (offs[(int64) sg] + j)];
+                r0 = r0 + 1;
+                j = j + 1;
+            }
+            sg = sg + 1;
+        }
+        this.pfTokDev.upload(this.pfTokHost, rows);
+        this.pfEmbPending = total;
+        this.pfBatchHint = 1;
+        this.pfSegs.n = m;
+        Diag.emit("prefill-batch", 0 - 1, null, rows, (int64) m, 0L, 0L, 0L, 0L);
+        this.forwardRows(seqs[0], hs, xn, q, k, v, ao, proj, gate, up, mlpOut,
+            total, this.pfSegs.start[0]);
+        this.pfSegs.n = 0;
+        sg = 0;
+        while (sg < m) { out[(int64) sg] = this.pfSegs.out[(int64) sg]; sg = sg + 1; }
+        CausalLM.pfStepNs = CausalLM.pfStepNs + (Clock.nanoTime() - tStep0);
+        return;
+    }
+
     /**
      * One decode step for `token` at the current position of sequence 0,
      * entirely in pooled buffers: zero heap allocations (6.1.6). Returns
@@ -1352,6 +1467,54 @@ public final class CausalLM extends InfModule {
         this.pfTokDev #= heap KernelBuffer<int32>((uint64) n);
         this.pfTokHost #= heap int32[n];
         this.pfTokCap = n;
+        return;
+    }
+
+    // 15.2.15.1.4: the segments of a multi-request prefill pass, one sequence
+    // each, its rows contiguous in the pass; set by stepPrefillBatch around
+    // forwardRows. 0 or 1 segments is the single-sequence pass unchanged.
+    // ONE holder field, not six: this class carries 61 class-reference and
+    // array fields, and the compiler's hidden per-instance ownership word is
+    // one 64-bit word with no check at the edge — five more fields here put
+    // two past it and the release build corrupted itself two steps later
+    // (measured 2026-10-24; cajeta fix pending). Keep this class under 64.
+    PrefillSegments pfSegs;
+
+    int32 pfSegCount() {
+        if (this.pfSegs == null) { return 0; }
+        return this.pfSegs.n;
+    }
+
+    void ensurePrefillAo(int64 n) {
+        if (this.pfSegs.aoCap >= n) { return; }
+        this.pfSegs.ao #= heap KernelBuffer<float32>((uint64) n);
+        this.pfSegs.aoCap = n;
+        return;
+    }
+
+    /** The positions of every row of a segmented pass: segment k's rows run
+     *  from its start position. */
+    void ensurePrefillPosSegs() {
+        int32 rows = 0;
+        int32 sg = 0;
+        while (sg < this.pfSegs.n) { rows = rows + this.pfSegs.rows[(int64) sg]; sg = sg + 1; }
+        if (this.pfPosCap < rows) {
+            this.pfPosDev #= heap KernelBuffer<int32>((uint64) rows);
+            this.pfPosHost #= heap int32[(int64) rows];
+            this.pfPosCap = rows;
+        }
+        int32 i = 0;
+        sg = 0;
+        while (sg < this.pfSegs.n) {
+            int32 r = 0;
+            while (r < this.pfSegs.rows[(int64) sg]) {
+                this.pfPosHost[(int64) i] = this.pfSegs.start[(int64) sg] + r;
+                i = i + 1;
+                r = r + 1;
+            }
+            sg = sg + 1;
+        }
+        this.pfPosDev.upload(this.pfPosHost, (int64) rows);
         return;
     }
 
@@ -2170,6 +2333,51 @@ public final class CausalLM extends InfModule {
      * O(n^2) and the next unit — but it is no longer competing with 2.4
      * TB of redundant weight traffic.
      */
+    /** The layer's prefill attention output: one launch pair for a single
+     *  sequence (the DeviceKv's own buffer), or one per segment of a
+     *  multi-request pass into the pass's shared buffer (15.2.15.1.4). */
+    KernelBuffer<float32> attendPrefillLayer(int32 l, Attention a, DeviceKv dkv,
+            boolean ropeFused, int32 rows, int32 startPos, int32 qd, int32 kvd,
+            int32 segN) {
+        if (segN > 1) {
+            // Per segment: its q/k/v rows, its positions, its slot's planes,
+            // and its rows of the pass's attention output.
+            this.ensurePrefillAo((int64) rows * (int64) qd);
+            int32 sg = 0;
+            int32 off = 0;
+            while (sg < segN) {
+                int32 sr = this.pfSegs.rows[(int64) sg];
+                int32 sp = this.pfSegs.start[(int64) sg];
+                DeviceKv sd = this.dkvOf(this.pfSegs.seq[(int64) sg]);
+                KernelBuffer<float32> qs #= a.qProj.yBatch.slice(
+                    (uint64) ((int64) off * (int64) qd), (uint64) ((int64) sr * (int64) qd));
+                KernelBuffer<float32> ks #= a.kProj.yBatch.slice(
+                    (uint64) ((int64) off * (int64) kvd), (uint64) ((int64) sr * (int64) kvd));
+                KernelBuffer<float32> vs #= a.vProj.yBatch.slice(
+                    (uint64) ((int64) off * (int64) kvd), (uint64) ((int64) sr * (int64) kvd));
+                KernelBuffer<int32> ps #= this.pfPosDev.slice((uint64) off, (uint64) sr);
+                KernelBuffer<float32> os #= this.pfSegs.ao.slice(
+                    (uint64) ((int64) off * (int64) qd), (uint64) ((int64) sr * (int64) qd));
+                if (ropeFused) {
+                    sd.prefillAttendRopedResidentInto(l, qs, ks, vs, a.deviceRopeInv(),
+                        ps, sr, sp, a.scale, os);
+                } else {
+                    sd.prefillAttendResidentInto(l, qs, ks, vs, sr, sp, a.scale, os);
+                }
+                off = off + sr;
+                sg = sg + 1;
+            }
+            return this.pfSegs.ao;
+        }
+        if (ropeFused) {
+            return dkv.prefillAttendRopedResident(l, a.qProj.yBatch,
+                a.kProj.yBatch, a.vProj.yBatch, a.deviceRopeInv(),
+                this.pfPosDev, rows, startPos, a.scale);
+        }
+        return dkv.prefillAttendResident(l, a.qProj.yBatch,
+            a.kProj.yBatch, a.vProj.yBatch, rows, startPos, a.scale);
+    }
+
     void forwardRowsBatched(int32 seq, Tensor<float32> hs,
             Tensor<float32> xn, Tensor<float32> q, Tensor<float32> k,
             Tensor<float32> v, Tensor<float32> ao, Tensor<float32> proj,
@@ -2228,7 +2436,21 @@ public final class CausalLM extends InfModule {
         // LAYER — 32 identical 2 KB uploads per prefill.
         DeviceKv dkv = this.dkvOf(seq);
         boolean resAttn = res && dkv != null;
-        if (resAttn) {
+        int32 segN = this.pfSegCount();
+        if (segN > 1) {
+            // A multi-request pass (15.2.15.1.4): stepPrefillBatch's contract
+            // is that every segment's slot is resident and the tail is the
+            // device's, so the per-sequence work below is per segment.
+            int32 sg = 0;
+            while (sg < segN) {
+                if (this.dkvOf(this.pfSegs.seq[(int64) sg]) == null) { resAttn = false; }
+                sg = sg + 1;
+            }
+            if (!res || !resAttn) {
+                throw heap LlmException("prefill batch: a segment is not resident");
+            }
+            this.ensurePrefillPosSegs();
+        } else if (resAttn) {
             this.ensurePrefillPos(rows, startPos);
             // 10.12.38 lazy authority: a mid-sequence chunk appends host
             // cache rows at exactly `startPos`, so any debt a lazy first
@@ -2313,20 +2535,13 @@ public final class CausalLM extends InfModule {
                 int64 ta0 = CausalLM.pfMark();
                 CausalLM.pfRopeNs = CausalLM.pfRopeNs
                     + (ta0 - tr0);
-                KernelBuffer<float32> aoDev = ropeFused
-                    ? dkv.prefillAttendRopedResident(l, a.qProj.yBatch,
-                        a.kProj.yBatch, a.vProj.yBatch, a.deviceRopeInv(),
-                        this.pfPosDev, rows, startPos, a.scale)
-                    : dkv.prefillAttendResident(l, a.qProj.yBatch,
-                        a.kProj.yBatch, a.vProj.yBatch, rows, startPos,
-                        a.scale);
-                // Cache authority (10.12.30): at startPos == 0 the k/v
-                // download + paged append are DEFERRED to one pass
-                // after the layer loop, reading the persistent planes
-                // — the loop stays launch-only and the GPU never waits
-                // for the host between layers. Mid-sequence prefill
-                // keeps the in-loop path (the planes hold absolute
-                // positions; a prefix download cannot reach them).
+                // Declared FROM the call, never `= null` then assigned: a local
+                // initialised from a literal holds a title (ownership rule 7),
+                // and assigning a borrowed buffer into it freed that buffer at
+                // the layer's end (measured 2026-10-24: a release-only crash two
+                // steps later, in stepDecodeBatch, on the reused memory).
+                KernelBuffer<float32> aoDev = this.attendPrefillLayer(l, a, dkv,
+                    ropeFused, rows, startPos, qd, kvd, segN);
                 if (startPos != 0 && CausalLM.eagerAuthOn) {
                     int64 kb0 = Clock.nanoTime();
                     KernelStream as = QuantKernel.stream();
@@ -2690,9 +2905,37 @@ public final class CausalLM extends InfModule {
             // rows-1, and hs is an arena slice that dies with the call.
             int64 tt0 = Clock.nanoTime();
             this.ensurePrefillLast((int64) h);
+            KernelStream ps = QuantKernel.stream();
+            if (segN > 1) {
+                // One device tail per segment: its last row's norm, head and
+                // argmax, the row at its offset plus its rows, less one.
+                this.ensureArgmaxBuffers();
+                int32 sg = 0;
+                int32 off = 0;
+                while (sg < segN) {
+                    int32 sr = this.pfSegs.rows[(int64) sg];
+                    Prim.sliceF32Device(this.pfLastDev, this.pfHsDev,
+                        (int64) h, (int64) (off + sr - 1) * (int64) h);
+                    Prim.rmsnormDevice(this.pfXnDev, this.pfLastDev,
+                        this.model.norm.deviceWeight(), (int64) h,
+                        this.model.norm.eps, this.cfg.normForm);
+                    Linear.stageDeviceActivation(this.pfXnDev, (int64) h);
+                    this.lmHead.matvecStagedKeep();
+                    QuantKernel.argmaxRowLaunchNoSync(this.tokDev,
+                        this.lmHead.out(), (int64) this.cfg.vocabSize, this.amPv,
+                        this.amPi, this.amCounter);
+                    ps.sync();
+                    this.tokDev.download(this.tokHost, 1L);
+                    this.pfSegs.out[(int64) sg] = this.tokHost[0];
+                    off = off + sr;
+                    sg = sg + 1;
+                }
+                this.lastArgmax = this.pfSegs.out[(int64) (segN - 1)];
+                this.logitsStale = true;
+                devTail = true;
+            } else {
             Prim.sliceF32Device(this.pfLastDev, this.pfHsDev,
                 (int64) h, (int64) (rows - 1) * (int64) h);
-            KernelStream ps = QuantKernel.stream();
             if (CausalLM.fuseTail && CausalLM.deviceArgmax
                     && this.lmHead.isDeviceRouted()) {
                 // THE FUSED TAIL, as decode's (1.8.3): the final norm, the
@@ -2730,6 +2973,7 @@ public final class CausalLM extends InfModule {
                     c2 = c2 + 1;
                 }
             }
+            }
             if (!this.tailSaid) {
                 this.tailSaid = true;
                 Diag.emit("prefill-tail", 0 - 1, devTail ? "device" : "host",
@@ -2739,7 +2983,7 @@ public final class CausalLM extends InfModule {
                 + (Clock.nanoTime() - tt0);
         }
 
-        if (resAttn && startPos == 0
+        if (segN <= 1 && resAttn && startPos == 0
                 && (CausalLM.eagerAuthOn
                     || CausalLM.forceReseed)) {
             // The deferred cache-authority pass (10.12.30): ONE sync,
@@ -2774,7 +3018,16 @@ public final class CausalLM extends InfModule {
                 + (Clock.nanoTime() - tda);
         }
 
-        if (dkv != null && !CausalLM.forceReseed) {
+        if (segN > 1) {
+            int32 sg = 0;
+            while (sg < segN) {
+                int32 ss = this.pfSegs.seq[(int64) sg];
+                DeviceKv sd = this.dkvOf(ss);
+                sd.adoptLazy(ss, this.pfSegs.start[(int64) sg] + this.pfSegs.rows[(int64) sg],
+                    this.cache.lengthOf(ss, 0));
+                sg = sg + 1;
+            }
+        } else if (dkv != null && !CausalLM.forceReseed) {
             // The planes now hold every prompt position, written by
             // `prefillAttend`, and the paged cache holds them too. Say so,
             // or the first decode token re-seeds 134 MB it already has.

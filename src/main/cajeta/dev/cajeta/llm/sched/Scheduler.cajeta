@@ -347,6 +347,19 @@ public final class Scheduler {
             this.bTok = heap int32[CausalLM.DECODE_BATCH_MAX];
             this.bOut = heap int32[CausalLM.DECODE_BATCH_MAX];
         }
+        // Prompt chunks batch across requests where the resident prefill
+        // and the device tail serve; greedy requests only, since the pass
+        // keeps one set of logits (the decode batch's selectBatchLogits has
+        // no prefill twin yet).
+        boolean pBatching = this.model.prefillBatchReady();
+        int32 np = 0;
+        if (pBatching && this.pIdx == null) {
+            this.pIdx = heap int32[(int64) this.maxSeqs];
+            this.pSeq = heap int32[(int64) this.maxSeqs];
+            this.pOff = heap int32[(int64) this.maxSeqs];
+            this.pN = heap int32[(int64) this.maxSeqs];
+            this.pOut = heap int32[(int64) this.maxSeqs];
+        }
         boolean loaded = this.pipeInFlight;
         int32 prompts = 0;
         int32 j = 0;
@@ -413,15 +426,27 @@ public final class Scheduler {
                     if (n > 1) {
                         if (n == cap) { fullChunks = fullChunks + 1; } else { partial = true; }
                     }
+                    if (pBatching && n > 1 && np < this.maxSeqs
+                            && (r.sampler == null || r.sampler.isGreedy())
+                            && !this.hashesStep(r)) {
+                        this.pIdx[(int64) np] = i;
+                        this.pSeq[(int64) np] = r.slot;
+                        this.pOff[(int64) np] = r.cachedLen;
+                        this.pN[(int64) np] = n;
+                        np = np + 1;
+                        tso = Clock.nanoTime();
+                    } else {
                     int64 tm0 = Clock.nanoTime();
                     int32 ret = this.model.stepSeq(r.slot, r.all, r.cachedLen, n);
                     tso = Clock.nanoTime();
                     Scheduler.traceModelNs = Scheduler.traceModelNs + (tso - tm0);
                     this.consume(i, r, ret, n);
+                    }
                 }
             }
             i = i + 1;
         }
+        if (np > 0) { this.runPrefillBatch(np); }
         if (nb > 0) { this.runDecodeBatch(nb); }
         // Completions freed blocks: same-step admission (6.24).
         this.admitPhase();
@@ -608,9 +633,71 @@ public final class Scheduler {
     int32[] bSeq;
     int32[] bTok;
     int32[] bOut;
+    // 15.2.15.1.4: the prompt chunks a step admits together, run as ONE
+    // pass by CausalLM.stepPrefillBatch; pTok holds their tokens in order.
+    int32[] pIdx;
+    int32[] pSeq;
+    int32[] pOff;
+    int32[] pN;
+    int32[] pOut;
+    int32[] pTok;
 
     /** Run the collected decode rows as one step (xpu-kernel-adaptor 13B),
      *  dropping any a preemption stopped after it was collected. */
+    /** The collected prompt chunks as one pass; a request preempted since
+     *  it was collected is skipped (its blocks are gone; admission returns
+     *  it), and one chunk alone is the plain step. */
+    void runPrefillBatch(int32 np) {
+        int32 m = 0;
+        int32 total = 0;
+        int32 k = 0;
+        while (k < np) {
+            Request r = this.reqs.get(this.pIdx[(int64) k]);
+            if (r.state == Request.RUNNING && r.slot == this.pSeq[(int64) k]) {
+                this.pIdx[(int64) m] = this.pIdx[(int64) k];
+                this.pSeq[(int64) m] = r.slot;
+                this.pN[(int64) m] = this.pN[(int64) k];
+                total = total + this.pN[(int64) k];
+                m = m + 1;
+            }
+            k = k + 1;
+        }
+        if (m == 0) { return; }
+        if (this.pTok == null || (int64) this.pTok.count() < (int64) total) {
+            this.pTok = heap int32[(int64) total];
+        }
+        int32 at = 0;
+        k = 0;
+        while (k < m) {
+            Request r = this.reqs.get(this.pIdx[(int64) k]);
+            int32 n = this.pN[(int64) k];
+            int32 j = 0;
+            while (j < n) {
+                this.pTok[(int64) (at + j)] = r.all[(int64) (r.cachedLen + j)];
+                j = j + 1;
+            }
+            this.pOff[(int64) k] = at;
+            at = at + n;
+            k = k + 1;
+        }
+        int64 tm0 = Clock.nanoTime();
+        if (m == 1) {
+            Request r1 = this.reqs.get(this.pIdx[0]);
+            int32 ret = this.model.stepSeq(r1.slot, r1.all, r1.cachedLen, this.pN[0]);
+            Scheduler.traceModelNs = Scheduler.traceModelNs + (Clock.nanoTime() - tm0);
+            this.consume(this.pIdx[0], r1, ret, this.pN[0]);
+            return;
+        }
+        this.model.stepPrefillBatch(this.pSeq, this.pTok, this.pOff, this.pN, m, this.pOut);
+        Scheduler.traceModelNs = Scheduler.traceModelNs + (Clock.nanoTime() - tm0);
+        k = 0;
+        while (k < m) {
+            Request rk = this.reqs.get(this.pIdx[(int64) k]);
+            this.consume(this.pIdx[(int64) k], rk, this.pOut[(int64) k], this.pN[(int64) k]);
+            k = k + 1;
+        }
+        return;
+    }
     void runDecodeBatch(int32 nb) {
         int32 m = 0;
         int32 k = 0;
