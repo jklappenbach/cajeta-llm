@@ -266,6 +266,77 @@ public final class CausalLM extends InfModule {
         return warmed;
     }
 
+    /**
+     * Size every buffer a multi-request prefill of `rows` rows grows on
+     * first use, at load (15.2.15.1.4): the pass's hidden-state, position,
+     * token and attention-output buffers, every projection's batch output
+     * and the fused gate|up output at the padded row count, the shared
+     * packed-activation stage, and the tile's split-K scratch (sized in
+     * the shape prewarm). Measured on the 4090 before this: nine
+     * drain-syncs and ~40 ms of allocation inside the first 2048-row pass,
+     * each a GPU idle while the host reallocated. Returns the growths it
+     * performed.
+     */
+    public int64 prewarmBatchBuffers(int32 rows) {
+        if (rows <= 0) { return 0L; }
+        int64 g0 = Diag.growthCount();
+        int64 h = (int64) this.cfg.hiddenSize;
+        int64 qd = (int64) this.cfg.qDim();
+        int32 padRows = (rows + 127) / 128 * 128;
+        this.ensurePrefillRes((int64) rows * h);
+        this.ensurePrefillTok((int64) rows);
+        this.ensurePrefillPosCap(rows);
+        if (this.pfSegs == null) { this.pfSegs #= heap PrefillSegments(); }
+        this.ensurePrefillAo((int64) rows * qd);
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            DecoderLayer d = this.model.layerArr[l];
+            d.selfAttn.qProj.ensureBatchOut(padRows);
+            d.selfAttn.kProj.ensureBatchOut(padRows);
+            d.selfAttn.vProj.ensureBatchOut(padRows);
+            d.selfAttn.oProj.ensureBatchOut(padRows);
+            if (d.mlp != null) {
+                if (d.mlp.gateProj.fusedPairTcFits(d.mlp.upProj, rows)) {
+                    d.mlp.gateProj.ensureFusedPacked2(d.mlp.upProj);
+                    d.mlp.gateProj.ensureFusedY(padRows);
+                } else {
+                    d.mlp.gateProj.ensureBatchOut(padRows);
+                    d.mlp.upProj.ensureBatchOut(padRows);
+                }
+                d.mlp.downProj.ensureBatchOut(padRows);
+            }
+            l = l + 1;
+        }
+        int64 grew = Diag.growthCount() - g0;
+        if (Diag.on()) {
+            Diag.emit("prewarm-buffers", 0 - 1, null, (int64) rows, grew,
+                0L, 0L, 0L, 0L);
+        }
+        return grew;
+    }
+
+    /**
+     * Build the planes of slots 0..n-1 and size their prefill scratch for
+     * a `chunk`-row segment, off the clock (15.2.15.1.4): a scheduler
+     * calls it with the pool reserve at submit, so the pass that admits
+     * the sequences builds nothing (a DeviceKv and its scratch were ~8 ms
+     * a slot inside the first pass on the 4090). Lazy still: a scheduler
+     * asks for the sequences it holds, not for maxSeqs.
+     */
+    public void prepareDeviceKvSlots(int32 n, int32 chunk) {
+        if (!CausalLM.devAttnOn || !KernelCap.attendHere()
+                || !DeviceKv.supports(this.cfg) || !this.residentRouted()) {
+            return;
+        }
+        int32 s = 0;
+        while (s < n && s < this.maxSeqsN) {
+            DeviceKv d = this.ensureDkvSlot(s);
+            if (d != null && chunk > 0) { d.ensurePrefill(chunk); }
+            s = s + 1;
+        }
+        return;
+    }
+
     public void prewarmPrefillWeights() {
         boolean deq = Linear.deqPrefillOn();
         // 13.2.1: the batched decode's per-format verdict (ColsProbe) is
@@ -686,9 +757,8 @@ public final class CausalLM extends InfModule {
         int64 kvd = (int64) this.cfg.kvDim();
         int64 inter = (int64) this.cfg.intermediateSize;
         int64 arenaBytes = rows * (h * 4 + qd * 2 + kvd * 2 + inter * 2);
-        int64 tArena0 = Clock.nanoTime();
+        int64 growths0 = Diag.growthCount();
         PrefillArena arena = heap PrefillArena(arenaBytes);
-        int64 arenaNs = Clock.nanoTime() - tArena0;
         Tensor<float32> hs #= arena.take(rows, h);
         Tensor<float32> xn #= arena.take(rows, h);
         Tensor<float32> proj #= arena.take(rows, h);
@@ -724,11 +794,12 @@ public final class CausalLM extends InfModule {
         sg = 0;
         while (sg < m) { out[(int64) sg] = this.pfSegs.out[(int64) sg]; sg = sg + 1; }
         int64 tEnd = Clock.nanoTime();
-        // rows, segments, then where the call's time went: the lead-in
-        // before the first layer (of which the arena's host zero-fill),
-        // the pass, the tail (15.2.15.1.4).
+        // rows, segments, where the call's time went (the lead-in before
+        // the first layer, the pass, the tail), and how many buffers grew
+        // inside it: zero when load sized them (15.2.15.1.4).
         Diag.emit("prefill-batch", 0 - 1, null, rows, (int64) m,
-            tPass0 - tStep0, tPass1 - tPass0, tEnd - tPass1, arenaNs);
+            tPass0 - tStep0, tPass1 - tPass0, tEnd - tPass1,
+            Diag.growthCount() - growths0);
         CausalLM.pfStepNs = CausalLM.pfStepNs + (tEnd - tStep0);
         return;
     }
@@ -1468,6 +1539,7 @@ public final class CausalLM extends InfModule {
     void ensurePrefillRes(int64 n) {
         if (this.pfHsCap >= n) { return; }
         int64 rg0 = Clock.nanoTime();
+        Diag.growth();
         this.pfHsDev #= heap KernelBuffer<float32>((uint64) n);
         this.pfXnDev #= heap KernelBuffer<float32>((uint64) n);
         this.pfHsHost #= heap float32[n];
@@ -1518,6 +1590,7 @@ public final class CausalLM extends InfModule {
 
     void ensurePrefillTok(int64 n) {
         if (this.pfTokCap >= n) { return; }
+        Diag.growth();
         this.pfTokDev #= heap KernelBuffer<int32>((uint64) n);
         this.pfTokHost #= heap int32[n];
         this.pfTokCap = n;
@@ -1541,6 +1614,7 @@ public final class CausalLM extends InfModule {
 
     void ensurePrefillAo(int64 n) {
         if (this.pfSegs.aoCap >= n) { return; }
+        Diag.growth();
         this.pfSegs.ao #= heap KernelBuffer<float32>((uint64) n);
         this.pfSegs.aoCap = n;
         return;
@@ -1552,11 +1626,7 @@ public final class CausalLM extends InfModule {
         int32 rows = 0;
         int32 sg = 0;
         while (sg < this.pfSegs.n) { rows = rows + this.pfSegs.rows[(int64) sg]; sg = sg + 1; }
-        if (this.pfPosCap < rows) {
-            this.pfPosDev #= heap KernelBuffer<int32>((uint64) rows);
-            this.pfPosHost #= heap int32[(int64) rows];
-            this.pfPosCap = rows;
-        }
+        this.ensurePrefillPosCap(rows);
         int32 i = 0;
         sg = 0;
         while (sg < this.pfSegs.n) {
@@ -1572,12 +1642,18 @@ public final class CausalLM extends InfModule {
         return;
     }
 
+    /** The position buffers hold `rows` entries. */
+    void ensurePrefillPosCap(int32 rows) {
+        if (this.pfPosCap >= rows) { return; }
+        Diag.growth();
+        this.pfPosDev #= heap KernelBuffer<int32>((uint64) rows);
+        this.pfPosHost #= heap int32[(int64) rows];
+        this.pfPosCap = rows;
+        return;
+    }
+
     void ensurePrefillPos(int32 rows, int32 startPos) {
-        if (this.pfPosCap < rows) {
-            this.pfPosDev #= heap KernelBuffer<int32>((uint64) rows);
-            this.pfPosHost #= heap int32[(int64) rows];
-            this.pfPosCap = rows;
-        }
+        this.ensurePrefillPosCap(rows);
         int32 i = 0;
         while (i < rows) {
             this.pfPosHost[(int64) i] = startPos + i;
@@ -1611,6 +1687,7 @@ public final class CausalLM extends InfModule {
     void ensurePrefillKv(int64 n) {
         if (this.pfKvCap >= n) { return; }
         int64 kg0 = Clock.nanoTime();
+        Diag.growth();
         this.pfKScr #= heap float32[n];
         this.pfVScr #= heap float32[n];
         this.pfKvCap = n;
@@ -1671,6 +1748,7 @@ public final class CausalLM extends InfModule {
             this.dkvs #= heap DeviceKv[(int64) this.maxSeqsN];
         }
         if (this.dkvs[(int64) seq] == null) {
+            Diag.growth();
             if (this.kvPool == null) {
                 this.kvPool #= heap KvPool(this.cfg.numLayers,
                     (int64) this.maxSeq * (int64) this.cfg.kvDim());
