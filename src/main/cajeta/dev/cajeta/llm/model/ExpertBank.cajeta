@@ -6,7 +6,9 @@ import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.Checkpoint;
 import cajeta.io.file.MappedFile;
 import cajeta.math.Tensor;
+import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.Diag;
 import cajeta.xpu.KernelStream;
 import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.IdBatch;
@@ -111,12 +113,62 @@ public final class ExpertBank {
 
     public static void setResidencyBudget(int64 bytes) {
         ExpertBank.resBudget = bytes;
+        ExpertBank.resAuto = false;
         return;
     }
 
-    public static int64 residencyBudget() {
+    // AUTO (moe-expert-cache spec 3.2.1, revised cajeta-llm 15.2.15.4): the
+    // budget is what the device has FREE when the first slab asks, less a
+    // reserve for what the engine will still allocate (the K/V pool at
+    // maxSeqs, the slots' prefill scratch, a margin). "Half the device" was
+    // the first default; on a 24 GB part under a 30B-A3B whose experts are
+    // 20 GB it bound 30 of 48 layers' slabs and the capped regime then
+    // spent 5.7 GB on per-expert copies for the rest, while every host
+    // layer held decode at 2.5 tok/s. Frozen at first use so admission
+    // accounting is stable; measured 2026-10-24 on the 4090.
+    static boolean resAuto;
+    static int64 resReserve;
+    static int64 resFreeAtFreeze;
+
+    /** Budget AUTO: decided at the first slab bind from free device memory less `reserve`. */
+    public static void setResidencyBudgetAuto(int64 reserve) {
+        ExpertBank.resAuto = true;
+        ExpertBank.resReserve = reserve;
+        ExpertBank.resBudget = 0L;
+        ExpertBank.resFreeAtFreeze = 0L;
+        return;
+    }
+
+    /** Refine the AUTO reserve before it freezes (the engine knows its pool and scratch only once the model is built). */
+    public static void setResidencyReserve(int64 reserve) {
+        if (ExpertBank.resAuto && ExpertBank.resFreeAtFreeze == 0L) { ExpertBank.resReserve = reserve; }
+        return;
+    }
+
+    /** The budget in force: an explicit byte count, or AUTO frozen now from free memory. */
+    static int64 budget() {
+        if (ExpertBank.resAuto && ExpertBank.resFreeAtFreeze == 0L) {
+            int64 free = Device.freeMemoryBytes();
+            if (free <= 0L) { free = 1L; }
+            ExpertBank.resFreeAtFreeze = free;
+            int64 b = free - ExpertBank.resReserve;
+            if (b < 0L) { b = 0L; }
+            ExpertBank.resBudget = b;
+            Diag.emit("moe-budget", 0 - 1, "auto", free, ExpertBank.resReserve, b,
+                0L, 0L, 0L);
+        }
         return ExpertBank.resBudget;
     }
+
+    public static int64 residencyBudget() {
+        return ExpertBank.budget();
+    }
+
+    /** Free device bytes the AUTO budget was frozen from (0 before, or when explicit). */
+    public static int64 residencyBudgetFree() { return ExpertBank.resFreeAtFreeze; }
+
+    /** The reserve the AUTO budget subtracted. */
+    public static int64 residencyBudgetReserve() { return ExpertBank.resReserve; }
 
     public static int64 residencyUsedBytes() {
         return ExpertBank.resUsed;
@@ -402,8 +454,8 @@ public final class ExpertBank {
             }
             return;
         }
-        boolean tryAdmit = ExpertBank.resBudget > 0L
-            && ExpertBank.resUsed < ExpertBank.resBudget;
+        boolean tryAdmit = ExpertBank.budget() > 0L
+            && ExpertBank.resUsed < ExpertBank.budget();
         if (tryAdmit && this.refused != null && this.refused[e]) {
             tryAdmit = false;
         }
@@ -443,8 +495,8 @@ public final class ExpertBank {
         if (this.slabRefused) { return false; }
         if (this.map == null) { return false; }
         int64 charge = (int64) this.expertsN * this.stride;
-        if (ExpertBank.resBudget <= 0L
-                || ExpertBank.resUsed + charge > ExpertBank.resBudget) {
+        if (ExpertBank.budget() <= 0L
+                || ExpertBank.resUsed + charge > ExpertBank.budget()) {
             this.slabRefused = true;
             return false;
         }
@@ -1148,7 +1200,7 @@ public final class ExpertBank {
         this.touched[e] = this.touched[e] + this.stride;
         sl.matmulInto(m, dst, dstOff);
         int64 charge = sl.devWeightBytes();
-        if (ExpertBank.resUsed + charge > ExpertBank.resBudget) {
+        if (ExpertBank.resUsed + charge > ExpertBank.budget()) {
             this.refused[e] = true;
             ExpertBank.resWindowed = ExpertBank.resWindowed + 1L;
             return;
