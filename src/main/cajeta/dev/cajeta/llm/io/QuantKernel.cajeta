@@ -14,6 +14,7 @@ import cajeta.xpu.Wave;
 import cajeta.xpu.Workgroup;
 import cajeta.xpu.Group;
 import cajeta.xpu.Autotune;
+import cajeta.xpu.ShapeChoice;
 import cajeta.xpu.KernelManifest;
 import cajeta.lang.Optional;
 import cajeta.xpu.GroupOp;
@@ -13240,6 +13241,15 @@ public final class QuantKernel {
             if (ty == Quant.GG_Q6_K) { rk = "q6kQ8WaveR2MatVecColsKernel"; }
             if (!Device.kernelAvailable(rk)) { return QuantKernel.probeArms(ty, rows, cols, ncols, 2); }
         }
+        String knob #= QuantKernel.variantKnob(ty, rows, cols, ncols);
+        String bid #= QuantKernel.variantBuildId(ty, ncols, arms);
+        if (QuantKernel.mvTuneDir.byteLength() > 0) {
+            Optional<int32> t = Autotune.recallFor(QuantKernel.mvTuneDir, knob, bid);
+            if (t.isPresent() && t.get() >= 1 && t.get() <= arms) {
+                QuantKernel.probeRecalls = QuantKernel.probeRecalls + 1L;
+                return t.get();
+            }
+        }
         int8[] raw #= QuantKernel.probeWeight(ty, rows, cols);
         int64 nb = (int64) raw.count();
         int32 nc = ncols;
@@ -13320,15 +13330,65 @@ public final class QuantKernel {
         QuantKernel.probePfNs = best[1];
         QuantKernel.probePlainNs = best[2];
         if (arms > 2) { QuantKernel.probeR2Ns = best[3]; }
-        int32 win = 2;
-        if (best[1] < best[2]) { win = 1; }
-        if (arms > 2 && best[3] < best[(int64) win]) { win = 3; }
+        int32 win = QuantKernel.probeVerdict(best[1], best[2], arms > 2 ? best[3] : 0L - 1L);
         String wn = "plain";
         if (win == 1) { wn = "prefetch"; }
         if (win == 3) { wn = "rows2"; }
         Diag.emit("mv-probe", 0 - 1, wn, best[1], best[2], rows, (int64) nc, cols, (int64) ty);
+        if (QuantKernel.mvTuneDir.byteLength() > 0) {
+            Autotune.rememberFor(QuantKernel.mvTuneDir, knob, win, bid);
+        }
         return win;
     }
+
+    /** The variant a timed probe takes: plain (2) unless prefetch (1) beats it by at least the
+     *  tie margin (ShapeChoice.tiePerMille), then two-row (3, when timed: `r2 >= 0`) only when it
+     *  beats that winner by the same margin. A tie keeps the earlier variant, so the choice
+     *  reproduces across runs (cajeta-llm 15.2.12.2.1.1.2). */
+    public static int32 probeVerdict(int64 pf, int64 plain, int64 r2) {
+        int64 m = (int64) ShapeChoice.tiePerMille;
+        int32 win = 2;
+        int64 wt = plain;
+        if (pf > 0L && plain > 0L && (plain - pf) * 1000L >= m * plain) { win = 1; wt = pf; }
+        if (r2 > 0L && wt > 0L && (wt - r2) * 1000L >= m * wt) { win = 3; }
+        return win;
+    }
+
+    /** The store key of a shape's variant verdict. */
+    static #String variantKnob(int32 ty, int64 rows, int64 cols, int32 ncols) {
+        String k #= "mvVariant-" + GgufFile.typeName(ty) + "-" + rows + "x" + cols + "-c" + ncols;
+        return #k;
+    }
+
+    /** The timed kernels' manifests, so a rebuilt kernel is measured again. */
+    static #String variantBuildId(int32 ty, int32 ncols, int32 arms) {
+        String pk = "q4kQ8WavePfMatVecKernel";
+        String qk = "q4kQ8WaveMatVecKernel";
+        String rk = "q4kQ8WaveR2MatVecColsKernel";
+        if (ty == Quant.GG_Q6_K && ncols > 0) {
+            pk = "q6kQ8WavePfMatVecColsKernel"; qk = "q6kQ8WaveMatVecColsKernel"; rk = "q6kQ8WaveR2MatVecColsKernel";
+        } else if (ty == Quant.GG_Q6_K) {
+            pk = "q6kQ8WavePfMatVecKernel"; qk = "q6kQ8WaveMatVecKernel";
+        } else if (ncols > 0) {
+            pk = "q4kQ8WavePfMatVecColsKernel"; qk = "q4kQ8WaveMatVecColsKernel";
+        }
+        String id #= QuantKernel.manifestPrint(pk) + "/" + QuantKernel.manifestPrint(qk);
+        if (arms > 2) { id #= id + "/" + QuantKernel.manifestPrint(rk); }
+        return #id;
+    }
+
+    static #String manifestPrint(String kernel) {
+        KernelManifest m #= KernelManifest.of(kernel);
+        if (m == null) { String none #= "none"; return #none; }
+        String f #= "v" + m.vgpr().orElse(0 - 1) + "s" + m.sgpr().orElse(0 - 1)
+            + "l" + m.ldsStaticBytes().orElse(0 - 1) + "p" + m.spillBytes().orElse(0 - 1)
+            + "w" + m.waveWidth().orElse(0 - 1);
+        return #f;
+    }
+
+    /** How many variant verdicts came from the store rather than a timing, this process. */
+    static int64 probeRecalls = 0L;
+    public static int64 variantRecalls() { return QuantKernel.probeRecalls; }
 
     /** One WAVE per rowsPerWave output rows, 32 threads each — the
      *  geometry is the point, so it is not chunked and not tunable. */
