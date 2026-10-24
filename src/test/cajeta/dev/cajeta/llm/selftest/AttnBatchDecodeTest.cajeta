@@ -44,8 +44,8 @@ public class AttnBatchDecodeTest {
     }
 
     /** A pool of `n` slots whose earlier positions hold spread halves. */
-    static #KvPool pool(int32 n) {
-        int64 kvDim = (int64) (AttnBatchDecodeTest.NKV * AttnBatchDecodeTest.HD);
+    static #KvPool pool(int32 n, int32 nKv) {
+        int64 kvDim = (int64) (nKv * AttnBatchDecodeTest.HD);
         KvPool p #= heap KvPool(1, (int64) AttnBatchDecodeTest.CAP * kvDim);
         p.ensureSlots(n);
         int32 s = 0;
@@ -66,14 +66,12 @@ public class AttnBatchDecodeTest {
     }
 
     /** Runs `n` rows through the batched launches when `batch`, else each row's own; returns the packed rows then the pool's K and V as bytes. */
-    static #int8[] run(int32 n, boolean batch, boolean norm) {
-        int32 nH = AttnBatchDecodeTest.NH;
-        int32 nKv = AttnBatchDecodeTest.NKV;
+    static #int8[] run(int32 n, boolean batch, boolean norm, int32 nH, int32 nKv) {
         int32 hd = AttnBatchDecodeTest.HD;
         int64 qd = (int64) (nH * hd);
         int64 kvd = (int64) (nKv * hd);
         float32 scale = 1.0f / Math.sqrt((float32) hd);
-        KvPool p #= AttnBatchDecodeTest.pool(n);
+        KvPool p #= AttnBatchDecodeTest.pool(n, nKv);
         float32[] q #= AttnKernelTest.spread(qd * (int64) n, 3);
         float32[] k #= AttnKernelTest.spread(kvd * (int64) n, 4);
         float32[] v #= AttnKernelTest.spread(kvd * (int64) n, 6);
@@ -151,15 +149,15 @@ public class AttnBatchDecodeTest {
     }
 
     /** Holds the batched launches byte-equal to each row's own, which AttnKernelTest holds to the host floor. */
-    static void same(int32 n, boolean norm) {
+    static void same(int32 n, boolean norm, int32 nH, int32 nKv) {
         // The row-by-row route derives its splits for one row and the batched route for n,
         // so the comparison pins one chunk for both (FlashDecodeSplitsTest holds the rule).
         AttnKernel.setFlashDecodeChunk(8);
-        int8[] want #= AttnBatchDecodeTest.run(n, false, norm);
+        int8[] want #= AttnBatchDecodeTest.run(n, false, norm, nH, nKv);
         int64[] vc #= ValueCheck.mark();
-        int8[] got #= AttnBatchDecodeTest.run(n, true, norm);
+        int8[] got #= AttnBatchDecodeTest.run(n, true, norm, nH, nKv);
         AttnKernel.setFlashDecodeChunk(0);
-        int64 qd = (int64) (AttnBatchDecodeTest.NH * AttnBatchDecodeTest.HD);
+        int64 qd = (int64) (nH * AttnBatchDecodeTest.HD);
         int64 pbAll = Quant.q8kPackedBytes(qd) * (int64) n;
         Assert.equals((int64) want.count(), (int64) got.count());
         int64 i = 0;
@@ -167,7 +165,7 @@ public class AttnBatchDecodeTest {
             if (want[i] != got[i]) {
                 String where = "packed attention byte " + i;
                 if (i >= pbAll) { where = "K/V pool element " + ((i - pbAll) / 4L); }
-                Assert.fail(n + " rows" + (norm ? " with qk-norm" : "") + ": " + where
+                Assert.fail(n + " rows of GQA x" + (nH / nKv) + (norm ? " with qk-norm" : "") + ": " + where
                     + " is " + (int32) got[i] + " batched, " + (int32) want[i] + " row by row");
                 return;
             }
@@ -179,34 +177,62 @@ public class AttnBatchDecodeTest {
     @Test
     public void oneRowMatchesItsOwnLaunches() {
         if (!AttnBatchDecodeTest.kernels()) { return; }
-        AttnBatchDecodeTest.same(1, false);
+        AttnBatchDecodeTest.same(1, false, AttnBatchDecodeTest.NH, AttnBatchDecodeTest.NKV);
     }
 
     @Test
     public void twoAndFourRowsOfMixedLengthsMatchTheirOwnLaunches() {
         if (!AttnBatchDecodeTest.kernels()) { return; }
-        AttnBatchDecodeTest.same(2, false);
-        AttnBatchDecodeTest.same(4, false);
+        AttnBatchDecodeTest.same(2, false, AttnBatchDecodeTest.NH, AttnBatchDecodeTest.NKV);
+        AttnBatchDecodeTest.same(4, false, AttnBatchDecodeTest.NH, AttnBatchDecodeTest.NKV);
     }
 
     @Test
     public void eightRowsMatchTheirOwnLaunches() {
         if (!AttnBatchDecodeTest.kernels()) { return; }
-        AttnBatchDecodeTest.same(8, false);
+        AttnBatchDecodeTest.same(8, false, AttnBatchDecodeTest.NH, AttnBatchDecodeTest.NKV);
     }
 
     @Test
     public void rowsWithQkNormMatchTheirOwnLaunches() {
         if (!AttnBatchDecodeTest.kernels()) { return; }
-        AttnBatchDecodeTest.same(4, true);
+        AttnBatchDecodeTest.same(4, true, AttnBatchDecodeTest.NH, AttnBatchDecodeTest.NKV);
     }
 
-    /** FIRES for GQA x4 at head 128, DOES NOT for x8 or another head size. */
+    static boolean kernels8() {
+        if (!AttnBatchDecodeTest.kernels()) { return false; }
+        if (!KernelCap.usable("attnFlashDecodeGqa8BatchKernel")) {
+            DeviceSkip.noKernel("attnFlashDecodeGqa8BatchKernel", Device.activeBackend());
+            return false;
+        }
+        return true;
+    }
+
+    /** cajeta-llm 15.2.15.4.1: GQA x8 (Qwen3-30B-A3B is 32 heads over 4) takes the batched
+     *  route too — two waves a kv head as the per-row x8 kernel — and each row's bytes are its
+     *  own launches'. Before this the 30B's decode batch ran twelve attention launches a layer
+     *  instead of three: 1.9 ms a step against llama.cpp's 0.5 (tally of 2026-10-24 14:22). */
     @Test
-    public void theBatchedRouteServesOnlyGqaFourAtHead128() {
+    public void rowsOfGqaEightMatchTheirOwnLaunches() {
+        if (!AttnBatchDecodeTest.kernels8()) { return; }
+        AttnBatchDecodeTest.same(1, false, 16, 2);
+        AttnBatchDecodeTest.same(4, false, 16, 2);
+    }
+
+    @Test
+    public void rowsOfGqaEightWithQkNormMatchTheirOwnLaunches() {
+        if (!AttnBatchDecodeTest.kernels8()) { return; }
+        AttnBatchDecodeTest.same(4, true, 16, 2);
+    }
+
+    /** FIRES for GQA x4 and x8 at head 128, DOES NOT for another ratio or head size. */
+    @Test
+    public void theBatchedRouteServesGqaFourAndEightAtHead128() {
         Assert.isTrue(AttnKernel.batchDecodeServes(8, 2, 128));
         Assert.isTrue(AttnKernel.batchDecodeServes(32, 8, 128));
-        Assert.isTrue(!AttnKernel.batchDecodeServes(16, 2, 128));
+        Assert.isTrue(AttnKernel.batchDecodeServes(16, 2, 128));
+        Assert.isTrue(AttnKernel.batchDecodeServes(32, 4, 128));
+        Assert.isTrue(!AttnKernel.batchDecodeServes(12, 2, 128));
         Assert.isTrue(!AttnKernel.batchDecodeServes(8, 2, 64));
         Assert.isTrue(!AttnKernel.batchDecodeServes(8, 8, 128));
     }
@@ -216,7 +242,7 @@ public class AttnBatchDecodeTest {
     public void theLauncherCountsEachBatchedLayer() {
         if (!AttnBatchDecodeTest.kernels()) { return; }
         int64 before = AttnKernel.batchDecodeCalls();
-        AttnBatchDecodeTest.run(2, true, false);
+        AttnBatchDecodeTest.run(2, true, false, AttnBatchDecodeTest.NH, AttnBatchDecodeTest.NKV);
         Assert.equals(before + 1L, AttnKernel.batchDecodeCalls());
     }
 }
