@@ -1,0 +1,109 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.EngineOptions;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.llm.sched.Request;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * cajeta-llm 15.2.15.4.1 — a model with experts decodes its sequences
+ * batched: decodeBatchReady admits MoE layers whose banks are resident
+ * and id-ready, and the step serves every row's selected experts with
+ * one id mat-vec launch per bank. Before this a 4-seq decode of a MoE
+ * took four row passes a step (Qwen3-Coder-30B-A3B: 153 against
+ * llama.cpp's 467 tok/s on the 4090 with every layer resident).
+ */
+public class BatchedMoeDecodeTest {
+
+    public BatchedMoeDecodeTest() { return; }
+
+    static final int32 SEQS = 4;
+    static final int32 GEN = 8;
+
+    static #LlmEngine engine(int32 seqs) {
+        EngineOptions o #= heap EngineOptions(ResidentMoeDecodeTest.FIX);
+        o.ctx = 128;
+        o.maxSeqs = seqs;
+        o.blockTokens = 16;
+        o.chunk = 64;
+        LlmEngine e #= LlmEngine.load(#o);
+        return #e;
+    }
+
+    /** FIRES: the engine says `decode-batch ready` for the MoE fixture, and
+     *  each of four streams decoded together equals its solo stream. */
+    @Test
+    public void fourSequencesOfAMoeDecodeBatchedAndMatchTheirSoloStreams() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        ExpertBank.resetResidency();
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        LlmEngine all #= BatchedMoeDecodeTest.engine(BatchedMoeDecodeTest.SEQS);
+        // Resident experts are the precondition; a backend that keeps them on
+        // the host has nothing to batch (the row route says so).
+        boolean resident = all.model().moeAt(0).zeroSyncRowsReady();
+        if (!resident) {
+            Diag.register(null);
+            all.close();
+            ExpertBank.setResidencyBudget(0L);
+            DeviceSkip.tracked("the MoE fixture's experts are not resident here: "
+                + cap.namesOf("moe-row-route"), "cajeta-llm 15.2.15.4.1");
+            return;
+        }
+        boolean ready = all.model().decodeBatchReady();
+        if (!ready) {
+            Diag.register(null);
+            all.close();
+            ExpertBank.setResidencyBudget(0L);
+            Assert.fail("decode-batch refused for a MoE whose experts are resident: "
+                + cap.namesOf("decode-batch"));
+            return;
+        }
+        int32[] ids #= heap int32[BatchedMoeDecodeTest.SEQS];
+        int32 q = 0;
+        while (q < BatchedMoeDecodeTest.SEQS) {
+            int32 len = 12 + 3 * q;
+            int32[] p #= RoutableFixtureTest.promptOf(len, 5 + 11 * q);
+            ids[q] = all.submitTokens(p, len, BatchedMoeDecodeTest.GEN,
+                #heap SampleParams(0.0f, (int64) (41 + q)));
+            q = q + 1;
+        }
+        all.runAll(400);
+        Diag.register(null);
+        // The mechanism: the batched step ran for the MoE's rows.
+        Assert.isTrue(cap.countOf("moe-rows") > 0);
+        q = 0;
+        while (q < BatchedMoeDecodeTest.SEQS) {
+            LlmEngine one #= BatchedMoeDecodeTest.engine(1);
+            int32 len = 12 + 3 * q;
+            int32[] p #= RoutableFixtureTest.promptOf(len, 5 + 11 * q);
+            int32 id = one.submitTokens(p, len, BatchedMoeDecodeTest.GEN,
+                #heap SampleParams(0.0f, (int64) (41 + q)));
+            one.runAll(400);
+            Request solo = one.request(id);
+            Request inBatch = all.request(ids[q]);
+            Assert.equals((int64) BatchedMoeDecodeTest.GEN, (int64) inBatch.generatedCount());
+            Assert.equals((int64) solo.generatedCount(), (int64) inBatch.generatedCount());
+            int32 k = 0;
+            while (k < solo.generatedCount()) {
+                if (solo.generatedAt(k) != inBatch.generatedAt(k)) {
+                    Assert.fail("sequence " + q + " token " + k + ": " + inBatch.generatedAt(k)
+                        + " decoded in the batch, " + solo.generatedAt(k) + " decoded alone");
+                }
+                k = k + 1;
+            }
+            one.close();
+            q = q + 1;
+        }
+        all.close();
+        ExpertBank.setResidencyBudget(0L);
+        ExpertBank.resetResidency();
+    }
+}

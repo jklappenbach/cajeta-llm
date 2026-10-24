@@ -3641,30 +3641,56 @@ public final class CausalLM extends InfModule {
     public boolean decodeBatchReady() {
         if (!CausalLM.decodeBatchOn || !CausalLM.deviceArgmax) { return false; }
         if (this.bdReady != 0) { return this.bdReady == 1; }
-        boolean ok = this.deviceResidentReady() && CausalLM.fuseTail
-            && CausalLM.devAttnOn && KernelCap.attendHere()
-            && DeviceKv.supports(this.cfg) && this.cfg.headDim <= 128
-            && this.lmHead.isDeviceRouted() && this.lmHead.colsReady()
-            && this.cfg.hiddenSize % 256 == 0
-            && this.cfg.intermediateSize % 256 == 0
-            && this.cfg.qDim() % 256 == 0;
+        // The refusal names its gate: a step that silently decodes row by
+        // row reads as a slow kernel (15.2.15.4.1 met it on the 30B).
+        String why = "";
+        if (!this.deviceResidentReady()) { why = "not device-resident"; }
+        else if (!CausalLM.fuseTail) { why = "fused tail off"; }
+        else if (!CausalLM.devAttnOn || !KernelCap.attendHere()) { why = "no device attention"; }
+        else if (!DeviceKv.supports(this.cfg)) { why = "DeviceKv does not support the shape"; }
+        else if (this.cfg.headDim > 128) { why = "headDim over 128"; }
+        else if (!this.lmHead.isDeviceRouted() || !this.lmHead.colsReady()) { why = "lm_head has no column route"; }
+        else if (this.cfg.hiddenSize % 256 != 0) { why = "hidden not a multiple of 256"; }
+        else if (this.cfg.qDim() % 256 != 0) { why = "qDim not a multiple of 256"; }
+        boolean ok = why.byteLength() == 0;
         int32 l = 0;
         while (ok && l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
-            if (d.moe != null || d.subNorm || d.fourNorm) {
+            if (d.subNorm || d.fourNorm) {
                 ok = false;
+                why = "layer " + l + " has sub/four norms";
             } else if (!a.qProj.colsReady() || !a.kProj.colsReady()
-                    || !a.vProj.colsReady() || !a.oProj.colsReady()
-                    || !d.mlp.gateProj.colsReady() || !d.mlp.upProj.colsReady()
+                    || !a.vProj.colsReady() || !a.oProj.colsReady()) {
+                ok = false;
+                why = "layer " + l + ": an attention projection has no column route";
+            } else if (d.moe != null) {
+                // 15.2.15.4.1: a layer of experts is served when its banks
+                // are resident and id-ready (the zero-sync row route).
+                if (!d.moe.zeroSyncRowsReady()) {
+                    ok = false;
+                    why = "layer " + l + ": the expert rows route is not ready";
+                }
+            } else if (this.cfg.intermediateSize % 256 != 0) {
+                // The dense FFN width matters only where a layer has one: an
+                // all-expert model declares a feed_forward_length it never
+                // runs (Qwen3-Coder-30B-A3B says 5472).
+                ok = false;
+                why = "intermediate not a multiple of 256";
+            } else if (!d.mlp.gateProj.colsReady() || !d.mlp.upProj.colsReady()
                     || !d.mlp.downProj.colsReady()) {
                 ok = false;
+                why = "layer " + l + ": an FFN projection has no column route";
             }
             l = l + 1;
         }
         if (ok) { this.bdReady = 1; } else { this.bdReady = 2; }
-        Diag.emit("decode-batch", 0 - 1, ok ? "ready" : "refused",
-            0L, 0L, 0L, 0L, 0L, 0L);
+        if (ok) {
+            Diag.emit("decode-batch", 0 - 1, "ready", 0L, 0L, 0L, 0L, 0L, 0L);
+        } else {
+            String tag #= "refused: " + why;
+            Diag.emit("decode-batch", 0 - 1, tag, 0L, 0L, 0L, 0L, 0L, 0L);
+        }
         return ok;
     }
 
@@ -3687,8 +3713,12 @@ public final class CausalLM extends InfModule {
         this.bdQ #= heap KernelBuffer<float32>((uint64) (n * qd));
         this.bdK #= heap KernelBuffer<float32>((uint64) (n * kvd));
         this.bdV #= heap KernelBuffer<float32>((uint64) (n * kvd));
-        this.bdG #= heap KernelBuffer<float32>((uint64) (n * inter));
-        this.bdU #= heap KernelBuffer<float32>((uint64) (n * inter));
+        // A model of experts may declare no dense FFN width; one element keeps the
+        // allocation valid (15.2.15.4.1: its layers take the MoE rows route).
+        int64 interB = inter;
+        if (interB < 1L) { interB = 1L; }
+        this.bdG #= heap KernelBuffer<float32>((uint64) (n * interB));
+        this.bdU #= heap KernelBuffer<float32>((uint64) (n * interB));
         this.bdLogits #= heap KernelBuffer<float32>((uint64) (n * vocab));
         this.bdTok #= heap KernelBuffer<int32>((uint64) n);
         this.bdTokHost #= heap int32[n];
@@ -3864,6 +3894,17 @@ public final class CausalLM extends InfModule {
             a.oProj.matvecCols(this.bdXp, pbQd, n, this.bdHs, (int64) h, true);
             this.batchNormPack(n, d.postAttentionLayernorm.deviceWeight(),
                 d.postAttentionLayernorm.eps, d.normForm);
+            if (d.moe != null) {
+                // 15.2.15.4.1: every row's experts in one id mat-vec a bank;
+                // the combine accumulates onto the residual rows.
+                if (!d.moe.forwardRowsZeroSync(this.bdXn, this.bdXp, this.bdHs, n,
+                        d.activation)) {
+                    throw heap LlmException("decode batch: layer " + li
+                        + "'s expert route refused inside the step");
+                }
+                li = li + 1;
+                continue;
+            }
             d.mlp.gateProj.matvecCols(this.bdXp, pbH, n, this.bdG, (int64) inter, false);
             d.mlp.upProj.matvecCols(this.bdXp, pbH, n, this.bdU, (int64) inter, false);
             int64 gn = (int64) n * (int64) inter;

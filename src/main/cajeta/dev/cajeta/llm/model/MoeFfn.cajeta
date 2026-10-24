@@ -1452,6 +1452,96 @@ public final class MoeFfn extends InfModule {
         return this.forwardRowZeroSync(xDev, acc, act, false);
     }
 
+    // ---- 15.2.15.4.1: the zero-sync route over a BATCH of decode rows -----
+    // One router launch and one top-k over n rows, each row's packed
+    // activation replicated once per selected expert, then one id mat-vec a
+    // bank over every selection (used = n * k) and one combine over the rows.
+    // The chain is the one-row route's unfused chain, operation for
+    // operation, so a row decoded in the batch is the row decoded alone.
+    KernelBuffer<int32> selRowsDev;
+    KernelBuffer<float32> wRowsDev;
+    KernelBuffer<float32> lgRowsDev;
+    KernelBuffer<int8> xpSelDev;
+    KernelBuffer<float32> gyRowsDev;
+    KernelBuffer<float32> uyRowsDev;
+    KernelBuffer<float32> dyRowsDev;
+    KernelBuffer<int8> xpGyRowsDev;
+    int32 rowsCap;
+
+    void ensureRowsBufs(int32 n) {
+        if (this.rowsCap >= n) { return; }
+        Diag.growth();
+        int64 e = (int64) this.expertsN;
+        int64 u = (int64) n * (int64) this.usedN;
+        int64 wid = (int64) this.widthN;
+        int64 hid = (int64) this.hidden;
+        int64 pb = (hid / 256L) * 320L;
+        int64 pbG = (Quant.q8kPadCols(wid) / 256L) * 320L;
+        this.selRowsDev #= heap KernelBuffer<int32>((uint64) u);
+        this.wRowsDev #= heap KernelBuffer<float32>((uint64) u);
+        this.lgRowsDev #= heap KernelBuffer<float32>((uint64) ((int64) n * e));
+        this.xpSelDev #= heap KernelBuffer<int8>((uint64) (u * pb));
+        this.gyRowsDev #= heap KernelBuffer<float32>((uint64) (u * wid));
+        this.uyRowsDev #= heap KernelBuffer<float32>((uint64) (u * wid));
+        this.dyRowsDev #= heap KernelBuffer<float32>((uint64) (u * hid));
+        this.xpGyRowsDev #= heap KernelBuffer<int8>((uint64) (u * pbG));
+        this.rowsCap = n;
+        return;
+    }
+
+    /** Whether {@link #forwardRowsZeroSync} serves here: the one-row route
+     *  ready and no shared expert (its row add is the one-row route's). */
+    public boolean zeroSyncRowsReady() {
+        return this.zeroSyncReady() && this.sharedW == 0;
+    }
+
+    /**
+     * The MoE FFN for `n` decode rows at once: `xRows` the normed rows
+     * (n x hidden, f32), `xpRows` their packed q8_K forms (n rows of
+     * hidden/256 blocks), `accRows` the residual rows accumulated in place.
+     * False, with nothing launched, when the route is not ready.
+     */
+    public boolean forwardRowsZeroSync(KernelBuffer<float32> xRows,
+            KernelBuffer<int8> xpRows, KernelBuffer<float32> accRows, int32 n,
+            int32 act) {
+        if (n == 1) { return this.forwardRowZeroSync(xRows, accRows, act); }
+        if (!this.zeroSyncRowsReady()) { return false; }
+        this.ensureZeroSyncBufs();
+        this.ensureRouterDev();
+        this.ensureRowsBufs(n);
+        int64 hid = (int64) this.hidden;
+        int64 wid = (int64) this.widthN;
+        int64 en = (int64) this.expertsN;
+        int64 k = (int64) this.usedN;
+        int64 used = (int64) n * k;
+        int64 pb = (hid / 256L) * 320L;
+        int64 widPad = Quant.q8kPadCols(wid);
+        QuantKernel.routerBatchF32LaunchNoSync(this.lgRowsDev, this.routerWDev,
+            xRows, (int64) n, en, hid);
+        QuantKernel.moeTopKBatchLaunchNoSync(this.selRowsDev, this.wRowsDev,
+            this.lgRowsDev, (int64) n, en, k, this.normTopk, this.wScale);
+        this.noteRoutesDev(this.selRowsDev, (int64) n);
+        QuantKernel.i8ReplicateRowsLaunchNoSync(this.xpSelDev, xpRows, (int64) n, k, pb);
+        if (!this.gateB.idLaunch(this.gyRowsDev, this.xpSelDev, this.selRowsDev,
+                (int32) used, hid / 256L)) { return false; }
+        if (!this.upB.idLaunch(this.uyRowsDev, this.xpSelDev, this.selRowsDev,
+                (int32) used, hid / 256L)) { return false; }
+        Prim.gluDevice(this.gyRowsDev, this.uyRowsDev, used * wid, act);
+        if (widPad == wid) {
+            QuantKernel.q8kPackLaunchNoSync(this.xpGyRowsDev, this.gyRowsDev, used * wid);
+        } else {
+            QuantKernel.q8kPackRowsLaunchNoSync(this.xpGyRowsDev, this.gyRowsDev, used,
+                wid, widPad);
+        }
+        if (!this.downB.idLaunch(this.dyRowsDev, this.xpGyRowsDev, this.selRowsDev,
+                (int32) used, widPad / 256L)) { return false; }
+        QuantKernel.moeCombineAddRowsLaunchNoSync(accRows, this.dyRowsDev, this.wRowsDev,
+            k, hid, (int64) n);
+        Diag.emit("moe-rows", 0 - 1, "resident: id mat-vecs over the batch",
+            (int64) this.layerIdx, (int64) n, used, 0L, 0L, 0L);
+        return true;
+    }
+
     /** The packed activation buffer the zero-sync route reads — for
      *  a caller that fills it itself (the fused norm + pack, unit 48)
      *  and then calls with `prePacked`. Null until the route is ready. */
