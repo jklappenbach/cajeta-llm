@@ -7,6 +7,7 @@ import cajeta.xpu.Bits;
 import cajeta.xpu.BlockPadded;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelTimer;
 import cajeta.xpu.KernelThread;
 import cajeta.xpu.Shared;
 import cajeta.xpu.Wave;
@@ -12906,9 +12907,18 @@ public final class QuantKernel {
     static int64 q4ColsR2Launches = 0L;
     static int64 q6ColsR2Launches = 0L;
     static int64 probeR2Ns = 0L;
+    // The Q4_K verdict for the 4096-row shapes (q, o, down, k, v), probed at
+    // 4096 x 4096: at the gate shape the three variants tie once the loads
+    // are vectors (47/50/52 us), and at 4096 rows the two-row kernel wins
+    // (8.4 against 13.1 us, 4 columns), so one verdict cannot serve both
+    // (cajeta-llm 15.2.15.1, 2026-10-24).
+    static int32 q4ColsPfS = 0;
+    static int64 q4ColsPfNsS = 0L;
+    static int64 q4ColsPlainNsS = 0L;
+    static int64 q4ColsR2NsS = 0L;
 
-    /** Pin {@link #q4ColsVariant} (1 prefetch, 2 plain, 3 two rows a wave), or 0 to measure again. */
-    public static void setQ4ColsPrefetch(int32 v) { QuantKernel.q4ColsPf = v; }
+    /** Pin {@link #q4ColsVariant} and {@link #q4ColsSmallVariant} (1 prefetch, 2 plain, 3 two rows a wave), or 0 to measure again. */
+    public static void setQ4ColsPrefetch(int32 v) { QuantKernel.q4ColsPf = v; QuantKernel.q4ColsPfS = v; }
 
     /** Pin {@link #q6ColsVariant} (1 prefetch, 2 plain, 3 two rows a wave), or 0 to measure again. */
     public static void setQ6ColsPrefetch(int32 v) { QuantKernel.q6ColsPf = v; }
@@ -12952,6 +12962,33 @@ public final class QuantKernel {
             QuantKernel.q4ColsR2Ns = QuantKernel.probeR2Ns;
         }
         return QuantKernel.q4ColsPf;
+    }
+
+    /** Which Cols variant serves type Q4_K at the 4096-row shapes (1 prefetch, 2 plain, 3 two rows a wave), timed once per process at 4096 x 4096 over 4 columns. */
+    public static int32 q4ColsSmallVariant() {
+        if (QuantKernel.q4ColsPfS == 0) {
+            QuantKernel.q4ColsPfS = QuantKernel.probeArms(Quant.GG_Q4_K, 4096L, 4096L, 4, 3);
+            QuantKernel.q4ColsPfNsS = QuantKernel.probePfNs;
+            QuantKernel.q4ColsPlainNsS = QuantKernel.probePlainNs;
+            QuantKernel.q4ColsR2NsS = QuantKernel.probeR2Ns;
+        }
+        return QuantKernel.q4ColsPfS;
+    }
+
+    /** The Q4_K small-shape probe's times, ns per launch (0 before it has run). */
+    public static int64 q4ColsSmallProbePfNs() { return QuantKernel.q4ColsPfNsS; }
+    public static int64 q4ColsSmallProbePlainNs() { return QuantKernel.q4ColsPlainNsS; }
+    public static int64 q4ColsSmallProbeRowsNs() { return QuantKernel.q4ColsR2NsS; }
+
+    /** The Q4_K Cols variant for a launch of `rows` rows: the gate-shape verdict at 8192 rows and up, the 4096-row verdict below. */
+    public static int32 q4ColsVariantFor(int64 rows) {
+        if (rows >= 8192L) { return QuantKernel.q4ColsVariant(); }
+        return QuantKernel.q4ColsSmallVariant();
+    }
+
+    /** The Q6_K Cols variant for a launch of `rows` rows: one verdict, probed at the down shape; the head (128256 rows) is bandwidth-bound under every variant. */
+    public static int32 q6ColsVariantFor(int64 rows) {
+        return QuantKernel.q6ColsVariant();
     }
 
     /** Which Cols variant serves type Q6_K here (1 prefetch, 2 plain, 3 two rows a wave), timed once per process at an 8B's down projection over 4 columns. */
@@ -13158,24 +13195,21 @@ public final class QuantKernel {
     }
 
     /** `n` launches of one variant of type `ty` over `ncols` columns `pb` bytes apart (0: the one-column kernel), cycling four weight copies so each reads from memory, as decode's weights do. */
+    /** `n` launches of `variant`, each on the next weight copy of `ws` in turn, so a
+     *  burst reads cold weights when the ring is wider than L2 (see probeArms). */
     static void probeBurst(int32 ty, int32 ncols, int64 pb, int32 variant, int32 n, KernelBuffer<float32> y, KernelBuffer<int8> xp,
-            KernelBuffer<int8> w0, KernelBuffer<int8> w1, KernelBuffer<int8> w2,
-            KernelBuffer<int8> w3, int64 rows, int64 cols) {
+            KernelBuffer<int8>[] ws, int64 rows, int64 cols) {
+        int32 copies = (int32) ws.count();
         int32 k = 0;
         while (k < n) {
-            int32 m = k % 4;
-            if (m == 0 && ncols > 0) { QuantKernel.colsLaunchAs(ty, variant, y, w0, xp, rows, cols, 0L, ncols, rows, pb, 0); }
-            if (m == 0 && ncols == 0 && ty == Quant.GG_Q6_K) { QuantKernel.q6kWaveLaunchAs(variant == 1, y, w0, xp, rows, cols, 0L, 0); }
-            if (m == 0 && ncols == 0 && ty != Quant.GG_Q6_K) { QuantKernel.q4kWaveLaunchAs(variant == 1, y, w0, xp, rows, cols, 0L, 0); }
-            if (m == 1 && ncols > 0) { QuantKernel.colsLaunchAs(ty, variant, y, w1, xp, rows, cols, 0L, ncols, rows, pb, 0); }
-            if (m == 1 && ncols == 0 && ty == Quant.GG_Q6_K) { QuantKernel.q6kWaveLaunchAs(variant == 1, y, w1, xp, rows, cols, 0L, 0); }
-            if (m == 1 && ncols == 0 && ty != Quant.GG_Q6_K) { QuantKernel.q4kWaveLaunchAs(variant == 1, y, w1, xp, rows, cols, 0L, 0); }
-            if (m == 2 && ncols > 0) { QuantKernel.colsLaunchAs(ty, variant, y, w2, xp, rows, cols, 0L, ncols, rows, pb, 0); }
-            if (m == 2 && ncols == 0 && ty == Quant.GG_Q6_K) { QuantKernel.q6kWaveLaunchAs(variant == 1, y, w2, xp, rows, cols, 0L, 0); }
-            if (m == 2 && ncols == 0 && ty != Quant.GG_Q6_K) { QuantKernel.q4kWaveLaunchAs(variant == 1, y, w2, xp, rows, cols, 0L, 0); }
-            if (m == 3 && ncols > 0) { QuantKernel.colsLaunchAs(ty, variant, y, w3, xp, rows, cols, 0L, ncols, rows, pb, 0); }
-            if (m == 3 && ncols == 0 && ty == Quant.GG_Q6_K) { QuantKernel.q6kWaveLaunchAs(variant == 1, y, w3, xp, rows, cols, 0L, 0); }
-            if (m == 3 && ncols == 0 && ty != Quant.GG_Q6_K) { QuantKernel.q4kWaveLaunchAs(variant == 1, y, w3, xp, rows, cols, 0L, 0); }
+            KernelBuffer<int8> w = ws[k % copies];
+            if (ncols > 0) {
+                QuantKernel.colsLaunchAs(ty, variant, y, w, xp, rows, cols, 0L, ncols, rows, pb, 0);
+            } else if (ty == Quant.GG_Q6_K) {
+                QuantKernel.q6kWaveLaunchAs(variant == 1, y, w, xp, rows, cols, 0L, 0);
+            } else {
+                QuantKernel.q4kWaveLaunchAs(variant == 1, y, w, xp, rows, cols, 0L, 0);
+            }
             k = k + 1;
         }
         return;
@@ -13226,14 +13260,27 @@ public final class QuantKernel {
             while (k < pb) { xh[(int64) c * pb + k] = one[k]; k = k + 1; }
             c = c + 1;
         }
-        KernelBuffer<int8> w0 #= heap KernelBuffer<int8>((uint64) nb);
-        KernelBuffer<int8> w1 #= heap KernelBuffer<int8>((uint64) nb);
-        KernelBuffer<int8> w2 #= heap KernelBuffer<int8>((uint64) nb);
-        KernelBuffer<int8> w3 #= heap KernelBuffer<int8>((uint64) nb);
-        w0.upload(raw);
-        w1.upload(raw);
-        w2.upload(raw);
-        w3.upload(raw);
+        // A ring of weight copies wider than twice the L2, so every launch of a
+        // burst reads its weight COLD, as a decode step does. Four copies of a
+        // 4096 x 4096 weight (38 MB) sat inside the 4090's 72 MB L2 and the
+        // probe timed the L2-hot regime, where the two-row kernel wins by a
+        // third while the engine, cold, ran 6% slower on it (cajeta-llm
+        // 15.2.15.1, 2026-10-24).
+        int64 l2 = Device.l2CacheBytes();
+        if (l2 <= 0L) { l2 = 75497472L; }
+        int64 copies64 = (2L * l2) / nb + 1L;
+        if (copies64 < 4L) { copies64 = 4L; }
+        if (copies64 > 24L) { copies64 = 24L; }
+        int32 copies = (int32) copies64;
+        KernelBuffer<int8> pool #= heap KernelBuffer<int8>((uint64) (nb * (int64) copies));
+        KernelBuffer<int8>[] ws = heap KernelBuffer<int8>[copies];
+        int32 ci = 0;
+        while (ci < copies) {
+            KernelBuffer<int8> wk #= pool.slice((uint64) ((int64) ci * nb), (uint64) nb);
+            wk.upload(raw);
+            ws[ci] #= wk;
+            ci = ci + 1;
+        }
         KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) xh.count());
         xp.upload(xh);
         KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) (rows * (int64) nc));
@@ -13245,17 +13292,26 @@ public final class QuantKernel {
         best[3] = 0L - 1L;
         int32 warm = 2;
         int32 rounds = warm + 6;
-        int32 burst = 8;
+        int32 burst = copies;
         int32 round = 0;
         while (round < rounds) {
             int32 n = 4;
             if (round >= warm) { n = burst; }
             int32 v = 1;
             while (v <= arms) {
+                // Device-timed over the burst; the host bracket stands where the
+                // device has no timer. A host bracket read 47/50/52 us for arms
+                // the device times apart (cajeta-llm 15.2.15.1).
+                KernelTimer kt #= KernelTimer.create();
                 int64 t0 = Clock.nanoTime();
-                QuantKernel.probeBurst(ty, ncols, pb, v, n, y, xp, w0, w1, w2, w3, rows, cols);
+                kt.begin(s);
+                QuantKernel.probeBurst(ty, ncols, pb, v, n, y, xp, ws, rows, cols);
+                kt.end(s);
                 s.sync();
-                int64 t = (Clock.nanoTime() - t0) / (int64) n;
+                int64 host = Clock.nanoTime() - t0;
+                int64 dev = kt.elapsedNanos();
+                kt.destroy();
+                int64 t = (dev > 0L ? dev : host) / (int64) n;
                 if (round >= warm && (best[(int64) v] < 0L || t < best[(int64) v])) { best[(int64) v] = t; }
                 v = v + 1;
             }
@@ -13340,28 +13396,17 @@ public final class QuantKernel {
 
     /** {@link #q4kColAcc} on an activation already loaded. */
     @Device
+    /** One lane's 64-weight chunk of a Q4_K block against one packed q8_K column, added
+     *  to `acc`: the two sub-block dots as chained dp4a (`dotSum`), the activation's
+     *  sub-block sums `as0`, `as1` read from the pack (bytes 256..287 of its block) rather
+     *  than recomputed, and its scale `xs` decoded once per column, not per row. The sum
+     *  is the same integer the lane-wise form reached, so the float result is bit-identical
+     *  (cajeta-llm 15.2.15.1: the lane-wise form spent a third of its dp4a on the sums and
+     *  seven adds on every partial). */
     static float32 q4kColDot(float32 acc, Vector<int8,32> a0, Vector<int8,32> a1,
-            Vector<int8,4> dv, Vector<uint8,32> lo, Vector<uint8,32> hi,
-            int32 sc0, int32 sc1, int32 mn0, int32 mn1, float32 d,
-            float32 dmin) {
-        Vector<int32,8> zv = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0);
-        float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
-            | (((int32) dv[1] & 255) << 8)
-            | (((int32) dv[2] & 255) << 16)
-            | (((int32) dv[3] & 255) << 24));
-        Vector<uint8,32> ones = (a0 ^ a0).asUnsigned() | 1;
-        Vector<int32,8> os0 = ones.dotAccum(a0, zv);
-        Vector<int32,8> os1 = ones.dotAccum(a1, zv);
-        int32 as0 = os0[0] + os0[1] + os0[2] + os0[3]
-            + os0[4] + os0[5] + os0[6] + os0[7];
-        int32 as1 = os1[0] + os1[1] + os1[2] + os1[3]
-            + os1[4] + os1[5] + os1[6] + os1[7];
-        Vector<int32,8> dl = lo.dotAccum(a0, zv);
-        Vector<int32,8> dh = hi.dotAccum(a1, zv);
-        int32 sumi = (dl[0] + dl[1] + dl[2] + dl[3]
-            + dl[4] + dl[5] + dl[6] + dl[7]) * sc0
-                   + (dh[0] + dh[1] + dh[2] + dh[3]
-                       + dh[4] + dh[5] + dh[6] + dh[7]) * sc1;
+            float32 xs, int32 as0, int32 as1, Vector<uint8,32> lo, Vector<uint8,32> hi,
+            int32 sc0, int32 sc1, int32 mn0, int32 mn1, float32 d, float32 dmin) {
+        int32 sumi = lo.dotSum(a0, 0) * sc0 + hi.dotSum(a1, 0) * sc1;
         int32 dmins = as0 * mn0 + as1 * mn1;
         return acc + d * xs * (float32) sumi - dmin * xs * (float32) dmins;
     }
@@ -13379,6 +13424,7 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum,
             uint32 ncols, uint32 yStride, uint32 xpStride) {
+        uint32 xps = (xpStride >> 4) << 4;   // provably 16-aligned column offsets: see q4kQ8WaveR2MatVecColsKernel
         uint32 wv = (uint32) Group.width();
         uint32 lane = KernelThread.x() % wv;
         uint32 row = KernelThread.globalIdX() / wv;
@@ -13434,13 +13480,13 @@ public final class QuantKernel {
                 uint32 xo = b * 320 + (uint32) (64 * g);
                 uint32 xr = b * 320 + 288;
                 c0 = QuantKernel.q4kColAcc(c0, xp, xo, xr, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                if (ncols > 1) { c1 = QuantKernel.q4kColAcc(c1, xp, xo + xpStride, xr + xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 2) { c2 = QuantKernel.q4kColAcc(c2, xp, xo + 2 * xpStride, xr + 2 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 3) { c3 = QuantKernel.q4kColAcc(c3, xp, xo + 3 * xpStride, xr + 3 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 4) { c4 = QuantKernel.q4kColAcc(c4, xp, xo + 4 * xpStride, xr + 4 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 5) { c5 = QuantKernel.q4kColAcc(c5, xp, xo + 5 * xpStride, xr + 5 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 6) { c6 = QuantKernel.q4kColAcc(c6, xp, xo + 6 * xpStride, xr + 6 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 7) { c7 = QuantKernel.q4kColAcc(c7, xp, xo + 7 * xpStride, xr + 7 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 1) { c1 = QuantKernel.q4kColAcc(c1, xp, xo + xps, xr + xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 2) { c2 = QuantKernel.q4kColAcc(c2, xp, xo + 2 * xps, xr + 2 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 3) { c3 = QuantKernel.q4kColAcc(c3, xp, xo + 3 * xps, xr + 3 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 4) { c4 = QuantKernel.q4kColAcc(c4, xp, xo + 4 * xps, xr + 4 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 5) { c5 = QuantKernel.q4kColAcc(c5, xp, xo + 5 * xps, xr + 5 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 6) { c6 = QuantKernel.q4kColAcc(c6, xp, xo + 6 * xps, xr + 6 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 7) { c7 = QuantKernel.q4kColAcc(c7, xp, xo + 7 * xps, xr + 7 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
                 b = b + wv / 4;
             }
         }
@@ -13456,6 +13502,7 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum,
             uint32 ncols, uint32 yStride, uint32 xpStride) {
+        uint32 xps = (xpStride >> 4) << 4;   // provably 16-aligned column offsets: see q4kQ8WaveR2MatVecColsKernel
         uint32 wv = (uint32) Group.width();
         uint32 lane = KernelThread.x() % wv;
         uint32 row = KernelThread.globalIdX() / wv;
@@ -13516,13 +13563,13 @@ public final class QuantKernel {
                 uint32 xo = b * 320 + (uint32) (64 * g);
                 uint32 xr = b * 320 + 288;
                 c0 = QuantKernel.q4kColAcc(c0, xp, xo, xr, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                if (ncols > 1) { c1 = QuantKernel.q4kColAcc(c1, xp, xo + xpStride, xr + xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 2) { c2 = QuantKernel.q4kColAcc(c2, xp, xo + 2 * xpStride, xr + 2 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 3) { c3 = QuantKernel.q4kColAcc(c3, xp, xo + 3 * xpStride, xr + 3 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 4) { c4 = QuantKernel.q4kColAcc(c4, xp, xo + 4 * xpStride, xr + 4 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 5) { c5 = QuantKernel.q4kColAcc(c5, xp, xo + 5 * xpStride, xr + 5 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 6) { c6 = QuantKernel.q4kColAcc(c6, xp, xo + 6 * xpStride, xr + 6 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
-                if (ncols > 7) { c7 = QuantKernel.q4kColAcc(c7, xp, xo + 7 * xpStride, xr + 7 * xpStride, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 1) { c1 = QuantKernel.q4kColAcc(c1, xp, xo + xps, xr + xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 2) { c2 = QuantKernel.q4kColAcc(c2, xp, xo + 2 * xps, xr + 2 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 3) { c3 = QuantKernel.q4kColAcc(c3, xp, xo + 3 * xps, xr + 3 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 4) { c4 = QuantKernel.q4kColAcc(c4, xp, xo + 4 * xps, xr + 4 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 5) { c5 = QuantKernel.q4kColAcc(c5, xp, xo + 5 * xps, xr + 5 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 6) { c6 = QuantKernel.q4kColAcc(c6, xp, xo + 6 * xps, xr + 6 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
+                if (ncols > 7) { c7 = QuantKernel.q4kColAcc(c7, xp, xo + 7 * xps, xr + 7 * xps, lo, hi, sc0, sc1, mn0, mn1, d, dmin); }
                 b = bn;
             }
         }
@@ -13538,6 +13585,13 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum,
             uint32 ncols, uint32 yStride, uint32 xpStride) {
+        // The column stride is a whole number of 320-byte q8_K blocks, but as a
+        // kernel argument its alignment is unknowable to the compiler, and a
+        // byte-vector load it cannot prove aligned lowers to BYTE loads: 304
+        // ld.global.b8 for this kernel's activation vectors, 8 us a column
+        // (cajeta-llm 15.2.15.1, 2026-10-24). Clearing the low four bits makes
+        // every column offset provably 16-byte aligned and changes nothing.
+        uint32 xps = (xpStride >> 4) << 4;
         uint32 wv = (uint32) Group.width();
         uint32 lane = KernelThread.x() % wv;
         uint32 row = (KernelThread.globalIdX() / wv) * 2;
@@ -13642,77 +13696,102 @@ public final class QuantKernel {
                 Vector<uint8,32> hiB = ((rvB >> 4) & 252645135).asBytes().asUnsigned();
                 uint32 xo = b * 320 + (uint32) (64 * g);
                 uint32 xr = b * 320 + 288;
+                uint32 xq = b * 320 + 256 + (uint32) (8 * g);
                 {
                     uint32 xo0 = xo;
                     uint32 xr0 = xr;
                     Vector<int8,32> a00 = xp.vload<32>((int64) xo0);
                     Vector<int8,32> a01 = xp.vload<32>((int64) xo0 + 32L);
                     Vector<int8,4> v0 = xp.vload<4>((int64) xr0);
-                    c0 = QuantKernel.q4kColDot(c0, a00, a01, v0, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                    e0 = QuantKernel.q4kColDot(e0, a00, a01, v0, loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    Vector<int32,2> q0w = xp.vload<8>((int64) (xq)).asWords();
+                    float32 x0 = Cajeta.bitsToF32(((int32) v0[0] & 255) | (((int32) v0[1] & 255) << 8)
+                        | (((int32) v0[2] & 255) << 16) | (((int32) v0[3] & 255) << 24));
+                    c0 = QuantKernel.q4kColDot(c0, a00, a01, x0, q0w[0], q0w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e0 = QuantKernel.q4kColDot(e0, a00, a01, x0, q0w[0], q0w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
                 }
                 if (ncols > 1) {
-                    uint32 xo1 = xo + xpStride;
-                    uint32 xr1 = xr + xpStride;
+                    uint32 xo1 = xo + xps;
+                    uint32 xr1 = xr + xps;
                     Vector<int8,32> a10 = xp.vload<32>((int64) xo1);
                     Vector<int8,32> a11 = xp.vload<32>((int64) xo1 + 32L);
                     Vector<int8,4> v1 = xp.vload<4>((int64) xr1);
-                    c1 = QuantKernel.q4kColDot(c1, a10, a11, v1, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                    e1 = QuantKernel.q4kColDot(e1, a10, a11, v1, loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    Vector<int32,2> q1w = xp.vload<8>((int64) (xq + xps)).asWords();
+                    float32 x1 = Cajeta.bitsToF32(((int32) v1[0] & 255) | (((int32) v1[1] & 255) << 8)
+                        | (((int32) v1[2] & 255) << 16) | (((int32) v1[3] & 255) << 24));
+                    c1 = QuantKernel.q4kColDot(c1, a10, a11, x1, q1w[0], q1w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e1 = QuantKernel.q4kColDot(e1, a10, a11, x1, q1w[0], q1w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
                 }
                 if (ncols > 2) {
-                    uint32 xo2 = xo + 2 * xpStride;
-                    uint32 xr2 = xr + 2 * xpStride;
+                    uint32 xo2 = xo + 2 * xps;
+                    uint32 xr2 = xr + 2 * xps;
                     Vector<int8,32> a20 = xp.vload<32>((int64) xo2);
                     Vector<int8,32> a21 = xp.vload<32>((int64) xo2 + 32L);
                     Vector<int8,4> v2 = xp.vload<4>((int64) xr2);
-                    c2 = QuantKernel.q4kColDot(c2, a20, a21, v2, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                    e2 = QuantKernel.q4kColDot(e2, a20, a21, v2, loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    Vector<int32,2> q2w = xp.vload<8>((int64) (xq + 2 * xps)).asWords();
+                    float32 x2 = Cajeta.bitsToF32(((int32) v2[0] & 255) | (((int32) v2[1] & 255) << 8)
+                        | (((int32) v2[2] & 255) << 16) | (((int32) v2[3] & 255) << 24));
+                    c2 = QuantKernel.q4kColDot(c2, a20, a21, x2, q2w[0], q2w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e2 = QuantKernel.q4kColDot(e2, a20, a21, x2, q2w[0], q2w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
                 }
                 if (ncols > 3) {
-                    uint32 xo3 = xo + 3 * xpStride;
-                    uint32 xr3 = xr + 3 * xpStride;
+                    uint32 xo3 = xo + 3 * xps;
+                    uint32 xr3 = xr + 3 * xps;
                     Vector<int8,32> a30 = xp.vload<32>((int64) xo3);
                     Vector<int8,32> a31 = xp.vload<32>((int64) xo3 + 32L);
                     Vector<int8,4> v3 = xp.vload<4>((int64) xr3);
-                    c3 = QuantKernel.q4kColDot(c3, a30, a31, v3, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                    e3 = QuantKernel.q4kColDot(e3, a30, a31, v3, loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    Vector<int32,2> q3w = xp.vload<8>((int64) (xq + 3 * xps)).asWords();
+                    float32 x3 = Cajeta.bitsToF32(((int32) v3[0] & 255) | (((int32) v3[1] & 255) << 8)
+                        | (((int32) v3[2] & 255) << 16) | (((int32) v3[3] & 255) << 24));
+                    c3 = QuantKernel.q4kColDot(c3, a30, a31, x3, q3w[0], q3w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e3 = QuantKernel.q4kColDot(e3, a30, a31, x3, q3w[0], q3w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
                 }
                 if (ncols > 4) {
-                    uint32 xo4 = xo + 4 * xpStride;
-                    uint32 xr4 = xr + 4 * xpStride;
+                    uint32 xo4 = xo + 4 * xps;
+                    uint32 xr4 = xr + 4 * xps;
                     Vector<int8,32> a40 = xp.vload<32>((int64) xo4);
                     Vector<int8,32> a41 = xp.vload<32>((int64) xo4 + 32L);
                     Vector<int8,4> v4 = xp.vload<4>((int64) xr4);
-                    c4 = QuantKernel.q4kColDot(c4, a40, a41, v4, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                    e4 = QuantKernel.q4kColDot(e4, a40, a41, v4, loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    Vector<int32,2> q4w = xp.vload<8>((int64) (xq + 4 * xps)).asWords();
+                    float32 x4 = Cajeta.bitsToF32(((int32) v4[0] & 255) | (((int32) v4[1] & 255) << 8)
+                        | (((int32) v4[2] & 255) << 16) | (((int32) v4[3] & 255) << 24));
+                    c4 = QuantKernel.q4kColDot(c4, a40, a41, x4, q4w[0], q4w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e4 = QuantKernel.q4kColDot(e4, a40, a41, x4, q4w[0], q4w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
                 }
                 if (ncols > 5) {
-                    uint32 xo5 = xo + 5 * xpStride;
-                    uint32 xr5 = xr + 5 * xpStride;
+                    uint32 xo5 = xo + 5 * xps;
+                    uint32 xr5 = xr + 5 * xps;
                     Vector<int8,32> a50 = xp.vload<32>((int64) xo5);
                     Vector<int8,32> a51 = xp.vload<32>((int64) xo5 + 32L);
                     Vector<int8,4> v5 = xp.vload<4>((int64) xr5);
-                    c5 = QuantKernel.q4kColDot(c5, a50, a51, v5, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                    e5 = QuantKernel.q4kColDot(e5, a50, a51, v5, loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    Vector<int32,2> q5w = xp.vload<8>((int64) (xq + 5 * xps)).asWords();
+                    float32 x5 = Cajeta.bitsToF32(((int32) v5[0] & 255) | (((int32) v5[1] & 255) << 8)
+                        | (((int32) v5[2] & 255) << 16) | (((int32) v5[3] & 255) << 24));
+                    c5 = QuantKernel.q4kColDot(c5, a50, a51, x5, q5w[0], q5w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e5 = QuantKernel.q4kColDot(e5, a50, a51, x5, q5w[0], q5w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
                 }
                 if (ncols > 6) {
-                    uint32 xo6 = xo + 6 * xpStride;
-                    uint32 xr6 = xr + 6 * xpStride;
+                    uint32 xo6 = xo + 6 * xps;
+                    uint32 xr6 = xr + 6 * xps;
                     Vector<int8,32> a60 = xp.vload<32>((int64) xo6);
                     Vector<int8,32> a61 = xp.vload<32>((int64) xo6 + 32L);
                     Vector<int8,4> v6 = xp.vload<4>((int64) xr6);
-                    c6 = QuantKernel.q4kColDot(c6, a60, a61, v6, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                    e6 = QuantKernel.q4kColDot(e6, a60, a61, v6, loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    Vector<int32,2> q6w = xp.vload<8>((int64) (xq + 6 * xps)).asWords();
+                    float32 x6 = Cajeta.bitsToF32(((int32) v6[0] & 255) | (((int32) v6[1] & 255) << 8)
+                        | (((int32) v6[2] & 255) << 16) | (((int32) v6[3] & 255) << 24));
+                    c6 = QuantKernel.q4kColDot(c6, a60, a61, x6, q6w[0], q6w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e6 = QuantKernel.q4kColDot(e6, a60, a61, x6, q6w[0], q6w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
                 }
                 if (ncols > 7) {
-                    uint32 xo7 = xo + 7 * xpStride;
-                    uint32 xr7 = xr + 7 * xpStride;
+                    uint32 xo7 = xo + 7 * xps;
+                    uint32 xr7 = xr + 7 * xps;
                     Vector<int8,32> a70 = xp.vload<32>((int64) xo7);
                     Vector<int8,32> a71 = xp.vload<32>((int64) xo7 + 32L);
                     Vector<int8,4> v7 = xp.vload<4>((int64) xr7);
-                    c7 = QuantKernel.q4kColDot(c7, a70, a71, v7, lo, hi, sc0, sc1, mn0, mn1, d, dmin);
-                    e7 = QuantKernel.q4kColDot(e7, a70, a71, v7, loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    Vector<int32,2> q7w = xp.vload<8>((int64) (xq + 7 * xps)).asWords();
+                    float32 x7 = Cajeta.bitsToF32(((int32) v7[0] & 255) | (((int32) v7[1] & 255) << 8)
+                        | (((int32) v7[2] & 255) << 16) | (((int32) v7[3] & 255) << 24));
+                    c7 = QuantKernel.q4kColDot(c7, a70, a71, x7, q7w[0], q7w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e7 = QuantKernel.q4kColDot(e7, a70, a71, x7, q7w[0], q7w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
                 }
                 b = bn;
             }
@@ -13778,7 +13857,7 @@ public final class QuantKernel {
         QuantKernel.requireOffsets32(packed, "q4kQ8WaveMatVecCols");
         uint32 acc = 0;
         if (accum) { acc = 1; }
-        QuantKernel.colsLaunchAs(Quant.GG_Q4_K, QuantKernel.q4ColsVariant(), y, packed, xp, rows,
+        QuantKernel.colsLaunchAs(Quant.GG_Q4_K, QuantKernel.q4ColsVariantFor(rows), y, packed, xp, rows,
             cols, yOff, ncols, yStride, xpStride, acc);
         return;
     }
@@ -13871,6 +13950,7 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum,
             uint32 ncols, uint32 yStride, uint32 xpStride) {
+        uint32 xps = (xpStride >> 4) << 4;   // provably 16-aligned column offsets: see q4kQ8WaveR2MatVecColsKernel
         uint32 wv = (uint32) Group.width();
         uint32 lane = KernelThread.x() % wv;
         uint32 row = KernelThread.globalIdX() / wv;
@@ -13922,13 +14002,13 @@ public final class QuantKernel {
                 Vector<uint8,16> q2 = (((wA >> 4) & 252645135) | (wH & 808464432)).asBytes().asUnsigned();
                 Vector<uint8,16> q3 = (((wB >> 4) & 252645135) | ((wH >> 2) & 808464432)).asBytes().asUnsigned();
                 c0 = QuantKernel.q6kColAcc(c0, xp, xb, xa0, q0, q1, q2, q3, s0, s1, s2, s3, dsc);
-                if (ncols > 1) { c1 = QuantKernel.q6kColAcc(c1, xp, xb + xpStride, xa0 + xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 2) { c2 = QuantKernel.q6kColAcc(c2, xp, xb + 2 * xpStride, xa0 + 2 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 3) { c3 = QuantKernel.q6kColAcc(c3, xp, xb + 3 * xpStride, xa0 + 3 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 4) { c4 = QuantKernel.q6kColAcc(c4, xp, xb + 4 * xpStride, xa0 + 4 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 5) { c5 = QuantKernel.q6kColAcc(c5, xp, xb + 5 * xpStride, xa0 + 5 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 6) { c6 = QuantKernel.q6kColAcc(c6, xp, xb + 6 * xpStride, xa0 + 6 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 7) { c7 = QuantKernel.q6kColAcc(c7, xp, xb + 7 * xpStride, xa0 + 7 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 1) { c1 = QuantKernel.q6kColAcc(c1, xp, xb + xps, xa0 + xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 2) { c2 = QuantKernel.q6kColAcc(c2, xp, xb + 2 * xps, xa0 + 2 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 3) { c3 = QuantKernel.q6kColAcc(c3, xp, xb + 3 * xps, xa0 + 3 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 4) { c4 = QuantKernel.q6kColAcc(c4, xp, xb + 4 * xps, xa0 + 4 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 5) { c5 = QuantKernel.q6kColAcc(c5, xp, xb + 5 * xps, xa0 + 5 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 6) { c6 = QuantKernel.q6kColAcc(c6, xp, xb + 6 * xps, xa0 + 6 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 7) { c7 = QuantKernel.q6kColAcc(c7, xp, xb + 7 * xps, xa0 + 7 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
                 b = b + wv / 4;
             }
         }
@@ -13939,11 +14019,17 @@ public final class QuantKernel {
     /** {@link #q6kQ8WaveMatVecColsKernel} with block b + 1's weight loads issued before block b's
      *  math, for a compiler that keeps few loads in flight (cajeta-llm 15.2.12.3.1). */
     @Kernel
-    @Occupancy(maxThreads = 256)
+    // maxRegisters: ptxas's own occupancy target for this kernel was 80
+    // registers (three 256-thread blocks an SM), and the provably aligned
+    // column stride pushed it over by three, into an 8-byte spill the repo's
+    // gate refuses. The bound lets it allocate the 93 it wants; measured
+    // with ptxas -v on the dumped PTX (cajeta-llm 15.2.15.1, 2026-10-24).
+    @Occupancy(maxThreads = 256, maxRegisters = 128)
     public static void q6kQ8WavePfMatVecColsKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum,
             uint32 ncols, uint32 yStride, uint32 xpStride) {
+        uint32 xps = (xpStride >> 4) << 4;   // provably 16-aligned column offsets: see q4kQ8WaveR2MatVecColsKernel
         uint32 wv = (uint32) Group.width();
         uint32 lane = KernelThread.x() % wv;
         uint32 row = KernelThread.globalIdX() / wv;
@@ -14006,13 +14092,13 @@ public final class QuantKernel {
                 Vector<uint8,16> q2 = (((wA >> 4) & 252645135) | (wH & 808464432)).asBytes().asUnsigned();
                 Vector<uint8,16> q3 = (((wB >> 4) & 252645135) | ((wH >> 2) & 808464432)).asBytes().asUnsigned();
                 c0 = QuantKernel.q6kColAcc(c0, xp, xb, xa0, q0, q1, q2, q3, s0, s1, s2, s3, dsc);
-                if (ncols > 1) { c1 = QuantKernel.q6kColAcc(c1, xp, xb + xpStride, xa0 + xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 2) { c2 = QuantKernel.q6kColAcc(c2, xp, xb + 2 * xpStride, xa0 + 2 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 3) { c3 = QuantKernel.q6kColAcc(c3, xp, xb + 3 * xpStride, xa0 + 3 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 4) { c4 = QuantKernel.q6kColAcc(c4, xp, xb + 4 * xpStride, xa0 + 4 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 5) { c5 = QuantKernel.q6kColAcc(c5, xp, xb + 5 * xpStride, xa0 + 5 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 6) { c6 = QuantKernel.q6kColAcc(c6, xp, xb + 6 * xpStride, xa0 + 6 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
-                if (ncols > 7) { c7 = QuantKernel.q6kColAcc(c7, xp, xb + 7 * xpStride, xa0 + 7 * xpStride, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 1) { c1 = QuantKernel.q6kColAcc(c1, xp, xb + xps, xa0 + xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 2) { c2 = QuantKernel.q6kColAcc(c2, xp, xb + 2 * xps, xa0 + 2 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 3) { c3 = QuantKernel.q6kColAcc(c3, xp, xb + 3 * xps, xa0 + 3 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 4) { c4 = QuantKernel.q6kColAcc(c4, xp, xb + 4 * xps, xa0 + 4 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 5) { c5 = QuantKernel.q6kColAcc(c5, xp, xb + 5 * xps, xa0 + 5 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 6) { c6 = QuantKernel.q6kColAcc(c6, xp, xb + 6 * xps, xa0 + 6 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
+                if (ncols > 7) { c7 = QuantKernel.q6kColAcc(c7, xp, xb + 7 * xps, xa0 + 7 * xps, q0, q1, q2, q3, s0, s1, s2, s3, dsc); }
                 b = bn;
             }
         }
@@ -14028,6 +14114,7 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
             uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum,
             uint32 ncols, uint32 yStride, uint32 xpStride) {
+        uint32 xps = (xpStride >> 4) << 4;   // provably 16-aligned column offsets: see q4kQ8WaveR2MatVecColsKernel
         uint32 wv = (uint32) Group.width();
         uint32 lane = KernelThread.x() % wv;
         uint32 row = (KernelThread.globalIdX() / wv) * 2;
@@ -14147,8 +14234,8 @@ public final class QuantKernel {
                     e0 = QuantKernel.q6kColDot(e0, v0, a00, a01, a02, a03, q0B, q1B, q2B, q3B, s0B, s1B, s2B, s3B, dscB);
                 }
                 if (ncols > 1) {
-                    uint32 xb1 = xb + xpStride;
-                    uint32 xq1 = xa0 + xpStride;
+                    uint32 xb1 = xb + xps;
+                    uint32 xq1 = xa0 + xps;
                     Vector<int8,4> v1 = xp.vload<4>((int64) xb1 + 288L);
                     Vector<int8,16> a10 = xp.vload<16>((int64) xq1);
                     Vector<int8,16> a11 = xp.vload<16>((int64) xq1 + 32L);
@@ -14158,8 +14245,8 @@ public final class QuantKernel {
                     e1 = QuantKernel.q6kColDot(e1, v1, a10, a11, a12, a13, q0B, q1B, q2B, q3B, s0B, s1B, s2B, s3B, dscB);
                 }
                 if (ncols > 2) {
-                    uint32 xb2 = xb + 2 * xpStride;
-                    uint32 xq2 = xa0 + 2 * xpStride;
+                    uint32 xb2 = xb + 2 * xps;
+                    uint32 xq2 = xa0 + 2 * xps;
                     Vector<int8,4> v2 = xp.vload<4>((int64) xb2 + 288L);
                     Vector<int8,16> a20 = xp.vload<16>((int64) xq2);
                     Vector<int8,16> a21 = xp.vload<16>((int64) xq2 + 32L);
@@ -14169,8 +14256,8 @@ public final class QuantKernel {
                     e2 = QuantKernel.q6kColDot(e2, v2, a20, a21, a22, a23, q0B, q1B, q2B, q3B, s0B, s1B, s2B, s3B, dscB);
                 }
                 if (ncols > 3) {
-                    uint32 xb3 = xb + 3 * xpStride;
-                    uint32 xq3 = xa0 + 3 * xpStride;
+                    uint32 xb3 = xb + 3 * xps;
+                    uint32 xq3 = xa0 + 3 * xps;
                     Vector<int8,4> v3 = xp.vload<4>((int64) xb3 + 288L);
                     Vector<int8,16> a30 = xp.vload<16>((int64) xq3);
                     Vector<int8,16> a31 = xp.vload<16>((int64) xq3 + 32L);
@@ -14180,8 +14267,8 @@ public final class QuantKernel {
                     e3 = QuantKernel.q6kColDot(e3, v3, a30, a31, a32, a33, q0B, q1B, q2B, q3B, s0B, s1B, s2B, s3B, dscB);
                 }
                 if (ncols > 4) {
-                    uint32 xb4 = xb + 4 * xpStride;
-                    uint32 xq4 = xa0 + 4 * xpStride;
+                    uint32 xb4 = xb + 4 * xps;
+                    uint32 xq4 = xa0 + 4 * xps;
                     Vector<int8,4> v4 = xp.vload<4>((int64) xb4 + 288L);
                     Vector<int8,16> a40 = xp.vload<16>((int64) xq4);
                     Vector<int8,16> a41 = xp.vload<16>((int64) xq4 + 32L);
@@ -14191,8 +14278,8 @@ public final class QuantKernel {
                     e4 = QuantKernel.q6kColDot(e4, v4, a40, a41, a42, a43, q0B, q1B, q2B, q3B, s0B, s1B, s2B, s3B, dscB);
                 }
                 if (ncols > 5) {
-                    uint32 xb5 = xb + 5 * xpStride;
-                    uint32 xq5 = xa0 + 5 * xpStride;
+                    uint32 xb5 = xb + 5 * xps;
+                    uint32 xq5 = xa0 + 5 * xps;
                     Vector<int8,4> v5 = xp.vload<4>((int64) xb5 + 288L);
                     Vector<int8,16> a50 = xp.vload<16>((int64) xq5);
                     Vector<int8,16> a51 = xp.vload<16>((int64) xq5 + 32L);
@@ -14202,8 +14289,8 @@ public final class QuantKernel {
                     e5 = QuantKernel.q6kColDot(e5, v5, a50, a51, a52, a53, q0B, q1B, q2B, q3B, s0B, s1B, s2B, s3B, dscB);
                 }
                 if (ncols > 6) {
-                    uint32 xb6 = xb + 6 * xpStride;
-                    uint32 xq6 = xa0 + 6 * xpStride;
+                    uint32 xb6 = xb + 6 * xps;
+                    uint32 xq6 = xa0 + 6 * xps;
                     Vector<int8,4> v6 = xp.vload<4>((int64) xb6 + 288L);
                     Vector<int8,16> a60 = xp.vload<16>((int64) xq6);
                     Vector<int8,16> a61 = xp.vload<16>((int64) xq6 + 32L);
@@ -14213,8 +14300,8 @@ public final class QuantKernel {
                     e6 = QuantKernel.q6kColDot(e6, v6, a60, a61, a62, a63, q0B, q1B, q2B, q3B, s0B, s1B, s2B, s3B, dscB);
                 }
                 if (ncols > 7) {
-                    uint32 xb7 = xb + 7 * xpStride;
-                    uint32 xq7 = xa0 + 7 * xpStride;
+                    uint32 xb7 = xb + 7 * xps;
+                    uint32 xq7 = xa0 + 7 * xps;
                     Vector<int8,4> v7 = xp.vload<4>((int64) xb7 + 288L);
                     Vector<int8,16> a70 = xp.vload<16>((int64) xq7);
                     Vector<int8,16> a71 = xp.vload<16>((int64) xq7 + 32L);
@@ -14240,7 +14327,7 @@ public final class QuantKernel {
         QuantKernel.requireOffsets32(packed, "q6kQ8WaveMatVecCols");
         uint32 acc = 0;
         if (accum) { acc = 1; }
-        QuantKernel.colsLaunchAs(Quant.GG_Q6_K, QuantKernel.q6ColsVariant(), y, packed, xp, rows,
+        QuantKernel.colsLaunchAs(Quant.GG_Q6_K, QuantKernel.q6ColsVariantFor(rows), y, packed, xp, rows,
             cols, yOff, ncols, yStride, xpStride, acc);
         return;
     }

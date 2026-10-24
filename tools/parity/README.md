@@ -9,6 +9,7 @@ demands on the same line as the number.
 |---|---|
 | `llama-env.sh` | where llama.cpp is, and the WSL driver-library fix every llama.cpp binary on this box needs (see the file) |
 | `build-ggml-leg.sh` | builds `ggml-leg` and `llama-greedy` against the llama.cpp build at `$LLAMA_BUILD_DIR`, CUDA or HIP by the backend library it carries |
+| `cupti-tally.cpp` | a CUPTI injection library (`CUDA_INJECTION64_PATH`) that tallies every kernel's device time in ANY CUDA program, llama.cpp or ours, graph-launched kernels included; `kernel-tally.py` windows its CSV and totals it by kernel and launch shape, with `--gaps` for the idle between kernels. The way the 4-seq decode was attributed on the 4090 (cajeta-llm 15.2.15.1) |
 | `ggml-leg.cpp` | the llama.cpp leg: one MUL_MAT shape, device-timed on ggml's own stream through its own events, over a pool of real tensors from the reference GGUF, one `leg-row` per run |
 | `llama-greedy.cpp` | llama.cpp's greedy walk with the top-2 logit gap per position, the reference for GreedyVsLlama |
 | `run-parity-legs.sh` | both legs at the reference model's seven decode shapes, joined by `bench/ParityJoin` into `census/parity-<backend>.tsv` |

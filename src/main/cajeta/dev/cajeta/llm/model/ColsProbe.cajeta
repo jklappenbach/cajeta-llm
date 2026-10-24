@@ -7,6 +7,7 @@ import cajeta.xpu.Autotune;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelManifest;
 import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelTimer;
 import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.io.GgufFile;
 import dev.cajeta.llm.io.Quant;
@@ -42,9 +43,18 @@ public final class ColsProbe {
     static String tuneDir = "";
     public static void setTuneDir(String d) { ColsProbe.tuneDir #= d.clone(); }
 
-    // Verdicts per format: 0 unmeasured, 1 pays, 2 does not.
-    static int32 v4k;
-    static int32 v6k;
+    // Verdicts per format AND WIDTH: 0 unmeasured, 1 pays, 2 does not,
+    // at [format * WIDTHS + columns]. A verdict is a property of the width
+    // the engine runs, not of the batch ceiling: on the 4090 the two-row
+    // Q4_K column kernel at 8 columns is a near tie with 8 single rows and
+    // the probe said no, so a 4-sequence decode ran 768 single-row launches
+    // a step where one 4-column launch costs the same as one row
+    // (cajeta-llm 15.2.15.1, 2026-10-24).
+    static final int32 WIDTHS = 16;
+    /** Launches an arm per timed bracket. */
+    static final int32 REPS = 8;
+    static int32[] verdicts;
+    static int32 lastColsN;
     static int64 probesN;
     static int64 checksN;
     static int64 lastColsNs;
@@ -53,8 +63,10 @@ public final class ColsProbe {
     static boolean poisonCols;
     static String buildIdOverride = "";
 
-    /** How many decode rows the probe measures at: the batch ceiling. */
+    /** The widest decode batch, so the widths a probe prewarms are 2..rows(). */
     public static int32 rows() { return CausalLM.DECODE_BATCH_MAX; }
+    /** The column count the last measurement ran at. */
+    public static int32 lastCols() { return ColsProbe.lastColsN; }
 
     public static int64 probes() { return ColsProbe.probesN; }
     public static int64 checks() { return ColsProbe.checksN; }
@@ -67,10 +79,48 @@ public final class ColsProbe {
     /** Test seam: the build id the store is keyed under ("" = the manifests'). */
     public static void setBuildIdForTest(String id) { ColsProbe.buildIdOverride #= id.clone(); }
 
-    /** Pin a verdict (1 = pays, 2 = does not), or 0 to measure again. */
+    static int32 tyIndex(int32 ty) {
+        if (ty == Quant.GG_Q4_K) { return 0; }
+        if (ty == Quant.GG_Q6_K) { return 1; }
+        return 0 - 1;
+    }
+
+    static int32 widthIndex(int32 nc) {
+        if (nc < 1) { return 1; }
+        if (nc >= ColsProbe.WIDTHS) { return ColsProbe.WIDTHS - 1; }
+        return nc;
+    }
+
+    static int32[] table() {
+        if (ColsProbe.verdicts == null) { ColsProbe.verdicts #= heap int32[2 * ColsProbe.WIDTHS]; }
+        return ColsProbe.verdicts;
+    }
+
+    /** Pin a verdict (1 = pays, 2 = does not) for every width, or 0 to measure again. */
     public static void setPays(int32 ty, int32 v) {
-        if (ty == Quant.GG_Q4_K) { ColsProbe.v4k = v; }
-        if (ty == Quant.GG_Q6_K) { ColsProbe.v6k = v; }
+        int32 nc = 1;
+        while (nc < ColsProbe.WIDTHS) {
+            ColsProbe.setPays(ty, nc, v);
+            nc = nc + 1;
+        }
+    }
+
+    /** Pin a verdict for one width (1 = pays, 2 = does not), or 0 to measure again. */
+    public static void setPays(int32 ty, int32 nc, int32 v) {
+        int32 t = ColsProbe.tyIndex(ty);
+        if (t < 0) { return; }
+        int32[] tab = ColsProbe.table();
+        tab[t * ColsProbe.WIDTHS + ColsProbe.widthIndex(nc)] = v;
+    }
+
+    /** Measure every width a decode batch can take, 2..rows(), so no token a
+     *  user waits for pays for a probe (13.2.1). Verdicts already held stand. */
+    public static void prewarm(int32 ty) {
+        int32 nc = 2;
+        while (nc <= ColsProbe.rows()) {
+            ColsProbe.pays(ty, nc);
+            nc = nc + 1;
+        }
     }
 
     public static String colsKernel(int32 ty) {
@@ -85,9 +135,9 @@ public final class ColsProbe {
         return "";
     }
 
-    static #String knob(int32 ty) {
+    static #String knob(int32 ty, int32 nc) {
         String tn #= GgufFile.typeName(ty);
-        String k #= "colsPays-" + tn + "-b" + ColsProbe.rows();
+        String k #= "colsPays-" + tn + "-b" + nc;
         return #k;
     }
 
@@ -121,59 +171,71 @@ public final class ColsProbe {
     /** Drop the stored verdict for `ty` (a test's clean slate). */
     public static void forgetStored(int32 ty) {
         if (ColsProbe.tuneDir.byteLength() == 0) { return; }
-        String k #= ColsProbe.knob(ty);
-        Autotune.invalidate(ColsProbe.tuneDir, k);
+        int32 nc = 1;
+        while (nc < ColsProbe.WIDTHS) {
+            String k #= ColsProbe.knob(ty, nc);
+            Autotune.invalidate(ColsProbe.tuneDir, k);
+            nc = nc + 1;
+        }
     }
 
-    static int32 verdictOf(int32 ty) {
-        if (ty == Quant.GG_Q4_K) { return ColsProbe.v4k; }
-        if (ty == Quant.GG_Q6_K) { return ColsProbe.v6k; }
-        return 2;
+    static int32 verdictOf(int32 ty, int32 nc) {
+        int32 t = ColsProbe.tyIndex(ty);
+        if (t < 0) { return 2; }
+        int32[] tab = ColsProbe.table();
+        return tab[t * ColsProbe.WIDTHS + ColsProbe.widthIndex(nc)];
+    }
+
+    /** Whether the column kernel pays for `ty` at the batch ceiling. */
+    public static boolean pays(int32 ty) {
+        return ColsProbe.pays(ty, ColsProbe.rows());
     }
 
     /**
-     * Whether the column kernel pays for `ty` at the batch ceiling here:
-     * the in-process verdict, else the store's (keyed by device and the
-     * kernels' build), else a measurement that is then remembered.
+     * Whether the column kernel pays for `ty` at `nc` columns here: the
+     * in-process verdict, else the store's (keyed by device, width and the
+     * kernels' build), else a measurement at that width, then remembered.
      */
-    public static boolean pays(int32 ty) {
+    public static boolean pays(int32 ty, int32 nc) {
         if (ColsProbe.colsKernel(ty).byteLength() == 0) { return false; }
-        int32 v = ColsProbe.verdictOf(ty);
+        if (nc < 2) { return false; }
+        int32 v = ColsProbe.verdictOf(ty, nc);
         if (v != 0) { return v == 1; }
         if (!KernelCap.usable(ColsProbe.colsKernel(ty))) { return false; }
         if (!KernelCap.usable(ColsProbe.waveKernel(ty))
                 || !KernelCap.usable("q8kPackKernel")) {
             // No single-row alternative to measure against: the column
             // kernel is the only route and takes it.
-            ColsProbe.setPays(ty, 1);
+            ColsProbe.setPays(ty, nc, 1);
             return true;
         }
         String bid #= ColsProbe.buildId(ty);
         if (ColsProbe.tuneDir.byteLength() > 0) {
-            String k #= ColsProbe.knob(ty);
+            String k #= ColsProbe.knob(ty, nc);
             Optional<int32> t = Autotune.recallFor(ColsProbe.tuneDir, k, bid);
             if (t.isPresent() && (t.get() == 1 || t.get() == 2)) {
-                ColsProbe.setPays(ty, t.get());
+                ColsProbe.setPays(ty, nc, t.get());
                 return t.get() == 1;
             }
         }
-        boolean yes = ColsProbe.measure(ty);
+        boolean yes = ColsProbe.measure(ty, nc);
         int32 nv = yes ? 1 : 2;
-        ColsProbe.setPays(ty, nv);
+        ColsProbe.setPays(ty, nc, nv);
         if (ColsProbe.tuneDir.byteLength() > 0) {
-            String k #= ColsProbe.knob(ty);
+            String k #= ColsProbe.knob(ty, nc);
             Autotune.rememberFor(ColsProbe.tuneDir, k, nv, bid);
         }
         return yes;
     }
 
-    /** Both candidates on one synthetic weight at the batch ceiling, each
-     *  checked against the host mat-vec, then timed; true when the column
-     *  kernel is the cheaper. */
-    static boolean measure(int32 ty) {
+    /** Both candidates on one synthetic weight at `nc` columns, each checked
+     *  against the host mat-vec, then timed on the device (host-timed where
+     *  the device has no timer); true when the column kernel is the cheaper. */
+    static boolean measure(int32 ty, int32 nc) {
         ColsProbe.probesN = ColsProbe.probesN + 1L;
         ColsProbe.lastRefusal = "";
-        int64 rows = (int64) ColsProbe.rows();
+        ColsProbe.lastColsN = nc;
+        int64 rows = (int64) nc;
         int64 out = 4096L;
         int64 cols = 4096L;
         int64 bpr = cols / 256L;
@@ -296,20 +358,47 @@ public final class ColsProbe {
                 rows, 0L, 0L, 0L, 0L);
             return true;
         }
+        // Device-timed, REPS launches an arm: a bracket around one launch
+        // holds the host's submit latency (10 to 20 us on WSL2) that the
+        // many-launch arm hides behind its first kernel, and a host bracket
+        // charges the one-launch arm a sync the other pays once too. Either
+        // turned the verdict at a near tie, and at 4 columns on the 4090 the
+        // one-launch bracket read 77 us for a 13 us kernel (2026-10-24).
+        // Where the device offers no timer the host bracket stands.
         int64 cBest = 0L - 1L;
         int64 wBest = 0L - 1L;
         int32 round = 0;
         while (round < 3) {
+            KernelTimer tc #= KernelTimer.create();
             int64 t0 = Clock.nanoTime();
-            ColsProbe.launchCols(ty, yC, wD, xp, rows, out, cols, pb);
+            tc.begin(s);
+            int32 rep = 0;
+            while (rep < ColsProbe.REPS) {
+                ColsProbe.launchCols(ty, yC, wD, xp, rows, out, cols, pb);
+                rep = rep + 1;
+            }
+            tc.end(s);
             s.sync();
             int64 t1 = Clock.nanoTime();
-            ColsProbe.launchWaves(ty, yW, wD, xp, rows, out, cols, pb);
+            int64 cDev = tc.elapsedNanos();
+            tc.destroy();
+            KernelTimer tw #= KernelTimer.create();
+            tw.begin(s);
+            rep = 0;
+            while (rep < ColsProbe.REPS) {
+                ColsProbe.launchWaves(ty, yW, wD, xp, rows, out, cols, pb);
+                rep = rep + 1;
+            }
+            tw.end(s);
             s.sync();
             int64 t2 = Clock.nanoTime();
+            int64 wDev = tw.elapsedNanos();
+            tw.destroy();
+            int64 c = (cDev > 0L && wDev > 0L ? cDev : t1 - t0) / (int64) ColsProbe.REPS;
+            int64 w = (cDev > 0L && wDev > 0L ? wDev : t2 - t1) / (int64) ColsProbe.REPS;
             if (round > 0) {
-                if (cBest < 0L || t1 - t0 < cBest) { cBest = t1 - t0; }
-                if (wBest < 0L || t2 - t1 < wBest) { wBest = t2 - t1; }
+                if (cBest < 0L || c < cBest) { cBest = c; }
+                if (wBest < 0L || w < wBest) { wBest = w; }
             }
             round = round + 1;
         }
