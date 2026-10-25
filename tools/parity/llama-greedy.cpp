@@ -8,6 +8,8 @@
 // divergence at a gap under 1e-3 is a tie broken differently, not a bug.
 //
 //   llama-greedy --model M.gguf --prompt "..." --n 32 [--ngl 99] [--ctx 512]
+//   llama-greedy --model M.gguf --ids 1000,1007,... --n 32   (token ids verbatim,
+//       no BOS: SchedThroughput's synthetic prompts, 2026-10-25)
 //
 //   prompt-ids <n> <id,id,...>
 //   greedy <pos> <id> <top2gap>
@@ -23,13 +25,14 @@
 #include <vector>
 
 int main(int argc, char ** argv) {
-    std::string model_path, prompt = "The measured baseline for the parity gate is";
+    std::string model_path, prompt = "The measured baseline for the parity gate is", ids;
     int n = 32, ngl = 99, n_ctx = 512;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         auto next = [&](void) -> const char * { return (i + 1 < argc) ? argv[++i] : ""; };
         if (a == "--model") model_path = next();
         else if (a == "--prompt") prompt = next();
+        else if (a == "--ids") ids = next();
         else if (a == "--n") n = atoi(next());
         else if (a == "--ngl") ngl = atoi(next());
         else if (a == "--ctx") n_ctx = atoi(next());
@@ -51,13 +54,25 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "context init failed\n"); return 1; }
 
-    std::vector<llama_token> toks(prompt.size() + 16);
-    int nt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), toks.data(), (int) toks.size(), true, true);
-    if (nt < 0) {
-        toks.resize(-nt);
+    std::vector<llama_token> toks;
+    int nt = 0;
+    if (!ids.empty()) {
+        for (size_t p = 0; p < ids.size();) {
+            size_t q = ids.find(',', p);
+            if (q == std::string::npos) q = ids.size();
+            toks.push_back((llama_token) atoi(ids.substr(p, q - p).c_str()));
+            p = q + 1;
+        }
+        nt = (int) toks.size();
+    } else {
+        toks.resize(prompt.size() + 16);
         nt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), toks.data(), (int) toks.size(), true, true);
+        if (nt < 0) {
+            toks.resize(-nt);
+            nt = llama_tokenize(vocab, prompt.c_str(), (int) prompt.size(), toks.data(), (int) toks.size(), true, true);
+        }
+        toks.resize(nt);
     }
-    toks.resize(nt);
     printf("prompt-ids\t%d\t", nt);
     for (int i = 0; i < nt; i++) printf("%s%d", i ? "," : "", toks[i]);
     printf("\n");

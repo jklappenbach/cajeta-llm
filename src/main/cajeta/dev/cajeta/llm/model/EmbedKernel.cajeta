@@ -24,7 +24,7 @@ import dev.cajeta.llm.io.QuantKernel;
  * and far below a launch's floor.
  *
  * The formats a GGUF carries its `token_embd` in: Q4_K (Q4_K_M files),
- * Q6_K, Q8_0, F16; the host decoder (Quant.dequantize) is the oracle for
+ * Q5_K (Q5_K_M files), Q6_K, Q8_0, F16; the host decoder (Quant.dequantize) is the oracle for
  * each (EmbedKernelTest). The same kernels gather a whole prompt
  * (1.8.3): workgroup w decodes token w of the batch into row w of the
  * hidden state, which is what keeps a 512-token prompt's 8 MB embedding
@@ -37,13 +37,14 @@ public final class EmbedKernel {
 
     /** Which packed formats have a device row decoder. */
     public static boolean hasKernel(int32 ty) {
-        return ty == Quant.GG_Q4_K || ty == Quant.GG_Q6_K
+        return ty == Quant.GG_Q4_K || ty == Quant.GG_Q5_K || ty == Quant.GG_Q6_K
             || ty == Quant.GG_Q8_0 || ty == Quant.GG_F16;
     }
 
     /** The kernel name the launch for `ty` would use, for KernelCap.usable. */
     public static String kernelName(int32 ty) {
         if (ty == Quant.GG_Q4_K) { return "embedRowQ4kKernel"; }
+        if (ty == Quant.GG_Q5_K) { return "embedRowQ5kKernel"; }
         if (ty == Quant.GG_Q6_K) { return "embedRowQ6kKernel"; }
         if (ty == Quant.GG_Q8_0) { return "embedRowQ80Kernel"; }
         if (ty == Quant.GG_F16) { return "embedRowF16Kernel"; }
@@ -95,6 +96,54 @@ public final class EmbedKernel {
             }
             int32 q = (((int32) packed[ro + 16L + (int64) (32 * g + l)] & 255)
                 >> (4 * (int32) s)) & 15;
+            hs[hsOff + (int64) b * 256L + (int64) e] = d * (float32) sc * (float32) q
+                - dmin * (float32) mn;
+            b = b + 1;
+        }
+    }
+
+    /** The Q5_K row: { f16 d; f16 dmin; u8 scales[12]; u8 qh[32]; u8 qs[128] },
+     *  Q4_K's header and nibbles (the nibbles 32 bytes later) plus a plane of
+     *  fifth bits: element e of sub-block j carries bit j of qh[e % 32]
+     *  (Quant.q5kBlock). Without it a Q5_K_M model decoded every prompt's
+     *  embedding on the host, and its prompts could not share a prefill pass
+     *  (the 8B, 2026-10-25: about 40 ms of host a 512-token prompt). */
+    @Kernel
+    public static void embedRowQ5kKernel(KernelBuffer<float32> hs,
+            KernelBuffer<int8> packed, KernelBuffer<int32> tok,
+            uint32 blocksPerRow) {
+        uint32 e = KernelThread.x();
+        int64 w = (int64) (KernelThread.globalIdX() / 256);
+        int64 row = (int64) tok[w];
+        int64 rowOff = row * (int64) blocksPerRow * 176L;
+        int64 hsOff = w * (int64) blocksPerRow * 256L;
+        uint32 g = e / 64;
+        uint32 r = e - g * 64;
+        uint32 s = r / 32;
+        uint32 l = r - s * 32;
+        uint32 sb = e / 32;
+        uint32 el = e - sb * 32;
+        uint32 b = 0;
+        while (b < blocksPerRow) {
+            int64 ro = rowOff + (int64) b * 176L;
+            float32 d = EmbedKernel.h16(packed, ro);
+            float32 dmin = EmbedKernel.h16(packed, ro + 2L);
+            int32 sc = 0;
+            int32 mn = 0;
+            if (sb < 4) {
+                sc = ((int32) packed[ro + 4L + (int64) sb] & 255) & 63;
+                mn = ((int32) packed[ro + 8L + (int64) sb] & 255) & 63;
+            } else {
+                int32 dj = (int32) packed[ro + 4L + (int64) (sb - 4)] & 255;
+                int32 mj = (int32) packed[ro + 8L + (int64) (sb - 4)] & 255;
+                int32 kj = (int32) packed[ro + 12L + (int64) (sb - 4)] & 255;
+                sc = (kj & 15) | ((dj >> 2) & 48);
+                mn = (kj >> 4) | ((mj >> 2) & 48);
+            }
+            int32 ql = (((int32) packed[ro + 48L + (int64) (32 * g + l)] & 255)
+                >> (4 * (int32) s)) & 15;
+            int32 hb = (((int32) packed[ro + 16L + (int64) el] & 255) >> (int32) sb) & 1;
+            int32 q = ql | (hb << 4);
             hs[hsOff + (int64) b * 256L + (int64) e] = d * (float32) sc * (float32) q
                 - dmin * (float32) mn;
             b = b + 1;
@@ -195,6 +244,8 @@ public final class EmbedKernel {
         uint32 g = (uint32) n;
         if (ty == Quant.GG_Q4_K) {
             embedRowQ4kKernel.launch(s, grid: [g], block: [256])(hs, packed, tok, bpr);
+        } else if (ty == Quant.GG_Q5_K) {
+            embedRowQ5kKernel.launch(s, grid: [g], block: [256])(hs, packed, tok, bpr);
         } else if (ty == Quant.GG_Q6_K) {
             embedRowQ6kKernel.launch(s, grid: [g], block: [256])(hs, packed, tok, bpr);
         } else if (ty == Quant.GG_Q8_0) {
