@@ -1,0 +1,155 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.EngineOptions;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.sched.Request;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * The pipelined batched greedy decode (cajeta-llm 15.2.12.3.9.5): the batch runs one
+ * step ahead, its rows embedded on the device from the previous step's argmax, so the
+ * host consumes step N's tokens while the device runs step N+1. The pipeline must not
+ * change an answer: every stream equals the same prompt decoded alone.
+ */
+public class BatchPipelineTest {
+
+    static final int32 SEQS = 4;
+    static final int32 GEN = 24;
+
+    public BatchPipelineTest() { return; }
+
+    static #LlmEngine engine(int32 seqs) {
+        EngineOptions o #= heap EngineOptions(RoutableFixtureTest.FIX);
+        o.ctx = 128;
+        o.maxSeqs = seqs;
+        o.blockTokens = 16;
+        o.chunk = 64;
+        o.tuneDir = "off";
+        LlmEngine e #= LlmEngine.load(#o);
+        return #e;
+    }
+
+    /** The batched engine, or null (skipped) where the backend does not pipeline the batch. */
+    static #LlmEngine ready() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return null; }
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        LlmEngine all #= BatchPipelineTest.engine(BatchPipelineTest.SEQS);
+        boolean ready = all.model().decodeBatchReady() && all.model().batchPipelineReady();
+        Diag.register(null);
+        if (!ready) {
+            all.close();
+            DeviceSkip.tracked("backend " + be + " does not pipeline the batched decode: "
+                + cap.namesOf("decode-batch"), "cajeta-llm 15.2.12.3.9.5");
+            return null;
+        }
+        return #all;
+    }
+
+    /** Sequence `q`'s stream in `all` equals the same prompt decoded alone, `gen` tokens. */
+    static void matchesSolo(LlmEngine all, int32 id, int32 q, int32 gen, float32 temp) {
+        LlmEngine one #= BatchPipelineTest.engine(1);
+        int32[] p #= RoutableFixtureTest.promptOf(20 + 3 * q, 5 + 11 * q);
+        int32 sid = one.submitTokens(p, 20 + 3 * q, gen, #heap SampleParams(temp, (int64) (41 + q)));
+        one.runAll(400);
+        Request solo = one.request(sid);
+        Request inBatch = all.request(id);
+        Assert.equals((int64) gen, (int64) inBatch.generatedCount());
+        Assert.equals((int64) solo.generatedCount(), (int64) inBatch.generatedCount());
+        int32 k = 0;
+        while (k < solo.generatedCount()) {
+            if (solo.generatedAt(k) != inBatch.generatedAt(k)) {
+                Assert.fail("sequence " + q + " token " + k + ": " + inBatch.generatedAt(k)
+                    + " in the pipelined batch, " + solo.generatedAt(k) + " decoded alone");
+            }
+            k = k + 1;
+        }
+        one.close();
+    }
+
+    static int32 submit(LlmEngine all, int32 q, int32 gen, float32 temp) {
+        int32[] p #= RoutableFixtureTest.promptOf(20 + 3 * q, 5 + 11 * q);
+        return all.submitTokens(p, 20 + 3 * q, gen, #heap SampleParams(temp, (int64) (41 + q)));
+    }
+
+    @Test
+    public void greedyStreamsMatchEachSequenceDecodedAlone() {
+        LlmEngine all #= BatchPipelineTest.ready();
+        if (all == null) { return; }
+        int32[] ids #= heap int32[BatchPipelineTest.SEQS];
+        int32 q = 0;
+        while (q < BatchPipelineTest.SEQS) { ids[q] = BatchPipelineTest.submit(all, q, BatchPipelineTest.GEN, 0.0f); q = q + 1; }
+        int64 before = CausalLM.batchPipelinedSteps();
+        all.runAll(400);
+        Assert.isTrue(CausalLM.batchPipelinedSteps() > before);
+        q = 0;
+        while (q < BatchPipelineTest.SEQS) { BatchPipelineTest.matchesSolo(all, ids[q], q, BatchPipelineTest.GEN, 0.0f); q = q + 1; }
+        all.close();
+    }
+
+    /** One row stops early: its last queued step is awaited, not lost, and the others go on. */
+    @Test
+    public void anEarlyFinishIsAwaitedAndTheRestContinue() {
+        LlmEngine all #= BatchPipelineTest.ready();
+        if (all == null) { return; }
+        int32[] ids #= heap int32[BatchPipelineTest.SEQS];
+        int32 q = 0;
+        while (q < BatchPipelineTest.SEQS) {
+            int32 gen = q == 1 ? BatchPipelineTest.GEN / 2 : BatchPipelineTest.GEN;
+            ids[q] = BatchPipelineTest.submit(all, q, gen, 0.0f);
+            q = q + 1;
+        }
+        int64 before = CausalLM.batchPipelinedSteps();
+        all.runAll(400);
+        Assert.isTrue(CausalLM.batchPipelinedSteps() > before);
+        q = 0;
+        while (q < BatchPipelineTest.SEQS) {
+            int32 gen = q == 1 ? BatchPipelineTest.GEN / 2 : BatchPipelineTest.GEN;
+            BatchPipelineTest.matchesSolo(all, ids[q], q, gen, 0.0f);
+            q = q + 1;
+        }
+        Assert.equals((int64) BatchPipelineTest.SEQS, (int64) all.model().kvPoolSlots());
+        all.close();
+    }
+
+    /** DOES NOT FIRE: a sampled row needs the host's draw, so the batch takes the plain step. */
+    @Test
+    public void aSampledRowTakesThePlainBatch() {
+        LlmEngine all #= BatchPipelineTest.ready();
+        if (all == null) { return; }
+        int32 q = 0;
+        while (q < BatchPipelineTest.SEQS) { BatchPipelineTest.submit(all, q, BatchPipelineTest.GEN, q == 2 ? 0.8f : 0.0f); q = q + 1; }
+        int64 before = CausalLM.batchPipelinedSteps();
+        all.runAll(400);
+        Assert.equals(before, CausalLM.batchPipelinedSteps());
+        all.close();
+    }
+
+    /** Two rows run ahead; two more arrive: the in-flight step is awaited, the set reseeds. */
+    @Test
+    public void aLateAdmissionJoinsAfterTheInFlightStep() {
+        LlmEngine all #= BatchPipelineTest.ready();
+        if (all == null) { return; }
+        int32[] ids #= heap int32[BatchPipelineTest.SEQS];
+        ids[0] = BatchPipelineTest.submit(all, 0, BatchPipelineTest.GEN, 0.0f);
+        ids[1] = BatchPipelineTest.submit(all, 1, BatchPipelineTest.GEN, 0.0f);
+        int32 s = 0;
+        while (s < 6) { all.stepOnce(); s = s + 1; }
+        ids[2] = BatchPipelineTest.submit(all, 2, BatchPipelineTest.GEN, 0.0f);
+        ids[3] = BatchPipelineTest.submit(all, 3, BatchPipelineTest.GEN, 0.0f);
+        int64 before = CausalLM.batchPipelinedSteps();
+        all.runAll(400);
+        Assert.isTrue(CausalLM.batchPipelinedSteps() > before);
+        int32 q = 0;
+        while (q < BatchPipelineTest.SEQS) { BatchPipelineTest.matchesSolo(all, ids[q], q, BatchPipelineTest.GEN, 0.0f); q = q + 1; }
+        all.close();
+    }
+}

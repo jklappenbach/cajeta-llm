@@ -1545,6 +1545,13 @@ public final class CausalLM extends InfModule {
     boolean pipe;
     int32 pipeOut;
     int32 pipeQueued;              // steps queued and not yet awaited or drained
+    // 15.2.12.3.9.5 — the pipelined batched decode: two pinned token buffers of
+    // DECODE_BATCH_MAX rows (the device gathers the next step's embeddings from one and
+    // writes this step's argmaxes to the other), an event per buffer.
+    BatchPipe bp;                  // one object: the class stays under 64 reference fields
+    boolean bpHave;
+    int64 bdTb3;                   // the batched step's host clock after the prep
+    int64 bdTb4;                   // and before the head
     KernelBuffer<int8> embDev;
     KernelBuffer<float32> embF32Dev;
     int32 embTy;
@@ -3859,18 +3866,14 @@ public final class CausalLM extends InfModule {
         return;
     }
 
+
     /**
-     * One decode token for each of `n` sequences `seqs[i]`, fed `tokens[i]`,
-     * in one pass over the weights; greedy tokens land in `out[i]`. Needs
-     * {@link #decodeBatchReady} and 1 <= n <= {@link #DECODE_BATCH_MAX}.
+     * The batched step's device work for rows whose embeddings are in `bdHs`: the
+     * attention row table, the layers, the final norm, the head and one argmax a row
+     * into `tokRows`; `bdTb3`/`bdTb4` take the host clock after the prep and before the
+     * head, for the phase record. No sync.
      */
-    public void stepDecodeBatch(int32[] seqs, int32[] tokens, int32 n, int32[] out) {
-        if (n < 1 || n > CausalLM.DECODE_BATCH_MAX) {
-            throw heap LlmException("decode batch: " + n + " rows");
-        }
-        int64 tb0 = Clock.nanoTime();
-        this.ensureResidentBuffers(this.cfg.hiddenSize);
-        this.ensureDecodeBatch();
+    void decodeBatchRows(int32[] seqs, int32 n, KernelBuffer<int32>[] tokRows) {
         int32 h = this.cfg.hiddenSize;
         int32 qd = this.cfg.qDim();
         int32 kvd = this.cfg.kvDim();
@@ -3882,32 +3885,7 @@ public final class CausalLM extends InfModule {
         int64 pbH = Quant.q8kPackedBytes((int64) h);
         int64 pbQd = Quant.q8kPackedBytes((int64) qd);
         int64 pbI = Quant.q8kPackedBytes((int64) inter);
-        ActivationPool p = this.pool;
-        float32[] xb = p.x.hostBuffer();
-        int64 xbase = p.x.hostBase();
         int32 b = 0;
-        while (b < n) {
-            int32 seq = seqs[(int64) b];
-            this.armRoutes(seq);
-            this.ensureDeviceKv(seq);
-            int32 pos = this.seqLength(seq);
-            if (pos >= this.maxSeq) {
-                throw heap LlmException("decode: context is full (maxSeq "
-                    + this.maxSeq + ")");
-            }
-            this.bdPos[(int64) b] = pos;
-            this.model.embedTokens.rowIntoTensor(tokens[(int64) b], p.x, 0, h);
-            int64 ci = 0;
-            int64 ro = (int64) b * (int64) h;
-            while (ci < (int64) h) {
-                this.bdHsHost[ro + ci] = xb[xbase + ci];
-                ci = ci + 1;
-            }
-            b = b + 1;
-        }
-        int64 tb1 = Clock.nanoTime();
-        this.bdHs.upload(this.bdHsHost, (int64) n * (int64) h);
-        int64 tb2 = Clock.nanoTime();
         boolean bAttn = this.batchAttnReady(seqs, n);
         int32 maxSplits = 1;
         if (bAttn) {
@@ -3924,7 +3902,7 @@ public final class CausalLM extends InfModule {
             }
             maxSplits = AttnKernel.decodeRowTable(slots, poss, n, this.cfg.numKvHeads, this.bdRowTab);
         }
-        int64 tb3 = Clock.nanoTime();
+        this.bdTb3 = Clock.nanoTime();
         int32 li = 0;
         while (li < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[li];
@@ -4014,15 +3992,149 @@ public final class CausalLM extends InfModule {
             QuantKernel.q8kPackLaunchNoSync(this.bdXpHRow[r], this.bdXnRow[r], (int64) h);
             b = b + 1;
         }
-        int64 tb4 = Clock.nanoTime();
+        this.bdTb4 = Clock.nanoTime();
         this.lmHead.matvecCols(this.bdXp, pbH, n, this.bdLogits, (int64) vocab, false);
         b = 0;
         while (b < n) {
-            QuantKernel.argmaxRowLaunchNoSync(this.bdTokRow[(int64) b],
+            QuantKernel.argmaxRowLaunchNoSync(tokRows[(int64) b],
                 this.bdLogitRow[(int64) b], (int64) vocab, this.amPv, this.amPi,
                 this.amCounter);
             b = b + 1;
         }
+    }
+
+    /** Whether the batched decode can run one step ahead: the batch serves, the
+     *  embedding table is on the device with a decoder, and the pipeline is on. The
+     *  token buffers and events are made on the first yes. */
+    public boolean batchPipelineReady() {
+        if (!CausalLM.pipeOn || !CausalLM.bpipeOn) { return false; }
+        if (!this.decodeBatchReady()) { return false; }
+        if (!this.deviceEmbedReady()) { return false; }
+        if (!this.bpHave) {
+            this.bp #= heap BatchPipe((int64) CausalLM.DECODE_BATCH_MAX);
+            this.bpHave = true;
+        }
+        return true;
+    }
+
+    KernelBuffer<int32> bpTok(int32 slot) { return this.bp.tok(slot); }
+    KernelBuffer<int32>[] bpTokRows(int32 slot) { return this.bp.rows(slot); }
+    Event bpEvent(int32 slot) { return this.bp.event(slot); }
+
+    /** Write the rows' tokens into pipeline buffer `slot` from the host (the seed). */
+    public void bpSeed(int32 slot, int32[] toks, int32 n) {
+        int32 i = 0;
+        while (i < n) { this.bp.host[(int64) i] = toks[(int64) i]; i = i + 1; }
+        this.bpTok(slot).hostStore(this.bp.host);
+    }
+
+    /**
+     * Queue one batched decode step of `n` sequences whose input tokens the device
+     * reads from pipeline buffer `inSlot` and whose argmaxes it writes to `outSlot`;
+     * returns without waiting. Each row's position is consumed as by stepDecodeBatch.
+     */
+    public void queueDecodeBatch(int32[] seqs, int32 n, int32 inSlot, int32 outSlot) {
+        if (n < 1 || n > CausalLM.DECODE_BATCH_MAX) {
+            throw heap LlmException("decode batch: " + n + " rows");
+        }
+        this.ensureResidentBuffers(this.cfg.hiddenSize);
+        this.ensureDecodeBatch();
+        int32 h = this.cfg.hiddenSize;
+        int32 b = 0;
+        while (b < n) {
+            int32 seq = seqs[(int64) b];
+            this.armRoutes(seq);
+            this.ensureDeviceKv(seq);
+            int32 pos = this.seqLength(seq);
+            if (pos >= this.maxSeq) {
+                throw heap LlmException("decode: context is full (maxSeq "
+                    + this.maxSeq + ")");
+            }
+            this.bdPos[(int64) b] = pos;
+            b = b + 1;
+        }
+        if (this.embTy >= 0) {
+            EmbedKernel.embedRowsLaunchNoSync(this.embTy, this.bdHs, this.embDev,
+                this.bpTok(inSlot), (int64) n, (int64) h / (int64) Quant.blockElems(this.embTy));
+        } else {
+            QuantKernel.gatherRowsF32LaunchNoSync(this.bdHs, this.embF32Dev,
+                this.bpTok(inSlot), (int64) n, (int64) h);
+        }
+        this.decodeBatchRows(seqs, n, this.bpTokRows(outSlot));
+        this.bpEvent(outSlot).recordOn(QuantKernel.stream());
+        this.pipeQueued = this.pipeQueued + 1;
+        this.logitsStale = true;
+        CausalLM.bpStepsN = CausalLM.bpStepsN + 1L;
+    }
+
+    /** Wait for the batched step whose argmaxes go to `outSlot` and copy its `n` tokens to `out`. */
+    public void awaitDecodeBatch(int32 outSlot, int32 n, int32[] out) {
+        this.bpEvent(outSlot).waitHost();
+        if (this.pipeQueued > 0) { this.pipeQueued = this.pipeQueued - 1; }
+        this.bpTok(outSlot).hostLoad(this.bp.host);
+        int32 i = 0;
+        while (i < n) { out[(int64) i] = this.bp.host[(int64) i]; i = i + 1; }
+    }
+
+    /** The pipelined batched decode, on by default; off is the bench's control arm. */
+    public static void setBatchPipelined(boolean on) { CausalLM.bpipeOn = on; }
+    static boolean bpipeOn = true;
+    static int64 bpStepsN;
+    /** Batched steps queued through the pipeline in this process. */
+    public static int64 batchPipelinedSteps() { return CausalLM.bpStepsN; }
+
+    /**
+     * One decode token for each of `n` sequences `seqs[i]`, fed `tokens[i]`,
+     * in one pass over the weights; greedy tokens land in `out[i]`. Needs
+     * {@link #decodeBatchReady} and 1 <= n <= {@link #DECODE_BATCH_MAX}.
+     */
+    public void stepDecodeBatch(int32[] seqs, int32[] tokens, int32 n, int32[] out) {
+        if (n < 1 || n > CausalLM.DECODE_BATCH_MAX) {
+            throw heap LlmException("decode batch: " + n + " rows");
+        }
+        int64 tb0 = Clock.nanoTime();
+        this.ensureResidentBuffers(this.cfg.hiddenSize);
+        this.ensureDecodeBatch();
+        int32 h = this.cfg.hiddenSize;
+        int32 qd = this.cfg.qDim();
+        int32 kvd = this.cfg.kvDim();
+        int32 inter = this.cfg.intermediateSize;
+        int32 nH = this.cfg.numHeads;
+        int32 nKv = this.cfg.numKvHeads;
+        int32 hd = this.cfg.headDim;
+        int32 vocab = this.cfg.vocabSize;
+        int64 pbH = Quant.q8kPackedBytes((int64) h);
+        int64 pbQd = Quant.q8kPackedBytes((int64) qd);
+        int64 pbI = Quant.q8kPackedBytes((int64) inter);
+        ActivationPool p = this.pool;
+        float32[] xb = p.x.hostBuffer();
+        int64 xbase = p.x.hostBase();
+        int32 b = 0;
+        while (b < n) {
+            int32 seq = seqs[(int64) b];
+            this.armRoutes(seq);
+            this.ensureDeviceKv(seq);
+            int32 pos = this.seqLength(seq);
+            if (pos >= this.maxSeq) {
+                throw heap LlmException("decode: context is full (maxSeq "
+                    + this.maxSeq + ")");
+            }
+            this.bdPos[(int64) b] = pos;
+            this.model.embedTokens.rowIntoTensor(tokens[(int64) b], p.x, 0, h);
+            int64 ci = 0;
+            int64 ro = (int64) b * (int64) h;
+            while (ci < (int64) h) {
+                this.bdHsHost[ro + ci] = xb[xbase + ci];
+                ci = ci + 1;
+            }
+            b = b + 1;
+        }
+        int64 tb1 = Clock.nanoTime();
+        this.bdHs.upload(this.bdHsHost, (int64) n * (int64) h);
+        int64 tb2 = Clock.nanoTime();
+        this.decodeBatchRows(seqs, n, this.bdTokRow);
+        int64 tb3 = this.bdTb3;
+        int64 tb4 = this.bdTb4;
         KernelStream s = QuantKernel.stream();
         s.sync();
         this.bdTok.download(this.bdTokHost, (int64) n);

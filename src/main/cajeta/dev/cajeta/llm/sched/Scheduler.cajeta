@@ -202,6 +202,7 @@ public final class Scheduler {
         }
         if (this.model.deviceKvReserveGrows(want)) {
             if (this.pipeInFlight) { this.finishPipe(); }
+            this.finishBatchPipe();
             this.model.reserveDeviceKvSlots(want);
         }
         // The slots' planes and their chunk-sized prefill scratch, built
@@ -379,6 +380,7 @@ public final class Scheduler {
         int64 tRs = Clock.nanoTime();
         if (this.model.deviceKvReserveGrows(live)) {
             if (this.pipeInFlight) { this.finishPipe(); }
+            this.finishBatchPipe();
             this.model.reserveDeviceKvSlots(live);
         }
         Scheduler.traceReserveNs = Clock.nanoTime() - tRs;
@@ -392,6 +394,9 @@ public final class Scheduler {
             this.bSeq = heap int32[CausalLM.DECODE_BATCH_MAX];
             this.bTok = heap int32[CausalLM.DECODE_BATCH_MAX];
             this.bOut = heap int32[CausalLM.DECODE_BATCH_MAX];
+            this.bpIdx = heap int32[CausalLM.DECODE_BATCH_MAX];
+            this.bpSeq = heap int32[CausalLM.DECODE_BATCH_MAX];
+            this.bpTokOut = heap int32[CausalLM.DECODE_BATCH_MAX];
         }
         // Prompt chunks batch across requests where the resident prefill
         // and the device tail serve; greedy requests only, since the pass
@@ -458,7 +463,9 @@ public final class Scheduler {
                     Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
                     this.stepPipelined(i, r);
                     tso = Clock.nanoTime();
-                } else if (batching && n == 1) {
+                } else if (batching && (n == 1 || (n == 0 && this.bpHas(i)))) {
+                    // A row in the batched pipeline: its position was consumed at
+                    // queue time (n reads 0 here); the batch awaits it.
                     if (this.pipeInFlight) { this.finishPipe(); }
                     if (nb == CausalLM.DECODE_BATCH_MAX) {
                         this.runDecodeBatch(nb);
@@ -468,6 +475,7 @@ public final class Scheduler {
                     nb = nb + 1;
                 } else {
                     if (this.pipeInFlight) { this.finishPipe(); }
+                    this.finishBatchPipe();
                     Scheduler.ownNs = Scheduler.ownNs + (Clock.nanoTime() - tso);
                     if (n > 1) {
                         if (n == cap) { fullChunks = fullChunks + 1; } else { partial = true; }
@@ -686,6 +694,14 @@ public final class Scheduler {
     int32[] bSeq;
     int32[] bTok;
     int32[] bOut;
+    // 15.2.12.3.9.5 — the batched pipeline: the set in flight (request indices and
+    // slots), the buffer its argmaxes land in, and the tokens read back.
+    boolean bpInFlight;
+    int32 bpOut;
+    int32 bpN;
+    int32[] bpIdx;
+    int32[] bpSeq;
+    int32[] bpTokOut;
     // 15.2.15.1.4: the prompt chunks a step admits together, run as ONE
     // pass by CausalLM.stepPrefillBatch; pTok holds their tokens in order.
     int32[] pIdx;
@@ -751,7 +767,9 @@ public final class Scheduler {
         }
         return;
     }
-    void runDecodeBatch(int32 nb) {
+    /** The running rows among `bIdx[0..nb)`, compacted in place with their slots and
+     *  next tokens; returns the count. */
+    int32 collectBatch(int32 nb) {
         int32 m = 0;
         int32 k = 0;
         while (k < nb) {
@@ -764,7 +782,139 @@ public final class Scheduler {
             }
             k = k + 1;
         }
+        return m;
+    }
+
+    /** Whether the compacted batch of `m` rows is the set the pipeline has in flight. */
+    boolean bpSameSet(int32 m) {
+        if (!this.bpInFlight || m != this.bpN) { return false; }
+        int32 k = 0;
+        while (k < m) {
+            if (this.bIdx[k] != this.bpIdx[k] || this.bSeq[k] != this.bpSeq[k]) { return false; }
+            k = k + 1;
+        }
+        return true;
+    }
+
+    /** Whether request `i` is a row of the batched step in flight. */
+    boolean bpHas(int32 i) {
+        if (!this.bpInFlight) { return false; }
+        int32 k = 0;
+        while (k < this.bpN) {
+            if (this.bpIdx[k] == i) { return true; }
+            k = k + 1;
+        }
+        return false;
+    }
+
+    /** Whether the batch of `m` rows can run one step ahead: the set in flight, or two
+     *  or more greedy, unhashed rows each with one token to consume, the model's
+     *  pipeline ready, and the single sequence pipeline idle. */
+    boolean bpFor(int32 m) {
+        if (this.bpInFlight) { return this.bpSameSet(m); }
+        if (m < 2 || this.pipeInFlight) { return false; }
+        int32 k = 0;
+        while (k < m) {
+            Request r = this.reqs.get(this.bIdx[k]);
+            if (r.cachedLen != r.totalLen - 1) { return false; }
+            if (r.sampler != null && !r.sampler.isGreedy()) { return false; }
+            if (this.hashesStep(r)) { return false; }
+            k = k + 1;
+        }
+        return this.model.batchPipelineReady();
+    }
+
+    /** Await the in-flight batched step and consume its tokens for the rows still
+     *  running; a stopped row's speculative token is dropped. */
+    void finishBatchPipe() {
+        if (!this.bpInFlight) { return; }
+        this.bpInFlight = false;
+        this.model.awaitDecodeBatch(this.bpOut, this.bpN, this.bpTokOut);
+        int32 k = 0;
+        while (k < this.bpN) {
+            int32 i = this.bpIdx[k];
+            if (i >= 0 && i < this.reqs.count()) {
+                Request r = this.reqs.get(i);
+                if (r.state == Request.RUNNING && r.slot == this.bpSeq[k]) {
+                    this.consume(i, r, this.bpTokOut[k], 0);
+                }
+            }
+            k = k + 1;
+        }
+        return;
+    }
+
+    /** The batched step one step ahead (15.2.12.3.9.5): seed from the host's tokens,
+     *  else queue the next step and await the one in flight. */
+    void stepBatchPipelined(int32 m) {
+        int32 k;
+        if (!this.bpInFlight) {
+            this.model.bpSeed(0, this.bTok, m);
+            this.model.queueDecodeBatch(this.bSeq, m, 0, 1);
+            this.bpInFlight = true;
+            this.bpOut = 1;
+            this.bpN = m;
+            k = 0;
+            while (k < m) {
+                this.bpIdx[k] = this.bIdx[k];
+                this.bpSeq[k] = this.bSeq[k];
+                Request r = this.reqs.get(this.bIdx[k]);
+                r.cachedLen = r.cachedLen + 1;
+                this.prefillRowsN = this.prefillRowsN + 1;
+                k = k + 1;
+            }
+            return;
+        }
+        int32 inS = this.bpOut;
+        int32 outS = 1 - inS;
+        // Speculate only when no row can be the last by budget and every row has a
+        // position left; a stop the host cannot foresee costs the queued step's token.
+        boolean spec = true;
+        k = 0;
+        while (k < m) {
+            Request r = this.reqs.get(this.bIdx[k]);
+            if (r.genCount + 1 >= r.maxNew || !this.model.hasRoom(r.slot)) { spec = false; }
+            k = k + 1;
+        }
+        if (spec) { this.model.queueDecodeBatch(this.bSeq, m, inS, outS); }
+        this.model.awaitDecodeBatch(this.bpOut, m, this.bOut);
+        k = 0;
+        while (k < m) {
+            Request r = this.reqs.get(this.bIdx[k]);
+            this.consume(this.bIdx[k], r, this.bOut[k], 0);
+            k = k + 1;
+        }
+        if (!spec) {
+            this.bpInFlight = false;
+            return;
+        }
+        this.bpOut = outS;
+        k = 0;
+        while (k < m) {
+            Request r = this.reqs.get(this.bIdx[k]);
+            if (r.state == Request.RUNNING) {
+                r.cachedLen = r.cachedLen + 1;
+                this.prefillRowsN = this.prefillRowsN + 1;
+            }
+            k = k + 1;
+        }
+        return;
+    }
+
+    void runDecodeBatch(int32 nb) {
+        int32 m = this.collectBatch(nb);
+        if (this.bpInFlight && !this.bpSameSet(m)) {
+            // The set changed (a finish, an admission): land the step in flight, then
+            // read the rows again with the tokens it produced.
+            this.finishBatchPipe();
+            m = this.collectBatch(nb);
+        }
         if (m == 0) { return; }
+        if (this.bpFor(m)) {
+            this.stepBatchPipelined(m);
+            return;
+        }
+        int32 k = 0;
         if (m == 1) {
             Request r1 = this.reqs.get(this.bIdx[0]);
             int32 ret = this.model.stepSeq(r1.slot, r1.all, r1.cachedLen, 1);
