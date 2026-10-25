@@ -44,8 +44,6 @@ MARKS = {
     'DECLINED': '✗',
     None: '',
 }
-ROLE_MAX = 180          # a first sentence longer than this is cut to ROLE_MAX - 3 and an ellipsis
-ROLE_WITH_NOTE_MAX = 264  # the oracle-map note rides in parentheses only while the role stays this short
 TEMPLATE_INSTANCE = re.compile(r'^([A-Z][A-Za-z0-9]*Tile)_((?:\d+_)+)([a-z][A-Za-z0-9]*)$')
 
 
@@ -152,10 +150,8 @@ def scan_kernels(repo):
 
 def first_sentence(text):
     m = re.match(r'(.*?[.!?])(?=\s|$)', text)
-    s = m.group(1) if m else text
-    if len(s) > ROLE_MAX:
-        s = s[:ROLE_MAX - 3] + '\u2026'
-    return s
+    # whole, however long: the role has a full-width row of its own
+    return m.group(1) if m else text
 
 
 def locate(name, kernels):
@@ -193,7 +189,7 @@ def build(repo, retired_path):
         doc_role = loc[3] if loc else ''
         note = o.get('note', '')
         role = doc_role or note
-        if doc_role and note and len(doc_role) + len(note) + 3 <= ROLE_WITH_NOTE_MAX:
+        if doc_role and note:
             role = '%s (%s)' % (doc_role, note)
         library.append({
             'kernel': name, 'family': o['family'], 'counterpart': o['counterpart'],

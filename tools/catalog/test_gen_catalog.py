@@ -171,11 +171,20 @@ class DocTest(unittest.TestCase):
     def test_links_and_code_are_plain_text(self):
         self.assertEqual(gen.clean_doc(['/** {@link #a} with `b` and {@code c}. */']), '#a with b and c.')
 
-    def test_first_sentence_is_cut_with_an_ellipsis(self):
+    def test_first_sentence_is_whole_however_long(self):
         self.assertEqual(gen.first_sentence('One. Two.'), 'One.')
-        long = 'x' * 300
-        self.assertEqual(gen.first_sentence(long), 'x' * (gen.ROLE_MAX - 3) + '\u2026')
-        self.assertEqual(gen.first_sentence('y' * gen.ROLE_MAX), 'y' * gen.ROLE_MAX)
+        long = 'x' * 400 + '.'
+        self.assertEqual(gen.first_sentence(long + ' More.'), long)
+        self.assertNotIn('\u2026', gen.first_sentence(long))
+
+    def test_the_note_follows_every_documented_role(self):
+        model = gen.build(REPO, os.path.join(HERE, 'retired.tsv'))
+        notes = {r['kernel']: r['note'] for r in gen.read_tsv(os.path.join(REPO, 'census/oracle-map.tsv'))}
+        for row in model['library']:
+            note = notes[row['kernel']]
+            if note:
+                self.assertTrue(row['role'] == note or row['role'].endswith('(%s)' % note), row['kernel'])
+            self.assertNotIn('\u2026', row['role'], row['kernel'])
 
 
 if __name__ == '__main__':
