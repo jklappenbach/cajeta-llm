@@ -25,6 +25,17 @@ WMMA GEMMs) and `model` (attention, primitives, embedding); the census tables
 and the llama.cpp oracle map are under `census/`
 ([census/README.md](census/README.md)).
 
+The catalog page is generated from those inputs; after a census refresh or a
+new kernel, regenerate it into the cajeta checkout and commit the page there:
+
+```
+python3 tools/catalog/gen-catalog.py ../cajeta/docs/kernels/catalog-llm.md
+python3 -m unittest discover -s tools/catalog   # the page matches the inputs
+```
+
+A census kernel that is in neither `oracle-map.tsv` nor the PROBE/EXTERNAL
+classes must have a row in `tools/catalog/retired.tsv`, or the generator stops.
+
 ## Related projects
 
 - **[cabra](../cajeta-cabra)** (`dev.cajeta.cabra`) — the resident-model
