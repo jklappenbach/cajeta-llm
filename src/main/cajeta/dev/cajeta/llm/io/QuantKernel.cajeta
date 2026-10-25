@@ -12908,6 +12908,7 @@ public final class QuantKernel {
     static int64 q4ColsR2Launches = 0L;
     static int64 q4ColsR2C4Launches = 0L;
     static int64 q4ColsG2Launches = 0L;
+    static int64 q4ColsR4Launches = 0L;
     static int64 q6ColsR2Launches = 0L;
     static int64 probeR2Ns = 0L;
     // The Q4_K verdict for the 4096-row shapes (q, o, down, k, v), probed at
@@ -12920,7 +12921,7 @@ public final class QuantKernel {
     static int64 q4ColsPlainNsS = 0L;
     static int64 q4ColsR2NsS = 0L;
 
-    /** Pin {@link #q4ColsVariant} and {@link #q4ColsSmallVariant} (1 prefetch, 2 plain, 3 two rows a wave, 4 two rows a two-wave group at up to four columns), or 0 to measure again. */
+    /** Pin {@link #q4ColsVariant} and {@link #q4ColsSmallVariant} (1 prefetch, 2 plain, 3 two rows a wave, 4 two rows a two-wave group, 5 four rows a wave; 4 and 5 serve up to four columns), or 0 to measure again. */
     public static void setQ4ColsPrefetch(int32 v) { QuantKernel.q4ColsPf = v; QuantKernel.q4ColsPfS = v; }
 
     /** Pin {@link #q6ColsVariant} (1 prefetch, 2 plain, 3 two rows a wave), or 0 to measure again. */
@@ -12952,6 +12953,9 @@ public final class QuantKernel {
 
     /** How many Q4_K Cols launches took the two-wave group kernel, pin 4 (15.2.12.3.9.6.4), this process. */
     public static int64 q4ColsTwoWaveLaunches() { return QuantKernel.q4ColsG2Launches; }
+
+    /** How many Q4_K Cols launches took the four-row kernel, pin 5 (15.2.12.3.9.6.5), this process. */
+    public static int64 q4ColsFourRowLaunches() { return QuantKernel.q4ColsR4Launches; }
 
     /** How many Q6_K Cols mat-vec launches took the two-row variant. */
     public static int64 q6ColsRowsLaunches() { return QuantKernel.q6ColsR2Launches; }
@@ -13064,19 +13068,25 @@ public final class QuantKernel {
                     block: [QuantKernel.waveRowBlock()])
                 (y, packed, xp, (uint32) rows, cols / 256L, yOff, acc,
                  (uint32) ncols, (uint32) yStride, (uint32) xpStride);
+        } else if (variant == 5 && ncols <= 4) {
+            q4kQ8WaveR4MatVecColsKernel.launch(s, grid: [QuantKernel.waveGrid((rows + 3L) / 4L)],
+                    block: [QuantKernel.waveRowBlock()])
+                (y, packed, xp, (uint32) rows, cols / 256L, yOff, acc,
+                 (uint32) ncols, (uint32) yStride, (uint32) xpStride);
+            QuantKernel.q4ColsR4Launches = QuantKernel.q4ColsR4Launches + 1L;
         } else if (variant == 4 && ncols <= 4) {
             q4kQ8WaveG2MatVecColsKernel.launch(s, grid: [(uint32) ((rows + 1L) / 2L)], block: [64])
                 (y, packed, xp, (uint32) rows, cols / 256L, yOff, acc,
                  (uint32) ncols, (uint32) yStride, (uint32) xpStride);
             QuantKernel.q4ColsG2Launches = QuantKernel.q4ColsG2Launches + 1L;
-        } else if ((variant == 3 || variant == 4) && ncols <= 4) {
+        } else if (variant >= 3 && variant <= 5 && ncols <= 4) {
             q4kQ8WaveR2C4MatVecColsKernel.launch(s, grid: [QuantKernel.waveGrid((rows + 1L) / 2L)],
                     block: [QuantKernel.waveRowBlock()])
                 (y, packed, xp, (uint32) rows, cols / 256L, yOff, acc,
                  (uint32) ncols, (uint32) yStride, (uint32) xpStride);
             QuantKernel.q4ColsR2Launches = QuantKernel.q4ColsR2Launches + 1L;
             QuantKernel.q4ColsR2C4Launches = QuantKernel.q4ColsR2C4Launches + 1L;
-        } else if (variant == 3 || variant == 4) {
+        } else if (variant >= 3 && variant <= 5) {
             q4kQ8WaveR2MatVecColsKernel.launch(s, grid: [QuantKernel.waveGrid((rows + 1L) / 2L)],
                     block: [QuantKernel.waveRowBlock()])
                 (y, packed, xp, (uint32) rows, cols / 256L, yOff, acc,
@@ -14862,6 +14872,260 @@ public final class QuantKernel {
                 if (ncols > 3) { y[o + 3L * st] = t3; }
             }
         }
+    }
+
+    /** {@link #q4kQ8WaveR2C4MatVecColsKernel} over four rows a wave: each column's activation is loaded
+     *  once for all four (15.2.12.3.9.6.5). Rows past the end are clamped and not stored; bit-identical
+     *  to the plain kernel, each lane keeping its row's block order. */
+    @Kernel
+    @Occupancy(maxThreads = 256)
+    public static void q4kQ8WaveR4MatVecColsKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum,
+            uint32 ncols, uint32 yStride, uint32 xpStride) {
+        uint32 xps = (xpStride >> 4) << 4;   // provably 16-aligned column offsets: see q4kQ8WaveR2MatVecColsKernel
+        uint32 wv = (uint32) Group.width();
+        uint32 lane = KernelThread.x() % wv;
+        uint32 row = (KernelThread.globalIdX() / wv) * 4;
+        uint32 rowB = row + 1;
+        uint32 rowC = row + 2;
+        uint32 rowD = row + 3;
+        uint32 bpr = (uint32) blocksPerRow;
+        uint32 rowBytes = bpr * 144;
+        float32 c0 = 0.0f;
+        float32 c1 = 0.0f;
+        float32 c2 = 0.0f;
+        float32 c3 = 0.0f;
+        float32 e0 = 0.0f;
+        float32 f0 = 0.0f;
+        float32 g0 = 0.0f;
+        float32 e1 = 0.0f;
+        float32 f1 = 0.0f;
+        float32 g1 = 0.0f;
+        float32 e2 = 0.0f;
+        float32 f2 = 0.0f;
+        float32 g2 = 0.0f;
+        float32 e3 = 0.0f;
+        float32 f3 = 0.0f;
+        float32 g3 = 0.0f;
+        if (row < rows) {
+            uint32 rb = row * rowBytes;
+            uint32 rB = rowB;
+            uint32 rC = rowC;
+            uint32 rD = rowD;
+            if (rB > rows - 1) { rB = rows - 1; }
+            if (rC > rows - 1) { rC = rows - 1; }
+            if (rD > rows - 1) { rD = rows - 1; }
+            uint32 rbB = rB * rowBytes;
+            uint32 rbC = rC * rowBytes;
+            uint32 rbD = rD * rowBytes;
+            int32 g = (int32) (lane % 4);
+            uint32 b = lane / 4;
+            int32 sh0 = 16 * (g & 1);
+            int32 sh1 = sh0 + 8;
+            uint32 stepB = wv / 4;
+            Vector<int8,16> nhv = packed.vload<16>((int64) (rb + b * 144));
+            Vector<int8,16> nhvB = packed.vload<16>((int64) (rbB + b * 144));
+            Vector<int8,16> nhvC = packed.vload<16>((int64) (rbC + b * 144));
+            Vector<int8,16> nhvD = packed.vload<16>((int64) (rbD + b * 144));
+            Vector<uint8,32> nraw = packed.vload<32>((int64) (rb + b * 144 + (uint32) (32 * g)) + 16L).asUnsigned();
+            Vector<uint8,32> nrawB = packed.vload<32>((int64) (rbB + b * 144 + (uint32) (32 * g)) + 16L).asUnsigned();
+            Vector<uint8,32> nrawC = packed.vload<32>((int64) (rbC + b * 144 + (uint32) (32 * g)) + 16L).asUnsigned();
+            Vector<uint8,32> nrawD = packed.vload<32>((int64) (rbD + b * 144 + (uint32) (32 * g)) + 16L).asUnsigned();
+            while (b < bpr) {
+                Vector<int8,16> hv = nhv;
+                Vector<int8,16> hvB = nhvB;
+                Vector<int8,16> hvC = nhvC;
+                Vector<int8,16> hvD = nhvD;
+                Vector<uint8,32> raw = nraw;
+                Vector<uint8,32> rawB = nrawB;
+                Vector<uint8,32> rawC = nrawC;
+                Vector<uint8,32> rawD = nrawD;
+                uint32 bn = b + stepB;
+                int32 inr = (((int32) bn - (int32) bpr) >> 31) & 1;
+                uint32 bl = b + (uint32) (inr * (int32) stepB);
+                nhv = packed.vload<16>((int64) (rb + bl * 144));
+                nhvB = packed.vload<16>((int64) (rbB + bl * 144));
+                nhvC = packed.vload<16>((int64) (rbC + bl * 144));
+                nhvD = packed.vload<16>((int64) (rbD + bl * 144));
+                nraw = packed.vload<32>((int64) (rb + bl * 144 + (uint32) (32 * g)) + 16L).asUnsigned();
+                nrawB = packed.vload<32>((int64) (rbB + bl * 144 + (uint32) (32 * g)) + 16L).asUnsigned();
+                nrawC = packed.vload<32>((int64) (rbC + bl * 144 + (uint32) (32 * g)) + 16L).asUnsigned();
+                nrawD = packed.vload<32>((int64) (rbD + bl * 144 + (uint32) (32 * g)) + 16L).asUnsigned();
+                float32 d = GgufFile.halfBitsToF32Branchless(((int32) hv[0] & 255)
+                    | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32Branchless(((int32) hv[2] & 255)
+                    | (((int32) hv[3] & 255) << 8));
+                Vector<int32,4> hw = hv.asWords();
+                int32 scw = hw[1];
+                int32 mnw = hw[2];
+                int32 hiw = hw[3];
+                int32 sA = (scw >> sh0) & 255;
+                int32 sB = (scw >> sh1) & 255;
+                int32 mC = (mnw >> sh0) & 255;
+                int32 mD = (mnw >> sh1) & 255;
+                int32 sc0 = sA & 63;
+                int32 sc1 = sB & 63;
+                int32 mn0 = mC & 63;
+                int32 mn1 = mD & 63;
+                if (g >= 2) {
+                    int32 k0 = (hiw >> sh0) & 255;
+                    int32 k1 = (hiw >> sh1) & 255;
+                    sc0 = (k0 & 15) | ((sA >> 2) & 48);
+                    sc1 = (k1 & 15) | ((sB >> 2) & 48);
+                    mn0 = (k0 >> 4) | ((mC >> 2) & 48);
+                    mn1 = (k1 >> 4) | ((mD >> 2) & 48);
+                }
+                Vector<int32,8> rv = raw.asWords();
+                Vector<uint8,32> lo = (rv & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hi = ((rv >> 4) & 252645135).asBytes().asUnsigned();
+                float32 dB = GgufFile.halfBitsToF32Branchless(((int32) hvB[0] & 255)
+                    | (((int32) hvB[1] & 255) << 8));
+                float32 dC = GgufFile.halfBitsToF32Branchless(((int32) hvC[0] & 255)
+                    | (((int32) hvC[1] & 255) << 8));
+                float32 dD = GgufFile.halfBitsToF32Branchless(((int32) hvD[0] & 255)
+                    | (((int32) hvD[1] & 255) << 8));
+                float32 dminB = GgufFile.halfBitsToF32Branchless(((int32) hvB[2] & 255)
+                    | (((int32) hvB[3] & 255) << 8));
+                float32 dminC = GgufFile.halfBitsToF32Branchless(((int32) hvC[2] & 255)
+                    | (((int32) hvC[3] & 255) << 8));
+                float32 dminD = GgufFile.halfBitsToF32Branchless(((int32) hvD[2] & 255)
+                    | (((int32) hvD[3] & 255) << 8));
+                Vector<int32,4> hwB = hvB.asWords();
+                Vector<int32,4> hwC = hvC.asWords();
+                Vector<int32,4> hwD = hvD.asWords();
+                int32 scwB = hwB[1];
+                int32 scwC = hwC[1];
+                int32 scwD = hwD[1];
+                int32 mnwB = hwB[2];
+                int32 mnwC = hwC[2];
+                int32 mnwD = hwD[2];
+                int32 hiwB = hwB[3];
+                int32 hiwC = hwC[3];
+                int32 hiwD = hwD[3];
+                int32 sAB = (scwB >> sh0) & 255;
+                int32 sAC = (scwC >> sh0) & 255;
+                int32 sAD = (scwD >> sh0) & 255;
+                int32 sBB = (scwB >> sh1) & 255;
+                int32 sBC = (scwC >> sh1) & 255;
+                int32 sBD = (scwD >> sh1) & 255;
+                int32 mCB = (mnwB >> sh0) & 255;
+                int32 mCC = (mnwC >> sh0) & 255;
+                int32 mCD = (mnwD >> sh0) & 255;
+                int32 mDB = (mnwB >> sh1) & 255;
+                int32 mDC = (mnwC >> sh1) & 255;
+                int32 mDD = (mnwD >> sh1) & 255;
+                int32 sc0B = sAB & 63;
+                int32 sc0C = sAC & 63;
+                int32 sc0D = sAD & 63;
+                int32 sc1B = sBB & 63;
+                int32 sc1C = sBC & 63;
+                int32 sc1D = sBD & 63;
+                int32 mn0B = mCB & 63;
+                int32 mn0C = mCC & 63;
+                int32 mn0D = mCD & 63;
+                int32 mn1B = mDB & 63;
+                int32 mn1C = mDC & 63;
+                int32 mn1D = mDD & 63;
+                if (g >= 2) {
+                    int32 k0B = (hiwB >> sh0) & 255;
+                    int32 k0C = (hiwC >> sh0) & 255;
+                    int32 k0D = (hiwD >> sh0) & 255;
+                    int32 k1B = (hiwB >> sh1) & 255;
+                    int32 k1C = (hiwC >> sh1) & 255;
+                    int32 k1D = (hiwD >> sh1) & 255;
+                    sc0B = (k0B & 15) | ((sAB >> 2) & 48);
+                    sc0C = (k0C & 15) | ((sAC >> 2) & 48);
+                    sc0D = (k0D & 15) | ((sAD >> 2) & 48);
+                    sc1B = (k1B & 15) | ((sBB >> 2) & 48);
+                    sc1C = (k1C & 15) | ((sBC >> 2) & 48);
+                    sc1D = (k1D & 15) | ((sBD >> 2) & 48);
+                    mn0B = (k0B >> 4) | ((mCB >> 2) & 48);
+                    mn0C = (k0C >> 4) | ((mCC >> 2) & 48);
+                    mn0D = (k0D >> 4) | ((mCD >> 2) & 48);
+                    mn1B = (k1B >> 4) | ((mDB >> 2) & 48);
+                    mn1C = (k1C >> 4) | ((mDC >> 2) & 48);
+                    mn1D = (k1D >> 4) | ((mDD >> 2) & 48);
+                }
+                Vector<int32,8> rvB = rawB.asWords();
+                Vector<int32,8> rvC = rawC.asWords();
+                Vector<int32,8> rvD = rawD.asWords();
+                Vector<uint8,32> loB = (rvB & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> loC = (rvC & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> loD = (rvD & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hiB = ((rvB >> 4) & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hiC = ((rvC >> 4) & 252645135).asBytes().asUnsigned();
+                Vector<uint8,32> hiD = ((rvD >> 4) & 252645135).asBytes().asUnsigned();
+                uint32 xo = b * 320 + (uint32) (64 * g);
+                uint32 xr = b * 320 + 288;
+                uint32 xq = b * 320 + 256 + (uint32) (8 * g);
+                {
+                    uint32 xo0 = xo;
+                    uint32 xr0 = xr;
+                    Vector<int8,32> a00 = xp.vload<32>((int64) xo0);
+                    Vector<int8,32> a01 = xp.vload<32>((int64) xo0 + 32L);
+                    Vector<int8,4> v0 = xp.vload<4>((int64) xr0);
+                    Vector<int32,2> q0w = xp.vload<8>((int64) (xq)).asWords();
+                    float32 x0 = Cajeta.bitsToF32(((int32) v0[0] & 255) | (((int32) v0[1] & 255) << 8)
+                        | (((int32) v0[2] & 255) << 16) | (((int32) v0[3] & 255) << 24));
+                    c0 = QuantKernel.q4kColDot(c0, a00, a01, x0, q0w[0], q0w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e0 = QuantKernel.q4kColDot(e0, a00, a01, x0, q0w[0], q0w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    f0 = QuantKernel.q4kColDot(f0, a00, a01, x0, q0w[0], q0w[1], loC, hiC, sc0C, sc1C, mn0C, mn1C, dC, dminC);
+                    g0 = QuantKernel.q4kColDot(g0, a00, a01, x0, q0w[0], q0w[1], loD, hiD, sc0D, sc1D, mn0D, mn1D, dD, dminD);
+                }
+                if (ncols > 1) {
+                    uint32 xo1 = xo + xps;
+                    uint32 xr1 = xr + xps;
+                    Vector<int8,32> a10 = xp.vload<32>((int64) xo1);
+                    Vector<int8,32> a11 = xp.vload<32>((int64) xo1 + 32L);
+                    Vector<int8,4> v1 = xp.vload<4>((int64) xr1);
+                    Vector<int32,2> q1w = xp.vload<8>((int64) (xq + xps)).asWords();
+                    float32 x1 = Cajeta.bitsToF32(((int32) v1[0] & 255) | (((int32) v1[1] & 255) << 8)
+                        | (((int32) v1[2] & 255) << 16) | (((int32) v1[3] & 255) << 24));
+                    c1 = QuantKernel.q4kColDot(c1, a10, a11, x1, q1w[0], q1w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e1 = QuantKernel.q4kColDot(e1, a10, a11, x1, q1w[0], q1w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    f1 = QuantKernel.q4kColDot(f1, a10, a11, x1, q1w[0], q1w[1], loC, hiC, sc0C, sc1C, mn0C, mn1C, dC, dminC);
+                    g1 = QuantKernel.q4kColDot(g1, a10, a11, x1, q1w[0], q1w[1], loD, hiD, sc0D, sc1D, mn0D, mn1D, dD, dminD);
+                }
+                if (ncols > 2) {
+                    uint32 xo2 = xo + 2 * xps;
+                    uint32 xr2 = xr + 2 * xps;
+                    Vector<int8,32> a20 = xp.vload<32>((int64) xo2);
+                    Vector<int8,32> a21 = xp.vload<32>((int64) xo2 + 32L);
+                    Vector<int8,4> v2 = xp.vload<4>((int64) xr2);
+                    Vector<int32,2> q2w = xp.vload<8>((int64) (xq + 2 * xps)).asWords();
+                    float32 x2 = Cajeta.bitsToF32(((int32) v2[0] & 255) | (((int32) v2[1] & 255) << 8)
+                        | (((int32) v2[2] & 255) << 16) | (((int32) v2[3] & 255) << 24));
+                    c2 = QuantKernel.q4kColDot(c2, a20, a21, x2, q2w[0], q2w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e2 = QuantKernel.q4kColDot(e2, a20, a21, x2, q2w[0], q2w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    f2 = QuantKernel.q4kColDot(f2, a20, a21, x2, q2w[0], q2w[1], loC, hiC, sc0C, sc1C, mn0C, mn1C, dC, dminC);
+                    g2 = QuantKernel.q4kColDot(g2, a20, a21, x2, q2w[0], q2w[1], loD, hiD, sc0D, sc1D, mn0D, mn1D, dD, dminD);
+                }
+                if (ncols > 3) {
+                    uint32 xo3 = xo + 3 * xps;
+                    uint32 xr3 = xr + 3 * xps;
+                    Vector<int8,32> a30 = xp.vload<32>((int64) xo3);
+                    Vector<int8,32> a31 = xp.vload<32>((int64) xo3 + 32L);
+                    Vector<int8,4> v3 = xp.vload<4>((int64) xr3);
+                    Vector<int32,2> q3w = xp.vload<8>((int64) (xq + 3 * xps)).asWords();
+                    float32 x3 = Cajeta.bitsToF32(((int32) v3[0] & 255) | (((int32) v3[1] & 255) << 8)
+                        | (((int32) v3[2] & 255) << 16) | (((int32) v3[3] & 255) << 24));
+                    c3 = QuantKernel.q4kColDot(c3, a30, a31, x3, q3w[0], q3w[1], lo, hi, sc0, sc1, mn0, mn1, d, dmin);
+                    e3 = QuantKernel.q4kColDot(e3, a30, a31, x3, q3w[0], q3w[1], loB, hiB, sc0B, sc1B, mn0B, mn1B, dB, dminB);
+                    f3 = QuantKernel.q4kColDot(f3, a30, a31, x3, q3w[0], q3w[1], loC, hiC, sc0C, sc1C, mn0C, mn1C, dC, dminC);
+                    g3 = QuantKernel.q4kColDot(g3, a30, a31, x3, q3w[0], q3w[1], loD, hiD, sc0D, sc1D, mn0D, mn1D, dD, dminD);
+                }
+                b = bn;
+            }
+        }
+        QuantKernel.colsStore(y, row, rows, yOff, yStride, accum, ncols, lane,
+            c0, c1, c2, c3, 0.0f, 0.0f, 0.0f, 0.0f);
+        QuantKernel.colsStore(y, rowB, rows, yOff, yStride, accum, ncols, lane,
+            e0, e1, e2, e3, 0.0f, 0.0f, 0.0f, 0.0f);
+        QuantKernel.colsStore(y, rowC, rows, yOff, yStride, accum, ncols, lane,
+            f0, f1, f2, f3, 0.0f, 0.0f, 0.0f, 0.0f);
+        QuantKernel.colsStore(y, rowD, rows, yOff, yStride, accum, ncols, lane,
+            g0, g1, g2, g3, 0.0f, 0.0f, 0.0f, 0.0f);
     }
 
     /** Reduce each column's lane partials over the wave and store them from lane 0. */
