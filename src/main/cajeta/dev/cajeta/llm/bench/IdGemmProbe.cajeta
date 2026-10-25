@@ -1,0 +1,278 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.Integer;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.TcTile;
+import dev.cajeta.llm.io.IdBatch;
+import dev.cajeta.llm.io.IdShape;
+import dev.cajeta.llm.io.WmmaKernel;
+
+/**
+ * cajeta-llm 15.2.15.4.2: the multi-wave id GEMM at the 30B's expert
+ * shape, timed in bursts, so a kernel variant is measured in seconds
+ * rather than a prefill. Synthesized slabs (deterministic bytes, finite
+ * half scales), `rows` selections spread evenly over the experts in
+ * group-major order, the 64-row chunk maps the engine builds.
+ *
+ *   IdGemmProbe [outDim cols experts rows perExpert]
+ *
+ * Defaults are Qwen3-Coder-30B-A3B's gate/up bank at a 512-token
+ * prefill: 768 x 2048, 128 experts, 4096 selections (32 an expert).
+ * Prints ns a launch (median of nine bursts of eight) and the weight
+ * bytes the launch reads, for Q4_K (144 B a block) and Q5_K (176 B).
+ */
+public class IdGemmProbe {
+
+    static int64 median(int64[] v, int32 n) {
+        int32 i = 1;
+        while (i < n) {
+            int64 x = v[i];
+            int32 j = i - 1;
+            while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j = j - 1; }
+            v[j + 1] = x;
+            i = i + 1;
+        }
+        return v[n / 2];
+    }
+
+    static #KernelBuffer<int8> slab(int32 ty, int64 outDim, int64 cols, int64 experts) {
+        int64 bb = ty == Quant.GG_Q5_K ? 176L : 144L;
+        int64 total = experts * outDim * (cols / 256L) * bb;
+        int8[] raw = heap int8[total];
+        int64 i = 0;
+        while (i < total) {
+            int64 off = i % bb;
+            int64 blk = i / bb;
+            if (off == 1L) {
+                raw[i] = (int8) 44;     // d: a small finite half
+            } else if (off == 3L) {
+                raw[i] = (int8) 40;     // dmin
+            } else if (off == 0L || off == 2L) {
+                raw[i] = (int8) ((blk * 37L + off * 11L) % 256L);
+            } else {
+                raw[i] = (int8) ((i * 131L + 17L) % 256L);
+            }
+            i = i + 1;
+        }
+        KernelBuffer<int8> d #= heap KernelBuffer<int8>((uint64) (total + 4L));
+        d.upload(raw, total);
+        return #d;
+    }
+
+    static #KernelBuffer<int8> acts(int64 rows, int64 cols) {
+        int64 npp = rows + 64L;
+        float32[] xv = heap float32[npp * cols];
+        int64 i = 0;
+        while (i < npp * cols) {
+            xv[i] = (float32) ((i % 25) - 12) / 64.0f + (float32) (i % 7) * 0.01f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> xf #= heap KernelBuffer<float32>((uint64) (npp * cols));
+        xf.upload(xv, npp * cols);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) ((npp * cols / 256L) * 320L));
+        QuantKernel.q8kPackLaunchNoSync(xp, xf, npp * cols);
+        return #xp;
+    }
+
+    static int64 burst(int32 ty, int32 mode, KernelBuffer<float32> y, KernelBuffer<int8> s,
+            KernelBuffer<int32> sW, KernelBuffer<int8> xp, KernelBuffer<int32> e64,
+            KernelBuffer<int32> t64, KernelBuffer<int32> m64, KernelBuffer<int32> meta,
+            int64 nMax, int64 outDim, int64 cols) {
+        KernelStream st = QuantKernel.stream();
+        st.sync();
+        int64 t0 = Clock.nanoTime();
+        int32 k = 0;
+        while (k < 8) {
+            if (mode == 1) {
+                WmmaKernel.q4kIdWideLaunchNoSync(y, s, sW, xp, e64, t64, m64, meta,
+                    nMax, outDim, cols, outDim);
+            } else if (ty == Quant.GG_Q5_K) {
+                WmmaKernel.q5kWmmaIdMwLaunchNoSync(y, s, sW, xp, e64, t64, m64, meta,
+                    nMax, outDim, cols, outDim);
+            } else {
+                WmmaKernel.q4kWmmaIdMwLaunchNoSync(y, s, sW, xp, e64, t64, m64, meta,
+                    nMax, outDim, cols, outDim);
+            }
+            k = k + 1;
+        }
+        st.sync();
+        return (Clock.nanoTime() - t0) / 8L;
+    }
+
+    public static void run(String[] args) {
+        int64 outDim = 768L;
+        int64 cols = 2048L;
+        int64 experts = 128L;
+        int64 rows = 4096L;
+        if (args.count() >= 4) {
+            outDim = (int64) Integer.parseInt(args[0]);
+            cols = (int64) Integer.parseInt(args[1]);
+            experts = (int64) Integer.parseInt(args[2]);
+            rows = (int64) Integer.parseInt(args[3]);
+        }
+        int64 per = rows / experts;
+        // Group-major maps: expert e owns rows [e*per, (e+1)*per), chunked by 64.
+        int64 chunksPer = (per + 63L) / 64L;
+        int32 n64 = (int32) (experts * chunksPer);
+        int32[] mE = heap int32[n64];
+        int32[] mT0 = heap int32[n64];
+        int32[] mM1 = heap int32[n64];
+        int32 nT = 0;
+        int64 e = 0;
+        while (e < experts) {
+            int64 c = 0;
+            while (c < chunksPer) {
+                mE[nT] = (int32) e;
+                mT0[nT] = (int32) (e * per + c * 64L);
+                mM1[nT] = (int32) ((e + 1L) * per);
+                nT = nT + 1;
+                c = c + 1;
+            }
+            e = e + 1;
+        }
+        int64 chunks128 = (per + 127L) / 128L;
+        int32 n128 = (int32) (experts * chunks128);
+        int32[] mE8 = heap int32[n128];
+        int32[] mT8 = heap int32[n128];
+        int32[] mM8 = heap int32[n128];
+        int32 nT8 = 0;
+        e = 0;
+        while (e < experts) {
+            int64 c = 0;
+            while (c < chunks128) {
+                mE8[nT8] = (int32) e;
+                mT8[nT8] = (int32) (e * per + c * 128L);
+                mM8[nT8] = (int32) ((e + 1L) * per);
+                nT8 = nT8 + 1;
+                c = c + 1;
+            }
+            e = e + 1;
+        }
+        KernelBuffer<int32> e128 #= heap KernelBuffer<int32>((uint64) n128);
+        KernelBuffer<int32> t128 #= heap KernelBuffer<int32>((uint64) n128);
+        KernelBuffer<int32> m128 #= heap KernelBuffer<int32>((uint64) n128);
+        e128.upload(mE8, (int64) n128);
+        t128.upload(mT8, (int64) n128);
+        m128.upload(mM8, (int64) n128);
+        KernelBuffer<int32> e64 #= heap KernelBuffer<int32>((uint64) n64);
+        KernelBuffer<int32> t64 #= heap KernelBuffer<int32>((uint64) n64);
+        KernelBuffer<int32> m64 #= heap KernelBuffer<int32>((uint64) n64);
+        e64.upload(mE, (int64) n64);
+        t64.upload(mT0, (int64) n64);
+        m64.upload(mM1, (int64) n64);
+        int32[] metaH = heap int32[4];
+        metaH[0] = n64;
+        metaH[1] = n128;
+        KernelBuffer<int32> meta #= heap KernelBuffer<int32>((uint64) 4);
+        meta.upload(metaH, 4L);
+        int64 nMax = (int64) n64;
+        KernelBuffer<int8> xp #= IdGemmProbe.acts(rows, cols);
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) ((rows + 64L) * outDim));
+        System.stdout.println("shape " + outDim + "x" + cols + " experts " + experts
+            + " rows " + rows + " (" + per + " an expert, " + n64 + " chunks)");
+        int32 which = 0;
+        while (which < 3) {
+            int32 ty = which == 2 ? Quant.GG_Q5_K : Quant.GG_Q4_K;
+            int32 mode = which == 1 ? 1 : 0;
+            String nm = which == 0 ? "q4kWmmaIdMwKernel" : (which == 1 ? WmmaKernel.ID_WIDE_KERNEL : "q5kWmmaIdMwKernel");
+            KernelBuffer<int32> eM = mode == 1 ? e128 : e64;
+            KernelBuffer<int32> tM = mode == 1 ? t128 : t64;
+            KernelBuffer<int32> mM = mode == 1 ? m128 : m64;
+            int64 nMaxM = mode == 1 ? (int64) n128 : nMax;
+            KernelBuffer<int8> s #= IdGemmProbe.slab(ty, outDim, cols, experts);
+            KernelBuffer<int32> sW #= s.wordView();
+            int64 bb = ty == Quant.GG_Q5_K ? 176L : 144L;
+            // Weight bytes a launch touches: every expert with rows, whole.
+            int64 wBytes = experts * outDim * (cols / 256L) * bb;
+            // Warm, then nine bursts.
+            IdGemmProbe.burst(ty, mode, y, s, sW, xp, eM, tM, mM, meta, nMaxM, outDim, cols);
+            int64[] v = heap int64[9];
+            int32 r = 0;
+            while (r < 9) {
+                v[r] = IdGemmProbe.burst(ty, mode, y, s, sW, xp, eM, tM, mM, meta, nMaxM, outDim, cols);
+                r = r + 1;
+            }
+            int64 med = IdGemmProbe.median(v, 9);
+            int64 gbs = wBytes / (med < 1L ? 1L : med);
+            System.stdout.println(nm + ": " + (med / 1000L) + " us a launch (min "
+                + (v[0] / 1000L) + "), weights " + (wBytes / 1048576L) + " MiB -> "
+                + gbs + " GB/s");
+            which = which + 1;
+        }
+        // The Q5_K Id family's members over the batch's maps.
+        {
+            KernelBuffer<int8> s5i #= IdGemmProbe.slab(Quant.GG_Q5_K, outDim, cols, experts);
+            KernelBuffer<int32> s5iW #= s5i.wordView();
+            IdBatch b #= heap IdBatch(xp, e64, t64, m64, e128, t128, m128, meta,
+                (int64) n64, (int64) n128, rows, experts);
+            int64 wBytesI = experts * outDim * (cols / 256L) * 176L;
+            int32 nm = (int32) WmmaKernel.id5Family().shapes().count();
+            int32 mi = 0;
+            while (mi < nm) {
+                IdShape sh = WmmaKernel.id5Family().shapes().get(mi);
+                String kn #= sh.kernel();
+                KernelStream st = QuantKernel.stream();
+                sh.launch(y, s5i, s5iW, b, outDim, cols, outDim);
+                st.sync();
+                int64[] v = heap int64[9];
+                int32 r = 0;
+                while (r < 9) {
+                    st.sync();
+                    int64 t0 = Clock.nanoTime();
+                    int32 k = 0;
+                    while (k < 8) {
+                        sh.launch(y, s5i, s5iW, b, outDim, cols, outDim);
+                        k = k + 1;
+                    }
+                    st.sync();
+                    v[r] = (Clock.nanoTime() - t0) / 8L;
+                    r = r + 1;
+                }
+                int64 med = IdGemmProbe.median(v, 9);
+                System.stdout.println(kn + ": " + (med / 1000L) + " us a launch (min "
+                    + (v[0] / 1000L) + "), weights " + (wBytesI / 1048576L) + " MiB -> "
+                    + (wBytesI / (med < 1L ? 1L : med)) + " GB/s");
+                mi = mi + 1;
+            }
+        }
+        // The dense Q5_K tile on the equivalent problem: every expert at the
+        // same fill, the slab read as one (experts * outDim)-row weight. What
+        // the LDS-staged, prefetching design pays for this weight stream.
+        KernelBuffer<int8> s5 #= IdGemmProbe.slab(Quant.GG_Q5_K, outDim, cols, experts);
+        int64 wBytes5 = experts * outDim * (cols / 256L) * 176L;
+        int64 dr = 64L;
+        while (dr <= 128L) {
+            KernelBuffer<float32> yd #= heap KernelBuffer<float32>((uint64) (dr * experts * outDim));
+            KernelStream st = QuantKernel.stream();
+            TcTile.q5kQ8TcTileLaunchNoSync(yd, s5, xp, dr, experts * outDim, cols);
+            st.sync();
+            int64[] v = heap int64[9];
+            int32 r = 0;
+            while (r < 9) {
+                st.sync();
+                int64 t0 = Clock.nanoTime();
+                int32 k = 0;
+                while (k < 8) {
+                    TcTile.q5kQ8TcTileLaunchNoSync(yd, s5, xp, dr, experts * outDim, cols);
+                    k = k + 1;
+                }
+                st.sync();
+                v[r] = (Clock.nanoTime() - t0) / 8L;
+                r = r + 1;
+            }
+            int64 med = IdGemmProbe.median(v, 9);
+            String kn #= TcTile.lastQ5Kernel();
+            System.stdout.println("dense " + kn + " at " + dr + "x" + (experts * outDim) + "x" + cols
+                + ": " + (med / 1000L) + " us a launch (min " + (v[0] / 1000L) + "), weights "
+                + (wBytes5 / 1048576L) + " MiB -> " + (wBytes5 / (med < 1L ? 1L : med)) + " GB/s");
+            dr = dr * 2L;
+        }
+        return;
+    }
+}

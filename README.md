@@ -9,6 +9,22 @@ llama.cpp supplies the architecture reference; none of its code is reused —
 cajeta's `@Native` marshals no C structs or callbacks, so the engine is
 written against `cajeta.math.Tensor` + `cajeta.xpu` end to end.
 
+## Kernels
+
+Every device kernel the engine ships, how the families serve decode, prefill,
+batched decode, mixture-of-experts and attention, how a kernel is chosen for a
+weight format and a batch shape on the device the process landed on, and what
+is measured at load and per problem: the website's
+[Language models on the device](https://cajeta.dev/kernels/llm/) and the
+complete [catalog](https://cajeta.dev/kernels/catalog-llm/), one row per
+registered kernel with its source, its llama.cpp counterpart and its census
+standing on each backend. The machinery underneath is
+[One kernel, any device](https://cajeta.dev/kernels/). In this repository the
+sources are `src/main/cajeta/dev/cajeta/llm/io` (quantised kernels, tiles,
+WMMA GEMMs) and `model` (attention, primitives, embedding); the census tables
+and the llama.cpp oracle map are under `census/`
+([census/README.md](census/README.md)).
+
 ## Related projects
 
 - **[cabra](../cajeta-cabra)** (`dev.cajeta.cabra`) — the resident-model
@@ -24,37 +40,17 @@ written against `cajeta.math.Tensor` + `cajeta.xpu` end to end.
 
 Design and plan live in the cajeta workspace:
 `specs/cajeta-llm-spec.md` (requirements + decisions) and
-`agents/cajeta-llm-plan.md` (19 units, dependency-ordered). Units 1–4, 10
-and 17 are stdlib work in the `cajeta` repo; this repo is the engine
-(Units 5–16, 18–19).
+`agents/cajeta-llm-plan.md` (dependency-ordered units; the early stdlib units
+landed in the `cajeta` repo, the engine here).
 
-## Status
+## Documentation
 
-| Area | State |
-|------|-------|
-| Safetensors loading (mmap-backed, native dtype, sharded) | Unit 5 — in progress |
-| Tape-free forward path | Unit 6 — pending |
-| Transformer primitives, ragged attention | Unit 7 — pending |
-| Paged KV cache, scheduler, prefix store | Units 8–11 — pending |
-| Tokenizer, chat templates, sampling | Units 12–14 — pending |
-| GGUF + k-quants | Units 16, 18 — pending |
-| Parity + perf gates (vs transformers / llama.cpp) | Unit 15 — pending |
-
-## Targets
-
-Llama 3.x, Mistral, Qwen2/3, Gemma 3 (text). Perf gates: decode ≥60% /
-prefill ≥50% of llama.cpp on Llama-3.1-8B-Instruct Q4_K_M at gfx1151/ROCm,
-measured baseline first.
-
-Measured 2026-10-01 on an RTX 4090 (sm_89, WSL2), Llama-3.1-8B-Instruct
-Q4_K_M, interleaved with llama-bench on the same minute because the box's
-GPU clock is bimodal: decode (tg128) cajeta 164.9 to 165.5 tokens a second
-against llama-bench's 155.5 to 166.3 over four pairs; the token is 6.05 ms
-of device time with the host hidden behind it (the deferred stream replays
-a token as one CUDA graph, the decode token's embedding row is decoded on
-the device, and step N+1 is queued before step N's argmax is read:
-`bench/EndToEnd`). Prefill (pp512) is 3.7k tokens a second against 11.5k
-and is the batched route's open item.
+The user documentation is on the website: [Language models](https://cajeta.dev/llm/)
+(quickstart, the engine API, models and formats, inside the engine,
+configuration, running and serving with cabra, measuring and where it stands
+against llama.cpp). Status is kept there; the plan
+(`agents/cajeta-llm-plan.md` in the cajeta workspace) is the record of what
+is done and open.
 
 ## Building
 
