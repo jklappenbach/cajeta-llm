@@ -12907,6 +12907,7 @@ public final class QuantKernel {
     static int64 q6ColsR2Ns = 0L;
     static int64 q4ColsR2Launches = 0L;
     static int64 q4ColsR2C4Launches = 0L;
+    static int64 q4ColsG2Launches = 0L;
     static int64 q6ColsR2Launches = 0L;
     static int64 probeR2Ns = 0L;
     // The Q4_K verdict for the 4096-row shapes (q, o, down, k, v), probed at
@@ -12919,7 +12920,7 @@ public final class QuantKernel {
     static int64 q4ColsPlainNsS = 0L;
     static int64 q4ColsR2NsS = 0L;
 
-    /** Pin {@link #q4ColsVariant} and {@link #q4ColsSmallVariant} (1 prefetch, 2 plain, 3 two rows a wave), or 0 to measure again. */
+    /** Pin {@link #q4ColsVariant} and {@link #q4ColsSmallVariant} (1 prefetch, 2 plain, 3 two rows a wave, 4 two rows a two-wave group at up to four columns), or 0 to measure again. */
     public static void setQ4ColsPrefetch(int32 v) { QuantKernel.q4ColsPf = v; QuantKernel.q4ColsPfS = v; }
 
     /** Pin {@link #q6ColsVariant} (1 prefetch, 2 plain, 3 two rows a wave), or 0 to measure again. */
@@ -12948,6 +12949,9 @@ public final class QuantKernel {
 
     /** How many two-row Q4_K Cols launches took the four-column kernel (15.2.12.3.9.6), this process. */
     public static int64 q4ColsRowsC4Launches() { return QuantKernel.q4ColsR2C4Launches; }
+
+    /** How many Q4_K Cols launches took the two-wave group kernel, pin 4 (15.2.12.3.9.6.4), this process. */
+    public static int64 q4ColsTwoWaveLaunches() { return QuantKernel.q4ColsG2Launches; }
 
     /** How many Q6_K Cols mat-vec launches took the two-row variant. */
     public static int64 q6ColsRowsLaunches() { return QuantKernel.q6ColsR2Launches; }
@@ -13060,14 +13064,19 @@ public final class QuantKernel {
                     block: [QuantKernel.waveRowBlock()])
                 (y, packed, xp, (uint32) rows, cols / 256L, yOff, acc,
                  (uint32) ncols, (uint32) yStride, (uint32) xpStride);
-        } else if (variant == 3 && ncols <= 4) {
+        } else if (variant == 4 && ncols <= 4) {
+            q4kQ8WaveG2MatVecColsKernel.launch(s, grid: [(uint32) ((rows + 1L) / 2L)], block: [64])
+                (y, packed, xp, (uint32) rows, cols / 256L, yOff, acc,
+                 (uint32) ncols, (uint32) yStride, (uint32) xpStride);
+            QuantKernel.q4ColsG2Launches = QuantKernel.q4ColsG2Launches + 1L;
+        } else if ((variant == 3 || variant == 4) && ncols <= 4) {
             q4kQ8WaveR2C4MatVecColsKernel.launch(s, grid: [QuantKernel.waveGrid((rows + 1L) / 2L)],
                     block: [QuantKernel.waveRowBlock()])
                 (y, packed, xp, (uint32) rows, cols / 256L, yOff, acc,
                  (uint32) ncols, (uint32) yStride, (uint32) xpStride);
             QuantKernel.q4ColsR2Launches = QuantKernel.q4ColsR2Launches + 1L;
             QuantKernel.q4ColsR2C4Launches = QuantKernel.q4ColsR2C4Launches + 1L;
-        } else if (variant == 3) {
+        } else if (variant == 3 || variant == 4) {
             q4kQ8WaveR2MatVecColsKernel.launch(s, grid: [QuantKernel.waveGrid((rows + 1L) / 2L)],
                     block: [QuantKernel.waveRowBlock()])
                 (y, packed, xp, (uint32) rows, cols / 256L, yOff, acc,
@@ -14651,6 +14660,208 @@ public final class QuantKernel {
             c0, c1, c2, c3, 0.0f, 0.0f, 0.0f, 0.0f);
         QuantKernel.colsStore(y, rowB, rows, yOff, yStride, accum, ncols, lane,
             e0, e1, e2, e3, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    /** One lane's 16-weight slice of a Q4_K sub-block against one packed q8_K column, added to `acc`:
+     *  `q` the slice's nibbles, `a` the column's 16 activations, `asum` their sum, `xs` the column's
+     *  scale, `sc`/`mn` the sub-block's scale and minimum (15.2.12.3.9.6.4). */
+    @Device
+    static float32 q4kSliceDot(float32 acc, Vector<uint8,16> q, Vector<int8,16> a, int32 asum,
+            float32 xs, int32 sc, int32 mn, float32 d, float32 dmin) {
+        int32 sumi = q.dotSum(a, 0) * sc;
+        int32 dmins = asum * mn;
+        return acc + d * xs * (float32) sumi - dmin * xs * (float32) dmins;
+    }
+
+    /**
+     * Q4_K x q8_K for up to four columns, llama.cpp's mat-vec geometry: a 64-thread group takes two
+     * rows, 16 lanes take one 256-weight block (each lane 16 consecutive weights: half a sub-block,
+     * one 16-byte load), so a group covers four blocks a trip and both waves stream the same two rows;
+     * each wave reduces its partials and the two meet in shared memory. The integer sums are the
+     * one-column kernel's; the float order is not, so it is judged within reassociation
+     * (15.2.12.3.9.6.4). Row 2w + 1 past the end is clamped and not stored.
+     */
+    @Kernel
+    @Occupancy(maxThreads = 64)
+    public static void q4kQ8WaveG2MatVecColsKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum,
+            uint32 ncols, uint32 yStride, uint32 xpStride) {
+        uint32 xps = (xpStride >> 4) << 4;   // provably 16-aligned column offsets: see q4kQ8WaveR2MatVecColsKernel
+        Shared<float32> red = shared float32[16];
+        uint32 tid = KernelThread.x();          // 0..63
+        uint32 wv = (uint32) Group.width();
+        uint32 lane = tid % wv;
+        uint32 wave = tid / wv;
+        uint32 row = Workgroup.x() * 2;
+        uint32 rowB = row + 1;
+        uint32 bpr = (uint32) blocksPerRow;
+        uint32 rowBytes = bpr * 144;
+        float32 c0 = 0.0f;
+        float32 c1 = 0.0f;
+        float32 c2 = 0.0f;
+        float32 c3 = 0.0f;
+        float32 e0 = 0.0f;
+        float32 e1 = 0.0f;
+        float32 e2 = 0.0f;
+        float32 e3 = 0.0f;
+        if (row < rows) {
+            uint32 rb = row * rowBytes;
+            uint32 rB = rowB;
+            if (rB > rows - 1) { rB = rows - 1; }
+            uint32 rbB = rB * rowBytes;
+            uint32 il = tid % 16;                 // lane within the block
+            uint32 s = il / 2;                    // the sub-block, 0..7
+            uint32 h = il % 2;                    // which 16-weight half of it
+            int32 g = (int32) (s / 2);            // the 32-byte nibble chunk
+            int32 shn = 4 * (int32) (s % 2);      // low nibbles for an even sub-block, high for an odd
+            int32 odd = (int32) (s % 2);
+            int32 sh0 = 16 * (g & 1);
+                int32 upper = (g >> 1) & 1;           // sub-blocks 4..7 keep their high bits in word 3
+            uint32 wofs = 16 + (uint32) (32 * g) + 16 * h;
+            uint32 b = tid / 16;
+            while (b < bpr) {
+                uint32 ro = rb + b * 144;
+                uint32 roB = rbB + b * 144;
+                Vector<int8,16> hv = packed.vload<16>((int64) ro);
+                Vector<int8,16> hvB = packed.vload<16>((int64) roB);
+                Vector<int32,4> rw = packed.vload<16>((int64) (ro + wofs)).asWords();
+                Vector<int32,4> rwB = packed.vload<16>((int64) (roB + wofs)).asWords();
+                float32 d = GgufFile.halfBitsToF32Branchless(((int32) hv[0] & 255) | (((int32) hv[1] & 255) << 8));
+                float32 dmin = GgufFile.halfBitsToF32Branchless(((int32) hv[2] & 255) | (((int32) hv[3] & 255) << 8));
+                float32 dB = GgufFile.halfBitsToF32Branchless(((int32) hvB[0] & 255) | (((int32) hvB[1] & 255) << 8));
+                float32 dminB = GgufFile.halfBitsToF32Branchless(((int32) hvB[2] & 255) | (((int32) hvB[3] & 255) << 8));
+                Vector<int32,4> hw = hv.asWords();
+                Vector<int32,4> hwB = hvB.asWords();
+                int32 sc = QuantKernel.q4kSubScale(hw[1], hw[3], sh0, odd, upper);
+                int32 mn = QuantKernel.q4kSubMin(hw[2], hw[3], sh0, odd, upper);
+                int32 scB = QuantKernel.q4kSubScale(hwB[1], hwB[3], sh0, odd, upper);
+                int32 mnB = QuantKernel.q4kSubMin(hwB[2], hwB[3], sh0, odd, upper);
+                Vector<uint8,16> q = ((rw >> shn) & 252645135).asBytes().asUnsigned();
+                Vector<uint8,16> qB = ((rwB >> shn) & 252645135).asBytes().asUnsigned();
+                uint32 xo = b * 320 + 32 * s + 16 * h;
+                uint32 xr = b * 320 + 288;
+                {
+                    Vector<int8,16> a0 = xp.vload<16>((int64) xo);
+                    Vector<int8,4> v0 = xp.vload<4>((int64) xr);
+                    float32 x0 = Cajeta.bitsToF32(((int32) v0[0] & 255) | (((int32) v0[1] & 255) << 8)
+                        | (((int32) v0[2] & 255) << 16) | (((int32) v0[3] & 255) << 24));
+                    int32 as0 = ((a0 ^ a0).asUnsigned() | 1).dotSum(a0, 0);
+                    c0 = QuantKernel.q4kSliceDot(c0, q, a0, as0, x0, sc, mn, d, dmin);
+                    e0 = QuantKernel.q4kSliceDot(e0, qB, a0, as0, x0, scB, mnB, dB, dminB);
+                }
+                if (ncols > 1) {
+                    Vector<int8,16> a1 = xp.vload<16>((int64) (xo + xps));
+                    Vector<int8,4> v1 = xp.vload<4>((int64) (xr + xps));
+                    float32 x1 = Cajeta.bitsToF32(((int32) v1[0] & 255) | (((int32) v1[1] & 255) << 8)
+                        | (((int32) v1[2] & 255) << 16) | (((int32) v1[3] & 255) << 24));
+                    int32 as1 = ((a1 ^ a1).asUnsigned() | 1).dotSum(a1, 0);
+                    c1 = QuantKernel.q4kSliceDot(c1, q, a1, as1, x1, sc, mn, d, dmin);
+                    e1 = QuantKernel.q4kSliceDot(e1, qB, a1, as1, x1, scB, mnB, dB, dminB);
+                }
+                if (ncols > 2) {
+                    Vector<int8,16> a2 = xp.vload<16>((int64) (xo + 2 * xps));
+                    Vector<int8,4> v2 = xp.vload<4>((int64) (xr + 2 * xps));
+                    float32 x2 = Cajeta.bitsToF32(((int32) v2[0] & 255) | (((int32) v2[1] & 255) << 8)
+                        | (((int32) v2[2] & 255) << 16) | (((int32) v2[3] & 255) << 24));
+                    int32 as2 = ((a2 ^ a2).asUnsigned() | 1).dotSum(a2, 0);
+                    c2 = QuantKernel.q4kSliceDot(c2, q, a2, as2, x2, sc, mn, d, dmin);
+                    e2 = QuantKernel.q4kSliceDot(e2, qB, a2, as2, x2, scB, mnB, dB, dminB);
+                }
+                if (ncols > 3) {
+                    Vector<int8,16> a3 = xp.vload<16>((int64) (xo + 3 * xps));
+                    Vector<int8,4> v3 = xp.vload<4>((int64) (xr + 3 * xps));
+                    float32 x3 = Cajeta.bitsToF32(((int32) v3[0] & 255) | (((int32) v3[1] & 255) << 8)
+                        | (((int32) v3[2] & 255) << 16) | (((int32) v3[3] & 255) << 24));
+                    int32 as3 = ((a3 ^ a3).asUnsigned() | 1).dotSum(a3, 0);
+                    c3 = QuantKernel.q4kSliceDot(c3, q, a3, as3, x3, sc, mn, d, dmin);
+                    e3 = QuantKernel.q4kSliceDot(e3, qB, a3, as3, x3, scB, mnB, dB, dminB);
+                }
+                b = b + 4;
+            }
+        }
+        // Each wave's sums, then the waves meet in shared memory; thread 0 stores.
+        float32 t0 = Wave.reduceSumF32(c0);
+        float32 t1 = Wave.reduceSumF32(c1);
+        float32 t2 = Wave.reduceSumF32(c2);
+        float32 t3 = Wave.reduceSumF32(c3);
+        float32 u0 = Wave.reduceSumF32(e0);
+        float32 u1 = Wave.reduceSumF32(e1);
+        float32 u2 = Wave.reduceSumF32(e2);
+        float32 u3 = Wave.reduceSumF32(e3);
+        if (lane == 0) {
+            red[wave * 8] = t0;
+            red[wave * 8 + 1] = t1;
+            red[wave * 8 + 2] = t2;
+            red[wave * 8 + 3] = t3;
+            red[wave * 8 + 4] = u0;
+            red[wave * 8 + 5] = u1;
+            red[wave * 8 + 6] = u2;
+            red[wave * 8 + 7] = u3;
+        }
+        Barrier.workgroup();
+        if (tid == 0 && row < rows) {
+            uint32 nw = 64 / wv;
+            uint32 w = 1;
+            while (w < nw) {
+                t0 = t0 + red[w * 8];
+                t1 = t1 + red[w * 8 + 1];
+                t2 = t2 + red[w * 8 + 2];
+                t3 = t3 + red[w * 8 + 3];
+                u0 = u0 + red[w * 8 + 4];
+                u1 = u1 + red[w * 8 + 5];
+                u2 = u2 + red[w * 8 + 6];
+                u3 = u3 + red[w * 8 + 7];
+                w = w + 1;
+            }
+            QuantKernel.colsStore4(y, row, rows, yOff, yStride, accum, ncols, t0, t1, t2, t3);
+            QuantKernel.colsStore4(y, rowB, rows, yOff, yStride, accum, ncols, u0, u1, u2, u3);
+        }
+    }
+
+    /** Sub-block `s`'s 6-bit scale from a Q4_K header: words 1 (low scales) and 3 (the packed high
+     *  bits); `sh0` selects the chunk's byte pair, `odd` the second sub-block of the pair, `upper`
+     *  the sub-blocks 4..7 form. The one-column kernel's decode, one sub-block at a time. */
+    @Device
+    static int32 q4kSubScale(int32 scw, int32 hiw, int32 sh0, int32 odd, int32 upper) {
+        int32 sh = sh0 + 8 * odd;
+        int32 sA = (scw >> sh) & 255;
+        int32 lo = sA & 63;
+        int32 k = (hiw >> sh) & 255;
+        int32 hi = (k & 15) | ((sA >> 2) & 48);
+        return lo + (hi - lo) * upper;
+    }
+
+    /** Sub-block `s`'s 6-bit minimum from a Q4_K header, the twin of {@link #q4kSubScale} on word 2. */
+    @Device
+    static int32 q4kSubMin(int32 mnw, int32 hiw, int32 sh0, int32 odd, int32 upper) {
+        int32 sh = sh0 + 8 * odd;
+        int32 mC = (mnw >> sh) & 255;
+        int32 lo = mC & 63;
+        int32 k = (hiw >> sh) & 255;
+        int32 hi = (k >> 4) | ((mC >> 2) & 48);
+        return lo + (hi - lo) * upper;
+    }
+
+    /** Store up to four reduced column sums for `row` from the calling thread (the two-wave kernel's store). */
+    @Device
+    static void colsStore4(KernelBuffer<float32> y, uint32 row, uint32 rows, int64 yOff, uint32 yStride,
+            uint32 accum, uint32 ncols, float32 t0, float32 t1, float32 t2, float32 t3) {
+        if (row < rows) {
+            int64 o = yOff + (int64) row;
+            int64 st = (int64) yStride;
+            if (accum != 0) {
+                y[o] = y[o] + t0;
+                if (ncols > 1) { y[o + st] = y[o + st] + t1; }
+                if (ncols > 2) { y[o + 2L * st] = y[o + 2L * st] + t2; }
+                if (ncols > 3) { y[o + 3L * st] = y[o + 3L * st] + t3; }
+            } else {
+                y[o] = t0;
+                if (ncols > 1) { y[o + st] = t1; }
+                if (ncols > 2) { y[o + 2L * st] = t2; }
+                if (ncols > 3) { y[o + 3L * st] = t3; }
+            }
+        }
     }
 
     /** Reduce each column's lane partials over the wave and store them from lane 0. */
