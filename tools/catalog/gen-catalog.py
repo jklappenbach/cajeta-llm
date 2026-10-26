@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Generate the cajeta.dev kernel catalog page for dev.cajeta.llm.
 
-    python3 tools/catalog/gen-catalog.py ../cajeta/docs/kernels/catalog-llm.md
+    python3 tools/catalog/gen-catalog.py [../cajeta/docs/xpu/catalog-llm.md]
+
+The output defaults to the page in the sibling cajeta checkout (DEFAULT_OUTPUT).
 
 Inputs, all in this repository:
   - census/oracle-map.tsv      the library kernels: family, llama.cpp counterpart, note
@@ -27,6 +29,8 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 PKG = 'dev/cajeta/llm'
 SRC_ROOTS = [('', 'src/main/cajeta/' + PKG), ('test:', 'src/test/cajeta/' + PKG)]
 BACKENDS = [('cuda', 'nvptx'), ('cpu', 'cpu'), ('hip', 'amdgpu')]
+# the page on cajeta.dev/xpu/catalog-llm/, in the sibling cajeta checkout
+DEFAULT_OUTPUT = os.path.join(os.path.dirname(REPO), 'cajeta', 'docs', 'xpu', 'catalog-llm.md')
 
 FAMILIES = [
     ('wave', 'Wave mat-vecs: decode, one row per wave (llama.cpp mmvq)'),
@@ -310,7 +314,7 @@ def render(model, base, date):
         'values against a host or oracle answer; RAN-UNCHECKED and SKIP: excused against a named plan '
         'item; DECLINED: the compiler produced no device code there; blank: not registered on that '
         'backend), and under it the kernel\'s role from its own documentation. The families and routes '
-        'are described in [Language models on the device](llm.md); the adaptation machinery in '
+        'are described in [Language models on the device](kernels-llm.md); the adaptation machinery in '
         '[One kernel, any device](README.md).' % date)
     out.append('')
     out.append('%d library kernels, plus the probe, external and fixture kernels the binary also '
@@ -358,7 +362,8 @@ def render(model, base, date):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('output', help='the page to write, e.g. ../cajeta/docs/kernels/catalog-llm.md')
+    ap.add_argument('output', nargs='?', default=DEFAULT_OUTPUT,
+                    help='the page to write (default: %(default)s)')
     ap.add_argument('--repo', default=REPO, help='the cajeta-llm checkout (default: this one)')
     ap.add_argument('--date', default=datetime.date.today().isoformat())
     ap.add_argument('--retired', default=os.path.join(HERE, 'retired.tsv'))

@@ -5,7 +5,7 @@
 The row test regenerates the page from this checkout's inputs and compares
 every entry (section, kernel, source, counterpart, census, role) with the
 committed page in the cajeta repository (CATALOG_PAGE, default
-../cajeta/docs/kernels/catalog-llm.md). It reads both the old markdown-table
+../cajeta/docs/xpu/catalog-llm.md). It reads both the old markdown-table
 page and the HTML-table page the generator writes now, so it pinned the
 generator against the 2026-10-24 page and, since, tells a stale page from a
 current one.
@@ -20,7 +20,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 PAGE = os.environ.get('CATALOG_PAGE',
-                      os.path.join(os.path.dirname(REPO), 'cajeta', 'docs', 'kernels', 'catalog-llm.md'))
+                      os.path.join(os.path.dirname(REPO), 'cajeta', 'docs', 'xpu', 'catalog-llm.md'))
 
 spec = importlib.util.spec_from_file_location('gen_catalog', os.path.join(HERE, 'gen-catalog.py'))
 gen = importlib.util.module_from_spec(spec)
@@ -127,6 +127,20 @@ class CatalogTest(unittest.TestCase):
                              [e if isinstance(e, str) else e['kernel'] for e in g], title)
             for we, ge in zip(w, g):
                 self.assertEqual(we, ge, '%s: %s' % (title, we if isinstance(we, str) else we['kernel']))
+
+    def test_committed_page_is_at_the_xpu_path(self):
+        if not os.path.isdir(os.path.join(os.path.dirname(REPO), 'cajeta', 'docs')):
+            self.skipTest('no sibling cajeta checkout')
+        self.assertTrue(os.path.exists(PAGE), 'no committed page at ' + PAGE)
+
+    def test_default_output_is_the_xpu_page(self):
+        self.assertEqual(os.path.normpath(gen.DEFAULT_OUTPUT),
+                         os.path.normpath(os.path.join(os.path.dirname(REPO), 'cajeta', 'docs', 'xpu', 'catalog-llm.md')))
+
+    def test_preamble_links_the_xpu_pages(self):
+        self.assertIn('[Language models on the device](kernels-llm.md)', self.page)
+        self.assertIn('[One kernel, any device](README.md)', self.page)
+        self.assertNotIn('](llm.md)', self.page)
 
     def test_no_markdown_table(self):
         pipe_rows = [l for l in self.page.split('\n') if re.match(r'\s*\|.*\|\s*$', l)]

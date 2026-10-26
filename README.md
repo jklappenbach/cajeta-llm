@@ -15,11 +15,11 @@ Every device kernel the engine ships, how the families serve decode, prefill,
 batched decode, mixture-of-experts and attention, how a kernel is chosen for a
 weight format and a batch shape on the device the process landed on, and what
 is measured at load and per problem: the website's
-[Language models on the device](https://cajeta.dev/kernels/llm/) and the
-complete [catalog](https://cajeta.dev/kernels/catalog-llm/), one row per
+[Language models on the device](https://cajeta.dev/xpu/kernels-llm/) and the
+complete [catalog](https://cajeta.dev/xpu/catalog-llm/), one row per
 registered kernel with its source, its llama.cpp counterpart and its census
 standing on each backend. The machinery underneath is
-[One kernel, any device](https://cajeta.dev/kernels/). In this repository the
+[One kernel, any device](https://cajeta.dev/xpu/). In this repository the
 sources are `src/main/cajeta/dev/cajeta/llm/io` (quantised kernels, tiles,
 WMMA GEMMs) and `model` (attention, primitives, embedding); the census tables
 and the llama.cpp oracle map are under `census/`
@@ -29,7 +29,7 @@ The catalog page is generated from those inputs; after a census refresh or a
 new kernel, regenerate it into the cajeta checkout and commit the page there:
 
 ```
-python3 tools/catalog/gen-catalog.py ../cajeta/docs/kernels/catalog-llm.md
+python3 tools/catalog/gen-catalog.py   # writes ../cajeta/docs/xpu/catalog-llm.md
 python3 -m unittest discover -s tools/catalog   # the page matches the inputs
 ```
 
@@ -56,7 +56,7 @@ landed in the `cajeta` repo, the engine here).
 
 ## Documentation
 
-The user documentation is on the website: [Language models](https://cajeta.dev/llm/)
+The user documentation is on the website: [Language models](https://cajeta.dev/xpu/llm/)
 (quickstart, the engine API, models and formats, inside the engine,
 configuration, running and serving with cabra, measuring and where it stands
 against llama.cpp). Status is kept there; the plan
