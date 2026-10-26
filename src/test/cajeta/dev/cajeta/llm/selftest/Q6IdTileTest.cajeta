@@ -1,0 +1,359 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.IdBatch;
+import dev.cajeta.llm.io.IdShape;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.ExpertBank;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/**
+ * The Q6_K Id tile family (cajeta-llm 15.2.15.4.2): the dense Q6_K
+ * tensor-core tile's design over the MoE chunk maps, as Q5IdTile is the
+ * Q5_K tile's. Before it a Q6_K expert bank's prefill GEMM (the 30B's down
+ * projections) was the multi-wave kernel at 483 us a launch, the design the
+ * Q5_K tile halved.
+ *
+ * Every listed member is held to the HOST dequantized GEMM over eight
+ * ragged expert groups (5, 32, 48, 17, 128, 100, 156, 64 rows) on a slab in
+ * the resident split layout the bank uploads, and the output rows past the
+ * batch, which a chunk's pad rows must never land on, keep their sentinel.
+ */
+public class Q6IdTileTest {
+
+    public Q6IdTileTest() { return; }
+
+    static int32 E = 8;
+    static int32 ROWS_E = 128;
+    static int32 COLS = 512;
+    static int32 NP = 550;
+
+    static int32 gOff(int32 e) { return MoeIdMw8Test.gOff(e); }
+
+    static boolean skip() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return true; }
+        if (be.equals("vulkan")) { DeviceSkip.noRoute("packed WMMA id route", be); return true; }
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return true; }
+        return false;
+    }
+
+    /** The Q6_K expert slab's GGUF bytes from the real weight fixture, as the
+     *  dense tile's test reads them: synthetic bytes give large signed scales
+     *  whose terms cancel, and the int8 activations then miss the f32 host by
+     *  a few percent with no kernel defect (measured 2026-10-25: 10.61 vs
+     *  10.81). The synthetic slab is held to the multi-wave kernel instead. */
+    static #int8[] q6kRawBytes() {
+        int64 nBlocks = (int64) Q6IdTileTest.E * (int64) Q6IdTileTest.ROWS_E
+            * (int64) (Q6IdTileTest.COLS / 256);
+        return #CensusReachTest.tiled(Quant.GG_Q6_K, "q6_k.bin", nBlocks);
+    }
+
+    /** Distinct deterministic GGUF bytes in every expert, a finite half scale
+     *  at +208: what tells one expert's rows from another's. */
+    static #int8[] q6kSyntheticBytes() {
+        int32 rowBytes = (Q6IdTileTest.COLS / 256) * 210;
+        int64 total = (int64) Q6IdTileTest.E * (int64) Q6IdTileTest.ROWS_E * (int64) rowBytes;
+        int8[] raw #= heap int8[total];
+        int64 i = 0;
+        while (i < total) {
+            int64 blk = i / 210L;
+            int64 off = i % 210L;
+            if (off == 209L) {
+                raw[i] = (int8) 36;
+            } else if (off == 208L) {
+                raw[i] = (int8) ((blk * 37L + 11L) % 256L);
+            } else {
+                raw[i] = (int8) ((i * 131L + 17L) % 256L);
+            }
+            i = i + 1;
+        }
+        return #raw;
+    }
+
+    /** The resident split slab the bank uploads: each row's f16 scales, then
+     *  its payloads (Quant.splitInto). */
+    static #int8[] q6kSplitBytes(int8[] raw) {
+        int64 bpr = (int64) (Q6IdTileTest.COLS / 256);
+        int64 nRows = (int64) Q6IdTileTest.E * (int64) Q6IdTileTest.ROWS_E;
+        int64 resBytes = nRows * Quant.rowResidentBytes(Quant.GG_Q6_K, bpr);
+        int8[] dev #= heap int8[resBytes];
+        Quant.splitInto(Quant.GG_Q6_K, raw, 0L, nRows, bpr, dev, 0L);
+        return #dev;
+    }
+
+    /** y[t, r] = W_e[r, :] . x[t, :] over the dequantized Q6_K rows of the
+     *  expert whose group holds token t; pad rows are not in it. */
+    static #float32[] hostIdGemm(int8[] slab, float32[] xv) {
+        int64 cols = (int64) Q6IdTileTest.COLS;
+        int64 rows = (int64) Q6IdTileTest.ROWS_E;
+        int64 bpr = cols / 256L;
+        int64 rowBytes = bpr * 210L;
+        int64 np = (int64) Q6IdTileTest.NP;
+        float32[] want #= heap float32[np * rows];
+        float32[] w #= heap float32[rows * cols];
+        int32 e = 0;
+        while (e < Q6IdTileTest.E) {
+            int64 r = 0;
+            while (r < rows) {
+                int64 ro = ((int64) e * rows + r) * rowBytes;
+                Quant.dequantize(Quant.GG_Q6_K, slab, ro, bpr, w, r * cols);
+                r = r + 1;
+            }
+            int64 t = (int64) Q6IdTileTest.gOff(e);
+            int64 tEnd = (int64) Q6IdTileTest.gOff(e + 1);
+            while (t < tEnd) {
+                r = 0;
+                while (r < rows) {
+                    float64 acc = 0.0;
+                    int64 c = 0;
+                    while (c < cols) {
+                        acc = acc + (float64) w[r * cols + c] * (float64) xv[t * cols + c];
+                        c = c + 1;
+                    }
+                    want[t * rows + r] = (float32) acc;
+                    r = r + 1;
+                }
+                t = t + 1;
+            }
+            e = e + 1;
+        }
+        return #want;
+    }
+
+    /** One map entry per `stride`-row chunk of each group. */
+    static int32 buildMaps(int32 stride, int32[] mE, int32[] mT0, int32[] mM1) {
+        int32 nT = 0;
+        int32 e = 0;
+        while (e < Q6IdTileTest.E) {
+            int32 g0 = Q6IdTileTest.gOff(e);
+            int32 m = Q6IdTileTest.gOff(e + 1) - g0;
+            int32 tw = 0;
+            while (tw * stride < m) {
+                mE[nT] = e;
+                mT0[nT] = g0 + tw * stride;
+                mM1[nT] = g0 + m;
+                nT = nT + 1;
+                tw = tw + 1;
+            }
+            e = e + 1;
+        }
+        return nT;
+    }
+
+    /** The batch as the family reads it: both chunk maps and their counts. */
+    static #IdBatch batch(KernelBuffer<int8> xp, KernelBuffer<int32> e64, KernelBuffer<int32> t64,
+            KernelBuffer<int32> m64, KernelBuffer<int32> e128, KernelBuffer<int32> t128,
+            KernelBuffer<int32> m128, KernelBuffer<int32> meta, int32 n64, int32 n128) {
+        int32 cap = Q6IdTileTest.NP / 64 + Q6IdTileTest.E + 1;
+        int32[] mE = heap int32[cap];
+        int32[] mT0 = heap int32[cap];
+        int32[] mM1 = heap int32[cap];
+        int32 c64 = Q6IdTileTest.buildMaps(64, mE, mT0, mM1);
+        e64.upload(mE, (int64) c64);
+        t64.upload(mT0, (int64) c64);
+        m64.upload(mM1, (int64) c64);
+        int32 c128 = Q6IdTileTest.buildMaps(128, mE, mT0, mM1);
+        e128.upload(mE, (int64) c128);
+        t128.upload(mT0, (int64) c128);
+        m128.upload(mM1, (int64) c128);
+        int32[] metaH = heap int32[4];
+        metaH[0] = c64;
+        metaH[1] = c128;
+        meta.upload(metaH, 4L);
+        IdBatch b #= heap IdBatch(xp, e64, t64, m64, e128, t128, m128, meta,
+            (int64) c64, (int64) c128, (int64) Q6IdTileTest.NP, (int64) Q6IdTileTest.E);
+        return #b;
+    }
+
+    @Test
+    public void everyListedQ6IdMemberMatchesTheHost() {
+        if (Q6IdTileTest.skip()) { return; }
+        int32 n = (int32) WmmaKernel.id6Family().shapes().count();
+        Assert.isTrue(n >= 2);
+        int8[] raw #= Q6IdTileTest.q6kRawBytes();
+        float32[] xv #= MoeIdMw8Test.acts();
+        float32[] want #= Q6IdTileTest.hostIdGemm(raw, xv);
+        int8[] split #= Q6IdTileTest.q6kSplitBytes(raw);
+        int64 total = (int64) split.count();
+        KernelBuffer<int8> slab #= heap KernelBuffer<int8>((uint64) (total + 4L));
+        slab.upload(split, total);
+        KernelBuffer<int32> slabW #= slab.wordView();
+        KernelBuffer<int8> xp #= MoeIdMw8Test.packActs();
+        int32 cap = Q6IdTileTest.NP / 64 + Q6IdTileTest.E + 1;
+        KernelBuffer<int32> e64 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> t64 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> m64 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> e128 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> t128 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> m128 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> meta #= heap KernelBuffer<int32>((uint64) 4);
+        IdBatch b #= Q6IdTileTest.batch(xp, e64, t64, m64, e128, t128, m128, meta, 0, 0);
+        int64 outDim = (int64) Q6IdTileTest.ROWS_E;
+        int64 nOut = (int64) Q6IdTileTest.NP * outDim;
+        int64 nAll = ((int64) Q6IdTileTest.NP + 128L) * outDim;
+        float32[] sent = heap float32[nAll];
+        float32[] got = heap float32[nAll];
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) nAll);
+        int32 checked = 0;
+        int32 i = 0;
+        while (i < n) {
+            IdShape sh = WmmaKernel.id6Family().shapes().get(i);
+            String name #= sh.kernel();
+            if (!KernelCap.usable(name)) {
+                System.stdout.println("   " + name + " has no device code here");
+                i = i + 1;
+                continue;
+            }
+            int64 k = 0;
+            while (k < nAll) { sent[k] = -7.0f; k = k + 1; }
+            y.upload(sent, nAll);
+            int64[] vc #= ValueCheck.mark();
+            sh.launch(y, slab, slabW, b, outDim, (int64) Q6IdTileTest.COLS, outDim);
+            QuantKernel.stream().sync();
+            y.download(got, nAll);
+            CensusReachTest.nearOnePercent(want, got, nOut,
+                name + " vs the host Q6_K id GEMM at " + Q6IdTileTest.NP + " tokens");
+            k = nOut;
+            while (k < nAll) {
+                if (got[k] != -7.0f) {
+                    Assert.fail(name + " wrote pad row " + (k / outDim) + " (token count "
+                        + Q6IdTileTest.NP + "): a chunk's rows past its group landed");
+                    return;
+                }
+                k = k + 1;
+            }
+            ValueCheck.credit(vc);
+            checked = checked + 1;
+            i = i + 1;
+        }
+        if (checked == 0) {
+            DeviceSkip.noKernel("Q6IdTile_64_64_32_32_128_q6kId", Device.activeBackend());
+        }
+    }
+
+    /** Every listed member agrees with the multi-wave Q6_K id kernel it
+     *  replaces, on a slab whose experts all differ (so a wrong expert offset
+     *  or chunk shows), to the reassociation bar: both read the same int8
+     *  activations, so only summation order separates them. */
+    @Test
+    public void everyListedQ6IdMemberAgreesWithTheMultiWaveKernel() {
+        if (Q6IdTileTest.skip()) { return; }
+        if (!KernelCap.usable("q6kWmmaIdMwKernel")) {
+            DeviceSkip.noKernel("q6kWmmaIdMwKernel", Device.activeBackend());
+            return;
+        }
+        int8[] raw #= Q6IdTileTest.q6kSyntheticBytes();
+        int8[] split #= Q6IdTileTest.q6kSplitBytes(raw);
+        int64 total = (int64) split.count();
+        KernelBuffer<int8> slab #= heap KernelBuffer<int8>((uint64) (total + 4L));
+        slab.upload(split, total);
+        KernelBuffer<int32> slabW #= slab.wordView();
+        KernelBuffer<int8> xp #= MoeIdMw8Test.packActs();
+        int32 cap = Q6IdTileTest.NP / 64 + Q6IdTileTest.E + 1;
+        KernelBuffer<int32> e64 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> t64 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> m64 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> e128 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> t128 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> m128 #= heap KernelBuffer<int32>((uint64) cap);
+        KernelBuffer<int32> meta #= heap KernelBuffer<int32>((uint64) 4);
+        IdBatch b #= Q6IdTileTest.batch(xp, e64, t64, m64, e128, t128, m128, meta, 0, 0);
+        int64 outDim = (int64) Q6IdTileTest.ROWS_E;
+        int64 cols = (int64) Q6IdTileTest.COLS;
+        int64 nOut = (int64) Q6IdTileTest.NP * outDim;
+        int64 nAll = ((int64) Q6IdTileTest.NP + 128L) * outDim;
+        float32[] sent = heap float32[nAll];
+        int64 k = 0;
+        while (k < nAll) { sent[k] = -7.0f; k = k + 1; }
+        float32[] want = heap float32[nAll];
+        float32[] got = heap float32[nAll];
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) nAll);
+        y.upload(sent, nAll);
+        int32[] sE = heap int32[cap];
+        int32[] sT = heap int32[cap];
+        int32[] sM = heap int32[cap];
+        int32 c64 = Q6IdTileTest.buildMaps(64, sE, sT, sM);
+        WmmaKernel.q6kWmmaIdMwLaunchNoSync(y, slab, slabW, xp, e64, t64, m64, meta,
+            (int64) c64, outDim, cols, outDim);
+        QuantKernel.stream().sync();
+        y.download(want, nAll);
+        int32 n = (int32) WmmaKernel.id6Family().shapes().count();
+        int32 checked = 0;
+        int32 i = 0;
+        while (i < n) {
+            IdShape sh = WmmaKernel.id6Family().shapes().get(i);
+            String name #= sh.kernel();
+            if (!KernelCap.usable(name)) { i = i + 1; continue; }
+            y.upload(sent, nAll);
+            sh.launch(y, slab, slabW, b, outDim, cols, outDim);
+            QuantKernel.stream().sync();
+            y.download(got, nAll);
+            k = 0;
+            while (k < nOut) {
+                float32 d = got[k] - want[k];
+                if (d < 0.0f) { d = 0.0f - d; }
+                float32 mag = want[k] < 0.0f ? 0.0f - want[k] : want[k];
+                if (d > mag * 0.002f + 0.002f) {
+                    Assert.fail(name + " vs q6kWmmaIdMwKernel at [" + k + "] (token "
+                        + (k / outDim) + ", row " + (k % outDim) + "): " + got[k]
+                        + " vs " + want[k]);
+                    return;
+                }
+                k = k + 1;
+            }
+            checked = checked + 1;
+            i = i + 1;
+        }
+        if (checked == 0) {
+            DeviceSkip.noKernel("Q6IdTile_64_64_32_32_128_q6kId", Device.activeBackend());
+        }
+    }
+
+    /** The family serves the 30B's down bank at a 512-token prefill (4096
+     *  expert rows, 2048 out, 768 cols) wherever a member lowers, names its
+     *  64- and 128-row members over the two chunk maps, and is the family a
+     *  Q6_K bank (ggml type 14) asks for. */
+    @Test
+    public void theQ6IdFamilyServesTheThirtyBDownShape() {
+        if (Q6IdTileTest.skip()) { return; }
+        int32 n = (int32) WmmaKernel.id6Family().shapes().count();
+        boolean saw64 = false;
+        boolean saw128 = false;
+        boolean any = false;
+        int32 i = 0;
+        while (i < n) {
+            IdShape sh = WmmaKernel.id6Family().shapes().get(i);
+            if (sh.chunkRows() == 64) { saw64 = true; }
+            if (sh.chunkRows() == 128) { saw128 = true; }
+            String name #= sh.kernel();
+            if (KernelCap.usable(name)) { any = true; }
+            Assert.isTrue(sh.fits(4096L, 2048L, 768L));
+            i = i + 1;
+        }
+        Assert.isTrue(saw64);
+        Assert.isTrue(saw128);
+        String routed #= WmmaKernel.idFamilyFor(Quant.GG_Q6_K).shapes().get(0).kernel();
+        Assert.isTrue(routed.startsWith("Q6IdTile_"));
+        // Serving a shape is not being routed: where both members are measured
+        // wrong (the cpu software tile, KernelCap.WRONG_HERE) the bank must not
+        // admit the family, however well its shapes cover the batch. Asked
+        // before the skip so the refusal is pinned on the backend it is for.
+        Assert.equals(any, ExpertBank.idFamilyUsable(WmmaKernel.id6Family()));
+        if (KernelCap.wrongHere("Q6IdTile_128_128_32_64_128_q6kId").count() > 0L
+                && KernelCap.wrongHere("Q6IdTile_64_64_32_32_128_q6kId").count() > 0L) {
+            Assert.isFalse(ExpertBank.idFamilyUsable(WmmaKernel.id6Family()));
+        }
+        if (!any) { DeviceSkip.noKernel("Q6IdTile_64_64_32_32_128_q6kId", Device.activeBackend()); return; }
+        Assert.isTrue(WmmaKernel.idFamilyServesFor(Quant.GG_Q6_K, 4096L, 2048L, 768L));
+        // An outDim off the 64 grid is nobody's.
+        Assert.isFalse(WmmaKernel.idFamilyServesFor(Quant.GG_Q6_K, 4096L, 2080L, 768L));
+    }
+}

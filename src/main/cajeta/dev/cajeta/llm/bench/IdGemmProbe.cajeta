@@ -25,7 +25,9 @@ import dev.cajeta.llm.io.WmmaKernel;
  * Defaults are Qwen3-Coder-30B-A3B's gate/up bank at a 512-token
  * prefill: 768 x 2048, 128 experts, 4096 selections (32 an expert).
  * Prints ns a launch (median of nine bursts of eight) and the weight
- * bytes the launch reads, for Q4_K (144 B a block) and Q5_K (176 B).
+ * bytes the launch reads, for Q4_K (144 B a block), Q5_K (176 B) and
+ * Q6_K (210 B, resident split). The 30B's down bank is
+ * `IdGemmProbe 2048 768 128 4096`.
  */
 public class IdGemmProbe {
 
@@ -62,6 +64,33 @@ public class IdGemmProbe {
         }
         KernelBuffer<int8> d #= heap KernelBuffer<int8>((uint64) (total + 4L));
         d.upload(raw, total);
+        return #d;
+    }
+
+    /** A Q6_K expert slab in the resident split layout the bank uploads:
+     *  GGUF blocks (210 B, a finite half scale at +208) split per row. */
+    static #KernelBuffer<int8> slab6(int64 outDim, int64 cols, int64 experts) {
+        int64 bpr = cols / 256L;
+        int64 nRows = experts * outDim;
+        int64 total = nRows * bpr * 210L;
+        int8[] raw = heap int8[total];
+        int64 i = 0;
+        while (i < total) {
+            int64 off = i % 210L;
+            if (off == 209L) {
+                raw[i] = (int8) 36;
+            } else if (off == 208L) {
+                raw[i] = (int8) (((i / 210L) * 37L + 11L) % 256L);
+            } else {
+                raw[i] = (int8) ((i * 131L + 17L) % 256L);
+            }
+            i = i + 1;
+        }
+        int64 resBytes = nRows * Quant.rowResidentBytes(Quant.GG_Q6_K, bpr);
+        int8[] dev = heap int8[resBytes];
+        Quant.splitInto(Quant.GG_Q6_K, raw, 0L, nRows, bpr, dev, 0L);
+        KernelBuffer<int8> d #= heap KernelBuffer<int8>((uint64) (resBytes + 4L));
+        d.upload(dev, resBytes);
         return #d;
     }
 
@@ -238,6 +267,64 @@ public class IdGemmProbe {
                 System.stdout.println(kn + ": " + (med / 1000L) + " us a launch (min "
                     + (v[0] / 1000L) + "), weights " + (wBytesI / 1048576L) + " MiB -> "
                     + (wBytesI / (med < 1L ? 1L : med)) + " GB/s");
+                mi = mi + 1;
+            }
+        }
+        // The Q6_K bank (the 30B's down projections: 2048 x 768): the
+        // multi-wave kernel, then the Q6_K Id family's members.
+        {
+            KernelBuffer<int8> s6 #= IdGemmProbe.slab6(outDim, cols, experts);
+            KernelBuffer<int32> s6W #= s6.wordView();
+            int64 wBytes6 = experts * outDim * (cols / 256L) * 210L;
+            KernelStream st = QuantKernel.stream();
+            WmmaKernel.q6kWmmaIdMwLaunchNoSync(y, s6, s6W, xp, e64, t64, m64, meta,
+                nMax, outDim, cols, outDim);
+            st.sync();
+            int64[] v = heap int64[9];
+            int32 r = 0;
+            while (r < 9) {
+                st.sync();
+                int64 t0 = Clock.nanoTime();
+                int32 k = 0;
+                while (k < 8) {
+                    WmmaKernel.q6kWmmaIdMwLaunchNoSync(y, s6, s6W, xp, e64, t64, m64, meta,
+                        nMax, outDim, cols, outDim);
+                    k = k + 1;
+                }
+                st.sync();
+                v[r] = (Clock.nanoTime() - t0) / 8L;
+                r = r + 1;
+            }
+            int64 med = IdGemmProbe.median(v, 9);
+            System.stdout.println("q6kWmmaIdMwKernel: " + (med / 1000L) + " us a launch (min "
+                + (v[0] / 1000L) + "), weights " + (wBytes6 / 1048576L) + " MiB -> "
+                + (wBytes6 / (med < 1L ? 1L : med)) + " GB/s");
+            IdBatch b6 #= heap IdBatch(xp, e64, t64, m64, e128, t128, m128, meta,
+                (int64) n64, (int64) n128, rows, experts);
+            int32 nm6 = (int32) WmmaKernel.id6Family().shapes().count();
+            int32 mi = 0;
+            while (mi < nm6) {
+                IdShape sh = WmmaKernel.id6Family().shapes().get(mi);
+                String kn #= sh.kernel();
+                sh.launch(y, s6, s6W, b6, outDim, cols, outDim);
+                st.sync();
+                r = 0;
+                while (r < 9) {
+                    st.sync();
+                    int64 t0 = Clock.nanoTime();
+                    int32 k = 0;
+                    while (k < 8) {
+                        sh.launch(y, s6, s6W, b6, outDim, cols, outDim);
+                        k = k + 1;
+                    }
+                    st.sync();
+                    v[r] = (Clock.nanoTime() - t0) / 8L;
+                    r = r + 1;
+                }
+                med = IdGemmProbe.median(v, 9);
+                System.stdout.println(kn + ": " + (med / 1000L) + " us a launch (min "
+                    + (v[0] / 1000L) + "), weights " + (wBytes6 / 1048576L) + " MiB -> "
+                    + (wBytes6 / (med < 1L ? 1L : med)) + " GB/s");
                 mi = mi + 1;
             }
         }
