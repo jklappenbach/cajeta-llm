@@ -1,0 +1,213 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.DiagCallback;
+import dev.cajeta.llm.DiagRecord;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.TcTile;
+import dev.cajeta.llm.io.TuneMode;
+import dev.cajeta.llm.model.ColsProbe;
+import dev.cajeta.llm.model.ColsSegProbe;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.Linear;
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+
+/**
+ * cajeta-llm 15.2.15.3.6.2.1: an engine with no tune store takes every timed
+ * choice's default without timing it, so two such processes compute the same
+ * bits. Measured 2026-10-26 on gfx1151: the Q4_K tile choice at the fused
+ * gate|up shape reads a 12-33 per mille margin against the 30 per mille tie
+ * rule, and its two members round differently, so the 8B's greedy token at a
+ * 0.12 tie followed the timing from one process to the next.
+ */
+public class UntimedChoiceTest {
+
+    public UntimedChoiceTest() { return; }
+
+    @AfterEach
+    public void restore() {
+        Diag.register(null);
+        TuneMode.setUntimed(false);
+        return;
+    }
+
+    /** .1.1 — the family's first-listed survivor, and its choice record says untimed. */
+    @Test
+    public void aFamilyWithoutAStoreTakesItsFirstListedSurvivorUntimed() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!Linear.q4TileUsable()) { DeviceSkip.noKernel(TcTile.Q4_KERNEL, be); return; }
+        if (!KernelCap.usable("q8kPackKernel")) { DeviceSkip.noKernel("q8kPackKernel", be); return; }
+        int64 rows = 128L;
+        int64 out = 4096L;
+        int64 cols = 4096L;
+        int64 nBlocks = out * (cols / 256L);
+        int8[] raw #= CensusReachTest.tiled(Quant.GG_Q4_K, "q4_k.bin", nBlocks);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) raw.count()));
+        wD.upload(raw);
+        float32[] x #= CensusReachTest.ramp(rows * cols);
+        KernelBuffer<int8> xp #= CensusReachTest.packedActivations(x, rows, cols);
+        TuneMode.setUntimed(true);
+        TcTile.setShapeDir("");
+        ChoiceTap tap = heap ChoiceTap();
+        Diag.register(tap);
+        TcTile.prewarmQ4(wD, xp, rows, out, cols);
+        Diag.register(null);
+        TcTile.forgetShapes();
+        Assert.equals(1L, (int64) tap.tileChoices);
+        Assert.equals(0L, (int64) tap.timedChoices);
+        Assert.isTrue(tap.lastKernel.equals(TcTile.q4().shapes().get(0).kernel()));
+    }
+
+    /** .1.2 — the b1 mat-vec variant is plain, and nothing is timed. */
+    @Test
+    public void theMatVecVariantWithoutAStoreIsPlainUntimed() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q4kQ8WavePfMatVecKernel")) { DeviceSkip.noKernel("q4kQ8WavePfMatVecKernel", be); return; }
+        TuneMode.setUntimed(true);
+        QuantKernel.setMatVecTuneDir("");
+        QuantKernel.setQ4Prefetch(0);
+        ChoiceTap tap = heap ChoiceTap();
+        Diag.register(tap);
+        boolean pf = QuantKernel.q4PrefetchPays();
+        Diag.register(null);
+        QuantKernel.setQ4Prefetch(0);
+        Assert.isFalse(pf);
+        Assert.equals(0L, (int64) tap.probes);
+    }
+
+    /** .1.3 — the Cols verdict keeps the wave kernel and ColsSeg the separate launches, untimed. */
+    @Test
+    public void theColsVerdictsWithoutAStoreKeepTheSeparateKernelsUntimed() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable(ColsProbe.colsKernel(Quant.GG_Q4_K))
+                || !KernelCap.usable(ColsProbe.waveKernel(Quant.GG_Q4_K))
+                || !KernelCap.usable("q8kPackKernel")) {
+            DeviceSkip.noKernel(ColsProbe.colsKernel(Quant.GG_Q4_K), be);
+            return;
+        }
+        TuneMode.setUntimed(true);
+        ColsProbe.setTuneDir("");
+        ColsProbe.setPays(Quant.GG_Q4_K, 4, 0);
+        int64 p0 = ColsProbe.probes();
+        ChoiceTap tap = heap ChoiceTap();
+        Diag.register(tap);
+        boolean cols = ColsProbe.pays(Quant.GG_Q4_K, 4);
+        boolean seg = false;
+        boolean segAsked = ColsSegProbeTest.here();
+        int64 s0 = ColsSegProbe.probes();
+        if (segAsked) {
+            ColsSegProbe.setTuneDir("");
+            ColsSegProbe.setPays(0, 4, 0);
+            seg = ColsSegProbe.pays(0, 4, 256L, 64L, 64L, 1024L);
+        }
+        Diag.register(null);
+        ColsProbe.setPays(Quant.GG_Q4_K, 4, 0);
+        ColsSegProbe.setPays(0, 4, 0);
+        Assert.isFalse(cols);
+        Assert.equals(p0, ColsProbe.probes());
+        Assert.isFalse(seg);
+        Assert.equals(s0, ColsSegProbe.probes());
+        Assert.equals(0L, (int64) tap.probes);
+    }
+
+    /** .1.4 — tile-versus-int8 takes the tile and the matrix-core question answers "pays", untimed. */
+    @Test
+    public void tileVersusInt8AndMatrixCoresWithoutAStoreAnswerUntimed() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        TuneMode.setUntimed(true);
+        Linear.setTuneDir("");
+        Linear.setTileBeatsDeq(0);
+        Linear.setMatrixCoresPay(0);
+        ChoiceTap tap = heap ChoiceTap();
+        Diag.register(tap);
+        boolean tile = Linear.tileBeatsDeq();
+        boolean mc = Linear.matrixCoresPay();
+        Diag.register(null);
+        Linear.setTileBeatsDeq(0);
+        Linear.setMatrixCoresPay(0);
+        Assert.isTrue(tile);
+        Assert.isTrue(mc);
+        Assert.equals(0L, (int64) tap.probes);
+    }
+
+    /** .1.5 — with a store both are timed once, then read back after the memo is cleared. */
+    @Test
+    public void aStoreKeepsTileVersusInt8AndTheMatrixCoreAnswer() {
+        if (!CensusReachTest.deviceHere()) { return; }
+        String be #= Device.activeBackend();
+        // Where the tile or the int8 GEMM does not lower, the matrix-core probe falls back to the
+        // 16-row kernel at 4096x4096, which stalled Vulkan's gfx ring on gfx1151 (2026-10-26).
+        if (!Linear.q4TileUsable() || !KernelCap.usable("q4kWmmaDeqMw8Kernel")
+                || !KernelCap.usable("q8kPackKernel")) {
+            DeviceSkip.noKernel("q4kWmmaDeqMw8Kernel", be);
+            return;
+        }
+        Path dir #= Path.of("tmp/untimed-choice-tune");
+        dir.mkdirs();
+        Linear.setTuneDir("tmp/untimed-choice-tune");
+        Linear.forgetStoredChoices();
+        Linear.setTileBeatsDeq(0);
+        Linear.setMatrixCoresPay(0);
+        ChoiceTap first = heap ChoiceTap();
+        Diag.register(first);
+        boolean tile = Linear.tileBeatsDeq();
+        boolean mc = Linear.matrixCoresPay();
+        Diag.register(null);
+        Linear.setTileBeatsDeq(0);
+        Linear.setMatrixCoresPay(0);
+        ChoiceTap again = heap ChoiceTap();
+        Diag.register(again);
+        boolean tile2 = Linear.tileBeatsDeq();
+        boolean mc2 = Linear.matrixCoresPay();
+        Diag.register(null);
+        Linear.forgetStoredChoices();
+        Linear.setTuneDir("");
+        Linear.setTileBeatsDeq(0);
+        Linear.setMatrixCoresPay(0);
+        Assert.equals(1L, (int64) first.tileProbes);
+        Assert.equals(0L, (int64) again.probes);
+        Assert.isTrue(tile == tile2);
+        Assert.isTrue(mc == mc2);
+    }
+}
+
+/** Counts the records a timed choice emits: a tile choice and whether it was timed, and every probe. */
+final class ChoiceTap implements DiagCallback {
+    public int32 tileChoices;
+    public int32 timedChoices;
+    public int32 probes;
+    public int32 tileProbes;
+    public String lastKernel;
+    public ChoiceTap() {
+        this.tileChoices = 0;
+        this.timedChoices = 0;
+        this.probes = 0;
+        this.tileProbes = 0;
+        this.lastKernel #= "";
+    }
+    public void onRecord(DiagRecord r) {
+        if (r.category.equals("tile-choice")) {
+            this.tileChoices = this.tileChoices + 1;
+            if (r.v5 != 0L) { this.timedChoices = this.timedChoices + 1; }
+            this.lastKernel #= r.name.clone();
+            return;
+        }
+        if (r.category.equals("tile-probe")) { this.tileProbes = this.tileProbes + 1; }
+        boolean timedAb = r.category.equals("colsseg-ab") && !r.name.equals("pinned")
+            && !r.name.equals("skipped") && !r.name.equals("stored") && !r.name.equals("untimed");
+        if (r.category.equals("mv-probe") || r.category.equals("cols-probe")
+                || r.category.equals("colsseg-probe") || r.category.equals("tile-probe")
+                || r.category.equals("mc-probe") || timedAb) {
+            this.probes = this.probes + 1;
+        }
+        return;
+    }
+}
