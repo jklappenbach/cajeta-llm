@@ -19747,7 +19747,151 @@ public final class QuantKernel {
         }
     }
 
+    /**
+     * The grouping sort as a wave counting sort (cajeta-llm 15.2.15.4.2):
+     * the same output as {@link #moeGroupKernel}, order and maps
+     * included, without its per-expert walk of every pick (128 threads
+     * reading 4096 picks twice, 251 us a 30B layer against llama.cpp's
+     * mm_ids_helper at ~40). The picks go in passes of 256, one a thread,
+     * and the eight waves take each pass in turn: a lane's same-expert
+     * mask is the AND of eight ballots (one per bit of the expert id, so
+     * experts <= 256), its rank the running base of its expert plus the
+     * matching lanes below it, and the highest such lane advances the
+     * base. The rank waits in rowSlot; once every base is a count the
+     * offsets and chunk maps are the serial kernel's, and a second
+     * parallel pass places each pick at its offset plus its rank.
+     */
+    @Kernel @Wave(width = 32)
+    public static void moeGroupWaveKernel(KernelBuffer<int32> gRow,
+            KernelBuffer<float32> gW, KernelBuffer<int32> rowSlot,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, KernelBuffer<int32> map8E,
+            KernelBuffer<int32> map8T0, KernelBuffer<int32> map8M1,
+            KernelBuffer<int32> meta, KernelBuffer<int32> selAll,
+            KernelBuffer<float32> wAll, uint32 np, uint32 experts,
+            uint32 used) {
+        Shared<int32> base = shared int32[256];
+        Shared<int32> off = shared int32[257];
+        Shared<int32> coff = shared int32[257];
+        Shared<int32> coff8 = shared int32[257];
+        uint32 t = KernelThread.x();
+        uint32 wid = t / 32;
+        uint32 lane = t % 32;
+        uint32 below = (((uint32) 1) << lane) - 1;
+        base[t] = 0;
+        Barrier.workgroup();
+        uint32 c0 = 0;
+        while (c0 < np) {
+            uint32 i = c0 + t;
+            boolean valid = i < np;
+            uint32 e = 0;
+            if (valid) { e = (uint32) selAll[(int64) i]; }
+            uint32 w = 0;
+            while (w < 8) {
+                if (wid == w) {
+                    uint32 m = (uint32) Wave.ballotSync(valid);
+                    uint32 b = 0;
+                    while (b < 8) {
+                        uint32 bb = (uint32) Wave.ballotSync(((e >> b) & 1) == 1);
+                        if (((e >> b) & 1) == 1) { m = m & bb; } else { m = m & ~bb; }
+                        b = b + 1;
+                    }
+                    if (valid) {
+                        uint32 rank = Bits.count(m & below);
+                        rowSlot[(int64) i] = base[e] + (int32) rank;
+                        if ((m >> lane) == 1) {
+                            base[e] = base[e] + (int32) Bits.count(m);
+                        }
+                    }
+                }
+                Barrier.workgroup();
+                w = w + 1;
+            }
+            c0 = c0 + 256;
+        }
+        if (t == 0) {
+            int32 o = 0;
+            int32 co = 0;
+            int32 co8 = 0;
+            uint32 e = 0;
+            while (e < experts) {
+                off[e] = o;
+                coff[e] = co;
+                coff8[e] = co8;
+                o = o + base[e];
+                co = co + (base[e] + 63) / 64;
+                co8 = co8 + (base[e] + 127) / 128;
+                e = e + 1;
+            }
+            off[experts] = o;
+            coff[experts] = co;
+            coff8[experts] = co8;
+            meta[0L] = co;
+            meta[1L] = co8;
+        }
+        Barrier.workgroup();
+        uint32 i = t;
+        while (i < np) {
+            uint32 e = (uint32) selAll[(int64) i];
+            int32 slot = off[e] + rowSlot[(int64) i];
+            gRow[(int64) slot] = (int32) (i / used);
+            gW[(int64) slot] = wAll[(int64) i];
+            rowSlot[(int64) i] = slot;
+            i = i + 256;
+        }
+        if (t < experts) {
+            int32 c = base[t];
+            int32 tw = 0;
+            while (tw * 64 < c) {
+                int64 mi = (int64) (coff[t] + tw);
+                mapE[mi] = (int32) t;
+                mapT0[mi] = off[t] + tw * 64;
+                mapM1[mi] = off[t] + c;
+                tw = tw + 1;
+            }
+            int32 tw8 = 0;
+            while (tw8 * 128 < c) {
+                int64 mj = (int64) (coff8[t] + tw8);
+                map8E[mj] = (int32) t;
+                map8T0[mj] = off[t] + tw8 * 128;
+                map8M1[mj] = off[t] + c;
+                tw8 = tw8 + 1;
+            }
+        }
+    }
+
+    /** The serial grouping sort ({@link #moeGroupKernel}); MoeFfn asks the
+     *  registry and takes {@link #moeGroupWaveLaunchNoSync} where it is usable. */
     public static void moeGroupLaunchNoSync(KernelBuffer<int32> gRow,
+            KernelBuffer<float32> gW, KernelBuffer<int32> rowSlot,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, KernelBuffer<int32> map8E,
+            KernelBuffer<int32> map8T0, KernelBuffer<int32> map8M1,
+            KernelBuffer<int32> meta, KernelBuffer<int32> selAll,
+            KernelBuffer<float32> wAll, int64 np, int64 experts,
+            int64 used) {
+        QuantKernel.moeGroupSerialLaunchNoSync(gRow, gW, rowSlot, mapE, mapT0, mapM1,
+            map8E, map8T0, map8M1, meta, selAll, wAll, np, experts, used);
+        return;
+    }
+
+    public static void moeGroupWaveLaunchNoSync(KernelBuffer<int32> gRow,
+            KernelBuffer<float32> gW, KernelBuffer<int32> rowSlot,
+            KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
+            KernelBuffer<int32> mapM1, KernelBuffer<int32> map8E,
+            KernelBuffer<int32> map8T0, KernelBuffer<int32> map8M1,
+            KernelBuffer<int32> meta, KernelBuffer<int32> selAll,
+            KernelBuffer<float32> wAll, int64 np, int64 experts,
+            int64 used) {
+        KernelStream s = QuantKernel.stream();
+        moeGroupWaveKernel.launch(s, grid: [1], block: [256])
+            (gRow, gW, rowSlot, mapE, mapT0, mapM1, map8E, map8T0, map8M1,
+             meta, selAll, wAll, (uint32) np, (uint32) experts,
+             (uint32) used);
+        return;
+    }
+
+    public static void moeGroupSerialLaunchNoSync(KernelBuffer<int32> gRow,
             KernelBuffer<float32> gW, KernelBuffer<int32> rowSlot,
             KernelBuffer<int32> mapE, KernelBuffer<int32> mapT0,
             KernelBuffer<int32> mapM1, KernelBuffer<int32> map8E,

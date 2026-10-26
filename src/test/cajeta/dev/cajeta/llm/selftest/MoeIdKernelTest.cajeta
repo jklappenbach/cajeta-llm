@@ -133,19 +133,37 @@ public class MoeIdKernelTest {
 
     /** 45.1.1 — the device counting sort vs the host groupPicks
      *  algorithm on synthetic picks: gRow/gW/rowSlot IDENTICAL (the
-     *  order within a group is pick order on both sides), the 64-row
-     *  chunk maps identical, and meta[0] the host's chunk count. The
+     *  order within a group is pick order on both sides), both chunk
+     *  maps identical, and meta[0]/meta[1] the host's chunk counts. The
      *  picks are skewed (one hot expert, several empty) so both the
      *  multi-chunk and the empty-group arms run. */
     @Test
     public void deviceGroupingMatchesHostCountingSort() {
+        MoeIdKernelTest.checkGrouping(300, false, "moeGroupKernel");
+    }
+
+    /** cajeta-llm 15.2.15.4.2: the wave counting sort (ranks from lane
+     *  ballots, warps in turn) lands the host's exact order at a short
+     *  batch, at the 30B's 512-row prefill (4096 picks) and at its 4-seq
+     *  pass (2048 rows, 16384 picks, past the serial kernel's LDS stage). */
+    @Test
+    public void waveGroupingMatchesHostCountingSort() {
+        MoeIdKernelTest.checkGrouping(300, true, "moeGroupWaveKernel");
+        MoeIdKernelTest.checkGrouping(512, true, "moeGroupWaveKernel");
+        MoeIdKernelTest.checkGrouping(2048, true, "moeGroupWaveKernel");
+    }
+
+    static void checkGrouping(int32 rows, boolean wave, String kernel) {
         if (!Linear.residentEnabled()) {
             RoutableFixtureTest.saySkip();
             return;
         }
+        if (!KernelCap.usable(kernel)) {
+            DeviceSkip.noKernel(kernel, Device.activeBackend());
+            return;
+        }
         int32 E = 128;
         int32 K = 8;
-        int32 rows = 300;
         int32 np = rows * K;
         int32[] sel = heap int32[np];
         float32[] w = heap float32[np];
@@ -192,6 +210,25 @@ public class MoeIdKernelTest {
             }
             e2 = e2 + 1;
         }
+        int32 nC8 = 0;
+        e2 = 0;
+        while (e2 < E) { nC8 = nC8 + (cnt[e2] + 127) / 128; e2 = e2 + 1; }
+        int32[] h8E = heap int32[nC8];
+        int32[] h8T0 = heap int32[nC8];
+        int32[] h8M1 = heap int32[nC8];
+        ci = 0;
+        e2 = 0;
+        while (e2 < E) {
+            int32 tw8 = 0;
+            while (tw8 * 128 < cnt[e2]) {
+                h8E[ci] = e2;
+                h8T0[ci] = off[e2] + tw8 * 128;
+                h8M1[ci] = off[e2] + cnt[e2];
+                ci = ci + 1;
+                tw8 = tw8 + 1;
+            }
+            e2 = e2 + 1;
+        }
         i = 0;
         while (i < np) {
             int32 slot = cur[sel[i]];
@@ -222,9 +259,13 @@ public class MoeIdKernelTest {
         KernelBuffer<int32> m8M1 #= heap KernelBuffer<int32>((uint64) cap8);
         KernelBuffer<int32> meta #= heap KernelBuffer<int32>((uint64) 4);
         int64[] vc #= ValueCheck.mark();
-        QuantKernel.moeGroupLaunchNoSync(gRow, gW, rowSlot, mE, mT0, mM1,
-            m8E, m8T0, m8M1,
-            meta, selDev, wDev, (int64) np, (int64) E, (int64) K);
+        if (wave) {
+            QuantKernel.moeGroupWaveLaunchNoSync(gRow, gW, rowSlot, mE, mT0, mM1,
+                m8E, m8T0, m8M1, meta, selDev, wDev, (int64) np, (int64) E, (int64) K);
+        } else {
+            QuantKernel.moeGroupSerialLaunchNoSync(gRow, gW, rowSlot, mE, mT0, mM1,
+                m8E, m8T0, m8M1, meta, selDev, wDev, (int64) np, (int64) E, (int64) K);
+        }
         KernelStream s = QuantKernel.stream();
         s.sync();
         int32[] dRow = heap int32[np];
@@ -234,8 +275,9 @@ public class MoeIdKernelTest {
         gRow.download(dRow, (int64) np);
         gW.download(dW, (int64) np);
         rowSlot.download(dSlot, (int64) np);
-        meta.download(dMeta, 1L);
+        meta.download(dMeta, 2L);
         Assert.equals((int64) nC, (int64) dMeta[0]);
+        Assert.equals((int64) nC8, (int64) dMeta[1]);
         int32[] dE = heap int32[nC];
         int32[] dT0 = heap int32[nC];
         int32[] dM1 = heap int32[nC];
@@ -254,6 +296,19 @@ public class MoeIdKernelTest {
             Assert.equals((int64) hE[ci], (int64) dE[ci]);
             Assert.equals((int64) hT0[ci], (int64) dT0[ci]);
             Assert.equals((int64) hM1[ci], (int64) dM1[ci]);
+            ci = ci + 1;
+        }
+        int32[] d8E = heap int32[nC8];
+        int32[] d8T0 = heap int32[nC8];
+        int32[] d8M1 = heap int32[nC8];
+        m8E.download(d8E, (int64) nC8);
+        m8T0.download(d8T0, (int64) nC8);
+        m8M1.download(d8M1, (int64) nC8);
+        ci = 0;
+        while (ci < nC8) {
+            Assert.equals((int64) h8E[ci], (int64) d8E[ci]);
+            Assert.equals((int64) h8T0[ci], (int64) d8T0[ci]);
+            Assert.equals((int64) h8M1[ci], (int64) d8M1[ci]);
             ci = ci + 1;
         }
         // Vacuity: the hot expert really spans several chunks.
