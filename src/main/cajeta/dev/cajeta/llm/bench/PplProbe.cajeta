@@ -6,6 +6,7 @@ import cajeta.lang.System;
 import cajeta.math.Tensor;
 import cajeta.time.Clock;
 import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.QuantKernel;
 import cajeta.xpu.Device;
 import dev.cajeta.llm.model.AttnKernel;
 import dev.cajeta.llm.model.CausalLM;
@@ -26,6 +27,7 @@ import dev.cajeta.llm.tok.Tokenizer;
  * explicitly NOT asserted (near-ties may legitimately tip).
  *
  *   pplprobe <model.gguf> <text-file> [pre=N] [eval=N] [attncheck] [nocoop]
+ *            [klsave=<path>|klref=<path>] [noroute] [tile|int8gemm] [plainmv] ...
  */
 public final class PplProbe {
 
@@ -41,6 +43,8 @@ public final class PplProbe {
         int32 eval = 256;
         int32 pinMode = 0;
         String pinPath #= "";
+        String klSave #= "";
+        String klRef #= "";
         int32 ai = 2;
         while (ai < (int32) args.count()) {
             if (args[ai].startsWith("pre=")) {
@@ -93,6 +97,17 @@ public final class PplProbe {
                 pinPath #= args[ai].substring(7, args[ai].byteLength());
                 pinMode = 1;
             }
+            // 15.2.15.3.6.1's arms: each pins one route, and every timed choice is pinned.
+            if (args[ai].equals("noroute")) { QuantKernel.setRoutingEnabled(false); }
+            if (args[ai].equals("noq8")) { Linear.setQ8Route(false); }
+            if (args[ai].equals("tile")) { Linear.setTileBeatsDeq(1); Linear.setMatrixCoresPay(1); }
+            if (args[ai].equals("int8gemm")) { Linear.setTileBeatsDeq(2); Linear.setMatrixCoresPay(2); }
+            if (args[ai].equals("notc")) { Linear.setTc(false); }
+            if (args[ai].equals("deq")) { Linear.setDeqPrefill(true); }
+            if (args[ai].equals("hostattn")) { CausalLM.setDeviceAttention(false); }
+            if (args[ai].equals("plainmv")) { QuantKernel.setQ4Prefetch(2); QuantKernel.setQ6Prefetch(2); }
+            if (args[ai].startsWith("klsave=")) { klSave #= args[ai].substring(7, args[ai].byteLength()); }
+            if (args[ai].startsWith("klref=")) { klRef #= args[ai].substring(6, args[ai].byteLength()); }
             if (args[ai].startsWith("pinreplay=")) {
                 pinPath #= args[ai].substring(10, args[ai].byteLength());
                 pinMode = 2;
@@ -145,6 +160,18 @@ public final class PplProbe {
         int32 vocab = m.vocabSize();
         float32[] row #= heap float32[vocab];
         Perplexity ppl = heap Perplexity();
+        int64 rowBytes = (int64) vocab * 4L;
+        int8[] saved #= heap int8[klSave.byteLength() > 0 ? rowBytes * (int64) eval : 1L];
+        int8[] refRows #= heap int8[1];
+        if (klRef.byteLength() > 0) {
+            refRows #= File.readAllBytes(klRef);
+            if (refRows == null || (int64) refRows.count() < rowBytes * (int64) eval) {
+                System.stdout.println("pplprobe: klref " + klRef + " is missing or short");
+                return 2;
+            }
+        }
+        float32[] refRow #= heap float32[vocab];
+        KlCensus kc = heap KlCensus();
         int32[] one #= heap int32[1];
         t0 = Clock.nanoTime();
         int32 i = 0;
@@ -159,6 +186,11 @@ public final class PplProbe {
                 c = c + 1;
             }
             ppl.add(row, vocab, ids[pre + i]);
+            if (klSave.byteLength() > 0) { KlCensus.putRow(row, vocab, saved, (int64) i * rowBytes); }
+            if (klRef.byteLength() > 0) {
+                KlCensus.getRow(refRows, (int64) i * rowBytes, refRow, vocab);
+                kc.add(refRow, row, vocab);
+            }
             // Teacher-force the TRUE corpus token.
             one[0] = ids[pre + i];
             m.stepSeq(0, one, 0, 1);
@@ -168,6 +200,11 @@ public final class PplProbe {
             + ((float64) (Clock.nanoTime() - t0) / 1000000.0));
         System.stdout.println("positions: " + ppl.positions()
             + "  meanNll: " + ppl.meanNll() + "  ppl: " + ppl.ppl());
+        if (klSave.byteLength() > 0) { File.writeAllBytes(klSave, saved, rowBytes * (int64) eval); }
+        if (klRef.byteLength() > 0) {
+            System.stdout.println("kl-census\tpositions " + kc.positions() + "\tmeanKl " + kc.meanKl()
+                + "\tmaxKl " + kc.maxKl() + "\tsameTop " + kc.sameTopFraction());
+        }
         System.stdout.println("launches: attnScoreKernel "
             + Device.kernelLaunchCount("attnScoreKernel") + "  attnScorePrefillRowKernel "
             + Device.kernelLaunchCount("attnScorePrefillRowKernel") + "  attnScorePrefillKernel "
