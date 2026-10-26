@@ -1389,6 +1389,7 @@ public final class Linear extends InfModule {
             && !Linear.backendIsVulkan()
             && !QuantKernel.hasBatchKernel(this.packedTy)
             && !this.q5TileRoute()
+            && !this.q3TileRoute()
             && QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)
             && (int64) this.outDim % 128L == 0L;
     }
@@ -1402,6 +1403,19 @@ public final class Linear extends InfModule {
      *  (2026-10-24 15:59). */
     boolean q5TileRoute() {
         return this.packedTy == Quant.GG_Q5_K && Linear.avQ5Tc
+            && Linear.wmmaOn && Linear.tcOn && !Linear.backendIsVulkan()
+            && !this.slotMode && this.winStage == null;
+    }
+
+    /** The weight's output and input widths, for the route tests. */
+    public int32 outFeatures() { return this.outDim; }
+    public int32 inFeatures() { return this.inDim; }
+
+    /** {@link #q5TileRoute} for Q3_K (15.2.15.3.4): Q3_K has no native batch
+     *  kernel either, so without this it is a coop-routed format and the
+     *  stage would be f16 only. */
+    boolean q3TileRoute() {
+        return this.packedTy == Quant.GG_Q3_K && Linear.avQ3Tc
             && Linear.wmmaOn && Linear.tcOn && !Linear.backendIsVulkan()
             && !this.slotMode && this.winStage == null;
     }
@@ -1994,6 +2008,7 @@ public final class Linear extends InfModule {
     static boolean avQ4Tc;         // the tensor-core prefill tile (1.8.3)
     static boolean avQ6Tc;         // its Q6_K twin
     static boolean avQ5Tc;         // its Q5_K twin (15.2.15.3.4)
+    static boolean avQ3Tc;         // its Q3_K twin (15.2.15.3.4)
     /** Whether some listed Q4_K tile member can be launched here. */
     public static boolean q4TileUsable() { return Linear.familyUsable(TcTile.q4()); }
 
@@ -2002,6 +2017,9 @@ public final class Linear extends InfModule {
 
     /** Whether some listed Q5_K tile member can be launched here. */
     public static boolean q5TileUsable() { return Linear.familyUsable(TcTile.q5()); }
+
+    /** Whether some listed Q3_K tile member can be launched here. */
+    public static boolean q3TileUsable() { return Linear.familyUsable(TcTile.q3()); }
 
     static boolean familyUsable(TileFamily<Q4TileShape> fam) {
         int32 n = (int32) fam.shapes().count();
@@ -2019,6 +2037,7 @@ public final class Linear extends InfModule {
         Linear.avQ4Tc = Linear.q4TileUsable();
         Linear.avQ6Tc = Linear.q6TileUsable();
         Linear.avQ5Tc = Linear.q5TileUsable();
+        Linear.avQ3Tc = Linear.q3TileUsable();
         // usable, not merely registered: a kernel written for another wave
         // width, or one measured wrong on this backend, must not be routed
         // (KernelCap.WAVE32_ONLY, KernelCap.WRONG_HERE).
@@ -2158,7 +2177,7 @@ public final class Linear extends InfModule {
         if (this.isBatchRouted()) { return null; }
         // A Q5_K weight the tensor-core tile serves is batch-routed by it
         // (15.2.15.3.4); the coop classification below says no for it.
-        if (this.q5TileRoute()) { return null; }
+        if (this.q5TileRoute() || this.q3TileRoute()) { return null; }
         if (Linear.backendIsVulkan()) {
             return "vulkan: coop tile does not divide cols/outDim and no batch kernel";
         }
@@ -2584,9 +2603,14 @@ public final class Linear extends InfModule {
         boolean q5Tile = this.q5TileRoute() && Linear.matrixCoresPay()
             && Linear.tilePreferred()
             && TcTile.fits5(q5Rows, (int64) this.outDim, (int64) this.inDim);
-        boolean coopHere = Linear.coopOn && !q5Tile
+        // Q3_K's tile is decided here for the same reason (15.2.15.3.4).
+        boolean q3Tile = this.q3TileRoute() && Linear.matrixCoresPay()
+            && Linear.tilePreferred()
+            && TcTile.fits3(q5Rows, (int64) this.outDim, (int64) this.inDim);
+        boolean coopHere = Linear.coopOn && !q5Tile && !q3Tile
             && (Linear.backendIsVulkan() || this.coopRoutedHere()
-                || (this.packedTy == Quant.GG_Q5_K && Linear.avQ5Tc))
+                || (this.packedTy == Quant.GG_Q5_K && Linear.avQ5Tc)
+                || (this.packedTy == Quant.GG_Q3_K && Linear.avQ3Tc))
             && Linear.btXhSrc != null
             && QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)
             && (int64) this.outDim % 128L == 0L;
@@ -2624,7 +2648,7 @@ public final class Linear extends InfModule {
         int64 tRows = (int64) rows;
         if (tRows % 16L != 0L && Linear.wmmaOn && !Linear.backendIsVulkan()
                 && (this.packedTy == Quant.GG_Q4_K || this.packedTy == Quant.GG_Q6_K
-                    || this.q5TileRoute())
+                    || this.q5TileRoute() || this.q3TileRoute())
                 && (int64) this.outDim % 16L == 0L
                 && Linear.matrixCoresPay()) {
             tRows = ((int64) rows + 15L) / 16L * 16L;
@@ -2675,6 +2699,10 @@ public final class Linear extends InfModule {
             && TcTile.fits6(mw8RowsTc, (int64) this.outDim, (int64) this.inDim);
         // The Q5_K member reads the raw 176-byte blocks (15.2.15.3.4).
         boolean useTc5 = q5Tile && tcShape;
+        // The Q3_K member reads the resident (split) payload, as Q6_K's does;
+        // where it does not fit, Q3_K keeps its widened int8 GEMM, which
+        // reads the same int8 stage (15.2.15.3.4).
+        boolean useTc3 = q3Tile && tcShape;
         if (!useTc5 && Linear.tcOn && this.packedTy == Quant.GG_Q5_K
                 && !Linear.backendIsVulkan()) {
             this.sayRoute(281474976710656L, "q5 tcTile refused: avail=" + Linear.avQ5Tc
@@ -2732,7 +2760,7 @@ public final class Linear extends InfModule {
             && this.packedTy == Quant.GG_Q2_K && Linear.avQ2Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
             && this.deqAdmitted();
-        boolean useDeq3 = Linear.deqFor(this.packedTy) && Linear.wmmaOn
+        boolean useDeq3 = Linear.deqFor(this.packedTy) && Linear.wmmaOn && !useTc3
             && this.packedTy == Quant.GG_Q3_K && Linear.avQ3Mw8
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
             && this.deqAdmitted();
@@ -2754,6 +2782,12 @@ public final class Linear extends InfModule {
             this.ensureBatchOut((int32) mw8RowsTc);
             this.sayRoute(140737488355328L, "q5 tcTile");
             TcTile.q5kQ8TcTileLaunchNoSync(this.yBatch, this.payloadDev,
+                Linear.btXp, mw8RowsTc, (int64) this.outDim,
+                (int64) this.inDim);
+        } else if (useTc3) {
+            this.ensureBatchOut((int32) mw8RowsTc);
+            this.sayRoute(562949953421312L, "q3 tcTile");
+            TcTile.q3kQ8TcTileLaunchNoSync(this.yBatch, this.payloadDev,
                 Linear.btXp, mw8RowsTc, (int64) this.outDim,
                 (int64) this.inDim);
         } else if (useDeq) {
@@ -3373,7 +3407,9 @@ public final class Linear extends InfModule {
             && TcTile.fits6(padRows, (int64) this.outDim, (int64) this.inDim);
         boolean q5 = this.packedTy == Quant.GG_Q5_K && Linear.avQ5Tc
             && TcTile.fits5(padRows, (int64) this.outDim, (int64) this.inDim);
-        if (!q4 && !q6 && !q5) { return false; }
+        boolean q3 = this.packedTy == Quant.GG_Q3_K && Linear.avQ3Tc
+            && TcTile.fits3(padRows, (int64) this.outDim, (int64) this.inDim);
+        if (!q4 && !q6 && !q5 && !q3) { return false; }
         this.ensureDevice();
         Linear.ensureBatchStage((int32) padRows, this.inDim);
         if (q4) {
@@ -3381,6 +3417,9 @@ public final class Linear extends InfModule {
                 (int64) this.outDim, (int64) this.inDim);
         } else if (q5) {
             TcTile.prewarmQ5(this.payloadDev, Linear.btXp, padRows,
+                (int64) this.outDim, (int64) this.inDim);
+        } else if (q3) {
+            TcTile.prewarmQ3(this.payloadDev, Linear.btXp, padRows,
                 (int64) this.outDim, (int64) this.inDim);
         } else {
             TcTile.prewarmQ6(this.payloadDev, Linear.btXp, padRows,
