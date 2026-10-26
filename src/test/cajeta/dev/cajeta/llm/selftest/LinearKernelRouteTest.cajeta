@@ -1452,6 +1452,206 @@ public class LinearKernelRouteTest {
         }
     }
 
+    /** Whether `ty`'s tensor-core tile family is routed here (15.2.15.3.7). */
+    static boolean tileRoutedFor(int32 ty) {
+        if (Linear.backendIsVulkan() || !Linear.waveMv() || !Linear.matrixCoresPay()) {
+            return false;
+        }
+        if (ty == Quant.GG_Q6_K) { return Linear.q4TileUsable() && Linear.q6TileUsable(); }
+        if (ty == Quant.GG_Q5_K) { return Linear.q4TileUsable() && Linear.q5TileUsable(); }
+        if (ty == Quant.GG_Q3_K) { return Linear.q4TileUsable() && Linear.q3TileUsable(); }
+        if (ty == Quant.GG_Q8_0) { return Linear.q4TileUsable() && Linear.q8TileUsable(); }
+        if (ty == Quant.GG_Q2_K) { return Linear.q4TileUsable() && Linear.q2TileUsable(); }
+        return false;
+    }
+
+    /** The fused gate|up tile of fusedGateUpTileAgreesWithTheSeparateTiles
+     *  for one more format: the pair takes "<fmt> tcTile gate|up" and each
+     *  half of the fused output agrees with the projection's own tile. */
+    static void fusedPairCase(int32 ty, String fixture, String fmt) {
+        int32 rows = 256;
+        // 2048 wide: Q8Tile, Q3Tile and Q6Tile stage 2048 columns a K
+        // block and take the tile only at a width that divides by it (the
+        // narrower CI fixture takes the coop route for those formats).
+        int64 ci = 2048L;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        Linear a #= LinearKernelRouteTest.tiledAt(ty, fixture, (int32) ci, (int32) co);
+        int64 cob = co * 2L;
+        Linear b #= LinearKernelRouteTest.tiledAt(ty, fixture, (int32) ci, (int32) cob);
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ci, 0L);
+        Tensor<float32> wantA #= LinearKernelRouteTest.ramp(0L, (int64) rows * co);
+        Tensor<float32> wantB #= LinearKernelRouteTest.ramp(0L, (int64) rows * cob);
+        QuantKernel.setRoutingEnabled(true);
+        boolean tcWas = Linear.tcEnabled();
+        Linear.setTc(true);
+        Linear.setTileBeatsDeq(1);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        a.matmulInto(rows, wantA, 0L);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        b.matmulInto(rows, wantB, 0L);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap tap = heap PrefillTap();
+        Diag.register(tap);
+        boolean took = a.fusedPairBatchKeep(b, rows);
+        Diag.register(null);
+        Linear.setTc(tcWas);
+        Linear.setTileBeatsDeq(0);
+        if (!took || !tap.saw("batch-route", fmt + " tcTile gate|up")) {
+            Assert.fail(fmt + ": the fused gate|up tile was not taken, saw "
+                + tap.namesOf("batch-route"));
+            return;
+        }
+        QuantKernel.stream().sync();
+        int64 fo = co + cob;
+        float32[] got #= heap float32[(int64) rows * fo];
+        a.fusedBatchOut().download(got, (int64) rows * fo);
+        LinearKernelRouteTest.assertLive(wantA, (int64) rows * co, fmt + " gate alone");
+        int64 r = 0;
+        while (r < (int64) rows) {
+            int64 c = 0;
+            while (c < fo) {
+                float32 w = c < co ? wantA.flatGet(r * co + c)
+                    : wantB.flatGet(r * cob + (c - co));
+                float32 g = got[r * fo + c];
+                float32 d = w - g;
+                if (d < 0.0f) { d = 0.0f - d; }
+                float32 m = w < 0.0f ? 0.0f - w : w;
+                if (m < 1.0f) { m = 1.0f; }
+                if (d / m > 0.00001f) {
+                    Assert.fail(fmt + " fused gate|up row " + r + " col " + c + ": "
+                        + g + " vs the separate tile's " + w);
+                    return;
+                }
+                c = c + 1;
+            }
+            r = r + 1;
+        }
+    }
+
+    /** 15.2.15.3.7: every tile format fuses gate|up into one tile launch, so
+     *  the fused GLU-and-pack follows it as it does on Q4_K (a Q5_K or Q8_0
+     *  model ran two GEMMs, the f32 GLU and a separate q8_K pack). */
+    @Test
+    public void fusedGateUpTileServesEveryTileFormat() {
+        int32 ran = 0;
+        if (LinearKernelRouteTest.tileRoutedFor(Quant.GG_Q5_K)) {
+            LinearKernelRouteTest.fusedPairCase(Quant.GG_Q5_K, "q5_k.bin", "q5");
+            ran = ran + 1;
+        }
+        if (LinearKernelRouteTest.tileRoutedFor(Quant.GG_Q8_0)) {
+            LinearKernelRouteTest.fusedPairCase(Quant.GG_Q8_0, "q8_0.bin", "q8");
+            ran = ran + 1;
+        }
+        if (LinearKernelRouteTest.tileRoutedFor(Quant.GG_Q3_K)) {
+            LinearKernelRouteTest.fusedPairCase(Quant.GG_Q3_K, "q3_k.bin", "q3");
+            ran = ran + 1;
+        }
+        if (LinearKernelRouteTest.tileRoutedFor(Quant.GG_Q2_K)) {
+            LinearKernelRouteTest.fusedPairCase(Quant.GG_Q2_K, "q2_k.bin", "q2");
+            ran = ran + 1;
+        }
+        if (LinearKernelRouteTest.tileRoutedFor(Quant.GG_Q6_K)) {
+            LinearKernelRouteTest.fusedPairCase(Quant.GG_Q6_K, "q6_k.bin", "q6");
+            ran = ran + 1;
+        }
+        if (ran == 0) {
+            DeviceSkip.tracked("the tensor-core tiles are not routed on "
+                + Device.activeBackend(), "cajeta-llm 15.2.15.3.7");
+        }
+    }
+
+    /** accumulatingTileAddsTheProductIntoTheResidual for one more format:
+     *  "<fmt> tcTile +=" adds exactly the projection's own product. */
+    static void accumCase(int32 ty, String fixture, String fmt) {
+        int32 rows = 256;
+        // 2048 wide: Q8Tile, Q3Tile and Q6Tile stage 2048 columns a K
+        // block and take the tile only at a width that divides by it (the
+        // narrower CI fixture takes the coop route for those formats).
+        int64 ci = 2048L;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        int64 n = (int64) rows * co;
+        Linear lin #= LinearKernelRouteTest.tiledAt(ty, fixture, (int32) ci, (int32) co);
+        Tensor<float32> x #= LinearKernelRouteTest.ramp((int64) rows * ci, 0L);
+        Tensor<float32> want #= LinearKernelRouteTest.ramp(0L, n);
+        QuantKernel.setRoutingEnabled(true);
+        boolean tcWas = Linear.tcEnabled();
+        Linear.setTc(true);
+        Linear.setTileBeatsDeq(1);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        lin.matmulInto(rows, want, 0L);
+        float32[] pre #= heap float32[n];
+        int64 e = 0;
+        while (e < n) {
+            pre[e] = 0.5f * (float32) ((e * 5L) % 11L) - 2.0f;
+            e = e + 1L;
+        }
+        KernelBuffer<float32> dst #= heap KernelBuffer<float32>((uint64) n);
+        dst.upload(pre);
+        Linear.stageBatch(x, 0L, rows, (int32) ci, Linear.nextStageTag());
+        Linear.resetRouteSaid();
+        PrefillTap tap = heap PrefillTap();
+        Diag.register(tap);
+        boolean took = lin.matmulBatchAccum(rows, dst);
+        Diag.register(null);
+        Linear.setTc(tcWas);
+        Linear.setTileBeatsDeq(0);
+        if (!took || !tap.saw("batch-route", fmt + " tcTile +=")) {
+            Assert.fail(fmt + ": the accumulating tile was not taken, saw "
+                + tap.namesOf("batch-route"));
+            return;
+        }
+        QuantKernel.stream().sync();
+        float32[] got #= heap float32[n];
+        dst.download(got, n);
+        LinearKernelRouteTest.assertLive(want, n, fmt + " projection alone");
+        int64 i = 0;
+        while (i < n) {
+            float32 a = want.flatGet(i);
+            float32 b = got[i] - pre[i];
+            float32 d = a - b;
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 sc = a;
+            if (sc < 0.0f) { sc = 0.0f - sc; }
+            if (sc < 1.0f) { sc = 1.0f; }
+            if (d / sc > 0.0001f) {
+                Assert.fail(fmt + " element " + i + ": accumulated " + got[i]
+                    + " minus the prefill " + pre[i] + " is " + b
+                    + ", the projection alone " + a);
+                return;
+            }
+            i = i + 1;
+        }
+    }
+
+    /** 15.2.15.3.7: o_proj and down_proj add into the resident hidden state
+     *  on every tile format (Q8_0 and Q5_K models ran the projection, then a
+     *  separate add over the 2048-row residual twice a layer). */
+    @Test
+    public void accumulatingTileServesEveryTileFormat() {
+        int32 ran = 0;
+        if (LinearKernelRouteTest.tileRoutedFor(Quant.GG_Q5_K)) {
+            LinearKernelRouteTest.accumCase(Quant.GG_Q5_K, "q5_k.bin", "q5");
+            ran = ran + 1;
+        }
+        if (LinearKernelRouteTest.tileRoutedFor(Quant.GG_Q8_0)) {
+            LinearKernelRouteTest.accumCase(Quant.GG_Q8_0, "q8_0.bin", "q8");
+            ran = ran + 1;
+        }
+        if (LinearKernelRouteTest.tileRoutedFor(Quant.GG_Q3_K)) {
+            LinearKernelRouteTest.accumCase(Quant.GG_Q3_K, "q3_k.bin", "q3");
+            ran = ran + 1;
+        }
+        if (LinearKernelRouteTest.tileRoutedFor(Quant.GG_Q2_K)) {
+            LinearKernelRouteTest.accumCase(Quant.GG_Q2_K, "q2_k.bin", "q2");
+            ran = ran + 1;
+        }
+        if (ran == 0) {
+            DeviceSkip.tracked("the tensor-core tiles are not routed on "
+                + Device.activeBackend(), "cajeta-llm 15.2.15.3.7");
+        }
+    }
+
     @Test
     public void multiWavePackedQ4kAgreesWithDeqMw8() {
         if (!KernelCap.usable(WmmaKernel.MW_KERNEL)
