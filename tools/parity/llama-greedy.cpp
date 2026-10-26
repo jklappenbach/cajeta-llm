@@ -12,7 +12,7 @@
 //       no BOS: SchedThroughput's synthetic prompts, 2026-10-25)
 //
 //   prompt-ids <n> <id,id,...>
-//   greedy <pos> <id> <top2gap>
+//   greedy <pos> <id> <top2gap> <runner-up id>
 //
 // Deterministic by construction: no sampler, argmax over the raw logits.
 
@@ -89,7 +89,7 @@ int main(int argc, char ** argv) {
             else if (second < 0 || logits[t] > logits[second]) { second = t; }
         }
         float gap = second >= 0 ? logits[best] - logits[second] : 0.0f;
-        printf("greedy\t%d\t%d\t%.6g\n", pos, best, gap);
+        printf("greedy\t%d\t%d\t%.6g\t%d\n", pos, best, gap, second);
         if (llama_vocab_is_eog(vocab, best)) break;
         cur = best;
         batch = llama_batch_get_one(&cur, 1);

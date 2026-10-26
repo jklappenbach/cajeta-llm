@@ -2,8 +2,8 @@
 # Greedy token agreement against llama.cpp on the reference model
 # (cajeta xpu-kernel-adaptor plan 8.1.3): llama.cpp's walk with top-2 gaps
 # from tools/parity/llama-greedy, cajeta's walk on the SAME prompt ids from
-# bench/GreedyVsLlama, judged by GreedyAgreement (rate >= 0.99, every
-# divergence at a gap under 1e-3).
+# bench/GreedyVsLlama, judged by GreedyAgreement.passesWithTies (every
+# divergence onto llama.cpp's runner-up under GreedyVsLlama.TIE_BOUND).
 #
 #   XPU_BACKEND=nvptx DEVICE=cuda tools/parity/run-greedy.sh [prompt] [n]
 set -euo pipefail
@@ -16,7 +16,7 @@ prompt="${1:-The measured baseline for the parity gate is}"
 n="${2:-32}"
 out="$here/tmp/parity-build"
 mkdir -p "$out"
-[[ -x "$out/llama-greedy" ]] || "$here/tools/parity/build-ggml-leg.sh"
+[[ "$out/llama-greedy" -nt "$here/tools/parity/llama-greedy.cpp" ]] || "$here/tools/parity/build-ggml-leg.sh"
 [[ -f "$MODEL" ]] || { echo "no reference model at $MODEL" >&2; exit 1; }
 
 echo ">> llama.cpp greedy ($LLAMA_COMMIT, CUDA): $n tokens"
