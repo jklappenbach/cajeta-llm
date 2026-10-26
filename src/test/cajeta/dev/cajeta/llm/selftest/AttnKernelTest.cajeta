@@ -942,10 +942,12 @@ public class AttnKernelTest {
         AttnKernel.setPrefillTile(true);
         AttnKernel.setPrefillTilePays(pays);
         int64 before = Device.kernelLaunchCount("attnFlashPrefillTileKernel")
-            + Device.kernelLaunchCount("attnFlashPrefillOnlineKernel");
+            + Device.kernelLaunchCount("attnFlashPrefillOnlineKernel")
+            + Device.kernelLaunchCount("attnFlashPrefillF16Kernel");
         AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv, hd, 0, 0.088f);
         int64 after = Device.kernelLaunchCount("attnFlashPrefillTileKernel")
-            + Device.kernelLaunchCount("attnFlashPrefillOnlineKernel");
+            + Device.kernelLaunchCount("attnFlashPrefillOnlineKernel")
+            + Device.kernelLaunchCount("attnFlashPrefillF16Kernel");
         AttnKernel.setPrefillTilePays(paysWas);
         AttnKernel.setPrefillTile(tileWas);
         AttnKernelTest.assertLive(got, "pinned " + pays);
@@ -1295,6 +1297,8 @@ public class AttnKernelTest {
             startPos, scale);
         boolean onlineWas = AttnKernel.prefillOnlineOn();
         boolean tileWas = AttnKernel.prefillTileOn();
+        boolean f16Was = AttnKernel.prefillF16On();
+        AttnKernel.setPrefillF16(false);
         int64[] vc #= ValueCheck.mark();
         int64 before = Device.kernelLaunchCount("attnFlashPrefillOnlineKernel");
         int32 paysWas = AttnKernel.prefillTilePaysState();
@@ -1312,6 +1316,7 @@ public class AttnKernelTest {
             startPos, scale);
         AttnKernel.setPrefillOnline(onlineWas);
         AttnKernel.setPrefillTile(tileWas);
+        AttnKernel.setPrefillF16(f16Was);
         if (after <= before) {
             Assert.fail(what + ": the online kernel was not launched");
             return;
@@ -1336,6 +1341,83 @@ public class AttnKernelTest {
         AttnKernelTest.onlineCase(77, 32, 8, 1971, 77, "online gqa4 77@1971");
         AttnKernelTest.onlineCase(64, 32, 4, 448, 79, "online gqa8 64@448");
         AttnKernelTest.onlineCase(130, 32, 8, 0, 83, "online gqa4 130@0");
+    }
+
+    /** The f16 online prefill against the host floor, at llama.cpp's
+     *  precision: the query and the probabilities round to f16 once (no
+     *  residual pair). Measured on sm_89 at these shapes, the worst element
+     *  sits 0.0004 off the floor (the residual kernel holds 0.1% + 0.0002);
+     *  the bound is 0.2% of the element plus 0.0008, twice that. */
+    static void f16Case(int32 rows, int32 nH, int32 nKv, int32 startPos,
+            int32 seed, String what) {
+        int32 hd = 128;
+        int32 tMax = startPos + rows;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        float32[] q #= AttnKernelTest.spread(qn, seed);
+        float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, seed + 2);
+        float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim, seed + 4);
+        AttnKernel.roundHalf(k);
+        AttnKernel.roundHalf(v);
+        float32[] want #= heap float32[qn];
+        AttnKernel.attendPrefillHost(want, q, k, v, rows, nH, nKv, hd,
+            startPos, scale);
+        boolean onlineWas = AttnKernel.prefillOnlineOn();
+        boolean tileWas = AttnKernel.prefillTileOn();
+        boolean f16Was = AttnKernel.prefillF16On();
+        int64[] vc #= ValueCheck.mark();
+        int64 before = Device.kernelLaunchCount("attnFlashPrefillF16Kernel");
+        int32 paysWas = AttnKernel.prefillTilePaysState();
+        AttnKernel.setPrefillTilePays(1);
+        AttnKernel.setPrefillOnline(true);
+        AttnKernel.setPrefillTile(true);
+        AttnKernel.setPrefillF16(true);
+        float32[] got #= heap float32[qn];
+        AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv, hd,
+            startPos, scale);
+        int64 after = Device.kernelLaunchCount("attnFlashPrefillF16Kernel");
+        AttnKernel.setPrefillTilePays(paysWas);
+        AttnKernel.setPrefillOnline(onlineWas);
+        AttnKernel.setPrefillTile(tileWas);
+        AttnKernel.setPrefillF16(f16Was);
+        if (after <= before) {
+            Assert.fail(what + ": the f16 kernel was not launched");
+            return;
+        }
+        AttnKernelTest.assertLive(got, what);
+        float32 worst = 0.0f;
+        int64 i = 0;
+        while (i < qn) {
+            float32 d = want[i] - got[i];
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 mag = want[i] < 0.0f ? 0.0f - want[i] : want[i];
+            float32 excess = d - (mag * 0.002f + 0.0008f);
+            if (excess > 0.0f) {
+                Assert.fail(what + " at " + i + ": device " + got[i]
+                    + " vs host " + want[i] + " - past f16 rounding");
+                return;
+            }
+            if (d > worst) { worst = d; }
+            i = i + 1;
+        }
+        System.stdout.println("  " + what + ": worst |device - host| " + worst);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void thePrefillF16TileAgreesWithTheHostFloorAtF16Precision() {
+        AttnKernelTest.need("attnFlashPrefillF16Kernel");
+        AttnKernelTest.f16Case(5, 16, 16, 0, 81, "f16 gqa1 5@0");
+        AttnKernelTest.f16Case(64, 16, 16, 0, 85, "f16 gqa1 64@0");
+        AttnKernelTest.f16Case(65, 16, 16, 0, 87, "f16 gqa1 65@0");
+        AttnKernelTest.f16Case(128, 16, 16, 0, 89, "f16 gqa1 128@0");
+        AttnKernelTest.f16Case(512, 16, 16, 0, 71, "f16 gqa1 512@0");
+        AttnKernelTest.f16Case(100, 16, 16, 1948, 73, "f16 gqa1 100@1948");
+        AttnKernelTest.f16Case(512, 32, 8, 0, 75, "f16 gqa4 512@0");
+        AttnKernelTest.f16Case(77, 32, 8, 1971, 77, "f16 gqa4 77@1971");
+        AttnKernelTest.f16Case(64, 32, 4, 448, 79, "f16 gqa8 64@448");
+        AttnKernelTest.f16Case(130, 32, 8, 0, 83, "f16 gqa4 130@0");
     }
 
     /** 11.2: the query-tiled flash prefill at every GQA shape the MoE
