@@ -1,0 +1,173 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+
+/** llm-cpu-parity Unit 2: the Q4_K and Q6_K int8 mat-vecs against their q8_K host oracles. */
+public class CpuInt8MatVecTest {
+    static final int64 ROWS = 6L;
+    static final int64 BPR = 3L;
+    static final int64 YOFF = 5L;
+
+    public CpuInt8MatVecTest() { return; }
+
+    /** The host oracle on `x` quantized to q8_K, written to `y` at `yOff`. */
+    static void oracle(int32 ty, int8[] raw, int64 rows, int64 cols, float32[] x,
+            float32[] y, int64 yOff) {
+        int8[] xq #= heap int8[cols];
+        float32[] xd #= heap float32[cols / 256L];
+        int32[] xbs #= heap int32[cols / 16L];
+        Quant.q8kQuantize(x, 0L, cols, xq, xd, xbs);
+        if (ty == Quant.GG_Q4_K) {
+            Quant.q4kMatVecIntoQ8(raw, rows, cols, xq, xd, xbs, y, yOff);
+        } else {
+            Quant.q6kMatVecIntoQ8(raw, rows, cols, xq, xd, xbs, y, yOff);
+        }
+    }
+
+    /** The device kernel, plain (`accum` false) or adding into `y` at `yOff`. */
+    static void kernel(int32 ty, boolean accum, int8[] raw, int64 rows, int64 cols,
+            float32[] x, float32[] y, int64 yOff) {
+        if (ty == Quant.GG_Q4_K) {
+            if (accum) { QuantKernel.q4kQ8MatVecAccumIntoDevice(raw, rows, cols, x, 0L, y, yOff); }
+            else { QuantKernel.q4kQ8MatVecIntoDevice(raw, rows, cols, x, 0L, y, yOff); }
+        } else {
+            if (accum) { QuantKernel.q6kQ8MatVecAccumIntoDevice(raw, rows, cols, x, 0L, y, yOff); }
+            else { QuantKernel.q6kQ8MatVecIntoDevice(raw, rows, cols, x, 0L, y, yOff); }
+        }
+    }
+
+    /** Bit-equal on the native tier; within 1e-5 relative where the driver compiles the SPIR-V. */
+    static void agree(float32 got, float32 want, String what) {
+        String be #= Device.activeBackend();
+        if (got == want) { return; }
+        if (be.equals("vulkan")) {
+            float32 diff = got - want;
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = want < 0.0f ? 0.0f - want : want;
+            if (diff <= mag * 1.0e-5f + 1.0e-5f) { return; }
+        }
+        Assert.fail(what + ": kernel " + got + " vs host oracle " + want);
+    }
+
+    /** Plain, then accumulating into a seeded target at YOFF, with the slots around it untouched. */
+    static void checkKernel(int32 ty, String fixture) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        int64 cols = BPR * 256L;
+        int8[] raw #= WaveGeometryTest.rowsOf(fixture, ty, ROWS, BPR);
+        float32[] x #= QuantKernelTest.activationsVaried(cols);
+        float32[] want #= heap float32[ROWS];
+        CpuInt8MatVecTest.oracle(ty, raw, ROWS, cols, x, want, 0L);
+        QuantKernelTest.assertLive(want, fixture + " host oracle");
+
+        int64[] vc #= ValueCheck.mark();
+        float32[] got #= heap float32[ROWS];
+        CpuInt8MatVecTest.kernel(ty, false, raw, ROWS, cols, x, got, 0L);
+        int64 r = 0;
+        while (r < ROWS) { CpuInt8MatVecTest.agree(got[r], want[r], fixture + " plain row " + r); r = r + 1; }
+
+        int64 n = ROWS + 2L * YOFF;
+        float32[] acc #= heap float32[n];
+        float32[] seed #= heap float32[n];
+        int64 j = 0;
+        while (j < n) { seed[j] = 0.25f * (float32) (j - 4L); acc[j] = seed[j]; j = j + 1; }
+        CpuInt8MatVecTest.kernel(ty, true, raw, ROWS, cols, x, acc, YOFF);
+        ValueCheck.credit(vc);
+        j = 0;
+        while (j < n) {
+            if (j < YOFF || j >= YOFF + ROWS) {
+                if (acc[j] != seed[j]) { Assert.fail(fixture + " accum wrote slot " + j + " outside its rows"); }
+            } else {
+                CpuInt8MatVecTest.agree(acc[j], seed[j] + want[j - YOFF], fixture + " accum row " + (j - YOFF));
+            }
+            j = j + 1;
+        }
+    }
+
+    @Test
+    public void q4kInt8KernelMatchesItsOraclePlainAndAccumulatingAtAnOffset() {
+        CpuInt8MatVecTest.checkKernel(Quant.GG_Q4_K, "q4_k.bin");
+    }
+
+    @Test
+    public void q6kInt8KernelMatchesItsOraclePlainAndAccumulatingAtAnOffset() {
+        CpuInt8MatVecTest.checkKernel(Quant.GG_Q6_K, "q6_k.bin");
+    }
+
+    /** The Q6_K oracle computes the f32 path's sum on the dequantized q8_K activations. */
+    @Test
+    public void q6kOracleIsTheF32PathOnTheQuantizedActivations() {
+        int64 cols = BPR * 256L;
+        int8[] raw #= WaveGeometryTest.rowsOf("q6_k.bin", Quant.GG_Q6_K, ROWS, BPR);
+        float32[] x #= QuantKernelTest.activationsVaried(cols);
+        int8[] xq #= heap int8[cols];
+        float32[] xd #= heap float32[cols / 256L];
+        int32[] xbs #= heap int32[cols / 16L];
+        Quant.q8kQuantize(x, 0L, cols, xq, xd, xbs);
+        float32[] xh #= heap float32[cols];
+        int64 c = 0;
+        while (c < cols) { xh[c] = (float32) xq[c] * xd[c / 256L]; c = c + 1; }
+        float32[] want #= heap float32[ROWS];
+        float32[] got #= heap float32[ROWS];
+        Quant.q6kMatVecInto(raw, ROWS, cols, xh, 0L, want, 0L);
+        Quant.q6kMatVecIntoQ8(raw, ROWS, cols, xq, xd, xbs, got, 0L);
+        QuantKernelTest.assertLive(want, "f32 path");
+        int64 r = 0;
+        while (r < ROWS) {
+            float32 diff = got[r] - want[r];
+            if (diff < 0.0f) { diff = 0.0f - diff; }
+            float32 mag = want[r] < 0.0f ? 0.0f - want[r] : want[r];
+            if (diff > mag * 1.0e-4f + 1.0e-4f) {
+                Assert.fail("row " + r + ": q8 oracle " + got[r] + " vs f32 path " + want[r]);
+            }
+            r = r + 1;
+        }
+    }
+
+    /** spec 4.5: the same bits at 1, 2, 7 and 16 threads, each launch using the cap it was given. */
+    @Test
+    public void int8KernelsGiveTheSameBitsAtEveryThreadCount() {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("worker caps are the cpu backend's"); return; }
+        int64 rows = 4096L;
+        int64 cols = 512L;
+        int32[] caps = [1, 2, 7, 16];
+        int32 t = 0;
+        while (t < 2) {
+            int32 ty = t == 0 ? Quant.GG_Q4_K : Quant.GG_Q6_K;
+            String fixture = t == 0 ? "q4_k.bin" : "q6_k.bin";
+            int8[] raw #= WaveGeometryTest.rowsOf(fixture, ty, rows, cols / 256L);
+            float32[] x #= QuantKernelTest.activationsVaried(cols);
+            float32[] first #= heap float32[rows];
+            int64[] vc #= ValueCheck.mark();
+            int32 k = 0;
+            while (k < 4) {
+                float32[] y #= heap float32[rows];
+                Device.setCpuWorkerCap(caps[k]);
+                CpuInt8MatVecTest.kernel(ty, false, raw, rows, cols, x, y, 0L);
+                int32 used = Device.lastLaunchWorkers();
+                Device.setCpuWorkerCap(0);
+                if (used != caps[k]) {
+                    Assert.fail(fixture + ": cap " + caps[k] + " ran on " + used + " workers");
+                }
+                int64 r = 0;
+                while (r < rows) {
+                    if (k == 0) { first[r] = y[r]; }
+                    else if (y[r] != first[r]) {
+                        Assert.fail(fixture + " row " + r + ": " + caps[k] + " threads " + y[r] + " vs 1 thread " + first[r]);
+                    }
+                    r = r + 1;
+                }
+                k = k + 1;
+            }
+            ValueCheck.credit(vc);
+            QuantKernelTest.assertLive(first, fixture + " at 1 thread");
+            t = t + 1;
+        }
+    }
+}

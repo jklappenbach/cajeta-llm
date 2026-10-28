@@ -655,7 +655,7 @@ public final class QuantKernel {
     public static void q4kQ8MatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xq,
             KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
-            uint32 rows, int64 blocksPerRow, int64 yOff) {
+            uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum) {
         uint32 gi = KernelThread.globalIdX();
         if (gi < rows) {
             int64 i = (int64) gi;
@@ -749,7 +749,7 @@ public final class QuantKernel {
                           - dmin * xs * (float32) dmins;
                 b = b + 1;
             }
-            y[yOff + i] = acc;
+            if (accum != 0) { y[yOff + i] = y[yOff + i] + acc; } else { y[yOff + i] = acc; }
         }
     }
 
@@ -758,11 +758,119 @@ public final class QuantKernel {
             KernelBuffer<int8> packed, KernelBuffer<int8> xq,
             KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
             int64 rows, int64 cols, int64 yOff) {
-        uint32 ur = (uint32) rows;
+        QuantKernel.q4kQ8MatVecGo(y, packed, xq, xd, xbsums, rows, cols, yOff, 0);
+        return;
+    }
+
+    /** {@link #q4kQ8MatVecLaunchNoSync}, adding into `y[yOff..yOff+rows)`. */
+    public static void q4kQ8MatVecAccumLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q4kQ8MatVecGo(y, packed, xq, xd, xbsums, rows, cols, yOff, 1);
+        return;
+    }
+
+    static void q4kQ8MatVecGo(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
+            int64 rows, int64 cols, int64 yOff, uint32 accum) {
         uint32 blk = QuantKernel.scalarBlock();
         KernelStream s = QuantKernel.stream();
         q4kQ8MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
-            (y, packed, xq, xd, xbsums, ur, cols / 256L, yOff);
+            (y, packed, xq, xd, xbsums, (uint32) rows, cols / 256L, yOff, accum);
+        return;
+    }
+
+    /**
+     * Resident split Q6_K rows against q8_K activations, one row per work
+     * item, adding into `y` when `accum` is set. A 16-element sub-block's
+     * quants go unsigned (q + 32) into one `dotAccum` under its scale, and
+     * the 32 is taken back from the activation group sums.
+     */
+    @Kernel
+    @Occupancy(maxThreads = 256)
+    public static void q6kQ8MatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
+            uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+            int64 rb = i * (prefix + blocksPerRow * 208L);
+            Vector<int32,4> z4 = xbsums.vload<4>(0) * 0;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                float32 d = GgufFile.halfBitsToF32(((int32) packed[rb + 2L * b] & 255)
+                    | (((int32) packed[rb + 2L * b + 1L] & 255) << 8));
+                int64 ro = rb + prefix + b * 208L;
+                Vector<int8,16> sc = packed.vload<16>(ro + 192L);
+                int64 xb = b * 256L;
+                Vector<int32,4> tot = z4;
+                int32 n = 0;
+                while (n < 2) {
+                    int32 h = 0;
+                    while (h < 2) {
+                        int64 o = (int64) (16 * h);
+                        Vector<uint8,16> qa = packed.vload<16>(ro + (int64) (64 * n) + o).asUnsigned();
+                        Vector<uint8,16> qb = packed.vload<16>(ro + (int64) (64 * n + 32) + o).asUnsigned();
+                        Vector<uint8,16> qh = packed.vload<16>(ro + 128L + (int64) (32 * n) + o).asUnsigned();
+                        Vector<uint8,16> u0 = (qa & 15) | ((qh & 3) << 4);
+                        Vector<uint8,16> u1 = (qb & 15) | (((qh >> 2) & 3) << 4);
+                        Vector<uint8,16> u2 = (qa >> 4) | (((qh >> 4) & 3) << 4);
+                        Vector<uint8,16> u3 = (qb >> 4) | ((qh >> 6) << 4);
+                        int64 xo = xb + (int64) (128 * n) + o;
+                        int32 sj = 8 * n + h;
+                        tot = tot + u0.dotAccum(xq.vload<16>(xo), z4) * (int32) sc[sj];
+                        tot = tot + u1.dotAccum(xq.vload<16>(xo + 32L), z4) * (int32) sc[sj + 2];
+                        tot = tot + u2.dotAccum(xq.vload<16>(xo + 64L), z4) * (int32) sc[sj + 4];
+                        tot = tot + u3.dotAccum(xq.vload<16>(xo + 96L), z4) * (int32) sc[sj + 6];
+                        h = h + 1;
+                    }
+                    n = n + 1;
+                }
+                int32 bias = 0;
+                int32 j = 0;
+                while (j < 16) {
+                    bias = bias + (int32) sc[j] * xbsums[b * 16L + (int64) j];
+                    j = j + 1;
+                }
+                int32 sumi = tot[0] + tot[1] + tot[2] + tot[3] - 32 * bias;
+                acc = acc + d * xd[b] * (float32) sumi;
+                b = b + 1;
+            }
+            if (accum != 0) { y[yOff + i] = y[yOff + i] + acc; } else { y[yOff + i] = acc; }
+        }
+    }
+
+    /** Launches {@link #q6kQ8MatVecKernel} over resident split `packed`, writing `y[yOff..)`. */
+    public static void q6kQ8MatVecLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q6kQ8MatVecGo(y, packed, xq, xd, xbsums, rows, cols, yOff, 0);
+        return;
+    }
+
+    /** {@link #q6kQ8MatVecLaunchNoSync}, adding into `y[yOff..yOff+rows)`. */
+    public static void q6kQ8MatVecAccumLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
+            int64 rows, int64 cols, int64 yOff) {
+        QuantKernel.q6kQ8MatVecGo(y, packed, xq, xd, xbsums, rows, cols, yOff, 1);
+        return;
+    }
+
+    static void q6kQ8MatVecGo(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xq,
+            KernelBuffer<float32> xd, KernelBuffer<int32> xbsums,
+            int64 rows, int64 cols, int64 yOff, uint32 accum) {
+        uint32 blk = QuantKernel.scalarBlock();
+        KernelStream s = QuantKernel.stream();
+        q6kQ8MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
+            (y, packed, xq, xd, xbsums, (uint32) rows, cols / 256L, yOff, accum);
         return;
     }
 
@@ -23329,6 +23437,60 @@ public final class QuantKernel {
         yb.download(yh);
         int64 i = 0;
         while (i < rows) { y[yOff + i] = yh[i]; i = i + 1; }
+        return;
+    }
+
+    /** {@link #q4kQ8MatVecIntoDevice}, adding into `y[yOff..yOff+rows)` instead of writing it. */
+    public static void q4kQ8MatVecAccumIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        QuantKernel.q8RowsIntoDevice(Quant.GG_Q4_K, 1, packed, rows, cols, x, xOff, y, yOff);
+        return;
+    }
+
+    /** `q6kQ8MatVecKernel` over HOST arrays: `packed` is file-layout Q6_K, split here. */
+    public static void q6kQ8MatVecIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        QuantKernel.q8RowsIntoDevice(Quant.GG_Q6_K, 0, packed, rows, cols, x, xOff, y, yOff);
+        return;
+    }
+
+    /** {@link #q6kQ8MatVecIntoDevice}, adding into `y[yOff..yOff+rows)` instead of writing it. */
+    public static void q6kQ8MatVecAccumIntoDevice(int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        QuantKernel.q8RowsIntoDevice(Quant.GG_Q6_K, 1, packed, rows, cols, x, xOff, y, yOff);
+        return;
+    }
+
+    /** The Q4_K or Q6_K q8_K row kernel over host arrays, `y` uploaded whole so `accum` adds in place. */
+    static void q8RowsIntoDevice(int32 ty, uint32 accum, int8[] packed, int64 rows,
+            int64 cols, float32[] x, int64 xOff, float32[] y, int64 yOff) {
+        int8[] xq #= heap int8[cols];
+        float32[] xd #= heap float32[cols / 256L];
+        int32[] xbs #= heap int32[cols / 16L];
+        Quant.q8kQuantize(x, xOff, cols, xq, xd, xbs);
+        int64 bpr = cols / 256L;
+        boolean q6 = ty == Quant.GG_Q6_K;
+        int64 wn = q6 ? rows * Quant.rowResidentBytes(Quant.GG_Q6_K, bpr) : (int64) packed.count();
+        int8[] devW #= heap int8[q6 ? wn : 0L];
+        if (q6) { Quant.splitInto(Quant.GG_Q6_K, packed, 0L, rows, bpr, devW, 0L); }
+        KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) y.count());
+        KernelBuffer<int8> pb #= heap KernelBuffer<int8>((uint64) wn);
+        KernelBuffer<int8> xqb #= heap KernelBuffer<int8>((uint64) cols);
+        KernelBuffer<float32> xdb #= heap KernelBuffer<float32>((uint64) bpr);
+        KernelBuffer<int32> xbb #= heap KernelBuffer<int32>((uint64) (cols / 16L));
+        yb.upload(y);
+        if (q6) { pb.upload(devW); } else { pb.upload(packed); }
+        xqb.upload(xq);
+        xdb.upload(xd);
+        xbb.upload(xbs);
+        if (q6) {
+            QuantKernel.q6kQ8MatVecGo(yb, pb, xqb, xdb, xbb, rows, cols, yOff, accum);
+        } else {
+            QuantKernel.q4kQ8MatVecGo(yb, pb, xqb, xdb, xbb, rows, cols, yOff, accum);
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        yb.download(y);
         return;
     }
 
