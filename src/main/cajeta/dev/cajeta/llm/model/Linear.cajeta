@@ -117,6 +117,8 @@ public final class Linear extends InfModule {
     boolean packed1;
     boolean wave;
     boolean wave6;
+    boolean cpuInt8;
+    boolean cpuRouteNamed;
     boolean wave2;
     boolean wave3;
     boolean wave5;
@@ -323,6 +325,10 @@ public final class Linear extends InfModule {
     // activation, where the block layout `Quant.q8kPack` writes is
     // self-contained.
     static KernelBuffer<int8> stXp;
+    static KernelBuffer<int32> stS16;
+    static boolean stS16Ok;
+    static int64 stS16N;
+    static KernelBuffer<int32> colS16;
     static KernelBuffer<int8> stXq;
     static KernelBuffer<float32> stXd;
     static KernelBuffer<int32> stXbs;
@@ -350,6 +356,7 @@ public final class Linear extends InfModule {
      */
     public static void beginSharedActivation() {
         Linear.stValid = false;
+        Linear.stS16Ok = false;
         Linear.stShare = true;
     }
 
@@ -358,6 +365,7 @@ public final class Linear extends InfModule {
     public static void endSharedActivation() {
         Linear.stShare = false;
         Linear.stValid = false;
+        Linear.stS16Ok = false;
     }
 
     public static int64 stageHits() { return Linear.stHits; }
@@ -402,6 +410,77 @@ public final class Linear extends InfModule {
     static boolean asyncXfer;
 
     public static void setAsyncTransfers(boolean on) { Linear.asyncXfer = on; }
+
+    static boolean cpuInt8Want = true;
+
+    /** Whether the cpu backend's Q4_K and Q6_K decode takes the int8 kernels (llm-cpu-parity 5.3's switch). */
+    public static void setCpuInt8Decode(boolean on) { Linear.cpuInt8Want = on; }
+
+    public static boolean cpuInt8DecodeOn() { return Linear.cpuInt8Want; }
+
+    static boolean cpuSet;
+    static boolean cpuHere;
+
+    static boolean onCpu() {
+        if (!Linear.cpuSet) {
+            String be #= Device.activeBackend();
+            Linear.cpuHere = be.equals("cpu");
+            Linear.cpuSet = true;
+        }
+        return Linear.cpuHere;
+    }
+
+    /** Writes the per-16 group sums of pack `xp` (`n` elements) to stS16 (the shared stage's, once per staging) or colS16. */
+    static void groupSums16(KernelBuffer<int8> xp, int64 n, boolean shared) {
+        int64 need = n / 16L;
+        if (shared) {
+            if (Linear.stS16Ok && Linear.stS16N == n) { return; }
+            if (Linear.stS16 == null || (int64) Linear.stS16.length() < need) {
+                Linear.stS16 #= heap KernelBuffer<int32>((uint64) need);
+            }
+            QuantKernel.q8kGroupSums16LaunchNoSync(Linear.stS16, xp, n);
+            Linear.stS16Ok = true;
+            Linear.stS16N = n;
+            return;
+        }
+        if (Linear.colS16 == null || (int64) Linear.colS16.length() < need) {
+            Linear.colS16 #= heap KernelBuffer<int32>((uint64) need);
+        }
+        QuantKernel.q8kGroupSums16LaunchNoSync(Linear.colS16, xp, n);
+        return;
+    }
+
+    /** On the cpu backend, records once which decode route this weight takes: `int8:<kernel>` or `kept:<why>`. */
+    void nameCpuRoute() {
+        if (this.cpuRouteNamed || !Linear.onCpu()) { return; }
+        this.cpuRouteNamed = true;
+        String name #= "kept: no cpu int8 kernel for type " + this.packedTy;
+        if (this.cpuInt8) {
+            name #= this.packedTy == Quant.GG_Q4_K ? "int8:q4kQ8PackedMatVecKernel" : "int8:q6kQ8PackedMatVecKernel";
+        } else if (!Linear.cpuInt8Want) {
+            name #= "kept: cpu int8 decode switched off";
+        }
+        Diag.emit("cpu-decode-route", 0 - 1, name, (int64) this.packedTy, (int64) this.outDim,
+            (int64) this.inDim, 0L, 0L, 0L);
+        return;
+    }
+
+    /** `y[yOff..yOff+rows) (+)= W x` through the cpu int8 kernel on pack `xp`; false when this weight is not on that route. */
+    boolean cpuInt8Launch(KernelBuffer<float32> y, KernelBuffer<int8> w, KernelBuffer<int8> xp,
+            boolean shared, int64 rows, int64 yOff, boolean accum) {
+        if (!this.cpuInt8) { return false; }
+        if (this.packedTy == Quant.GG_Q4_K) {
+            QuantKernel.q4kQ8PackedCpuLaunchNoSync(y, w, xp, rows, (int64) this.inDim, yOff, accum);
+        } else {
+            Linear.groupSums16(xp, (int64) this.inDim, shared);
+            if (shared) {
+                QuantKernel.q6kQ8PackedCpuLaunchNoSync(y, w, xp, Linear.stS16, rows, (int64) this.inDim, yOff, accum);
+            } else {
+                QuantKernel.q6kQ8PackedCpuLaunchNoSync(y, w, xp, Linear.colS16, rows, (int64) this.inDim, yOff, accum);
+            }
+        }
+        return true;
+    }
 
     public static void setQ8Route(boolean on) {
         Linear.q8Want = on;
@@ -1251,6 +1330,7 @@ public final class Linear extends InfModule {
         Linear.growNs = Linear.growNs + (Clock.nanoTime() - sg0);
         // A resize invalidates whatever was staged: the buffers are new.
         Linear.stValid = false;
+        Linear.stS16Ok = false;
         return;
     }
 
@@ -4114,6 +4194,7 @@ public final class Linear extends InfModule {
         Linear.stSrcF32Done = false;
         Linear.stSrcPartNH = 0;
         Linear.stValid = false;
+        Linear.stS16Ok = false;
         return;
     }
 
@@ -4137,6 +4218,7 @@ public final class Linear extends InfModule {
         Linear.stSrcF32Done = false;
         Linear.stSrcPartNH = 0;
         Linear.stValid = false;
+        Linear.stS16Ok = false;
         return true;
     }
 
@@ -4151,6 +4233,7 @@ public final class Linear extends InfModule {
         Linear.stSrcF32Done = false;
         Linear.stSrcPartNH = 0;
         Linear.stValid = false;
+        Linear.stS16Ok = false;
         return;
     }
 
@@ -4216,6 +4299,7 @@ public final class Linear extends InfModule {
         Linear.stSrcF32Done = false;
         Linear.stSrcPartNH = nH;
         Linear.stValid = false;
+        Linear.stS16Ok = false;
         return;
     }
 
@@ -4250,6 +4334,7 @@ public final class Linear extends InfModule {
         if (this.packedTy < 0 || !QuantKernel.routingEnabled()) { return false; }
         this.ensureDevice();
         if (this.hasEpilogue() || !this.packedAct) { return false; }
+        if (this.cpuInt8) { return true; }
         if (this.q8 && this.wave) {
             return KernelCap.usable("q4kQ8WaveMatVecColsKernel");
         }
@@ -4268,6 +4353,16 @@ public final class Linear extends InfModule {
      *  `xpStride` bytes apart in `xp`: one pass over the weight for them all. */
     void matvecCols(KernelBuffer<int8> xp, int64 xpStride, int32 nc,
             KernelBuffer<float32> y, int64 yStride, boolean accum) {
+        if (this.cpuInt8) {
+            int32 c0 = 0;
+            while (c0 < nc) {
+                KernelBuffer<int8> xc #= xp.slice((uint64) ((int64) c0 * xpStride), (uint64) xpStride);
+                this.cpuInt8Launch(y, this.payloadDev, xc, false, (int64) this.outDim,
+                    (int64) c0 * yStride, accum);
+                c0 = c0 + 1;
+            }
+            return;
+        }
         // Where the column kernel does not pay on this device for this
         // format AT THIS WIDTH (ColsProbe, measured per width), the same B
         // rows are B single-row wave launches: the same bytes read B times.
@@ -4456,7 +4551,7 @@ public final class Linear extends InfModule {
         }
         this.ensureDevice();
         if (this.hasEpilogue() || !this.packedAct) { return false; }
-        return (this.q8 && this.wave) || this.wave6 || this.waveIq
+        return this.cpuInt8 || (this.q8 && this.wave) || this.wave6 || this.waveIq
             || this.wave4nl;
     }
 
@@ -4469,6 +4564,9 @@ public final class Linear extends InfModule {
      */
     boolean matvecPackedKeep(KernelBuffer<int8> xp) {
         if (!this.packedWaveReady()) { return false; }
+        if (this.cpuInt8Launch(this.yDev, this.payloadDev, xp, false, (int64) this.outDim, 0L, false)) {
+            return true;
+        }
         if (this.q8 && this.wave) {
             QuantKernel.q4kQ8WaveMatVecLaunchNoSync(this.yDev, this.payloadDev,
                 xp, (int64) this.outDim, (int64) this.inDim, 0L);
@@ -4550,6 +4648,10 @@ public final class Linear extends InfModule {
     boolean matvecStagedAccum(KernelBuffer<float32> dst) {
         this.ensureDevice();
         if (this.hasEpilogue() || !this.packedAct) { return false; }
+        if (this.cpuInt8Launch(dst, this.payloadDev, Linear.stXp, true, (int64) this.outDim, 0L, true)) {
+            Linear.nLaunches = Linear.nLaunches + 1L;
+            return true;
+        }
         if (this.waveIq) {
             QuantKernel.iqQ8WaveMatVecAccumLaunchNoSync(this.packedTy, dst,
                 this.payloadDev, Linear.stXp, (int64) this.outDim,
@@ -4588,6 +4690,7 @@ public final class Linear extends InfModule {
         this.ensureDevice();
         kL.ensureDevice();
         vL.ensureDevice();
+        if (this.cpuInt8 || kL.cpuInt8 || vL.cpuInt8) { return false; }
         // Unit 9.6.5: biases ride the epilogue, all three or none; a
         // scaled projection takes its own route.
         boolean biased = this.bias != null;
@@ -4700,6 +4803,7 @@ public final class Linear extends InfModule {
             Tensor<float32> dst, int64 dstOff) {
         this.ensureDevice();
         Linear.stValid = false;
+        Linear.stS16Ok = false;
         if (this.packedAct) {
             QuantKernel.q8kPackLaunchNoSync(Linear.stXp, xDev, n);
         } else if (this.qAct) {
@@ -5197,7 +5301,11 @@ public final class Linear extends InfModule {
             // so every Linear keyed alike and a Q6_K f32 weight took a hit
             // on an integer staging. Tokens went 15 198 334 62 334 ->
             // 15 13 40 13 40, which is the same signature 9.9 recorded.
-            this.qAct = this.q8 || this.wave6 || this.wave2 || this.wave3
+            this.cpuInt8 = Linear.cpuInt8Want && Linear.onCpu() && this.packed1
+                && Linear.q8Route() && q8kDims
+                && ((this.packedTy == Quant.GG_Q4_K && KernelCap.usable("q4kQ8PackedMatVecKernel"))
+                    || (this.packedTy == Quant.GG_Q6_K && KernelCap.usable("q6kQ8PackedMatVecKernel")));
+            this.qAct = this.cpuInt8 || this.q8 || this.wave6 || this.wave2 || this.wave3
                 || this.wave5 || this.wave8 || this.wave40 || this.wave50
                 || this.waveT1 || this.waveT2 || this.waveIq
                 || this.wave4nl;
@@ -5241,7 +5349,7 @@ public final class Linear extends InfModule {
         // kernel puts one workgroup on each row, so 14336 rows is already
         // 14336 workgroups and splitting them costs: measured 185.9 GB/s
         // chunked against 197.3 whole, on the same weight in the same run.
-        if (this.wave || this.wave6 || this.wave2 || this.wave3
+        if (this.cpuInt8 || this.wave || this.wave6 || this.wave2 || this.wave3
                 || this.wave5 || this.wave8 || this.wave40 || this.wave50
                 || this.waveT1 || this.waveT2 || this.wavef
                 || this.waveH || this.waveIq || this.wave4nl) {
@@ -5269,6 +5377,11 @@ public final class Linear extends InfModule {
      *  Whether it waits is `oneSync`'s business, not this method's. */
     void launchOne(KernelBuffer<int8> w, int64 nr, int64 r0,
             boolean foldBias) {
+        this.nameCpuRoute();
+        if (this.cpuInt8Launch(this.yDev, w, Linear.stXp, true, nr, r0, false)) {
+            if (!Linear.oneSync) { QuantKernel.stream().sync(); }
+            return;
+        }
         if (this.q8) {
             if (this.wave) {
                 if (Linear.oneSync) {

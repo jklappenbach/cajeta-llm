@@ -1,0 +1,245 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.AfterEach;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.DiagCallback;
+import dev.cajeta.llm.DiagRecord;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.Linear;
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.math.Tensor;
+import cajeta.xpu.Device;
+
+/** llm-cpu-parity Unit 3: the cpu backend's Q4_K and Q6_K decode takes the int8 kernels. */
+public class CpuDecodeRouteTest {
+    static final int32 CO = 128;
+    static final int32 CI = 256;
+
+    public CpuDecodeRouteTest() { return; }
+
+    @AfterEach
+    public void restore() {
+        Diag.register(null);
+        Linear.setCpuInt8Decode(true);
+        Linear.setQ8Route(true);
+        return;
+    }
+
+    /** A `[CO x CI]` weight in file layout, tiled from a kquant fixture's blocks. */
+    static #int8[] rawTiled(int32 ty, String fixture) {
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 be = (int64) Quant.blockElems(ty);
+        int64 nBlocks = (int64) CO * ((int64) CI / be);
+        int8[] fix #= File.readAllBytes(LinearKernelRouteTest.KQ + fixture);
+        int64 fixBlocks = (int64) fix.count() / bb;
+        int8[] raw #= heap int8[nBlocks * bb];
+        int64 b = 0;
+        while (b < nBlocks) {
+            int64 j = 0;
+            while (j < bb) { raw[b * bb + j] = fix[(b % fixBlocks) * bb + j]; j = j + 1; }
+            b = b + 1;
+        }
+        return #raw;
+    }
+
+    static #Linear bound(int8[] raw, int32 ty) {
+        int8[] copy #= heap int8[raw.count()];
+        int64 i = 0;
+        while (i < raw.count()) { copy[i] = raw[i]; i = i + 1; }
+        Linear lin = heap Linear(CI, CO);
+        lin.bindPacked(#copy, ty);
+        return #lin;
+    }
+
+    static #float32[] activations() {
+        float32[] x #= heap float32[(int64) CI];
+        int64 i = 0;
+        while (i < (int64) CI) { x[i] = (float32) ((i % 11L) - 5L) * 0.375f; i = i + 1; }
+        return #x;
+    }
+
+    static #Tensor<float32> tensorOf(float32[] x, int64 n) {
+        int64[] shp #= heap int64[1];
+        shp[0] = n;
+        Tensor<float32> t #= Tensor.zeros<float32>(shp);
+        int64 i = 0;
+        while (i < n) { t.flatSet(i, x[i]); i = i + 1; }
+        return #t;
+    }
+
+    static #Tensor<float32> zeros(int64 n) {
+        int64[] shp #= heap int64[1];
+        shp[0] = n;
+        Tensor<float32> t #= Tensor.zeros<float32>(shp);
+        return #t;
+    }
+
+    /** The q8_K host oracle for `raw` on `x`. */
+    static #float32[] oracle(int32 ty, int8[] raw, float32[] x) {
+        int64 cols = (int64) CI;
+        int8[] xq #= heap int8[cols];
+        float32[] xd #= heap float32[cols / 256L];
+        int32[] xbs #= heap int32[cols / 16L];
+        Quant.q8kQuantize(x, 0L, cols, xq, xd, xbs);
+        float32[] y #= heap float32[(int64) CO];
+        if (ty == Quant.GG_Q4_K) { Quant.q4kMatVecIntoQ8(raw, (int64) CO, cols, xq, xd, xbs, y, 0L); }
+        else { Quant.q6kMatVecIntoQ8(raw, (int64) CO, cols, xq, xd, xbs, y, 0L); }
+        return #y;
+    }
+
+    static void decode(Linear lin, Tensor<float32> src, Tensor<float32> dst) {
+        lin.matvecInto(src, 0L, dst, 0L);
+        return;
+    }
+
+    static void within(float32 got, float32 want, float32 rel, String what) {
+        float32 d = got - want;
+        if (d < 0.0f) { d = 0.0f - d; }
+        float32 m = want < 0.0f ? 0.0f - want : want;
+        if (d > m * rel + rel) { Assert.fail(what + ": got " + got + " want " + want); }
+        return;
+    }
+
+    /** 3.1.1: on the cpu backend Q4_K and Q6_K decode run the int8 kernels and match the oracle bit for bit; elsewhere they are not used. */
+    @Test
+    public void cpuDecodeOfQ4KAndQ6KTakesTheInt8Kernels() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        Linear.setQ8Route(true);
+        Linear.setCpuInt8Decode(true);
+        QuantKernel.resetCpuInt8Counts();
+        float32[] x #= CpuDecodeRouteTest.activations();
+        int32 t = 0;
+        while (t < 2) {
+            int32 ty = t == 0 ? Quant.GG_Q4_K : Quant.GG_Q6_K;
+            String fixture = t == 0 ? "q4_k.bin" : "q6_k.bin";
+            int8[] raw #= CpuDecodeRouteTest.rawTiled(ty, fixture);
+            float32[] want #= CpuDecodeRouteTest.oracle(ty, raw, x);
+            Linear lin #= CpuDecodeRouteTest.bound(raw, ty);
+            Tensor<float32> src #= CpuDecodeRouteTest.tensorOf(x, (int64) CI);
+            Tensor<float32> got #= CpuDecodeRouteTest.zeros((int64) CO);
+            int64[] vc #= ValueCheck.mark();
+            CpuDecodeRouteTest.decode(lin, src, got);
+            ValueCheck.credit(vc);
+            int64 r = 0;
+            while (r < (int64) CO) {
+                if (be.equals("cpu")) {
+                    if (got.flatGet(r) != want[r]) {
+                        Assert.fail(fixture + " row " + r + ": int8 route " + got.flatGet(r) + " vs oracle " + want[r]);
+                    }
+                } else {
+                    CpuDecodeRouteTest.within(got.flatGet(r), want[r], 1.0e-4f, fixture + " row " + r);
+                }
+                r = r + 1;
+            }
+            t = t + 1;
+        }
+        int64 want = be.equals("cpu") ? 2L : 0L;
+        Assert.equals(want, QuantKernel.cpuInt8Launches());
+    }
+
+    /** 3.1.1, 5.3: with the switch off the cpu backend keeps today's route. */
+    @Test
+    public void switchedOffTheCpuDecodeKeepsTodaysRoute() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        Linear.setQ8Route(true);
+        Linear.setCpuInt8Decode(false);
+        QuantKernel.resetCpuInt8Counts();
+        float32[] x #= CpuDecodeRouteTest.activations();
+        int8[] raw #= CpuDecodeRouteTest.rawTiled(Quant.GG_Q6_K, "q6_k.bin");
+        float32[] want #= CpuDecodeRouteTest.oracle(Quant.GG_Q6_K, raw, x);
+        Linear lin #= CpuDecodeRouteTest.bound(raw, Quant.GG_Q6_K);
+        Tensor<float32> src #= CpuDecodeRouteTest.tensorOf(x, (int64) CI);
+        Tensor<float32> got #= CpuDecodeRouteTest.zeros((int64) CO);
+        CpuDecodeRouteTest.decode(lin, src, got);
+        int64 r = 0;
+        while (r < (int64) CO) {
+            CpuDecodeRouteTest.within(got.flatGet(r), want[r], 1.0e-4f, "q6_k.bin off row " + r);
+            r = r + 1;
+        }
+        Assert.equals(0L, QuantKernel.cpuInt8Launches());
+    }
+
+    /** 3.1.2: two Q6_K projections of one activation share one pack and one group-sum pass. */
+    @Test
+    public void oneActivationIsPackedAndSummedOnceForEveryProjection() {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("the group sums are the cpu backend's"); return; }
+        Linear.setQ8Route(true);
+        Linear.setCpuInt8Decode(true);
+        float32[] x #= CpuDecodeRouteTest.activations();
+        int8[] raw #= CpuDecodeRouteTest.rawTiled(Quant.GG_Q6_K, "q6_k.bin");
+        Linear a #= CpuDecodeRouteTest.bound(raw, Quant.GG_Q6_K);
+        Linear b #= CpuDecodeRouteTest.bound(raw, Quant.GG_Q6_K);
+        Tensor<float32> src #= CpuDecodeRouteTest.tensorOf(x, (int64) CI);
+        Tensor<float32> warm #= CpuDecodeRouteTest.zeros((int64) CI);
+        Tensor<float32> ya #= CpuDecodeRouteTest.zeros((int64) CO);
+        Tensor<float32> yb #= CpuDecodeRouteTest.zeros((int64) CO);
+        CpuDecodeRouteTest.decode(a, warm, ya);
+        CpuDecodeRouteTest.decode(b, warm, yb);
+        QuantKernel.resetCpuInt8Counts();
+        Linear.resetStageCounts();
+        Linear.beginSharedActivation();
+        CpuDecodeRouteTest.decode(a, src, ya);
+        CpuDecodeRouteTest.decode(b, src, yb);
+        Linear.endSharedActivation();
+        Assert.equals(2L, QuantKernel.cpuInt8Launches());
+        Assert.equals(1L, QuantKernel.groupSumsLaunches());
+        Assert.equals(1L, Linear.stageMisses());
+        int64 r = 0;
+        while (r < (int64) CO) {
+            if (ya.flatGet(r) != yb.flatGet(r)) { Assert.fail("row " + r + ": " + ya.flatGet(r) + " vs " + yb.flatGet(r)); }
+            r = r + 1;
+        }
+    }
+
+    /** 3.1.3, 2.4: a format with no int8 kernel keeps its route, and the route record names it. */
+    @Test
+    public void aFormatWithNoInt8KernelKeepsItsRouteAndNamesIt() {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("the decode-route record is the cpu backend's"); return; }
+        Linear.setQ8Route(true);
+        Linear.setCpuInt8Decode(true);
+        QuantKernel.resetCpuInt8Counts();
+        DecodeRouteTap tap #= heap DecodeRouteTap();
+        Diag.register(tap);
+        float32[] x #= CpuDecodeRouteTest.activations();
+        int8[] r5 #= CpuDecodeRouteTest.rawTiled(Quant.GG_Q5_K, "q5_k.bin");
+        Linear l5 #= CpuDecodeRouteTest.bound(r5, Quant.GG_Q5_K);
+        int8[] r6 #= CpuDecodeRouteTest.rawTiled(Quant.GG_Q6_K, "q6_k.bin");
+        Linear l6 #= CpuDecodeRouteTest.bound(r6, Quant.GG_Q6_K);
+        Tensor<float32> src #= CpuDecodeRouteTest.tensorOf(x, (int64) CI);
+        Tensor<float32> y #= CpuDecodeRouteTest.zeros((int64) CO);
+        CpuDecodeRouteTest.decode(l5, src, y);
+        CpuDecodeRouteTest.decode(l6, src, y);
+        Diag.register(null);
+        Assert.equals(1L, QuantKernel.cpuInt8Launches());
+        Assert.equals(2L, (int64) tap.records);
+        Assert.isTrue(tap.q5.startsWith("kept:"));
+        Assert.isTrue(tap.q6.startsWith("int8:"));
+    }
+}
+
+/** Keeps the cpu decode-route records: the Q5_K and Q6_K names, and how many arrived. */
+final class DecodeRouteTap implements DiagCallback {
+    public int32 records;
+    public String q5;
+    public String q6;
+    public DecodeRouteTap() {
+        this.records = 0;
+        this.q5 #= "";
+        this.q6 #= "";
+    }
+    public void onRecord(DiagRecord r) {
+        if (!r.category.equals("cpu-decode-route")) { return; }
+        this.records = this.records + 1;
+        if (r.v0 == (int64) Quant.GG_Q5_K) { this.q5 #= r.name.clone(); }
+        if (r.v0 == (int64) Quant.GG_Q6_K) { this.q6 #= r.name.clone(); }
+        return;
+    }
+}

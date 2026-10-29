@@ -868,6 +868,17 @@ public final class QuantKernel {
         }
     }
 
+    static int64 cpuInt8N = 0L;
+    static int64 groupSumsN = 0L;
+
+    /** Launches of the cpu backend's int8 decode kernels since the last reset. */
+    public static int64 cpuInt8Launches() { return QuantKernel.cpuInt8N; }
+
+    /** Launches of the q8_K group-sum pass since the last reset. */
+    public static int64 groupSumsLaunches() { return QuantKernel.groupSumsN; }
+
+    public static void resetCpuInt8Counts() { QuantKernel.cpuInt8N = 0L; QuantKernel.groupSumsN = 0L; }
+
     /** Launches {@link #q6kQ8MatVecKernel} over resident split `packed`, writing `y[yOff..)`. */
     public static void q6kQ8MatVecLaunchNoSync(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xq,
@@ -894,6 +905,137 @@ public final class QuantKernel {
         KernelStream s = QuantKernel.stream();
         q6kQ8MatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
             (y, packed, xq, xd, xbsums, (uint32) rows, cols / 256L, yOff, accum);
+        return;
+    }
+
+    /** Sixteen q8_K group sums a block of the 320-byte pack `xp` into `s16`, the per-16 sums the Q6_K int8 kernel removes its offset with. */
+    @Kernel
+    @Occupancy(maxThreads = 256)
+    public static void q8kGroupSums16Kernel(KernelBuffer<int32> s16, KernelBuffer<int8> xp,
+            uint32 blocks) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < blocks) {
+            int64 b = (int64) gi;
+            int32 j = 0;
+            while (j < 16) {
+                int64 o = b * 320L + (int64) (16 * j);
+                int32 t = 0;
+                int32 e = 0;
+                while (e < 16) { t = t + (int32) xp[o + (int64) e]; e = e + 1; }
+                s16[b * 16L + (int64) j] = t;
+                j = j + 1;
+            }
+        }
+    }
+
+    /** Writes the per-16 group sums of the `n`-element pack `xp` into `s16`. */
+    public static void q8kGroupSums16LaunchNoSync(KernelBuffer<int32> s16, KernelBuffer<int8> xp,
+            int64 n) {
+        QuantKernel.groupSumsN = QuantKernel.groupSumsN + 1L;
+        int64 blocks = n / 256L;
+        uint32 blk = QuantKernel.scalarBlock();
+        KernelStream s = QuantKernel.stream();
+        q8kGroupSums16Kernel.launch(s, grid: [QuantKernel.scalarGrid(blocks)], block: [blk])
+            (s16, xp, (uint32) blocks);
+        return;
+    }
+
+    /** {@link #q6kQ8MatVecKernel} on the shared 320-byte pack `xp`, its group sums from `s16`. */
+    @Kernel
+    @Occupancy(maxThreads = 256)
+    public static void q6kQ8PackedMatVecKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp, KernelBuffer<int32> s16,
+            uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+            int64 rb = i * (prefix + blocksPerRow * 208L);
+            Vector<int32,4> z4 = s16.vload<4>(0) * 0;
+            float32 acc = 0.0f;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                float32 d = GgufFile.halfBitsToF32Branchless(((int32) packed[rb + 2L * b] & 255)
+                    | (((int32) packed[rb + 2L * b + 1L] & 255) << 8));
+                int64 ro = rb + prefix + b * 208L;
+                Vector<int8,16> sc = packed.vload<16>(ro + 192L);
+                Vector<int16,8> sl = sc.widenLo();
+                Vector<int16,8> sh = sc.widenHi();
+                Vector<int32,4> s0 = sl.widenLo();
+                Vector<int32,4> s1 = sl.widenHi();
+                Vector<int32,4> s2 = sh.widenLo();
+                Vector<int32,4> s3 = sh.widenHi();
+                int64 xb = b * 320L;
+                int64 gb = b * 16L;
+                Vector<int8,4> dv = xp.vload<4>(xb + 288L);
+                float32 xs = Cajeta.bitsToF32(((int32) dv[0] & 255)
+                    | (((int32) dv[1] & 255) << 8)
+                    | (((int32) dv[2] & 255) << 16)
+                    | (((int32) dv[3] & 255) << 24));
+                Vector<int32,4> tot = z4 - (s0 * s16.vload<4>(gb) + s1 * s16.vload<4>(gb + 4L)
+                    + s2 * s16.vload<4>(gb + 8L) + s3 * s16.vload<4>(gb + 12L)) * 32;
+                Vector<uint8,16> qa00 = packed.vload<16>(ro + 0L).asUnsigned();
+                Vector<uint8,16> qb00 = packed.vload<16>(ro + 32L).asUnsigned();
+                Vector<uint8,16> qh00 = packed.vload<16>(ro + 128L).asUnsigned();
+                Vector<uint8,16> u00 = (qa00 & 15) | ((qh00 & 3) << 4);
+                tot = tot + u00.dotAccum(xp.vload<16>(xb + 0L), z4) * s0[0];
+                Vector<uint8,16> u01 = (qb00 & 15) | (((qh00 >> 2) & 3) << 4);
+                tot = tot + u01.dotAccum(xp.vload<16>(xb + 32L), z4) * s0[2];
+                Vector<uint8,16> u02 = (qa00 >> 4) | (((qh00 >> 4) & 3) << 4);
+                tot = tot + u02.dotAccum(xp.vload<16>(xb + 64L), z4) * s1[0];
+                Vector<uint8,16> u03 = (qb00 >> 4) | ((qh00 >> 6) << 4);
+                tot = tot + u03.dotAccum(xp.vload<16>(xb + 96L), z4) * s1[2];
+                Vector<uint8,16> qa01 = packed.vload<16>(ro + 16L).asUnsigned();
+                Vector<uint8,16> qb01 = packed.vload<16>(ro + 48L).asUnsigned();
+                Vector<uint8,16> qh01 = packed.vload<16>(ro + 144L).asUnsigned();
+                Vector<uint8,16> u04 = (qa01 & 15) | ((qh01 & 3) << 4);
+                tot = tot + u04.dotAccum(xp.vload<16>(xb + 16L), z4) * s0[1];
+                Vector<uint8,16> u05 = (qb01 & 15) | (((qh01 >> 2) & 3) << 4);
+                tot = tot + u05.dotAccum(xp.vload<16>(xb + 48L), z4) * s0[3];
+                Vector<uint8,16> u06 = (qa01 >> 4) | (((qh01 >> 4) & 3) << 4);
+                tot = tot + u06.dotAccum(xp.vload<16>(xb + 80L), z4) * s1[1];
+                Vector<uint8,16> u07 = (qb01 >> 4) | ((qh01 >> 6) << 4);
+                tot = tot + u07.dotAccum(xp.vload<16>(xb + 112L), z4) * s1[3];
+                Vector<uint8,16> qa10 = packed.vload<16>(ro + 64L).asUnsigned();
+                Vector<uint8,16> qb10 = packed.vload<16>(ro + 96L).asUnsigned();
+                Vector<uint8,16> qh10 = packed.vload<16>(ro + 160L).asUnsigned();
+                Vector<uint8,16> u08 = (qa10 & 15) | ((qh10 & 3) << 4);
+                tot = tot + u08.dotAccum(xp.vload<16>(xb + 128L), z4) * s2[0];
+                Vector<uint8,16> u09 = (qb10 & 15) | (((qh10 >> 2) & 3) << 4);
+                tot = tot + u09.dotAccum(xp.vload<16>(xb + 160L), z4) * s2[2];
+                Vector<uint8,16> u10 = (qa10 >> 4) | (((qh10 >> 4) & 3) << 4);
+                tot = tot + u10.dotAccum(xp.vload<16>(xb + 192L), z4) * s3[0];
+                Vector<uint8,16> u11 = (qb10 >> 4) | ((qh10 >> 6) << 4);
+                tot = tot + u11.dotAccum(xp.vload<16>(xb + 224L), z4) * s3[2];
+                Vector<uint8,16> qa11 = packed.vload<16>(ro + 80L).asUnsigned();
+                Vector<uint8,16> qb11 = packed.vload<16>(ro + 112L).asUnsigned();
+                Vector<uint8,16> qh11 = packed.vload<16>(ro + 176L).asUnsigned();
+                Vector<uint8,16> u12 = (qa11 & 15) | ((qh11 & 3) << 4);
+                tot = tot + u12.dotAccum(xp.vload<16>(xb + 144L), z4) * s2[1];
+                Vector<uint8,16> u13 = (qb11 & 15) | (((qh11 >> 2) & 3) << 4);
+                tot = tot + u13.dotAccum(xp.vload<16>(xb + 176L), z4) * s2[3];
+                Vector<uint8,16> u14 = (qa11 >> 4) | (((qh11 >> 4) & 3) << 4);
+                tot = tot + u14.dotAccum(xp.vload<16>(xb + 208L), z4) * s3[1];
+                Vector<uint8,16> u15 = (qb11 >> 4) | ((qh11 >> 6) << 4);
+                tot = tot + u15.dotAccum(xp.vload<16>(xb + 240L), z4) * s3[3];
+                acc = acc + d * xs * (float32) (tot[0] + tot[1] + tot[2] + tot[3]);
+                b = b + 1;
+            }
+            if (accum != 0) { y[yOff + i] = y[yOff + i] + acc; } else { y[yOff + i] = acc; }
+        }
+    }
+
+    /** The cpu backend's Q6_K decode: {@link #q6kQ8PackedMatVecKernel}, plain or adding into `y`. */
+    public static void q6kQ8PackedCpuLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp, KernelBuffer<int32> s16,
+            int64 rows, int64 cols, int64 yOff, boolean accum) {
+        QuantKernel.cpuInt8N = QuantKernel.cpuInt8N + 1L;
+        uint32 ac = 0;
+        if (accum) { ac = 1; }
+        uint32 blk = QuantKernel.scalarBlock();
+        KernelStream s = QuantKernel.stream();
+        q6kQ8PackedMatVecKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])
+            (y, packed, xp, s16, (uint32) rows, cols / 256L, yOff, ac);
         return;
     }
 
@@ -928,7 +1070,7 @@ public final class QuantKernel {
     @Occupancy(maxThreads = 256)
     public static void q4kQ8PackedMatVecKernel(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<int8> xp,
-            uint32 rows, int64 blocksPerRow, int64 yOff) {
+            uint32 rows, int64 blocksPerRow, int64 yOff, uint32 accum) {
         uint32 gi = KernelThread.globalIdX();
         if (gi < rows) {
             int64 i = (int64) gi;
@@ -1031,7 +1173,7 @@ public final class QuantKernel {
                           - dmin * xs * (float32) dmins;
                 b = b + 1;
             }
-            y[yOff + i] = acc;
+            if (accum != 0) { y[yOff + i] = y[yOff + i] + acc; } else { y[yOff + i] = acc; }
         }
     }
 
@@ -11804,7 +11946,22 @@ public final class QuantKernel {
         KernelStream s = QuantKernel.stream();
         q4kQ8PackedMatVecKernel.launch(s,
             grid: [QuantKernel.scalarGrid(rows)], block: [blk])
-            (y, packed, xp, ur, cols / 256L, yOff);
+            (y, packed, xp, ur, cols / 256L, yOff, 0);
+        return;
+    }
+
+    /** The cpu backend's Q4_K decode: {@link #q4kQ8PackedMatVecKernel} over the shared pack, plain or adding into `y`. */
+    public static void q4kQ8PackedCpuLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<int8> xp,
+            int64 rows, int64 cols, int64 yOff, boolean accum) {
+        QuantKernel.cpuInt8N = QuantKernel.cpuInt8N + 1L;
+        uint32 ac = 0;
+        if (accum) { ac = 1; }
+        uint32 blk = QuantKernel.scalarBlock();
+        KernelStream s = QuantKernel.stream();
+        q4kQ8PackedMatVecKernel.launch(s,
+            grid: [QuantKernel.scalarGrid(rows)], block: [blk])
+            (y, packed, xp, (uint32) rows, cols / 256L, yOff, ac);
         return;
     }
 
