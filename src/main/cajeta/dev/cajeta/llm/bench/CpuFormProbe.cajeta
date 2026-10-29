@@ -13,8 +13,8 @@ import dev.cajeta.llm.io.QuantKernel;
 /**
  * llm-cpu-parity Unit 1: which Q4_K int8 form and which pool reach llama.cpp's
  * per-core pace on the cpu backend. Run with CAJETA_XPU_CPU_WORKERS=1 for the
- * one-core figures. `sweep` instead times the Q4_K and Q6_K int8 kernels
- * across worker caps (Unit 2).
+ * one-core figures. `sweep` instead times the Q4_K and Q6_K int8 kernels across worker caps
+ * (Unit 2); `stream` sets them beside plain reads of their bytes (2.6).
  */
 public class CpuFormProbe {
     static final int64 ROWS = 114688L;
@@ -100,8 +100,141 @@ public class CpuFormProbe {
         return;
     }
 
+    /** Reads a resident Q6_K row's bytes in q6kQ8MatVecKernel's order with no arithmetic but byte sums. */
+    @Kernel
+    @Occupancy(maxThreads = 256)
+    public static void q6kOrderStreamKernel(KernelBuffer<float32> y, KernelBuffer<int8> packed,
+            uint32 rows, int64 blocksPerRow) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 prefix = ((blocksPerRow * 2L + 3L) / 4L) * 4L;
+            int64 rb = i * (prefix + blocksPerRow * 208L);
+            Vector<int8,16> acc = packed.vload<16>(rb);
+            int32 ds = 0;
+            int64 b = 0;
+            while (b < blocksPerRow) {
+                ds = ds + (int32) packed[rb + 2L * b];
+                int64 ro = rb + prefix + b * 208L;
+                acc = acc + packed.vload<16>(ro + 192L);
+                int32 n = 0;
+                while (n < 2) {
+                    int32 h = 0;
+                    while (h < 2) {
+                        int64 o = (int64) (16 * h);
+                        acc = acc + packed.vload<16>(ro + (int64) (64 * n) + o);
+                        acc = acc + packed.vload<16>(ro + (int64) (64 * n + 32) + o);
+                        acc = acc + packed.vload<16>(ro + 128L + (int64) (32 * n) + o);
+                        h = h + 1;
+                    }
+                    n = n + 1;
+                }
+                b = b + 1;
+            }
+            y[i] = (float32) ((int32) acc[0] + (int32) acc[7] + (int32) acc[15] + ds);
+        }
+    }
+
+    /** Reads row `i` of `rowBytes` bytes front to back in 16-byte loads. */
+    @Kernel
+    @Occupancy(maxThreads = 256)
+    public static void seqStreamKernel(KernelBuffer<float32> y, KernelBuffer<int8> packed,
+            uint32 rows, int64 rowBytes) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < rows) {
+            int64 i = (int64) gi;
+            int64 rb = i * rowBytes;
+            Vector<int8,16> acc = packed.vload<16>(rb);
+            int64 o = 16L;
+            while (o < rowBytes) {
+                acc = acc + packed.vload<16>(rb + o);
+                o = o + 16L;
+            }
+            y[i] = (float32) ((int32) acc[0] + (int32) acc[7] + (int32) acc[15]);
+        }
+    }
+
+    /** GB/s of one form over `nbytes` at each worker cap: 0 Q6_K kernel, 1 Q6_K-order stream, 2 sequential stream, 3 Q4_K kernel. */
+    static void streamOne(String name, int32 form, int64 rows, int64 rowBytes, int64 nbytes,
+            KernelBuffer<int8> wD, KernelBuffer<int8> xqD, KernelBuffer<float32> xdD,
+            KernelBuffer<int32> xbD, KernelBuffer<float32> yD) {
+        int32[] caps = [1, 4, 8, 16, 0];
+        float64 gb = (float64) nbytes / 1.0e9;
+        uint32 blk = QuantKernel.scalarBlock();
+        int32 r = 0;
+        while (r < 3) {
+            String line #= name + " round " + r + " GB/s:";
+            int32 c = 0;
+            while (c < 5) {
+                Device.setCpuWorkerCap(caps[c]);
+                KernelStream s = QuantKernel.stream();
+                int32 k = 0;
+                int64 t0 = Clock.nanoTime();
+                while (k < SWEEP_ITERS) {
+                    if (form == 0) { QuantKernel.q6kQ8MatVecLaunchNoSync(yD, wD, xqD, xdD, xbD, rows, COLS, 0L); }
+                    else if (form == 3) { QuantKernel.q4kQ8MatVecLaunchNoSync(yD, wD, xqD, xdD, xbD, rows, COLS, 0L); }
+                    else if (form == 1) {
+                        q6kOrderStreamKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])(yD, wD, (uint32) rows, COLS / 256L);
+                    } else {
+                        seqStreamKernel.launch(s, grid: [QuantKernel.scalarGrid(rows)], block: [blk])(yD, wD, (uint32) rows, rowBytes);
+                    }
+                    s.sync();
+                    k = k + 1;
+                }
+                float64 sec = (float64) (Clock.nanoTime() - t0) / (float64) SWEEP_ITERS / 1.0e9;
+                line #= line + "  " + caps[c] + "w(" + Device.lastLaunchWorkers() + ") " + (gb / sec);
+                c = c + 1;
+            }
+            Device.setCpuWorkerCap(0);
+            System.stdout.println(line);
+            r = r + 1;
+        }
+        return;
+    }
+
+    static void stream() {
+        int64 bpr = COLS / 256L;
+        float32[] x #= heap float32[COLS];
+        int64 i = 0;
+        while (i < COLS) { x[i] = 0.05f * (float32) ((i % 13L) - 6L); i = i + 1; }
+        int8[] xq #= heap int8[COLS];
+        float32[] xd #= heap float32[bpr];
+        int32[] xbs #= heap int32[bpr * 16L];
+        Quant.q8kQuantize(x, 0L, COLS, xq, xd, xbs);
+        KernelBuffer<int8> xqD #= heap KernelBuffer<int8>((uint64) COLS);
+        xqD.upload(xq);
+        KernelBuffer<float32> xdD #= heap KernelBuffer<float32>((uint64) bpr);
+        xdD.upload(xd);
+        KernelBuffer<int32> xbD #= heap KernelBuffer<int32>((uint64) (bpr * 16L));
+        xbD.upload(xbs);
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) ROWS);
+
+        int64 n4 = ROWS * bpr * 144L;
+        int8[] p4 #= heap int8[n4];
+        ScalingProbe.fillBlocks(p4, Quant.GG_Q4_K, 1);
+        KernelBuffer<int8> w4 #= heap KernelBuffer<int8>((uint64) n4);
+        w4.upload(p4);
+        CpuFormProbe.streamOne("Q4_K kernel", 3, ROWS, bpr * 144L, n4, w4, xqD, xdD, xbD, yD);
+        CpuFormProbe.streamOne("Q4_K bytes, seq stream", 2, ROWS, bpr * 144L, n4, w4, xqD, xdD, xbD, yD);
+
+        int64 r6 = 81920L;
+        int8[] f6 #= heap int8[r6 * bpr * 210L];
+        ScalingProbe.fillBlocks(f6, Quant.GG_Q6_K, 2);
+        int64 rb6 = Quant.rowResidentBytes(Quant.GG_Q6_K, bpr);
+        int64 n6 = r6 * rb6;
+        int8[] p6 #= heap int8[n6];
+        Quant.splitInto(Quant.GG_Q6_K, f6, 0L, r6, bpr, p6, 0L);
+        KernelBuffer<int8> w6 #= heap KernelBuffer<int8>((uint64) n6);
+        w6.upload(p6);
+        CpuFormProbe.streamOne("Q6_K kernel", 0, r6, rb6, n6, w6, xqD, xdD, xbD, yD);
+        CpuFormProbe.streamOne("Q6_K bytes, kernel-order stream", 1, r6, rb6, n6, w6, xqD, xdD, xbD, yD);
+        CpuFormProbe.streamOne("Q6_K bytes, seq stream", 2, r6, rb6, n6, w6, xqD, xdD, xbD, yD);
+        return;
+    }
+
     public static void run(String[] args) {
         if (args.count() > 0 && args[0].equals("sweep")) { CpuFormProbe.sweep(); return; }
+        if (args.count() > 0 && args[0].equals("stream")) { CpuFormProbe.stream(); return; }
         int64 bpr = COLS / 256L;
         int64 nbytes = ROWS * bpr * 144L;
         float64 gb = (float64) nbytes / 1.0e9;
