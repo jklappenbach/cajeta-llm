@@ -465,6 +465,42 @@ public final class Linear extends InfModule {
         return;
     }
 
+    static boolean cpuRowsWant = true;
+
+    /** Whether the cpu backend's batched Q4_K and Q6_K rows take the many-row int8 kernels (llm-cpu-parity Unit 4's switch). */
+    public static void setCpuRows(boolean on) { Linear.cpuRowsWant = on; }
+
+    static KernelBuffer<int32> rowsS16;
+
+    /** `y[c*yStride + row] (+)= W[row] . x_c` for `nc` packed columns `xpStride` bytes apart, on the many-row int8 kernels. */
+    void cpuInt8Rows(KernelBuffer<int8> xp, int64 xpStride, int64 nc, KernelBuffer<float32> y,
+            int64 yStride, boolean accum) {
+        int64 n = (int64) this.inDim;
+        int64 rows = (int64) this.outDim;
+        if (this.packedTy == Quant.GG_Q4_K) {
+            QuantKernel.q4kQ8RowsCpuLaunchNoSync(y, this.payloadDev, xp, rows, n, nc, xpStride, yStride, accum);
+            return;
+        }
+        int64 per = n / 16L;
+        if (Linear.rowsS16 == null || (int64) Linear.rowsS16.length() < nc * per) {
+            Linear.rowsS16 #= heap KernelBuffer<int32>((uint64) (nc * per));
+        }
+        if (xpStride == Quant.q8kPackedBytes(n)) {
+            QuantKernel.q8kGroupSums16LaunchNoSync(Linear.rowsS16, xp, nc * n);
+        } else {
+            int64 c = 0;
+            while (c < nc) {
+                KernelBuffer<int8> xc #= xp.slice((uint64) (c * xpStride), (uint64) Quant.q8kPackedBytes(n));
+                KernelBuffer<int32> sc #= Linear.rowsS16.slice((uint64) (c * per), (uint64) per);
+                QuantKernel.q8kGroupSums16LaunchNoSync(sc, xc, n);
+                c = c + 1;
+            }
+        }
+        QuantKernel.q6kQ8RowsCpuLaunchNoSync(y, this.payloadDev, xp, Linear.rowsS16, rows, n, nc,
+            xpStride, yStride, accum);
+        return;
+    }
+
     /** `y[yOff..yOff+rows) (+)= W x` through the cpu int8 kernel on pack `xp`; false when this weight is not on that route. */
     boolean cpuInt8Launch(KernelBuffer<float32> y, KernelBuffer<int8> w, KernelBuffer<int8> xp,
             boolean shared, int64 rows, int64 yOff, boolean accum) {
@@ -3245,6 +3281,10 @@ public final class Linear extends InfModule {
                 Linear.btXpW, (int64) rows, (int64) this.outDim,
                 (int64) this.inDim);
             QuantKernel.stream().sync();
+        } else if (this.cpuInt8 && Linear.cpuRowsWant) {
+            this.sayRoute(8192L, "cpu int8 rows ty=" + this.packedTy);
+            this.cpuInt8Rows(Linear.btXp, Quant.q8kPackedBytes(Quant.q8kPadCols((int64) this.inDim)),
+                (int64) rows, this.yBatch, (int64) this.outDim, false);
         } else {
             this.sayRoute(1024L, "dotAccum ty=" + this.packedTy);
             QuantKernel.batchMatMulLaunch(this.packedTy, this.yBatch,
@@ -4354,6 +4394,10 @@ public final class Linear extends InfModule {
      *  `xpStride` bytes apart in `xp`: one pass over the weight for them all. */
     void matvecCols(KernelBuffer<int8> xp, int64 xpStride, int32 nc,
             KernelBuffer<float32> y, int64 yStride, boolean accum) {
+        if (this.cpuInt8 && nc > 1 && Linear.cpuRowsWant) {
+            this.cpuInt8Rows(xp, xpStride, (int64) nc, y, yStride, accum);
+            return;
+        }
         if (this.cpuInt8) {
             int32 c0 = 0;
             while (c0 < nc) {
