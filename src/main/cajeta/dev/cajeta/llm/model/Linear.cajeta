@@ -472,13 +472,40 @@ public final class Linear extends InfModule {
 
     static KernelBuffer<int32> rowsS16;
 
+    static boolean cpuX8Want = true;
+
+    /** Whether the cpu backend's Q4_K int8 routes read the 8-row interleave (llm-cpu-parity 4.3.1.1's switch). */
+    public static void setCpuX8(boolean on) { Linear.cpuX8Want = on; }
+
+    KernelBuffer<int8> x8Dev;
+
+    /** This Q4_K weight in {@link Quant#q4kInterleave8}'s layout, built from the resident payload on first use. */
+    KernelBuffer<int8> x8W() {
+        if (this.x8Dev != null) { return this.x8Dev; }
+        int64 rows = (int64) this.outDim;
+        int64 bpr = this.blocksPerRow();
+        int64 n = rows * bpr * 144L;
+        int8[] host #= heap int8[n];
+        this.payloadDev.download(host, n);
+        int64 xn = Quant.q4kInterleave8Bytes(rows, bpr);
+        int8[] wx #= heap int8[xn];
+        Quant.q4kInterleave8(host, 0L, rows, bpr, wx, 0L);
+        this.x8Dev #= heap KernelBuffer<int8>((uint64) xn);
+        this.x8Dev.upload(wx, xn);
+        return this.x8Dev;
+    }
+
     /** `y[c*yStride + row] (+)= W[row] . x_c` for `nc` packed columns `xpStride` bytes apart, on the many-row int8 kernels. */
     void cpuInt8Rows(KernelBuffer<int8> xp, int64 xpStride, int64 nc, KernelBuffer<float32> y,
             int64 yStride, boolean accum) {
         int64 n = (int64) this.inDim;
         int64 rows = (int64) this.outDim;
         if (this.packedTy == Quant.GG_Q4_K) {
-            QuantKernel.q4kQ8RowsCpuLaunchNoSync(y, this.payloadDev, xp, rows, n, nc, xpStride, yStride, accum);
+            if (Linear.cpuX8Want) {
+                QuantKernel.q4kQ8X8CpuLaunchNoSync(y, this.x8W(), xp, rows, n, nc, xpStride, yStride, accum);
+            } else {
+                QuantKernel.q4kQ8RowsCpuLaunchNoSync(y, this.payloadDev, xp, rows, n, nc, xpStride, yStride, accum);
+            }
             return;
         }
         int64 per = n / 16L;
@@ -505,7 +532,11 @@ public final class Linear extends InfModule {
     boolean cpuInt8Launch(KernelBuffer<float32> y, KernelBuffer<int8> w, KernelBuffer<int8> xp,
             boolean shared, int64 rows, int64 yOff, boolean accum) {
         if (!this.cpuInt8) { return false; }
-        if (this.packedTy == Quant.GG_Q4_K) {
+        if (this.packedTy == Quant.GG_Q4_K && Linear.cpuX8Want && rows == (int64) this.outDim) {
+            KernelBuffer<float32> yv #= y.slice((uint64) yOff, (uint64) rows);
+            QuantKernel.q4kQ8X8CpuLaunchNoSync(yv, this.x8W(), xp, rows, (int64) this.inDim, 1L,
+                Quant.q8kPackedBytes((int64) this.inDim), rows, accum);
+        } else if (this.packedTy == Quant.GG_Q4_K) {
             QuantKernel.q4kQ8PackedCpuLaunchNoSync(y, w, xp, rows, (int64) this.inDim, yOff, accum);
         } else {
             Linear.groupSums16(xp, (int64) this.inDim, shared);
