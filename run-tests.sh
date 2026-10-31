@@ -75,6 +75,24 @@ cajeta_artifact_path() {
 # failures the cpu compile could never see).
 XPU_BACKEND="${XPU_BACKEND:-${CAJETA_XPU_BACKEND:-cpu}}"
 echo ">> compile backend: ${XPU_BACKEND}"
+# CAJETA_CPU_PORTABLE=1 (cpu-isa-variants 4.1.1): the test binaries are built
+# `--cpu=portable`, one copy of every cpu kernel per x86 ISA level, and the
+# suite runs once per level this host reaches, forced through
+# CAJETA_XPU_CPU_LEVEL, with a census table per level. Not CI's default: the
+# build is fourfold.
+CPU_FLAGS=()
+CPU_LEVELS=()
+if [ "${CAJETA_CPU_PORTABLE:-0}" = "1" ]; then
+    CPU_FLAGS=(--cpu=portable)
+    flags=" $(sed -n 's/^flags[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo | head -1) "
+    has() { case "$flags" in *" $1 "*) return 0;; *) return 1;; esac; }
+    has avx2 && CPU_LEVELS+=(v3)
+    has avx_vnni && CPU_LEVELS+=(v3-vnni)
+    has avx512_vnni && has avx512bw && has avx512vl && CPU_LEVELS+=(v4)
+    has amx_int8 && has amx_tile && CPU_LEVELS+=(v4-amx)
+    [ "${#CPU_LEVELS[@]}" -gt 0 ] || { echo ">> CAJETA_CPU_PORTABLE=1 but this host reaches no ISA level (no AVX2)"; exit 1; }
+    echo ">> portable cpu build; the suite runs at each of: ${CPU_LEVELS[*]}"
+fi
 echo ">> kernel gate: CAJETA_XPU_KERNEL_GATE=${CAJETA_XPU_KERNEL_GATE:-unset (enforcing)}"
 
 # Run one suite binary and report what it ACTUALLY exercised.
@@ -122,15 +140,15 @@ skip_notes() {
 # name the kernels the registry never saw. Written to build/census-<be>.tsv;
 # the checked-in copies under census/ are refreshed by hand from there.
 census_table() {
-    local log="$1" be="$2" tsv errlog
+    local log="$1" be="$2" lvl="${3:-}" tsv errlog
     mkdir -p "$here/build"
-    tsv="$here/build/census-${be}.tsv"
-    { printf 'backend\tkernel\tclass\tlaunches\tchecks\tmanifest\tnote\n'
+    tsv="$here/build/census-${be}${lvl:+-$lvl}.tsv"
+    { printf 'backend\tkernel\tclass\tlaunches\tchecks\tmanifest\tlevel\tnote\n'
       { grep "^census-row"$'\t' "$log" || true; } | cut -f2- | sort -t$'\t' -k2,2
       for errlog in "$out/lib.err" "$out/test.err"; do
           [ -s "$errlog" ] || continue
           sed -n 's/.*\[xpu-kernel-skipped\] \([A-Za-z0-9_]*\): \(.*\)$/\1\t\2/p' "$errlog"
-      done | sort -u | awk -F'\t' -v be="$be" '{ printf "%s\t%s\tDECLINED\t0\t0\tno-manifest\t%s\n", be, $1, $2 }'
+      done | sort -u | awk -F'\t' -v be="$be" '{ printf "%s\t%s\tDECLINED\t0\t0\tno-manifest\t-\t%s\n", be, $1, $2 }'
     } > "$tsv"
     local rows
     rows=$(( $(wc -l < "$tsv") - 1 ))
@@ -138,7 +156,7 @@ census_table() {
 }
 
 run_suite() {
-    local bin="$1" label="$2" log
+    local bin="$1" label="$2" lvl="${3:-}" log
     phase_end
     log="$(mktemp)"
     set +e
@@ -191,8 +209,23 @@ run_suite() {
     if [ "${skipped}" != "0" ]; then
         echo ">> NOTE: ${skipped} kernel(s) produced no device code on this backend ([xpu-kernel-skipped], each held by @Unlowered naming its plan item; listed by cause above)."
     fi
-    census_table "$log" "${XPU_BACKEND%%,*}"
+    census_table "$log" "${XPU_BACKEND%%,*}" "$lvl"
     rm -f "$log"
+    return $rc
+}
+
+# The suite once, or once per ISA level under CAJETA_CPU_PORTABLE=1.
+run_leg() {
+    local bin="$1" label="$2" lvl
+    if [ "${#CPU_LEVELS[@]}" -eq 0 ]; then
+        run_suite "$bin" "$label"
+        return $?
+    fi
+    local rc=0
+    for lvl in "${CPU_LEVELS[@]}"; do
+        echo ">> ${label}: forced to ISA level ${lvl} (CAJETA_XPU_CPU_LEVEL)"
+        CAJETA_XPU_CPU_LEVEL="$lvl" run_suite "$bin" "${label} @${lvl}" "$lvl" || rc=1
+    done
     return $rc
 }
 
@@ -516,7 +549,7 @@ export CAJETA_XPU_POISON="${CAJETA_XPU_POISON:-1}"
 # so no earlier run's verdict reaches a test (cajeta-llm 15.2.12.2.1.1.1).
 export CAJETA_LLM_TUNE_DIR="${CAJETA_LLM_TUNE_DIR:-off}"
 echo ">> device buffers: CAJETA_XPU_POISON=${CAJETA_XPU_POISON}"
-"$CAJETA" --emit=exe --profile=test --xpu-backend="${XPU_BACKEND:-cpu}" \
+"$CAJETA" --emit=exe --profile=test --xpu-backend="${XPU_BACKEND:-cpu}" ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} \
     --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja,$logging_cja" \
     -o "$out/llamatests" \
     dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" \
@@ -525,7 +558,7 @@ cat "$out/test.err" >&2
 spill_gate "$out/test.err" "test binary"
 skip_notes "$out/test.err" "test binary"
 
-run_suite "$out/llamatests" "test profile"
+run_leg "$out/llamatests" "test profile"
 
 # RELEASE_PASS=0 skips the second pass while iterating on the suite itself:
 # each pass is an hour of compile on cpu (plan 6.4.12). The default runs it.
@@ -539,9 +572,9 @@ phase "building the release test binary"
 # rest of the suite) must hold under the SHIPPING configuration — release
 # codegen with the bounded live-set discipline — not only the test profile.
 "$CAJETA" --emit=exe --profile=test --release --live-set=bounded \
-    --xpu-backend="${XPU_BACKEND:-cpu}" \
+    --xpu-backend="${XPU_BACKEND:-cpu}" ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} \
     --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja,$logging_cja" \
     -o "$out/llamatests-release" \
     dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
-run_suite "$out/llamatests-release" "release, bounded live-set"
+run_leg "$out/llamatests-release" "release, bounded live-set"
