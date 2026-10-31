@@ -222,7 +222,8 @@ public class CpuInt8MatVecTest {
     static void checkRows(int32 ty, String fixture) { CpuInt8MatVecTest.checkRowsForm(ty, fixture, false); }
 
     /** {@link #checkRows}, on the 8-row interleaved kernels when `x8` is set (llm-cpu-parity 4.3.1.1). */
-    static void checkRowsForm(int32 ty, String fixture, boolean x8) {
+    /** `form`: 0 the many-row kernels on the file layout, 8 the 8-row interleave, 16 the 16-row one. */
+    static void checkRowsForm(int32 ty, String fixture, int32 form) {
         String be #= Device.activeBackend();
         if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
         int64 rows = 70L;
@@ -249,9 +250,13 @@ public class CpuInt8MatVecTest {
                 }
                 int64 c = 0;
                 while (c < nc) { CpuInt8MatVecTest.oneRowCol(ty, raw, rows, cols, x, c, want, accum); c = c + 1; }
-                if (x8 && ty == Quant.GG_Q6_K) {
+                if (form == 16 && ty == Quant.GG_Q6_K) {
+                    QuantKernel.q6kQ8X16IntoDevice(raw, rows, cols, x, nc, got, accum);
+                } else if (form == 16) {
+                    QuantKernel.q4kQ8X16IntoDevice(raw, rows, cols, x, nc, got, accum);
+                } else if (form == 8 && ty == Quant.GG_Q6_K) {
                     QuantKernel.q6kQ8X8IntoDevice(raw, rows, cols, x, nc, got, accum);
-                } else if (x8) {
+                } else if (form == 8) {
                     QuantKernel.q4kQ8X8IntoDevice(raw, rows, cols, x, nc, got, accum);
                 } else if (ty == Quant.GG_Q4_K) {
                     QuantKernel.q4kQ8RowsIntoDevice(raw, rows, cols, x, nc, got, accum);
@@ -285,7 +290,7 @@ public class CpuInt8MatVecTest {
 
     @Test
     public void q4kInterleavedKernelMatchesTheOneRowKernelAtEveryColumnCount() {
-        CpuInt8MatVecTest.checkRowsForm(Quant.GG_Q4_K, "q4_k.bin", true);
+        CpuInt8MatVecTest.checkRowsForm(Quant.GG_Q4_K, "q4_k.bin", 8);
     }
 
     /** llm-cpu-parity 4.3.1.3: a cpu int8 Q4_K weight holds one resident copy, the 8-row interleave, and its decode
@@ -299,7 +304,67 @@ public class CpuInt8MatVecTest {
 
     @Test
     public void q6kInterleavedKernelMatchesTheOneRowKernelAtEveryColumnCount() {
-        CpuInt8MatVecTest.checkRowsForm(Quant.GG_Q6_K, "q6_k.bin", true);
+        CpuInt8MatVecTest.checkRowsForm(Quant.GG_Q6_K, "q6_k.bin", 8);
+    }
+
+    /** cpu-isa-variants 5.1.1: the 16-row interleave's kernels match the one-row kernel at 1, 5, 16, 128 and 130
+     *  columns and 70 rows (a partial group of 16), plain and accumulating. */
+    @Test
+    public void q4kSixteenRowKernelMatchesTheOneRowKernelAtEveryColumnCount() {
+        if (!CpuInt8MatVecTest.x16Here()) { return; }
+        CpuInt8MatVecTest.checkRowsForm(Quant.GG_Q4_K, "q4_k.bin", 16);
+    }
+
+    @Test
+    public void q6kSixteenRowKernelMatchesTheOneRowKernelAtEveryColumnCount() {
+        if (!CpuInt8MatVecTest.x16Here()) { return; }
+        CpuInt8MatVecTest.checkRowsForm(Quant.GG_Q6_K, "q6_k.bin", 16);
+    }
+
+    /** The 16-row kernels want 512-bit vectors: level v4 and above, or no cpu backend at all. */
+    static boolean x16Here() {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { return true; }
+        if (Device.cpuLevel() >= 2) { return true; }
+        DeviceSkip.cannot("the 16-row interleave needs ISA level v4 (AVX-512); this host runs "
+            + Device.cpuLevelName(Device.cpuLevel()));
+        return false;
+    }
+
+    /** cpu-isa-variants 5.1.1: the 16-row repacks round-trip through their inverses, at 70 rows. */
+    @Test
+    public void sixteenRowInterleavesRoundTrip() {
+        CpuInt8MatVecTest.roundTrip16(Quant.GG_Q4_K, "q4_k.bin");
+        CpuInt8MatVecTest.roundTrip16(Quant.GG_Q6_K, "q6_k.bin");
+    }
+
+    static void roundTrip16(int32 ty, String fixture) {
+        int64 rows = 70L;
+        int8[] raw #= WaveGeometryTest.rowsOf(fixture, ty, rows, BPR);
+        boolean q6 = ty == Quant.GG_Q6_K;
+        int64 xn = q6 ? Quant.q6kInterleave16Bytes(rows, BPR) : Quant.q4kInterleave16Bytes(rows, BPR);
+        int8[] x #= heap int8[xn];
+        if (q6) { Quant.q6kInterleave16(raw, 0L, rows, BPR, x, 0L); } else { Quant.q4kInterleave16(raw, 0L, rows, BPR, x, 0L); }
+        int8[] back #= heap int8[raw.count()];
+        if (q6) { Quant.q6kDeinterleave16(x, 0L, rows, BPR, back, 0L); } else { Quant.q4kDeinterleave16(x, 0L, rows, BPR, back, 0L); }
+        int64 j = 0;
+        while (j < (int64) raw.count()) {
+            if (back[j] != raw[j]) { Assert.fail(fixture + " 16-row round trip byte " + j + ": " + back[j] + " vs " + raw[j]); }
+            j = j + 1;
+        }
+        // The last group's rows past 70 are zero.
+        int64 gb = q6 ? 3392L : 2432L;
+        int64 lastGroup = (rows - 1L) / 16L;
+        int64 d0 = lastGroup * BPR * gb;
+        int64 lane = rows % 16L;
+        int64 k = lane;
+        while (k < 16L) {
+            int64 o = d0 + k * 4L;
+            if (x[o] != 0 || x[o + 1L] != 0 || x[o + 2L] != 0 || x[o + 3L] != 0) {
+                Assert.fail(fixture + ": d of padding row " + k + " is not zero");
+            }
+            k = k + 1L;
+        }
     }
 
     static void onlyTheInterleave(int32 ty, String fixture) {
@@ -329,8 +394,10 @@ public class CpuInt8MatVecTest {
         }
         LinearKernelRouteTest.checkBatchedAt(lin, 5, ci, co, 0.02, "interleaved batch");
         ValueCheck.credit(vc);
-        int64 x8 = ty == Quant.GG_Q6_K ? Quant.q6kInterleave8Bytes((int64) co, (int64) (ci / 256))
-            : Quant.q4kInterleave8Bytes((int64) co, (int64) (ci / 256));
+        boolean wide = lin.xRowsForTest() == 16;
+        int64 x8 = ty == Quant.GG_Q6_K
+            ? (wide ? Quant.q6kInterleave16Bytes((int64) co, (int64) (ci / 256)) : Quant.q6kInterleave8Bytes((int64) co, (int64) (ci / 256)))
+            : (wide ? Quant.q4kInterleave16Bytes((int64) co, (int64) (ci / 256)) : Quant.q4kInterleave8Bytes((int64) co, (int64) (ci / 256)));
         int8[] back #= lin.deviceBytesForTest();
         int8[] file #= lin.hostPackedCopyForTest();
         int64 j = 0;

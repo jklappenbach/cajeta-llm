@@ -483,6 +483,122 @@ public final class Linear extends InfModule {
 
     boolean x8Resident;
     boolean x8Ok;
+    /** Rows a lane group of the resident interleave holds: 8, or 16 on a v4 host where the probe found it faster. */
+    int32 xRows = 8;
+
+    /** The resident interleave's rows a group, for tests. */
+    public int32 xRowsForTest() { return this.xRows; }
+
+    static int32 cpuXWidthWant = 0;
+    static int32 cpuXWidthChosen = 0;
+    static int64 x16ProbeX8Ns = 0L;
+    static int64 x16ProbeX16Ns = 0L;
+
+    /** Pins the interleave width (8 or 16); 0 lets the level and the probe decide (cpu-isa-variants 5.1.2). */
+    public static void setCpuXWidth(int32 rows) { Linear.cpuXWidthWant = rows; Linear.cpuXWidthChosen = 0; }
+
+    /** The probe's two times, ns per decode launch (0 before it has run). */
+    public static int64 x16ProbeX8Ns() { return Linear.x16ProbeX8Ns; }
+    public static int64 x16ProbeX16Ns() { return Linear.x16ProbeX16Ns; }
+
+    /**
+     * The interleave width this host takes: 8 below ISA level v4 or where the 16-row kernels did not lower;
+     * at v4 and above the load-time probe's winner (cpu-isa-variants 5.1.2, 5.2.2), remembered in the tune store.
+     */
+    static int32 cpuXWidth() {
+        if (Linear.cpuXWidthWant != 0) { return Linear.cpuXWidthWant; }
+        if (Linear.cpuXWidthChosen != 0) { return Linear.cpuXWidthChosen; }
+        if (Device.cpuLevel() < 2 || !KernelCap.usable("q4kQ8X16VecKernel") || !KernelCap.usable("q4kQ8X16RowsKernel")
+                || !KernelCap.usable("q6kQ8X16VecKernel") || !KernelCap.usable("q6kQ8X16RowsKernel")) {
+            Linear.cpuXWidthChosen = 8;
+            return 8;
+        }
+        String bid #= Linear.choiceBuildId("q4kQ8X8VecKernel", "q4kQ8X16VecKernel");
+        int32 got = Linear.recalled("cpuX16", bid);
+        if (got == 0 && TuneMode.skipTiming(Linear.tuneDir)) { got = 2; }
+        if (got == 0) {
+            got = Linear.probeX16() ? 1 : 2;
+            if (Linear.tuneDir.byteLength() > 0) { Autotune.rememberFor(Linear.tuneDir, "cpuX16", got, bid); }
+        }
+        Linear.cpuXWidthChosen = got == 1 ? 16 : 8;
+        return Linear.cpuXWidthChosen;
+    }
+
+    /** Times the decode mat-vec of one 4096 x 4096 Q4_K weight on both interleaves; true when 16 rows is faster. */
+    static boolean probeX16() {
+        int64 out = 4096L;
+        int64 cols = 4096L;
+        int64 bpr = cols / 256L;
+        int8[] raw #= Linear.probeQ4Weight(out * bpr);
+        int8[] w8 #= heap int8[Quant.q4kInterleave8Bytes(out, bpr)];
+        Quant.q4kInterleave8(raw, 0L, out, bpr, w8, 0L);
+        int8[] w16 #= heap int8[Quant.q4kInterleave16Bytes(out, bpr)];
+        Quant.q4kInterleave16(raw, 0L, out, bpr, w16, 0L);
+        float32[] x #= heap float32[cols];
+        int64 z = 0;
+        while (z < cols) { x[z] = 0.02f * (float32) ((z % 11L) - 5L); z = z + 1; }
+        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
+        Quant.q8kPack(x, 0L, cols, xp);
+        KernelBuffer<int8> d8 #= heap KernelBuffer<int8>((uint64) w8.count());
+        KernelBuffer<int8> d16 #= heap KernelBuffer<int8>((uint64) w16.count());
+        KernelBuffer<int8> xpD #= heap KernelBuffer<int8>((uint64) xp.count());
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) out);
+        d8.upload(w8);
+        d16.upload(w16);
+        xpD.upload(xp);
+        KernelStream s = QuantKernel.stream();
+        int64 stride = Quant.q8kPackedBytes(cols);
+        int64 best8 = 0L - 1L;
+        int64 best16 = 0L - 1L;
+        int32 warm = 2;
+        int32 rounds = warm + 6;
+        int32 burst = 8;
+        int32 round = 0;
+        while (round < rounds) {
+            int32 n = round >= warm ? burst : 1;
+            int64 t0 = Clock.nanoTime();
+            int32 k = 0;
+            while (k < n) { QuantKernel.q4kQ8X8CpuLaunchNoSync(y, d8, xpD, out, cols, 1L, stride, out, false); k = k + 1; }
+            s.sync();
+            int64 t1 = Clock.nanoTime();
+            k = 0;
+            while (k < n) { QuantKernel.q4kQ8X16CpuLaunchNoSync(y, d16, xpD, out, cols, 1L, stride, out, false); k = k + 1; }
+            s.sync();
+            int64 t2 = Clock.nanoTime();
+            if (round >= warm) {
+                int64 a = (t1 - t0) / (int64) n;
+                int64 b = (t2 - t1) / (int64) n;
+                if (best8 < 0L || a < best8) { best8 = a; }
+                if (best16 < 0L || b < best16) { best16 = b; }
+            }
+            round = round + 1;
+        }
+        Linear.x16ProbeX8Ns = best8;
+        Linear.x16ProbeX16Ns = best16;
+        return best16 * 20L < best8 * 19L;
+    }
+
+    /** Q4_K on the resident interleave, {@link QuantKernel#q4kQ8X8CpuLaunchNoSync} or the 16-row form by {@link #xRows}. */
+    void launchXQ4(KernelBuffer<float32> y, KernelBuffer<int8> xp, int64 rows, int64 cols, int64 nc,
+            int64 xpStride, int64 yStride, boolean accum) {
+        if (this.xRows == 16) {
+            QuantKernel.q4kQ8X16CpuLaunchNoSync(y, this.payloadDev, xp, rows, cols, nc, xpStride, yStride, accum);
+        } else {
+            QuantKernel.q4kQ8X8CpuLaunchNoSync(y, this.payloadDev, xp, rows, cols, nc, xpStride, yStride, accum);
+        }
+        return;
+    }
+
+    /** Q6_K on the resident interleave, by {@link #xRows}. */
+    void launchXQ6(KernelBuffer<float32> y, KernelBuffer<int8> xp, KernelBuffer<int32> s16, int64 rows, int64 cols,
+            int64 nc, int64 xpStride, int64 yStride, boolean accum) {
+        if (this.xRows == 16) {
+            QuantKernel.q6kQ8X16CpuLaunchNoSync(y, this.payloadDev, xp, s16, rows, cols, nc, xpStride, yStride, accum);
+        } else {
+            QuantKernel.q6kQ8X8CpuLaunchNoSync(y, this.payloadDev, xp, s16, rows, cols, nc, xpStride, yStride, accum);
+        }
+        return;
+    }
 
     /** Lets this weight hold the cpu 8-row interleave as its one resident copy; a model's dense projections set it. */
     public void allowInterleave() { this.x8Ok = true; }
@@ -507,19 +623,21 @@ public final class Linear extends InfModule {
         int64 rows = (int64) this.outDim;
         int64 bpr = this.blocksPerRow();
         boolean q6 = this.packedTy == Quant.GG_Q6_K;
+        int32 L = Linear.cpuXWidth();
+        this.xRows = L;
         int64 rb = bpr * (q6 ? 210L : 144L);
-        int64 gb = bpr * (q6 ? 1696L : 1216L);
-        int64 groups = (rows + 7L) / 8L;
+        int64 gb = bpr * (q6 ? (L == 16 ? 3392L : 1696L) : (L == 16 ? 2432L : 1216L));
+        int64 groups = (rows + (int64) L - 1L) / (int64) L;
         this.payloadDev #= heap KernelBuffer<int8>((uint64) (groups * gb));
         if (this.packed == null && this.permuteHeads > 0) { this.ensureHostPacked(); }
         File f = null;
         if (this.packed == null && this.srcPath != null) { f #= File.open(this.srcPath, OpenMode.READ); }
-        int8[] src #= heap int8[8L * rb];
+        int8[] src #= heap int8[(int64) L * rb];
         int8[] dst #= heap int8[gb];
         int64 g = 0;
         while (g < groups) {
-            int64 r0 = g * 8L;
-            int64 nr = rows - r0 < 8L ? rows - r0 : 8L;
+            int64 r0 = g * (int64) L;
+            int64 nr = rows - r0 < (int64) L ? rows - r0 : (int64) L;
             int64 n = nr * rb;
             if (this.packed != null) {
                 int64 i = 0;
@@ -534,7 +652,9 @@ public final class Linear extends InfModule {
                         + " - wanted " + n + ", got " + got);
                 }
             }
-            if (q6) { Quant.q6kInterleave8(src, 0L, nr, bpr, dst, 0L); }
+            if (q6 && L == 16) { Quant.q6kInterleave16(src, 0L, nr, bpr, dst, 0L); }
+            else if (q6) { Quant.q6kInterleave8(src, 0L, nr, bpr, dst, 0L); }
+            else if (L == 16) { Quant.q4kInterleave16(src, 0L, nr, bpr, dst, 0L); }
             else { Quant.q4kInterleave8(src, 0L, nr, bpr, dst, 0L); }
             KernelBuffer<int8> sl #= this.payloadDev.slice((uint64) (g * gb), (uint64) gb);
             sl.upload(dst, gb);
@@ -553,7 +673,7 @@ public final class Linear extends InfModule {
         int64 rows = (int64) this.outDim;
         if (this.packedTy == Quant.GG_Q4_K) {
             if (this.x8Resident) {
-                QuantKernel.q4kQ8X8CpuLaunchNoSync(y, this.payloadDev, xp, rows, n, nc, xpStride, yStride, accum);
+                this.launchXQ4(y, xp, rows, n, nc, xpStride, yStride, accum);
             } else {
                 QuantKernel.q4kQ8RowsCpuLaunchNoSync(y, this.payloadDev, xp, rows, n, nc, xpStride, yStride, accum);
             }
@@ -575,7 +695,7 @@ public final class Linear extends InfModule {
             }
         }
         if (this.x8Resident) {
-            QuantKernel.q6kQ8X8CpuLaunchNoSync(y, this.payloadDev, xp, Linear.rowsS16, rows, n, nc,
+            this.launchXQ6(y, xp, Linear.rowsS16, rows, n, nc,
                 xpStride, yStride, accum);
             return;
         }
@@ -597,11 +717,11 @@ public final class Linear extends InfModule {
             if (this.packedTy == Quant.GG_Q6_K) {
                 Linear.groupSums16(xp, (int64) this.inDim, shared);
                 KernelBuffer<int32> s16 = shared ? Linear.stS16 : Linear.colS16;
-                QuantKernel.q6kQ8X8CpuLaunchNoSync(yv, this.payloadDev, xp, s16, rows, (int64) this.inDim, 1L,
+                this.launchXQ6(yv, xp, s16, rows, (int64) this.inDim, 1L,
                     Quant.q8kPackedBytes((int64) this.inDim), rows, accum);
                 return true;
             }
-            QuantKernel.q4kQ8X8CpuLaunchNoSync(yv, this.payloadDev, xp, rows, (int64) this.inDim, 1L,
+            this.launchXQ4(yv, xp, rows, (int64) this.inDim, 1L,
                 Quant.q8kPackedBytes((int64) this.inDim), rows, accum);
         } else if (this.packedTy == Quant.GG_Q4_K) {
             QuantKernel.q4kQ8PackedCpuLaunchNoSync(y, w, xp, rows, (int64) this.inDim, yOff, accum);
@@ -2613,7 +2733,10 @@ public final class Linear extends InfModule {
         if (Linear.mcPay == 0) {
             String bid #= Linear.choiceBuildId(TcTile.Q4_KERNEL, "q4kQ8BatchMatMulKernel");
             Linear.mcPay = Linear.recalled("matrixCoresPay", bid);
-            if (Linear.mcPay == 0 && TuneMode.skipTiming(Linear.tuneDir)) {
+            if (Linear.mcPay == 0 && Linear.onCpu() && Device.cpuLevel() != 3) {
+                // The cpu backend has a matrix unit only at ISA level v4-amx (cpu-isa-variants 6.2.2).
+                Linear.mcPay = 2;
+            } else if (Linear.mcPay == 0 && TuneMode.skipTiming(Linear.tuneDir)) {
                 Linear.mcPay = 1;
             } else if (Linear.mcPay == 0) {
                 Linear.mcPay = Linear.probeMatrixCores() ? 1 : 2;
@@ -4463,7 +4586,7 @@ public final class Linear extends InfModule {
     public static void setCpuFuse(boolean on) { Linear.cpuFuseWant = on; }
 
     boolean x8Fusable() {
-        return this.x8Resident && this.packedTy == Quant.GG_Q4_K && !this.hasEpilogue();
+        return this.x8Resident && this.xRows == 8 && this.packedTy == Quant.GG_Q4_K && !this.hasEpilogue();
     }
 
     /** {@link #matvecStagedKeep} for `a`, `b` and `c` (null for a pair): the Q4_K interleaves among them that share
@@ -5284,8 +5407,12 @@ public final class Linear extends InfModule {
             int64 xn = (int64) this.payloadDev.length();
             int8[] x #= heap int8[xn];
             this.payloadDev.download(x, xn);
-            if (this.packedTy == Quant.GG_Q6_K) {
+            if (this.packedTy == Quant.GG_Q6_K && this.xRows == 16) {
+                Quant.q6kDeinterleave16(x, 0L, (int64) this.outDim, this.blocksPerRow(), b, 0L);
+            } else if (this.packedTy == Quant.GG_Q6_K) {
                 Quant.q6kDeinterleave8(x, 0L, (int64) this.outDim, this.blocksPerRow(), b, 0L);
+            } else if (this.xRows == 16) {
+                Quant.q4kDeinterleave16(x, 0L, (int64) this.outDim, this.blocksPerRow(), b, 0L);
             } else {
                 Quant.q4kDeinterleave8(x, 0L, (int64) this.outDim, this.blocksPerRow(), b, 0L);
             }
