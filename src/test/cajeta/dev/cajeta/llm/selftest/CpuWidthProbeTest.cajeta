@@ -1,0 +1,136 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.Linear;
+import cajeta.math.Tensor;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.io.file.Path;
+
+/**
+ * llm-cpu-parity Unit 7: the cpu interleave width is measured on layer 0's real
+ * launch sequence at both widths, not hard-coded. The choice is a pure function
+ * of the four times and the workload; a weight repacks between widths without
+ * changing its answer; the probe leaves every weight at its answer.
+ */
+public class CpuWidthProbeTest {
+
+    /** 7.1.1 — decode workload: 16 rows only when at least 5% faster on decode; prefill is not consulted. */
+    @Test
+    public void theDecodeWorkloadChoosesByDecodeWithAFivePercentMargin() {
+        Assert.equals(16, Linear.cpuWidthChoice(1000L, 900L, 1000L, 1000L, Linear.WIDTH_FOR_DECODE));
+        Assert.equals(8, Linear.cpuWidthChoice(1000L, 960L, 1000L, 500L, Linear.WIDTH_FOR_DECODE));
+        Assert.equals(8, Linear.cpuWidthChoice(1000L, 1000L, 1000L, 500L, Linear.WIDTH_FOR_DECODE));
+        Assert.equals(8, Linear.cpuWidthChoice(1000L, 1070L, 1000L, 500L, Linear.WIDTH_FOR_DECODE));
+    }
+
+    /** 7.1.1 — prefill workload: by prefill with the same margin; decode is not consulted. */
+    @Test
+    public void thePrefillWorkloadChoosesByPrefill() {
+        Assert.equals(16, Linear.cpuWidthChoice(1000L, 1070L, 1000L, 700L, Linear.WIDTH_FOR_PREFILL));
+        Assert.equals(8, Linear.cpuWidthChoice(1000L, 900L, 1000L, 960L, Linear.WIDTH_FOR_PREFILL));
+        Assert.equals(8, Linear.cpuWidthChoice(1000L, 900L, 1000L, 1000L, Linear.WIDTH_FOR_PREFILL));
+    }
+
+    /** 7.1.1 — a time that was never measured (0 or negative) keeps 8. */
+    @Test
+    public void anUnmeasuredTimeKeepsEight() {
+        Assert.equals(8, Linear.cpuWidthChoice(0L, 900L, 1000L, 700L, Linear.WIDTH_FOR_DECODE));
+        Assert.equals(8, Linear.cpuWidthChoice(1000L, 0L, 1000L, 700L, Linear.WIDTH_FOR_PREFILL));
+    }
+
+    static boolean x16Here() {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("the interleave is the cpu backend's resident layout"); return false; }
+        if (Device.cpuLevel() < 2) {
+            DeviceSkip.cannot("the 16-row interleave is chosen only at ISA level v4 and above; this host runs "
+                + Device.cpuLevelName(Device.cpuLevel()));
+            return false;
+        }
+        if (!KernelCap.usable("q4kQ8X16VecKernel") || !KernelCap.usable("q6kQ8X16VecKernel")) {
+            DeviceSkip.noKernel("q4kQ8X16VecKernel", be);
+            return false;
+        }
+        return true;
+    }
+
+    static void assertSame(Tensor<float32> want, Tensor<float32> got, int64 n, String what) {
+        int64 o = 0;
+        while (o < n) {
+            float32 d = got.flatGet(o) - want.flatGet(o);
+            if (d < 0.0f) { d = 0.0f - d; }
+            float32 m = want.flatGet(o) < 0.0f ? 0.0f - want.flatGet(o) : want.flatGet(o);
+            if (d > m * 0.02f + 0.01f) {
+                Assert.fail(what + " row " + o + ": " + got.flatGet(o) + " vs " + want.flatGet(o));
+            }
+            o = o + 1;
+        }
+    }
+
+    /** 7.1.2 — a weight repacked from 8 to 16 rows and back answers the same mat-vec, and reports its width. */
+    @Test
+    public void aWeightRepacksBetweenWidthsWithoutChangingItsAnswer() {
+        if (!CpuWidthProbeTest.x16Here()) { return; }
+        int32 ci = 512;
+        int32 co = 70;
+        Linear.setCpuXWidth(8);
+        Linear lin #= LinearKernelRouteTest.tiledAt(Quant.GG_Q4_K, "q4_k.bin", ci, co);
+        lin.allowInterleave();
+        Tensor<float32> src #= LinearKernelRouteTest.ramp((int64) ci, 0L);
+        Tensor<float32> at8 #= LinearKernelRouteTest.ramp(0L, (int64) co);
+        Tensor<float32> at16 #= LinearKernelRouteTest.ramp(0L, (int64) co);
+        Tensor<float32> back #= LinearKernelRouteTest.ramp(0L, (int64) co);
+        lin.matvecInto(src, 0L, at8, 0L);
+        Assert.equals(8, lin.xRowsForTest());
+        lin.repackCpuRows(16);
+        Assert.equals(16, lin.xRowsForTest());
+        lin.matvecInto(src, 0L, at16, 0L);
+        CpuWidthProbeTest.assertSame(at8, at16, (int64) co, "16 rows against 8");
+        lin.repackCpuRows(8);
+        Assert.equals(8, lin.xRowsForTest());
+        lin.matvecInto(src, 0L, back, 0L);
+        CpuWidthProbeTest.assertSame(at8, back, (int64) co, "back to 8");
+        Linear.setCpuXWidth(0);
+    }
+
+    /** 7.1.3 — the layer probe on seven fixture weights: positive times at both widths, an answer of 8 or 16, every
+     *  weight left at the answer. */
+    @Test
+    public void theLayerProbeTimesBothWidthsAndLeavesTheLayerAtItsAnswer() {
+        if (!CpuWidthProbeTest.x16Here()) { return; }
+        Linear.setCpuXWidth(8);
+        Linear[] layer #= heap Linear[7];
+        int32 i = 0;
+        while (i < 6) {
+            layer[i] #= LinearKernelRouteTest.tiledAt(Quant.GG_Q4_K, "q4_k.bin", 1024, 1024);
+            layer[i].allowInterleave();
+            i = i + 1;
+        }
+        layer[6] #= LinearKernelRouteTest.tiledAt(Quant.GG_Q6_K, "q6_k.bin", 2048, 1024);
+        layer[6].allowInterleave();
+        Path dir #= Path.of("tmp/cpu-width-probe-tune");
+        dir.mkdirs();
+        Linear.setTuneDir("tmp/cpu-width-probe-tune");
+        Linear.forgetStoredChoices();
+        int32 w = Linear.probeCpuWidth(layer, Linear.WIDTH_FOR_DECODE);
+        boolean remembered = Linear.cpuWidthRemembered();
+        Linear.forgetStoredChoices();
+        Linear.setTuneDir("");
+        Assert.isTrue(remembered);
+        Assert.isTrue(w == 8 || w == 16);
+        Assert.isTrue(Linear.cpuWidthDecode8Ns() > 0L);
+        Assert.isTrue(Linear.cpuWidthDecode16Ns() > 0L);
+        Assert.isTrue(Linear.cpuWidthPrefill8Ns() > 0L);
+        Assert.isTrue(Linear.cpuWidthPrefill16Ns() > 0L);
+        Assert.equals(w, Linear.cpuWidthChoice(Linear.cpuWidthDecode8Ns(), Linear.cpuWidthDecode16Ns(),
+            Linear.cpuWidthPrefill8Ns(), Linear.cpuWidthPrefill16Ns(), Linear.WIDTH_FOR_DECODE));
+        i = 0;
+        while (i < 7) { Assert.equals(w, layer[i].xRowsForTest()); i = i + 1; }
+        System.stdout.println("   cpu width probe: decode 8 rows " + Linear.cpuWidthDecode8Ns() + " ns, 16 rows "
+            + Linear.cpuWidthDecode16Ns() + " ns; prefill 8 rows " + Linear.cpuWidthPrefill8Ns() + " ns, 16 rows "
+            + Linear.cpuWidthPrefill16Ns() + " ns; chose " + w);
+        Linear.setCpuXWidth(0);
+    }
+}

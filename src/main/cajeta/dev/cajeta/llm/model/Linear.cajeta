@@ -492,8 +492,6 @@ public final class Linear extends InfModule {
 
     static int32 cpuXWidthWant = 0;
     static int32 cpuXWidthChosen = 0;
-    static int64 x16ProbeX8Ns = 0L;
-    static int64 x16ProbeX16Ns = 0L;
 
     /** Pins the interleave width (8 or 16); 0 lets the level and the probe decide (cpu-isa-variants 5.1.2). */
     public static void setCpuXWidth(int32 rows) { Linear.cpuXWidthWant = rows; Linear.cpuXWidthChosen = 0; }
@@ -504,8 +502,6 @@ public final class Linear extends InfModule {
     }
 
     /** The probe's two times, ns per decode launch (0 before it has run). */
-    public static int64 x16ProbeX8Ns() { return Linear.x16ProbeX8Ns; }
-    public static int64 x16ProbeX16Ns() { return Linear.x16ProbeX16Ns; }
 
     /**
      * The interleave width this host takes: 8 below ISA level v4 or where the 16-row kernels did not lower;
@@ -519,75 +515,175 @@ public final class Linear extends InfModule {
             Linear.cpuXWidthChosen = 8;
             return 8;
         }
-        // 8 rows unless pinned or CAJETA_LLM_CPU_X16=probe asks for the probe's choice (5.3.3).
-        String ask #= System.env.get("CAJETA_LLM_CPU_X16");
-        if (ask == null || !ask.equals("probe")) {
-            Linear.cpuXWidthChosen = 8;
-            return 8;
-        }
-        String bid #= Linear.choiceBuildId("q4kQ8X8VecKernel", "q4kQ8X16VecKernel");
-        int32 got = Linear.recalled("cpuX16", bid);
-        if (got == 0 && TuneMode.skipTiming(Linear.tuneDir)) { got = 2; }
-        if (got == 0) {
-            got = Linear.probeX16() ? 1 : 2;
-            if (Linear.tuneDir.byteLength() > 0) { Autotune.rememberFor(Linear.tuneDir, "cpuX16", got, bid); }
-        }
-        Linear.cpuXWidthChosen = got == 1 ? 16 : 8;
+        // 8 rows unless the layer probe (probeCpuWidth) chose and remembered 16 (llm-cpu-parity Unit 7).
+        Linear.cpuXWidthChosen = Linear.recalled("cpuWidth", Linear.cpuWidthBuildId()) == 2 ? 16 : 8;
         return Linear.cpuXWidthChosen;
     }
 
-    /** Times the decode mat-vec of one 4096 x 4096 Q4_K weight on both interleaves; true when 16 rows is faster. */
-    static boolean probeX16() {
-        int64 out = 4096L;
-        int64 cols = 4096L;
-        int64 bpr = cols / 256L;
-        int8[] raw #= Linear.probeQ4Weight(out * bpr);
-        int8[] w8 #= heap int8[Quant.q4kInterleave8Bytes(out, bpr)];
-        Quant.q4kInterleave8(raw, 0L, out, bpr, w8, 0L);
-        int8[] w16 #= heap int8[Quant.q4kInterleave16Bytes(out, bpr)];
-        Quant.q4kInterleave16(raw, 0L, out, bpr, w16, 0L);
-        float32[] x #= heap float32[cols];
-        int64 z = 0;
-        while (z < cols) { x[z] = 0.02f * (float32) ((z % 11L) - 5L); z = z + 1; }
-        int8[] xp #= heap int8[Quant.q8kPackedBytes(cols)];
-        Quant.q8kPack(x, 0L, cols, xp);
-        KernelBuffer<int8> d8 #= heap KernelBuffer<int8>((uint64) w8.count());
-        KernelBuffer<int8> d16 #= heap KernelBuffer<int8>((uint64) w16.count());
-        KernelBuffer<int8> xpD #= heap KernelBuffer<int8>((uint64) xp.count());
-        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) out);
-        d8.upload(w8);
-        d16.upload(w16);
-        xpD.upload(xp);
+    static String cpuWidthBuildId() { return Linear.choiceBuildId("q4kQ8X8VecKernel", "q4kQ8X16VecKernel"); }
+
+    /** Whether the tune store already holds the width for this build, so a load need not probe. */
+    public static boolean cpuWidthRemembered() { return Linear.recalled("cpuWidth", Linear.cpuWidthBuildId()) != 0; }
+
+    public static int32 WIDTH_FOR_DECODE = 1;
+    public static int32 WIDTH_FOR_PREFILL = 2;
+    static int64 cwD8 = 0L;
+    static int64 cwD16 = 0L;
+    static int64 cwP8 = 0L;
+    static int64 cwP16 = 0L;
+    /** The layer probe's best decode step at 8 rows, ns (0 before it ran). */
+    public static int64 cpuWidthDecode8Ns() { return Linear.cwD8; }
+    public static int64 cpuWidthDecode16Ns() { return Linear.cwD16; }
+    /** The layer probe's best 64-column prefill at 8 rows, ns (0 before it ran). */
+    public static int64 cpuWidthPrefill8Ns() { return Linear.cwP8; }
+    public static int64 cpuWidthPrefill16Ns() { return Linear.cwP16; }
+
+    /** 8 or 16 from the four probe times for `workload`: 16 only when at least 5% faster on the weighted phase;
+     *  a time never measured keeps 8. */
+    public static int32 cpuWidthChoice(int64 d8, int64 d16, int64 p8, int64 p16, int32 workload) {
+        if (d8 <= 0L || d16 <= 0L || p8 <= 0L || p16 <= 0L) { return 8; }
+        int64 a = workload == Linear.WIDTH_FOR_PREFILL ? p8 : d8;
+        int64 b = workload == Linear.WIDTH_FOR_PREFILL ? p16 : d16;
+        return b * 20L < a * 19L ? 16 : 8;
+    }
+
+    /** Re-uploads this interleave-resident weight at `rows` (8 or 16) from its source; a no-op at that width. */
+    public void repackCpuRows(int32 rows) {
+        this.ensureDevice();
+        if (!this.x8Resident || this.xRows == rows) { return; }
+        int64 was = (int64) this.payloadDev.length();
+        this.payloadDev = null;
+        this.devWBytes = this.devWBytes - was + this.uploadX8At(rows);
+    }
+
+    /** Times `layer` (one decoder layer's q, k, v, o, gate, up, down, all interleave-resident) at 8 and 16 rows through
+     *  the decode's launch sequence and the prefill's rows kernels at 64 columns, leaves every weight at the width
+     *  {@link #cpuWidthChoice} picks for `workload`, remembers it in the tune store, and returns it. 8 where the host
+     *  cannot take 16 or the layer is not interleaved. */
+    public static int32 probeCpuWidth(Linear[] layer, int32 workload) {
+        int32 n = (int32) layer.count();
+        if (n == 0 || !Linear.onCpu() || Device.cpuLevel() < 2 || !KernelCap.usable("q4kQ8X16VecKernel")
+                || !KernelCap.usable("q6kQ8X16VecKernel") || TuneMode.skipTiming(Linear.tuneDir)) {
+            return n == 0 ? 8 : layer[0].xRows;
+        }
+        int32 i = 0;
+        while (i < n) {
+            layer[i].ensureDevice();
+            if (!layer[i].x8Resident) { return layer[0].xRows; }
+            i = i + 1;
+        }
+        int32 first = layer[0].xRows;
+        int32 second = first == 8 ? 16 : 8;
+        Linear.timeLayer(layer, first);
+        Linear.repackLayer(layer, second);
+        Linear.timeLayer(layer, second);
+        int32 w = Linear.cpuWidthChoice(Linear.cwD8, Linear.cwD16, Linear.cwP8, Linear.cwP16, workload);
+        if (w != second) { Linear.repackLayer(layer, w); }
+        Linear.cpuXWidthChosen = w;
+        if (Linear.tuneDir.byteLength() > 0) {
+            Autotune.rememberFor(Linear.tuneDir, "cpuWidth", w == 16 ? 2 : 1, Linear.cpuWidthBuildId());
+        }
+        Diag.emit("cpu-width", 0 - 1, null, (int64) w, Linear.cwD8, Linear.cwD16, Linear.cwP8, Linear.cwP16, (int64) workload);
+        return w;
+    }
+
+    static void repackLayer(Linear[] layer, int32 rows) {
+        int32 i = 0;
+        while (i < (int32) layer.count()) { layer[i].repackCpuRows(rows); i = i + 1; }
+    }
+
+    /** One decode step of `layer`: the fused q|k|v, o, the fused gate|up, then down on its own activation. */
+    static void decodeStep(Linear[] layer, KernelBuffer<float32> xh, int64 hidden, KernelBuffer<float32> xi, int64 inter) {
+        int32 n = (int32) layer.count();
+        Linear.stageDeviceActivation(xh, hidden);
+        if (n >= 3) { Linear.matvecStagedKeep3(layer[0], layer[1], layer[2]); }
+        else { int32 i = 0; while (i < n && i < 3) { layer[i].matvecStagedKeep(); i = i + 1; } }
+        if (n >= 4) { layer[3].matvecStagedKeep(); }
+        if (n >= 6) { Linear.matvecStagedKeep3(layer[4], layer[5], null); }
+        else if (n == 5) { layer[4].matvecStagedKeep(); }
+        if (n >= 7) {
+            Linear.stageDeviceActivation(xi, inter);
+            layer[6].matvecStagedKeep();
+        }
+    }
+
+    /** The layer's decode step and 64-column prefill at its current width, best of six timed rounds, into the cw* fields. */
+    static void timeLayer(Linear[] layer, int32 width) {
+        int32 n = (int32) layer.count();
+        int64 hidden = (int64) layer[0].inDim;
+        int64 inter = (int64) layer[n - 1].inDim;
+        KernelBuffer<float32> xh #= Linear.probeActivation(hidden);
+        KernelBuffer<float32> xi #= Linear.probeActivation(inter);
         KernelStream s = QuantKernel.stream();
-        int64 stride = Quant.q8kPackedBytes(cols);
-        int64 best8 = 0L - 1L;
-        int64 best16 = 0L - 1L;
         int32 warm = 2;
         int32 rounds = warm + 6;
-        int32 burst = 8;
+        int64 bestD = 0L - 1L;
         int32 round = 0;
         while (round < rounds) {
-            int32 n = round >= warm ? burst : 1;
+            int32 steps = round >= warm ? 4 : 1;
+            s.sync();
             int64 t0 = Clock.nanoTime();
             int32 k = 0;
-            while (k < n) { QuantKernel.q4kQ8X8CpuLaunchNoSync(y, d8, xpD, out, cols, 1L, stride, out, false); k = k + 1; }
+            while (k < steps) { Linear.decodeStep(layer, xh, hidden, xi, inter); k = k + 1; }
             s.sync();
-            int64 t1 = Clock.nanoTime();
-            k = 0;
-            while (k < n) { QuantKernel.q4kQ8X16CpuLaunchNoSync(y, d16, xpD, out, cols, 1L, stride, out, false); k = k + 1; }
-            s.sync();
-            int64 t2 = Clock.nanoTime();
-            if (round >= warm) {
-                int64 a = (t1 - t0) / (int64) n;
-                int64 b = (t2 - t1) / (int64) n;
-                if (best8 < 0L || a < best8) { best8 = a; }
-                if (best16 < 0L || b < best16) { best16 = b; }
-            }
+            int64 dt = (Clock.nanoTime() - t0) / (int64) steps;
+            if (round >= warm && (bestD < 0L || dt < bestD)) { bestD = dt; }
             round = round + 1;
         }
-        Linear.x16ProbeX8Ns = best8;
-        Linear.x16ProbeX16Ns = best16;
-        return best16 * 20L < best8 * 19L;
+        int32 nc = 64;
+        int64 maxOut = 0L;
+        int32 i = 0;
+        while (i < n) { if ((int64) layer[i].outDim > maxOut) { maxOut = (int64) layer[i].outDim; } i = i + 1; }
+        KernelBuffer<int8> xph #= Linear.probePackedColumns(hidden, nc);
+        KernelBuffer<int8> xpi #= Linear.probePackedColumns(inter, nc);
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) (maxOut * (int64) nc));
+        int64 bestP = 0L - 1L;
+        round = 0;
+        while (round < rounds) {
+            s.sync();
+            int64 t0 = Clock.nanoTime();
+            i = 0;
+            while (i < n) {
+                boolean wide = (int64) layer[i].inDim == inter && inter != hidden;
+                layer[i].cpuInt8Rows(wide ? xpi : xph, Quant.q8kPackedBytes(wide ? inter : hidden), (int64) nc, y,
+                    (int64) layer[i].outDim, false);
+                i = i + 1;
+            }
+            s.sync();
+            int64 dt = Clock.nanoTime() - t0;
+            if (round >= warm && (bestP < 0L || dt < bestP)) { bestP = dt; }
+            round = round + 1;
+        }
+        if (width == 16) { Linear.cwD16 = bestD; Linear.cwP16 = bestP; }
+        else { Linear.cwD8 = bestD; Linear.cwP8 = bestP; }
+    }
+
+    static #KernelBuffer<float32> probeActivation(int64 n) {
+        float32[] x #= heap float32[n];
+        int64 z = 0;
+        while (z < n) { x[z] = 0.02f * (float32) ((z % 11L) - 5L); z = z + 1; }
+        KernelBuffer<float32> d #= heap KernelBuffer<float32>((uint64) n);
+        d.upload(x);
+        return #d;
+    }
+
+    static #KernelBuffer<int8> probePackedColumns(int64 n, int32 nc) {
+        int64 stride = Quant.q8kPackedBytes(n);
+        int8[] all #= heap int8[stride * (int64) nc];
+        int8[] one #= heap int8[stride];
+        float32[] x #= heap float32[n];
+        int32 c = 0;
+        while (c < nc) {
+            int64 z = 0;
+            while (z < n) { x[z] = 0.02f * (float32) (((z + (int64) c) % 11L) - 5L); z = z + 1; }
+            Quant.q8kPack(x, 0L, n, one);
+            int64 j = 0;
+            while (j < stride) { all[(int64) c * stride + j] = one[j]; j = j + 1; }
+            c = c + 1;
+        }
+        KernelBuffer<int8> d #= heap KernelBuffer<int8>((uint64) (stride * (int64) nc));
+        d.upload(all);
+        return #d;
     }
 
     /** Q4_K on the resident interleave, {@link QuantKernel#q4kQ8X8CpuLaunchNoSync} or the 16-row form by {@link #xRows}. */
@@ -630,12 +726,14 @@ public final class Linear extends InfModule {
             && KernelCap.usable("q6kQ8PackedMatVecKernel") && KernelCap.usable("q6kQ8X8VecKernel");
     }
 
-    /** Streams this Q4_K weight into payloadDev as the 8-row interleave, one group at a time; returns its bytes. */
-    int64 uploadX8() {
+    /** Streams this weight into payloadDev as the interleave of {@link #cpuXWidth} rows; returns its bytes. */
+    int64 uploadX8() { return this.uploadX8At(Linear.cpuXWidth()); }
+
+    /** Streams this Q4_K or Q6_K weight into payloadDev as the `L`-row interleave, one group at a time; returns its bytes. */
+    int64 uploadX8At(int32 L) {
         int64 rows = (int64) this.outDim;
         int64 bpr = this.blocksPerRow();
         boolean q6 = this.packedTy == Quant.GG_Q6_K;
-        int32 L = Linear.cpuXWidth();
         this.xRows = L;
         int64 rb = bpr * (q6 ? 210L : 144L);
         int64 gb = bpr * (q6 ? (L == 16 ? 3392L : 1696L) : (L == 16 ? 2432L : 1216L));
