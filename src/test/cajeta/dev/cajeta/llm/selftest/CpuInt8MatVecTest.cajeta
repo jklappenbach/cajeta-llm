@@ -383,7 +383,11 @@ public class CpuInt8MatVecTest {
         LinearKernelRouteTest.checkBatchedAt(lin, 5, ci, co, 0.02, "interleaved batch");
         ValueCheck.credit(vc);
         boolean wide = lin.xRowsForTest() == 16;
-        int64 x8 = ty == Quant.GG_Q6_K
+        int64 x8 = ty == Quant.GG_Q8_0 ? Quant.q80Interleave8Bytes((int64) co, (int64) (ci / 256))
+            : ty == Quant.GG_Q5_K ? Quant.q5kInterleave8Bytes((int64) co, (int64) (ci / 256))
+            : ty == Quant.GG_Q3_K ? Quant.q3kInterleave8Bytes((int64) co, (int64) (ci / 256))
+            : ty == Quant.GG_Q2_K ? Quant.q2kInterleave8Bytes((int64) co, (int64) (ci / 256))
+            : ty == Quant.GG_Q6_K
             ? (wide ? Quant.q6kInterleave16Bytes((int64) co, (int64) (ci / 256)) : Quant.q6kInterleave8Bytes((int64) co, (int64) (ci / 256)))
             : (wide ? Quant.q4kInterleave16Bytes((int64) co, (int64) (ci / 256)) : Quant.q4kInterleave8Bytes((int64) co, (int64) (ci / 256)));
         int8[] back #= lin.deviceBytesForTest();
@@ -398,6 +402,187 @@ public class CpuInt8MatVecTest {
                 + " (the file's " + (int64) (lin.hostPackedCopyForTest().count()) + ")");
         }
     }
+
+    /** Ggml blocks a row of `ty` holds at {@link #BPR} 256-column super-blocks. */
+    static int64 blocksOf(int32 ty) { return ty == Quant.GG_Q8_0 ? BPR * 8L : BPR; }
+
+    /** The host int8 oracle of `ty` (Q8_0, Q5_K, Q3_K or Q2_K) on q8_K activations, into `y` at `yOff`. */
+    static void oracleOf(int32 ty, int8[] raw, int64 rows, int64 cols, int8[] xq, float32[] xd, int32[] xbs,
+            float32[] y, int64 yOff) {
+        if (ty == Quant.GG_Q8_0) { Quant.q80MatVecIntoQ8(raw, rows, cols, xq, xd, y, yOff); }
+        else if (ty == Quant.GG_Q5_K) { Quant.q5kMatVecIntoQ8(raw, rows, cols, xq, xd, xbs, y, yOff); }
+        else if (ty == Quant.GG_Q3_K) { Quant.q3kMatVecIntoQ8(raw, rows, cols, xq, xd, y, yOff); }
+        else { Quant.q2kMatVecIntoQ8(raw, rows, cols, xq, xd, xbs, y, yOff); }
+    }
+
+    /** The interleaved kernel of `ty` over host arrays. */
+    static void interleavedOf(int32 ty, int8[] raw, int64 rows, int64 cols, float32[] x, int64 nc, float32[] y,
+            boolean accum) {
+        if (ty == Quant.GG_Q8_0) { QuantKernel.q80Q8X8IntoDevice(raw, rows, cols, x, nc, y, accum); }
+        else if (ty == Quant.GG_Q5_K) { QuantKernel.q5kQ8X8IntoDevice(raw, rows, cols, x, nc, y, accum); }
+        else if (ty == Quant.GG_Q3_K) { QuantKernel.q3kQ8X8IntoDevice(raw, rows, cols, x, nc, y, accum); }
+        else { QuantKernel.q2kQ8X8IntoDevice(raw, rows, cols, x, nc, y, accum); }
+    }
+
+    /** The int8 oracle of `ty` is the f32 sum of the dequantized weights and q8_K activations. */
+    static void oracleIsF32(int32 ty, String fixture) {
+        int64 cols = BPR * 256L;
+        int64 bpr = CpuInt8MatVecTest.blocksOf(ty);
+        int8[] raw #= WaveGeometryTest.rowsOf(fixture, ty, ROWS, bpr);
+        float32[] x #= QuantKernelTest.activationsVaried(cols);
+        int8[] xq #= heap int8[cols];
+        float32[] xd #= heap float32[cols / 256L];
+        int32[] xbs #= heap int32[cols / 16L];
+        Quant.q8kQuantize(x, 0L, cols, xq, xd, xbs);
+        float32[] got #= heap float32[ROWS];
+        CpuInt8MatVecTest.oracleOf(ty, raw, ROWS, cols, xq, xd, xbs, got, 0L);
+        float32[] wr #= heap float32[cols];
+        int64 rowBytes = bpr * (int64) Quant.blockBytes(ty);
+        int64 r = 0;
+        while (r < ROWS) {
+            Quant.dequantize(ty, raw, r * rowBytes, bpr, wr, 0L);
+            float64 want = 0.0;
+            int64 c = 0;
+            while (c < cols) {
+                want = want + (float64) wr[c] * (float64) xq[c] * (float64) xd[c / 256L];
+                c = c + 1;
+            }
+            float64 diff = (float64) got[r] - want;
+            if (diff < 0.0) { diff = 0.0 - diff; }
+            float64 mag = want < 0.0 ? 0.0 - want : want;
+            if (diff > mag * 1.0e-4 + 1.0e-4) {
+                Assert.fail(fixture + " row " + r + ": q8 oracle " + got[r] + " vs f32 path " + want);
+            }
+            r = r + 1;
+        }
+        QuantKernelTest.assertLive(got, fixture + " oracle");
+    }
+
+    /** The interleaved kernels of `ty` equal its oracle column by column at 1, 5, 16, 128 and 130 columns, plain and
+     *  accumulating, 70 rows leaving a partial group, a poisoned column past the last. */
+    static void interleavedMatchesOracle(int32 ty, String fixture) {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("the interleave is the cpu backend's resident layout"); return; }
+        int64 rows = 70L;
+        int64 cols = BPR * 256L;
+        int8[] raw #= WaveGeometryTest.rowsOf(fixture, ty, rows, CpuInt8MatVecTest.blocksOf(ty));
+        int64[] ncs = [1L, 5L, 16L, 128L, 130L];
+        int64[] vc #= ValueCheck.mark();
+        int32 t = 0;
+        while (t < 5) {
+            int64 nc = ncs[t];
+            float32[] x #= QuantKernelTest.activationsVaried(nc * cols);
+            float32[] col #= heap float32[cols];
+            int8[] xq #= heap int8[cols];
+            float32[] xd #= heap float32[cols / 256L];
+            int32[] xbs #= heap int32[cols / 16L];
+            float32[] one #= heap float32[rows];
+            int32 pass = 0;
+            while (pass < 2) {
+                boolean accum = pass == 1;
+                int64 n = (nc + 1L) * rows;
+                float32[] want #= heap float32[n];
+                float32[] got #= heap float32[n];
+                int64 j = 0;
+                while (j < n) {
+                    float32 seed = accum || j >= nc * rows ? 0.25f * (float32) (j % 9L - 4L) : 0.0f;
+                    want[j] = seed;
+                    got[j] = seed;
+                    j = j + 1;
+                }
+                int64 c = 0;
+                while (c < nc) {
+                    int64 k = 0;
+                    while (k < cols) { col[k] = x[c * cols + k]; k = k + 1; }
+                    Quant.q8kQuantize(col, 0L, cols, xq, xd, xbs);
+                    CpuInt8MatVecTest.oracleOf(ty, raw, rows, cols, xq, xd, xbs, one, 0L);
+                    k = 0;
+                    while (k < rows) {
+                        want[c * rows + k] = accum ? want[c * rows + k] + one[k] : one[k];
+                        k = k + 1;
+                    }
+                    c = c + 1;
+                }
+                CpuInt8MatVecTest.interleavedOf(ty, raw, rows, cols, x, nc, got, accum);
+                j = 0;
+                while (j < n) {
+                    if (got[j] != want[j]) {
+                        Assert.fail(fixture + " nc " + nc + (accum ? " accum" : " plain") + " col " + (j / rows)
+                            + " row " + (j % rows) + ": interleaved " + got[j] + " vs oracle " + want[j]);
+                    }
+                    j = j + 1;
+                }
+                pass = pass + 1;
+            }
+            t = t + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+
+    /** llm-cpu-parity 5.1.1: the Q8_0 int8 oracle is the f32 path on the quantized activations. */
+    @Test
+    public void q80OracleIsTheF32PathOnTheQuantizedActivations() {
+        CpuInt8MatVecTest.oracleIsF32(Quant.GG_Q8_0, "q8_0.bin");
+    }
+
+    /** llm-cpu-parity 5.1.1: the Q8_0 interleaved kernels equal the oracle at every column count. */
+    @Test
+    public void q80InterleavedKernelMatchesItsOracleAtEveryColumnCount() {
+        CpuInt8MatVecTest.interleavedMatchesOracle(Quant.GG_Q8_0, "q8_0.bin");
+    }
+
+    /** llm-cpu-parity 5.1.1: the Q5_K int8 oracle is the f32 path on the quantized activations. */
+    @Test
+    public void q5kOracleIsTheF32PathOnTheQuantizedActivations() {
+        CpuInt8MatVecTest.oracleIsF32(Quant.GG_Q5_K, "q5_k.bin");
+    }
+
+    /** llm-cpu-parity 5.1.1: the Q5_K interleaved kernels equal the oracle at every column count. */
+    @Test
+    public void q5kInterleavedKernelMatchesItsOracleAtEveryColumnCount() {
+        CpuInt8MatVecTest.interleavedMatchesOracle(Quant.GG_Q5_K, "q5_k.bin");
+    }
+
+    /** llm-cpu-parity 5.1.1: the Q3_K int8 oracle is the f32 path on the quantized activations. */
+    @Test
+    public void q3kOracleIsTheF32PathOnTheQuantizedActivations() {
+        CpuInt8MatVecTest.oracleIsF32(Quant.GG_Q3_K, "q3_k.bin");
+    }
+
+    /** llm-cpu-parity 5.1.1: the Q3_K interleaved kernels equal the oracle at every column count. */
+    @Test
+    public void q3kInterleavedKernelMatchesItsOracleAtEveryColumnCount() {
+        CpuInt8MatVecTest.interleavedMatchesOracle(Quant.GG_Q3_K, "q3_k.bin");
+    }
+
+    /** llm-cpu-parity 5.1.1: the Q2_K int8 oracle is the f32 path on the quantized activations. */
+    @Test
+    public void q2kOracleIsTheF32PathOnTheQuantizedActivations() {
+        CpuInt8MatVecTest.oracleIsF32(Quant.GG_Q2_K, "q2_k.bin");
+    }
+
+    /** llm-cpu-parity 5.1.1: the Q2_K interleaved kernels equal the oracle at every column count. */
+    @Test
+    public void q2kInterleavedKernelMatchesItsOracleAtEveryColumnCount() {
+        CpuInt8MatVecTest.interleavedMatchesOracle(Quant.GG_Q2_K, "q2_k.bin");
+    }
+
+    /** llm-cpu-parity 5.2.1: a cpu Q3_K weight holds only its interleave and de-interleaves to the file's bytes. */
+    @Test
+    public void aCpuQ3kWeightHoldsOnlyTheInterleave() { CpuInt8MatVecTest.onlyTheInterleave(Quant.GG_Q3_K, "q3_k.bin"); }
+
+    /** llm-cpu-parity 5.2.1: a cpu Q2_K weight holds only its interleave and de-interleaves to the file's bytes. */
+    @Test
+    public void aCpuQ2kWeightHoldsOnlyTheInterleave() { CpuInt8MatVecTest.onlyTheInterleave(Quant.GG_Q2_K, "q2_k.bin"); }
+
+    /** llm-cpu-parity 5.2.1: a cpu Q5_K weight holds only its interleave and de-interleaves to the file's bytes. */
+    @Test
+    public void aCpuQ5kWeightHoldsOnlyTheInterleave() { CpuInt8MatVecTest.onlyTheInterleave(Quant.GG_Q5_K, "q5_k.bin"); }
+
+    /** llm-cpu-parity 5.2.1: a cpu Q8_0 weight holds only its interleave, routes decode and batches through it, and
+     *  de-interleaves to the file's bytes. */
+    @Test
+    public void aCpuQ80WeightHoldsOnlyTheInterleave() { CpuInt8MatVecTest.onlyTheInterleave(Quant.GG_Q8_0, "q8_0.bin"); }
 
     /** llm-cpu-parity 4.3.1.7: three Q4_K interleaves in one launch give each one's single-launch output, bit for bit,
      *  at row counts that leave partial groups. */

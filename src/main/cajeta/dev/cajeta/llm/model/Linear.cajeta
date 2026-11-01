@@ -457,7 +457,11 @@ public final class Linear extends InfModule {
         this.cpuRouteNamed = true;
         String name #= "kept: no cpu int8 kernel for type " + this.packedTy;
         if (this.cpuInt8) {
-            name #= this.packedTy == Quant.GG_Q4_K ? "int8:q4kQ8PackedMatVecKernel" : "int8:q6kQ8PackedMatVecKernel";
+            name #= this.packedTy == Quant.GG_Q4_K ? "int8:q4kQ8PackedMatVecKernel"
+                : this.packedTy == Quant.GG_Q8_0 ? "int8:q80Q8X8VecKernel"
+                : this.packedTy == Quant.GG_Q5_K ? "int8:q5kQ8X8VecKernel"
+                : this.packedTy == Quant.GG_Q3_K ? "int8:q3kQ8X8VecKernel"
+                : this.packedTy == Quant.GG_Q2_K ? "int8:q2kQ8X8VecKernel" : "int8:q6kQ8PackedMatVecKernel";
         } else if (!Linear.cpuInt8Want) {
             name #= "kept: cpu int8 decode switched off";
         }
@@ -549,7 +553,7 @@ public final class Linear extends InfModule {
 
     /** Re-uploads this interleave-resident weight at `rows` (8 or 16) from its source; a no-op at that width. */
     public void repackCpuRows(int32 rows) {
-        if (!this.cpuX8Here()) { return; }
+        if (!this.widthPlastic()) { return; }
         this.ensureDevice();
         if (!this.x8Resident || this.xRows == rows) { return; }
         int64 was = (int64) this.payloadDev.length();
@@ -569,7 +573,7 @@ public final class Linear extends InfModule {
         }
         int32 i = 0;
         while (i < n) {
-            if (!layer[i].cpuX8Here()) { return 8; }
+            if (!layer[i].widthPlastic()) { return 8; }
             i = i + 1;
         }
         i = 0;
@@ -699,9 +703,17 @@ public final class Linear extends InfModule {
         return;
     }
 
-    /** Q6_K on the resident interleave, by {@link #xRows}. */
+    /** Q6_K, Q3_K or Q2_K on the resident interleave, by type and {@link #xRows}; `s16` holds the 16-column sums. */
     void launchXQ6(KernelBuffer<float32> y, KernelBuffer<int8> xp, KernelBuffer<int32> s16, int64 rows, int64 cols,
             int64 nc, int64 xpStride, int64 yStride, boolean accum) {
+        if (this.packedTy == Quant.GG_Q3_K) {
+            QuantKernel.q3kQ8X8CpuLaunchNoSync(y, this.payloadDev, xp, s16, rows, cols, nc, xpStride, yStride, accum);
+            return;
+        }
+        if (this.packedTy == Quant.GG_Q2_K) {
+            QuantKernel.q2kQ8X8CpuLaunchNoSync(y, this.payloadDev, xp, s16, rows, cols, nc, xpStride, yStride, accum);
+            return;
+        }
         if (this.xRows == 16) {
             QuantKernel.q6kQ8X16CpuLaunchNoSync(y, this.payloadDev, xp, s16, rows, cols, nc, xpStride, yStride, accum);
         } else {
@@ -724,21 +736,46 @@ public final class Linear extends InfModule {
         if (this.packedTy == Quant.GG_Q4_K) {
             return KernelCap.usable("q4kQ8PackedMatVecKernel") && KernelCap.usable("q4kQ8X8VecKernel");
         }
+        if (this.packedTy == Quant.GG_Q8_0) {
+            return KernelCap.usable("q80Q8X8VecKernel") && KernelCap.usable("q80Q8X8RowsKernel");
+        }
+        if (this.packedTy == Quant.GG_Q5_K) {
+            return KernelCap.usable("q5kQ8X8VecKernel") && KernelCap.usable("q5kQ8X8RowsKernel");
+        }
+        if (this.packedTy == Quant.GG_Q3_K) {
+            return KernelCap.usable("q3kQ8X8VecKernel") && KernelCap.usable("q3kQ8X8RowsKernel");
+        }
+        if (this.packedTy == Quant.GG_Q2_K) {
+            return KernelCap.usable("q2kQ8X8VecKernel") && KernelCap.usable("q2kQ8X8RowsKernel");
+        }
         return this.packedTy == Quant.GG_Q6_K && Linear.cpuX8Q6Want
             && KernelCap.usable("q6kQ8PackedMatVecKernel") && KernelCap.usable("q6kQ8X8VecKernel");
     }
 
+    /** Whether this interleave-resident weight's format has a 16-row form, so the width probe may repack it. */
+    boolean widthPlastic() {
+        return this.cpuX8Here() && (this.packedTy == Quant.GG_Q4_K || this.packedTy == Quant.GG_Q6_K);
+    }
+
     /** Streams this weight into payloadDev as the interleave of {@link #cpuXWidth} rows; returns its bytes. */
-    int64 uploadX8() { return this.uploadX8At(Linear.cpuXWidth()); }
+    int64 uploadX8() {
+        if (!this.widthPlastic()) { return this.uploadX8At(8); }
+        return this.uploadX8At(Linear.cpuXWidth());
+    }
 
     /** Streams this Q4_K or Q6_K weight into payloadDev as the `L`-row interleave, one group at a time; returns its bytes. */
     int64 uploadX8At(int32 L) {
         int64 rows = (int64) this.outDim;
-        int64 bpr = this.blocksPerRow();
+        int64 bpr = (int64) this.inDim / 256L;
         boolean q6 = this.packedTy == Quant.GG_Q6_K;
+        boolean q80 = this.packedTy == Quant.GG_Q8_0;
+        boolean q5 = this.packedTy == Quant.GG_Q5_K;
+        boolean q3 = this.packedTy == Quant.GG_Q3_K;
+        boolean q2 = this.packedTy == Quant.GG_Q2_K;
         this.xRows = L;
-        int64 rb = bpr * (q6 ? 210L : 144L);
-        int64 gb = bpr * (q6 ? (L == 16 ? 3392L : 1696L) : (L == 16 ? 2432L : 1216L));
+        int64 rb = bpr * (q80 ? 272L : q5 ? 176L : q3 ? 110L : q2 ? 84L : q6 ? 210L : 144L);
+        int64 gb = bpr * (q80 ? 2304L : q5 ? 1472L : q3 ? 928L : q2 ? 704L
+            : q6 ? (L == 16 ? 3392L : 1696L) : (L == 16 ? 2432L : 1216L));
         int64 groups = (rows + (int64) L - 1L) / (int64) L;
         this.payloadDev #= heap KernelBuffer<int8>((uint64) (groups * gb));
         if (this.packed == null && this.permuteHeads > 0) { this.ensureHostPacked(); }
@@ -764,7 +801,11 @@ public final class Linear extends InfModule {
                         + " - wanted " + n + ", got " + got);
                 }
             }
-            if (q6 && L == 16) { Quant.q6kInterleave16(src, 0L, nr, bpr, dst, 0L); }
+            if (q80) { Quant.q80Interleave8(src, 0L, nr, bpr, dst, 0L); }
+            else if (q5) { Quant.q5kInterleave8(src, 0L, nr, bpr, dst, 0L); }
+            else if (q3) { Quant.q3kInterleave8(src, 0L, nr, bpr, dst, 0L); }
+            else if (q2) { Quant.q2kInterleave8(src, 0L, nr, bpr, dst, 0L); }
+            else if (q6 && L == 16) { Quant.q6kInterleave16(src, 0L, nr, bpr, dst, 0L); }
             else if (q6) { Quant.q6kInterleave8(src, 0L, nr, bpr, dst, 0L); }
             else if (L == 16) { Quant.q4kInterleave16(src, 0L, nr, bpr, dst, 0L); }
             else { Quant.q4kInterleave8(src, 0L, nr, bpr, dst, 0L); }
@@ -783,6 +824,14 @@ public final class Linear extends InfModule {
             int64 yStride, boolean accum) {
         int64 n = (int64) this.inDim;
         int64 rows = (int64) this.outDim;
+        if (this.packedTy == Quant.GG_Q8_0) {
+            QuantKernel.q80Q8X8CpuLaunchNoSync(y, this.payloadDev, xp, rows, n, nc, xpStride, yStride, accum);
+            return;
+        }
+        if (this.packedTy == Quant.GG_Q5_K) {
+            QuantKernel.q5kQ8X8CpuLaunchNoSync(y, this.payloadDev, xp, rows, n, nc, xpStride, yStride, accum);
+            return;
+        }
         if (this.packedTy == Quant.GG_Q4_K) {
             if (this.x8Resident) {
                 this.launchXQ4(y, xp, rows, n, nc, xpStride, yStride, accum);
@@ -826,6 +875,23 @@ public final class Linear extends InfModule {
                     + this.outDim + ")");
             }
             KernelBuffer<float32> yv #= y.slice((uint64) yOff, (uint64) rows);
+            if (this.packedTy == Quant.GG_Q3_K || this.packedTy == Quant.GG_Q2_K) {
+                Linear.groupSums16(xp, (int64) this.inDim, shared);
+                KernelBuffer<int32> s16q = shared ? Linear.stS16 : Linear.colS16;
+                this.launchXQ6(yv, xp, s16q, rows, (int64) this.inDim, 1L,
+                    Quant.q8kPackedBytes((int64) this.inDim), rows, accum);
+                return true;
+            }
+            if (this.packedTy == Quant.GG_Q8_0) {
+                QuantKernel.q80Q8X8CpuLaunchNoSync(yv, this.payloadDev, xp, rows, (int64) this.inDim, 1L,
+                    Quant.q8kPackedBytes((int64) this.inDim), rows, accum);
+                return true;
+            }
+            if (this.packedTy == Quant.GG_Q5_K) {
+                QuantKernel.q5kQ8X8CpuLaunchNoSync(yv, this.payloadDev, xp, rows, (int64) this.inDim, 1L,
+                    Quant.q8kPackedBytes((int64) this.inDim), rows, accum);
+                return true;
+            }
             if (this.packedTy == Quant.GG_Q6_K) {
                 Linear.groupSums16(xp, (int64) this.inDim, shared);
                 KernelBuffer<int32> s16 = shared ? Linear.stS16 : Linear.colS16;
@@ -5530,7 +5596,15 @@ public final class Linear extends InfModule {
             int64 xn = (int64) this.payloadDev.length();
             int8[] x #= heap int8[xn];
             this.payloadDev.download(x, xn);
-            if (this.packedTy == Quant.GG_Q6_K && this.xRows == 16) {
+            if (this.packedTy == Quant.GG_Q8_0) {
+                Quant.q80Deinterleave8(x, 0L, (int64) this.outDim, (int64) this.inDim / 256L, b, 0L);
+            } else if (this.packedTy == Quant.GG_Q5_K) {
+                Quant.q5kDeinterleave8(x, 0L, (int64) this.outDim, this.blocksPerRow(), b, 0L);
+            } else if (this.packedTy == Quant.GG_Q3_K) {
+                Quant.q3kDeinterleave8(x, 0L, (int64) this.outDim, this.blocksPerRow(), b, 0L);
+            } else if (this.packedTy == Quant.GG_Q2_K) {
+                Quant.q2kDeinterleave8(x, 0L, (int64) this.outDim, this.blocksPerRow(), b, 0L);
+            } else if (this.packedTy == Quant.GG_Q6_K && this.xRows == 16) {
                 Quant.q6kDeinterleave16(x, 0L, (int64) this.outDim, this.blocksPerRow(), b, 0L);
             } else if (this.packedTy == Quant.GG_Q6_K) {
                 Quant.q6kDeinterleave8(x, 0L, (int64) this.outDim, this.blocksPerRow(), b, 0L);
@@ -5764,7 +5838,9 @@ public final class Linear extends InfModule {
             this.cpuInt8 = Linear.cpuInt8Want && Linear.onCpu() && this.packed1
                 && Linear.q8Route() && q8kDims
                 && ((this.packedTy == Quant.GG_Q4_K && KernelCap.usable("q4kQ8PackedMatVecKernel"))
-                    || (this.packedTy == Quant.GG_Q6_K && KernelCap.usable("q6kQ8PackedMatVecKernel")));
+                    || (this.packedTy == Quant.GG_Q6_K && KernelCap.usable("q6kQ8PackedMatVecKernel"))
+                    || ((this.packedTy == Quant.GG_Q8_0 || this.packedTy == Quant.GG_Q5_K
+                        || this.packedTy == Quant.GG_Q3_K || this.packedTy == Quant.GG_Q2_K) && this.x8Resident));
             if (this.x8Resident && !this.cpuInt8) {
                 throw heap LlmException("finishDeviceSetup: an interleaved Q4_K weight did not latch the cpu int8 route");
             }
