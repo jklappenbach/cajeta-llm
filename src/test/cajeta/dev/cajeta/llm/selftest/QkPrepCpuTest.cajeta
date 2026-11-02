@@ -1,0 +1,126 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.lang.Cajeta;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.AttnKernel;
+import dev.cajeta.llm.model.KernelCap;
+
+/**
+ * cajeta-llm 15.2.14.6.2: the decode's QK-norm, RoPE and K/V append on the cpu backend take a work item a kv head;
+ * q, k and the K/V rows equal the 128-lane kernel's bit for bit.
+ */
+public class QkPrepCpuTest {
+
+    public QkPrepCpuTest() { return; }
+
+    static boolean cpuHere() {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("the row form is the cpu backend's"); return false; }
+        if (!KernelCap.usable("qkPrepCpuKernel")) { DeviceSkip.noKernel("qkPrepCpuKernel", be); return false; }
+        return true;
+    }
+
+    static #KernelBuffer<float32> buf(int64 n, int64 mul, int64 add, float32 div, float32 bias) {
+        float32[] h = heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            h[i] = (float32) (((i * mul + add) % 193L) - 96L) / div + bias;
+            i = i + 1;
+        }
+        KernelBuffer<float32> b #= heap KernelBuffer<float32>((uint64) n);
+        b.upload(h, n);
+        return #b;
+    }
+
+    static #float32[] f32(KernelBuffer<float32> b, int64 n) {
+        float32[] h = heap float32[n];
+        b.download(h, n);
+        return #h;
+    }
+
+    static #float32[] f16(KernelBuffer<float16> b, int64 n) {
+        float16[] h = heap float16[n];
+        b.download(h, n);
+        float32[] f = heap float32[n];
+        int64 i = 0;
+        while (i < n) { f[i] = (float32) h[i]; i = i + 1; }
+        return #f;
+    }
+
+    /** q, k and the pools after one prep at `row`/`pos`, by the kernel or the cpu form. */
+    static #float32[] prep(int32 nH, int32 nKv, boolean norm, int32 form, int32 row, int32 pos, boolean cpuForm) {
+        int64 qn = (int64) nH * 128L;
+        int64 kn = (int64) nKv * 128L;
+        int64 pn = 4L * kn;
+        KernelBuffer<float32> q #= QkPrepCpuTest.buf(qn, 37L, 11L, 13.0f, 0.0f);
+        KernelBuffer<float32> k #= QkPrepCpuTest.buf(kn, 53L, 7L, 9.0f, 0.0f);
+        KernelBuffer<float32> v #= QkPrepCpuTest.buf(kn, 61L, 5L, 17.0f, 0.0f);
+        KernelBuffer<float32> qw #= QkPrepCpuTest.buf(128L, 7L, 3L, 400.0f, 1.0f);
+        KernelBuffer<float32> kw #= QkPrepCpuTest.buf(128L, 11L, 2L, 300.0f, 1.0f);
+        float32[] fr = heap float32[64];
+        int64 d = 0;
+        while (d < 64L) { fr[d] = 1.0f / (float32) (1L + d * d * 31L); d = d + 1L; }
+        KernelBuffer<float32> inv #= heap KernelBuffer<float32>((uint64) 64L);
+        inv.upload(fr, 64L);
+        float16[] z = heap float16[pn];
+        KernelBuffer<float16> kp #= heap KernelBuffer<float16>((uint64) pn);
+        KernelBuffer<float16> vp #= heap KernelBuffer<float16>((uint64) pn);
+        kp.upload(z, pn);
+        vp.upload(z, pn);
+        AttnKernel.setCpuQkPrep(cpuForm);
+        AttnKernel.qkPrepLaunchNoSync(q, k, v, kp, vp, qw, kw, inv, nH, nKv, 128, norm, 0.000001f, form, row, pos);
+        QuantKernel.stream().sync();
+        AttnKernel.setCpuQkPrep(true);
+        float32[] a #= QkPrepCpuTest.f32(q, qn);
+        float32[] b #= QkPrepCpuTest.f32(k, kn);
+        float32[] c #= QkPrepCpuTest.f16(kp, pn);
+        float32[] e #= QkPrepCpuTest.f16(vp, pn);
+        float32[] all = heap float32[qn + kn + 2L * pn];
+        int64 i = 0;
+        while (i < qn) { all[i] = a[i]; i = i + 1; }
+        i = 0;
+        while (i < kn) { all[qn + i] = b[i]; i = i + 1; }
+        i = 0;
+        while (i < pn) { all[qn + kn + i] = c[i]; all[qn + kn + pn + i] = e[i]; i = i + 1; }
+        return #all;
+    }
+
+    static void same(int32 nH, int32 nKv, boolean norm, int32 form, int32 row, int32 pos) {
+        float32[] a #= QkPrepCpuTest.prep(nH, nKv, norm, form, row, pos, false);
+        float32[] b #= QkPrepCpuTest.prep(nH, nKv, norm, form, row, pos, true);
+        int64 n = (int64) nH * 128L + 9L * (int64) nKv * 128L;
+        boolean nz = false;
+        int64 i = 0;
+        while (i < n) {
+            if (Cajeta.f32ToBits(a[i]) != Cajeta.f32ToBits(b[i])) {
+                Assert.fail("nH " + nH + " nKv " + nKv + " norm " + norm + " pos " + pos + ": value " + i + " is "
+                    + b[i] + ", the kernel's " + a[i]);
+                return;
+            }
+            if (a[i] != 0.0f) { nz = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(nz);
+    }
+
+    /** The 8B's shape (32 query heads over 8 kv heads), no QK-norm, near and far positions. */
+    @Test
+    public void theRowFormMatchesTheKernelWithoutNorm() {
+        if (!QkPrepCpuTest.cpuHere()) { return; }
+        QkPrepCpuTest.same(32, 8, false, 0, 2, 5);
+        QkPrepCpuTest.same(32, 8, false, 0, 3, 3071);
+    }
+
+    /** QK-norm in both weight forms, at a GQA-8 shape and the 8B's. */
+    @Test
+    public void theRowFormMatchesTheKernelWithNorm() {
+        if (!QkPrepCpuTest.cpuHere()) { return; }
+        QkPrepCpuTest.same(32, 4, true, 0, 1, 17);
+        QkPrepCpuTest.same(32, 8, true, 1, 0, 900);
+    }
+}

@@ -213,11 +213,154 @@ public final class AttnKernel {
         KernelStream s = QuantKernel.stream();
         uint32 nn = 0;
         if (norm) { nn = 1; }
+        if (hd == 128 && AttnKernel.cpuQkPrepHere()) {
+            if (AttnKernel.qkCs == null) { AttnKernel.qkCs #= heap KernelBuffer<float32>((uint64) 128L); }
+            qkPrepCpuKernel.launch(s, grid: [1], block: [1])
+                (q, k, v, kPool, vPool, qw, kw, invFreq, AttnKernel.qkCs, (uint32) nH, (uint32) nKv, nn, eps, form,
+                 (uint32) row, (float32) pos);
+            return;
+        }
         qkPrepKernel.launch(s, grid: [(uint32) (nH + nKv)], block: [128])
             (q, k, v, kPool, vPool, qw, kw, invFreq, (uint32) nH,
              (uint32) nKv, (uint32) hd, nn, eps, form, (uint32) row,
              (float32) pos);
         return;
+    }
+
+    /** The sum of squares of x[b .. b + 16) in the wave butterfly's order: adjacent pairs, then pairs of those. */
+    @Device
+    static float32 cpuSq16(KernelBuffer<float32> x, int64 b) {
+        float32 a0 = x[b + 0L] * x[b + 0L] + x[b + 1L] * x[b + 1L];
+        float32 a1 = x[b + 2L] * x[b + 2L] + x[b + 3L] * x[b + 3L];
+        float32 a2 = x[b + 4L] * x[b + 4L] + x[b + 5L] * x[b + 5L];
+        float32 a3 = x[b + 6L] * x[b + 6L] + x[b + 7L] * x[b + 7L];
+        float32 a4 = x[b + 8L] * x[b + 8L] + x[b + 9L] * x[b + 9L];
+        float32 a5 = x[b + 10L] * x[b + 10L] + x[b + 11L] * x[b + 11L];
+        float32 a6 = x[b + 12L] * x[b + 12L] + x[b + 13L] * x[b + 13L];
+        float32 a7 = x[b + 14L] * x[b + 14L] + x[b + 15L] * x[b + 15L];
+        float32 c0 = a0 + a1;
+        float32 c1 = a2 + a3;
+        float32 c2 = a4 + a5;
+        float32 c3 = a6 + a7;
+        float32 e0 = c0 + c1;
+        float32 e1 = c2 + c3;
+        return e0 + e1;
+    }
+
+    /** One head's QK-norm in place at `b` (hd 128): the sum of squares in qkPrepKernel's order (four 32-lane
+     *  wave sums, added in wave order). */
+    @Device
+    static void cpuHeadNorm(KernelBuffer<float32> x, KernelBuffer<float32> w, int64 b, float32 eps, int32 form) {
+        float32 w0 = AttnKernel.cpuSq16(x, b + 0L) + AttnKernel.cpuSq16(x, b + 16L);
+        float32 w1 = AttnKernel.cpuSq16(x, b + 32L) + AttnKernel.cpuSq16(x, b + 48L);
+        float32 w2 = AttnKernel.cpuSq16(x, b + 64L) + AttnKernel.cpuSq16(x, b + 80L);
+        float32 w3 = AttnKernel.cpuSq16(x, b + 96L) + AttnKernel.cpuSq16(x, b + 112L);
+        float32 tot = ((w0 + w1) + w2) + w3;
+        float32 scale = 1.0f / Math.sqrt(tot / 128.0f + eps);
+        uint32 j = 0;
+        while (j < 128) {
+            float32 wi = w[(int64) j];
+            if (form == 1) { wi = 1.0f + wi; }
+            x[b + (int64) j] = x[b + (int64) j] * scale * wi;
+            j = j + 1;
+        }
+    }
+
+    /** {@link #qkPrepKernel}'s cpu form at hd 128, one work item: each angle's cos and sin once into `cs`, then
+     *  every head rotated on 16-lane vectors; the same q, k and K/V rows. */
+    @Unlowered(backend = {"vulkan", "nvptx", "amdgpu"}, tracked = "cajeta-llm 15.2.14.6.2", hold = true)
+    @Kernel
+    public static void qkPrepCpuKernel(KernelBuffer<float32> q,
+            KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool,
+            KernelBuffer<float32> qw, KernelBuffer<float32> kw,
+            KernelBuffer<float32> invFreq, KernelBuffer<float32> cs, uint32 nH, uint32 nKv,
+            uint32 norm, float32 eps, int32 form, uint32 row, float32 pos) {
+        if (KernelThread.globalIdX() == 0) {
+            int64 nq = (int64) nH;
+            int64 nk = (int64) nKv;
+            if (norm != 0) {
+                int64 hn = 0;
+                while (hn < nq) { AttnKernel.cpuHeadNorm(q, qw, hn * 128L, eps, form); hn = hn + 1L; }
+                hn = 0;
+                while (hn < nk) { AttnKernel.cpuHeadNorm(k, kw, hn * 128L, eps, form); hn = hn + 1L; }
+            }
+            int64 d = 0;
+            while (d < 64L) {
+                float32 ang = pos * invFreq[d];
+                cs[d] = Math.cos(ang);
+                cs[64L + d] = Math.sin(ang);
+                d = d + 1L;
+            }
+            Vector<float32,16> c0 = cs.vload<16>(0L);
+            Vector<float32,16> c1 = cs.vload<16>(16L);
+            Vector<float32,16> c2 = cs.vload<16>(32L);
+            Vector<float32,16> c3 = cs.vload<16>(48L);
+            Vector<float32,16> s0 = cs.vload<16>(64L);
+            Vector<float32,16> s1 = cs.vload<16>(80L);
+            Vector<float32,16> s2 = cs.vload<16>(96L);
+            Vector<float32,16> s3 = cs.vload<16>(112L);
+            int64 h = 0;
+            while (h < nq) {
+                int64 b = h * 128L;
+                Vector<float32,16> a0 = q.vload<16>(b + 0L);
+                Vector<float32,16> r0 = q.vload<16>(b + 64L);
+                q.vstore(b + 0L, a0 * c0 - r0 * s0);
+                q.vstore(b + 64L, a0 * s0 + r0 * c0);
+                Vector<float32,16> a1 = q.vload<16>(b + 16L);
+                Vector<float32,16> r1 = q.vload<16>(b + 80L);
+                q.vstore(b + 16L, a1 * c1 - r1 * s1);
+                q.vstore(b + 80L, a1 * s1 + r1 * c1);
+                Vector<float32,16> a2 = q.vload<16>(b + 32L);
+                Vector<float32,16> r2 = q.vload<16>(b + 96L);
+                q.vstore(b + 32L, a2 * c2 - r2 * s2);
+                q.vstore(b + 96L, a2 * s2 + r2 * c2);
+                Vector<float32,16> a3 = q.vload<16>(b + 48L);
+                Vector<float32,16> r3 = q.vload<16>(b + 112L);
+                q.vstore(b + 48L, a3 * c3 - r3 * s3);
+                q.vstore(b + 112L, a3 * s3 + r3 * c3);
+                h = h + 1L;
+            }
+            h = 0;
+            while (h < nk) {
+                int64 b = h * 128L;
+                Vector<float32,16> a0 = k.vload<16>(b + 0L);
+                Vector<float32,16> r0 = k.vload<16>(b + 64L);
+                k.vstore(b + 0L, a0 * c0 - r0 * s0);
+                k.vstore(b + 64L, a0 * s0 + r0 * c0);
+                Vector<float32,16> a1 = k.vload<16>(b + 16L);
+                Vector<float32,16> r1 = k.vload<16>(b + 80L);
+                k.vstore(b + 16L, a1 * c1 - r1 * s1);
+                k.vstore(b + 80L, a1 * s1 + r1 * c1);
+                Vector<float32,16> a2 = k.vload<16>(b + 32L);
+                Vector<float32,16> r2 = k.vload<16>(b + 96L);
+                k.vstore(b + 32L, a2 * c2 - r2 * s2);
+                k.vstore(b + 96L, a2 * s2 + r2 * c2);
+                Vector<float32,16> a3 = k.vload<16>(b + 48L);
+                Vector<float32,16> r3 = k.vload<16>(b + 112L);
+                k.vstore(b + 48L, a3 * c3 - r3 * s3);
+                k.vstore(b + 112L, a3 * s3 + r3 * c3);
+                h = h + 1L;
+            }
+            int64 o = (int64) row * nk * 128L;
+            int64 n = nk * 128L;
+            int64 i = 0;
+            while (i < n) {
+                kPool[o + i] = (float16) k[i];
+                vPool[o + i] = (float16) v[i];
+                i = i + 1L;
+            }
+        }
+    }
+
+    static boolean cpuQkPrep = true;
+    static KernelBuffer<float32> qkCs;
+
+    /** Whether the cpu backend takes {@link #qkPrepCpuKernel} for the decode's norm, RoPE and append (the test's A/B). */
+    public static void setCpuQkPrep(boolean on) { AttnKernel.cpuQkPrep = on; }
+
+    static boolean cpuQkPrepHere() {
+        return AttnKernel.cpuQkPrep && Linear.onCpu() && KernelCap.usable("qkPrepCpuKernel");
     }
 
     // ── KV append (6.1) ─────────────────────────────────────────────────
@@ -3998,6 +4141,412 @@ public final class AttnKernel {
         }
     }
 
+    /** {@link #attnReducePackQ8Kernel}'s cpu form: one work item a pack block (two heads), the same bytes. */
+    @Unlowered(backend = {"vulkan", "nvptx", "amdgpu"}, tracked = "cajeta-llm 15.2.14.6.2", hold = true)
+    @Kernel
+    public static void attnReducePackQ8CpuKernel(KernelBuffer<int8> packed,
+            KernelBuffer<float32> part, uint32 nH, uint32 splits) {
+        uint32 blk = KernelThread.globalIdX();
+        if (blk * 2 < nH) {
+            Vector<float32,16> zf = heap Vector<float32,16>(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+            Vector<float32,16> x0 = zf;
+            Vector<float32,16> x1 = zf;
+            Vector<float32,16> x2 = zf;
+            Vector<float32,16> x3 = zf;
+            Vector<float32,16> x4 = zf;
+            Vector<float32,16> x5 = zf;
+            Vector<float32,16> x6 = zf;
+            Vector<float32,16> x7 = zf;
+            Vector<float32,16> x8 = zf;
+            Vector<float32,16> x9 = zf;
+            Vector<float32,16> x10 = zf;
+            Vector<float32,16> x11 = zf;
+            Vector<float32,16> x12 = zf;
+            Vector<float32,16> x13 = zf;
+            Vector<float32,16> x14 = zf;
+            Vector<float32,16> x15 = zf;
+            int64 base0 = (int64) ((blk * 2 + 0) * splits * 130);
+            float32 gm0 = 0.0f - 3.0e38f;
+            uint32 ms0 = 0;
+            while (ms0 < splits) {
+                float32 mv = part[base0 + (int64) (ms0 * 130) + 128L];
+                if (mv > gm0) { gm0 = mv; }
+                ms0 = ms0 + 1;
+            }
+            Vector<float32,16> t0_0 = zf;
+            Vector<float32,16> t0_1 = zf;
+            Vector<float32,16> t0_2 = zf;
+            Vector<float32,16> t0_3 = zf;
+            Vector<float32,16> t0_4 = zf;
+            Vector<float32,16> t0_5 = zf;
+            Vector<float32,16> t0_6 = zf;
+            Vector<float32,16> t0_7 = zf;
+            float32 gt0 = 0.0f;
+            uint32 sub0 = 0;
+            while (sub0 < 4) {
+                Vector<float32,16> a0 = zf;
+                Vector<float32,16> a1 = zf;
+                Vector<float32,16> a2 = zf;
+                Vector<float32,16> a3 = zf;
+                Vector<float32,16> a4 = zf;
+                Vector<float32,16> a5 = zf;
+                Vector<float32,16> a6 = zf;
+                Vector<float32,16> a7 = zf;
+                float32 gl = 0.0f;
+                uint32 sp = sub0;
+                while (sp < splits) {
+                    int64 pb = base0 + (int64) (sp * 130);
+                    float32 ls = part[pb + 129L];
+                    if (ls > 0.0f) {
+                        float32 wt = Math.exp(part[pb + 128L] - gm0);
+                        gl = gl + wt * ls;
+                        a0 = a0 + part.vload<16>(pb + 0L) * wt;
+                        a1 = a1 + part.vload<16>(pb + 16L) * wt;
+                        a2 = a2 + part.vload<16>(pb + 32L) * wt;
+                        a3 = a3 + part.vload<16>(pb + 48L) * wt;
+                        a4 = a4 + part.vload<16>(pb + 64L) * wt;
+                        a5 = a5 + part.vload<16>(pb + 80L) * wt;
+                        a6 = a6 + part.vload<16>(pb + 96L) * wt;
+                        a7 = a7 + part.vload<16>(pb + 112L) * wt;
+                    }
+                    sp = sp + 4;
+                }
+                if (sub0 == 0) {
+                    t0_0 = a0;
+                    t0_1 = a1;
+                    t0_2 = a2;
+                    t0_3 = a3;
+                    t0_4 = a4;
+                    t0_5 = a5;
+                    t0_6 = a6;
+                    t0_7 = a7;
+                    gt0 = gl;
+                } else {
+                    t0_0 = t0_0 + a0;
+                    t0_1 = t0_1 + a1;
+                    t0_2 = t0_2 + a2;
+                    t0_3 = t0_3 + a3;
+                    t0_4 = t0_4 + a4;
+                    t0_5 = t0_5 + a5;
+                    t0_6 = t0_6 + a6;
+                    t0_7 = t0_7 + a7;
+                    gt0 = gt0 + gl;
+                }
+                sub0 = sub0 + 1;
+            }
+            float32 rs0 = 1.0f / gt0;
+            x0 = t0_0 * rs0;
+            x1 = t0_1 * rs0;
+            x2 = t0_2 * rs0;
+            x3 = t0_3 * rs0;
+            x4 = t0_4 * rs0;
+            x5 = t0_5 * rs0;
+            x6 = t0_6 * rs0;
+            x7 = t0_7 * rs0;
+            int64 base1 = (int64) ((blk * 2 + 1) * splits * 130);
+            float32 gm1 = 0.0f - 3.0e38f;
+            uint32 ms1 = 0;
+            while (ms1 < splits) {
+                float32 mv = part[base1 + (int64) (ms1 * 130) + 128L];
+                if (mv > gm1) { gm1 = mv; }
+                ms1 = ms1 + 1;
+            }
+            Vector<float32,16> t1_0 = zf;
+            Vector<float32,16> t1_1 = zf;
+            Vector<float32,16> t1_2 = zf;
+            Vector<float32,16> t1_3 = zf;
+            Vector<float32,16> t1_4 = zf;
+            Vector<float32,16> t1_5 = zf;
+            Vector<float32,16> t1_6 = zf;
+            Vector<float32,16> t1_7 = zf;
+            float32 gt1 = 0.0f;
+            uint32 sub1 = 0;
+            while (sub1 < 4) {
+                Vector<float32,16> a0 = zf;
+                Vector<float32,16> a1 = zf;
+                Vector<float32,16> a2 = zf;
+                Vector<float32,16> a3 = zf;
+                Vector<float32,16> a4 = zf;
+                Vector<float32,16> a5 = zf;
+                Vector<float32,16> a6 = zf;
+                Vector<float32,16> a7 = zf;
+                float32 gl = 0.0f;
+                uint32 sp = sub1;
+                while (sp < splits) {
+                    int64 pb = base1 + (int64) (sp * 130);
+                    float32 ls = part[pb + 129L];
+                    if (ls > 0.0f) {
+                        float32 wt = Math.exp(part[pb + 128L] - gm1);
+                        gl = gl + wt * ls;
+                        a0 = a0 + part.vload<16>(pb + 0L) * wt;
+                        a1 = a1 + part.vload<16>(pb + 16L) * wt;
+                        a2 = a2 + part.vload<16>(pb + 32L) * wt;
+                        a3 = a3 + part.vload<16>(pb + 48L) * wt;
+                        a4 = a4 + part.vload<16>(pb + 64L) * wt;
+                        a5 = a5 + part.vload<16>(pb + 80L) * wt;
+                        a6 = a6 + part.vload<16>(pb + 96L) * wt;
+                        a7 = a7 + part.vload<16>(pb + 112L) * wt;
+                    }
+                    sp = sp + 4;
+                }
+                if (sub1 == 0) {
+                    t1_0 = a0;
+                    t1_1 = a1;
+                    t1_2 = a2;
+                    t1_3 = a3;
+                    t1_4 = a4;
+                    t1_5 = a5;
+                    t1_6 = a6;
+                    t1_7 = a7;
+                    gt1 = gl;
+                } else {
+                    t1_0 = t1_0 + a0;
+                    t1_1 = t1_1 + a1;
+                    t1_2 = t1_2 + a2;
+                    t1_3 = t1_3 + a3;
+                    t1_4 = t1_4 + a4;
+                    t1_5 = t1_5 + a5;
+                    t1_6 = t1_6 + a6;
+                    t1_7 = t1_7 + a7;
+                    gt1 = gt1 + gl;
+                }
+                sub1 = sub1 + 1;
+            }
+            float32 rs1 = 1.0f / gt1;
+            x8 = t1_0 * rs1;
+            x9 = t1_1 * rs1;
+            x10 = t1_2 * rs1;
+            x11 = t1_3 * rs1;
+            x12 = t1_4 * rs1;
+            x13 = t1_5 * rs1;
+            x14 = t1_6 * rs1;
+            x15 = t1_7 * rs1;
+            Vector<float32,16> mx = zf;
+            mx = mx.max(x0.max(zf - x0));
+            mx = mx.max(x1.max(zf - x1));
+            mx = mx.max(x2.max(zf - x2));
+            mx = mx.max(x3.max(zf - x3));
+            mx = mx.max(x4.max(zf - x4));
+            mx = mx.max(x5.max(zf - x5));
+            mx = mx.max(x6.max(zf - x6));
+            mx = mx.max(x7.max(zf - x7));
+            mx = mx.max(x8.max(zf - x8));
+            mx = mx.max(x9.max(zf - x9));
+            mx = mx.max(x10.max(zf - x10));
+            mx = mx.max(x11.max(zf - x11));
+            mx = mx.max(x12.max(zf - x12));
+            mx = mx.max(x13.max(zf - x13));
+            mx = mx.max(x14.max(zf - x14));
+            mx = mx.max(x15.max(zf - x15));
+            float32 bmax = 0.0f;
+            if (mx[0] > bmax) { bmax = mx[0]; }
+            if (mx[1] > bmax) { bmax = mx[1]; }
+            if (mx[2] > bmax) { bmax = mx[2]; }
+            if (mx[3] > bmax) { bmax = mx[3]; }
+            if (mx[4] > bmax) { bmax = mx[4]; }
+            if (mx[5] > bmax) { bmax = mx[5]; }
+            if (mx[6] > bmax) { bmax = mx[6]; }
+            if (mx[7] > bmax) { bmax = mx[7]; }
+            if (mx[8] > bmax) { bmax = mx[8]; }
+            if (mx[9] > bmax) { bmax = mx[9]; }
+            if (mx[10] > bmax) { bmax = mx[10]; }
+            if (mx[11] > bmax) { bmax = mx[11]; }
+            if (mx[12] > bmax) { bmax = mx[12]; }
+            if (mx[13] > bmax) { bmax = mx[13]; }
+            if (mx[14] > bmax) { bmax = mx[14]; }
+            if (mx[15] > bmax) { bmax = mx[15]; }
+            float32 inv = 0.0f;
+            if (bmax > 0.0f) { inv = 127.0f / bmax; }
+            int64 ob = (int64) blk * 320L;
+            Vector<float32,16> tq0 = x0 * inv;
+            Vector<int32,16> r0 = tq0.toI32();
+            Vector<int32,16> q0 = r0 + ((tq0 - r0.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq1 = x1 * inv;
+            Vector<int32,16> r1 = tq1.toI32();
+            Vector<int32,16> q1 = r1 + ((tq1 - r1.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq2 = x2 * inv;
+            Vector<int32,16> r2 = tq2.toI32();
+            Vector<int32,16> q2 = r2 + ((tq2 - r2.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq3 = x3 * inv;
+            Vector<int32,16> r3 = tq3.toI32();
+            Vector<int32,16> q3 = r3 + ((tq3 - r3.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq4 = x4 * inv;
+            Vector<int32,16> r4 = tq4.toI32();
+            Vector<int32,16> q4 = r4 + ((tq4 - r4.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq5 = x5 * inv;
+            Vector<int32,16> r5 = tq5.toI32();
+            Vector<int32,16> q5 = r5 + ((tq5 - r5.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq6 = x6 * inv;
+            Vector<int32,16> r6 = tq6.toI32();
+            Vector<int32,16> q6 = r6 + ((tq6 - r6.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq7 = x7 * inv;
+            Vector<int32,16> r7 = tq7.toI32();
+            Vector<int32,16> q7 = r7 + ((tq7 - r7.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq8 = x8 * inv;
+            Vector<int32,16> r8 = tq8.toI32();
+            Vector<int32,16> q8 = r8 + ((tq8 - r8.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq9 = x9 * inv;
+            Vector<int32,16> r9 = tq9.toI32();
+            Vector<int32,16> q9 = r9 + ((tq9 - r9.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq10 = x10 * inv;
+            Vector<int32,16> r10 = tq10.toI32();
+            Vector<int32,16> q10 = r10 + ((tq10 - r10.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq11 = x11 * inv;
+            Vector<int32,16> r11 = tq11.toI32();
+            Vector<int32,16> q11 = r11 + ((tq11 - r11.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq12 = x12 * inv;
+            Vector<int32,16> r12 = tq12.toI32();
+            Vector<int32,16> q12 = r12 + ((tq12 - r12.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq13 = x13 * inv;
+            Vector<int32,16> r13 = tq13.toI32();
+            Vector<int32,16> q13 = r13 + ((tq13 - r13.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq14 = x14 * inv;
+            Vector<int32,16> r14 = tq14.toI32();
+            Vector<int32,16> q14 = r14 + ((tq14 - r14.toF32()) * 2.0f).toI32();
+            Vector<float32,16> tq15 = x15 * inv;
+            Vector<int32,16> r15 = tq15.toI32();
+            Vector<int32,16> q15 = r15 + ((tq15 - r15.toF32()) * 2.0f).toI32();
+            Vector<int16,32> n0 = q0.narrow(q1);
+            Vector<int16,32> n2 = q2.narrow(q3);
+            packed.vstore(ob + 0L, n0.narrow(n2));
+            Vector<int16,32> n4 = q4.narrow(q5);
+            Vector<int16,32> n6 = q6.narrow(q7);
+            packed.vstore(ob + 64L, n4.narrow(n6));
+            Vector<int16,32> n8 = q8.narrow(q9);
+            Vector<int16,32> n10 = q10.narrow(q11);
+            packed.vstore(ob + 128L, n8.narrow(n10));
+            Vector<int16,32> n12 = q12.narrow(q13);
+            Vector<int16,32> n14 = q14.narrow(q15);
+            packed.vstore(ob + 192L, n12.narrow(n14));
+            Vector<int32,16> sv0 = q0 + q1;
+            int32 tsum0 = sv0[0] + sv0[1] + sv0[2] + sv0[3] + sv0[4] + sv0[5] + sv0[6] + sv0[7] + sv0[8] + sv0[9] + sv0[10] + sv0[11] + sv0[12] + sv0[13] + sv0[14] + sv0[15];
+            int32 b0x0 = (tsum0 >> 0) & 255;
+            if (b0x0 > 127) { b0x0 = b0x0 - 256; }
+            packed[ob + 256L] = (int8) b0x0;
+            int32 b0x1 = (tsum0 >> 8) & 255;
+            if (b0x1 > 127) { b0x1 = b0x1 - 256; }
+            packed[ob + 257L] = (int8) b0x1;
+            int32 b0x2 = (tsum0 >> 16) & 255;
+            if (b0x2 > 127) { b0x2 = b0x2 - 256; }
+            packed[ob + 258L] = (int8) b0x2;
+            int32 b0x3 = (tsum0 >> 24) & 255;
+            if (b0x3 > 127) { b0x3 = b0x3 - 256; }
+            packed[ob + 259L] = (int8) b0x3;
+            Vector<int32,16> sv1 = q2 + q3;
+            int32 tsum1 = sv1[0] + sv1[1] + sv1[2] + sv1[3] + sv1[4] + sv1[5] + sv1[6] + sv1[7] + sv1[8] + sv1[9] + sv1[10] + sv1[11] + sv1[12] + sv1[13] + sv1[14] + sv1[15];
+            int32 b1x0 = (tsum1 >> 0) & 255;
+            if (b1x0 > 127) { b1x0 = b1x0 - 256; }
+            packed[ob + 260L] = (int8) b1x0;
+            int32 b1x1 = (tsum1 >> 8) & 255;
+            if (b1x1 > 127) { b1x1 = b1x1 - 256; }
+            packed[ob + 261L] = (int8) b1x1;
+            int32 b1x2 = (tsum1 >> 16) & 255;
+            if (b1x2 > 127) { b1x2 = b1x2 - 256; }
+            packed[ob + 262L] = (int8) b1x2;
+            int32 b1x3 = (tsum1 >> 24) & 255;
+            if (b1x3 > 127) { b1x3 = b1x3 - 256; }
+            packed[ob + 263L] = (int8) b1x3;
+            Vector<int32,16> sv2 = q4 + q5;
+            int32 tsum2 = sv2[0] + sv2[1] + sv2[2] + sv2[3] + sv2[4] + sv2[5] + sv2[6] + sv2[7] + sv2[8] + sv2[9] + sv2[10] + sv2[11] + sv2[12] + sv2[13] + sv2[14] + sv2[15];
+            int32 b2x0 = (tsum2 >> 0) & 255;
+            if (b2x0 > 127) { b2x0 = b2x0 - 256; }
+            packed[ob + 264L] = (int8) b2x0;
+            int32 b2x1 = (tsum2 >> 8) & 255;
+            if (b2x1 > 127) { b2x1 = b2x1 - 256; }
+            packed[ob + 265L] = (int8) b2x1;
+            int32 b2x2 = (tsum2 >> 16) & 255;
+            if (b2x2 > 127) { b2x2 = b2x2 - 256; }
+            packed[ob + 266L] = (int8) b2x2;
+            int32 b2x3 = (tsum2 >> 24) & 255;
+            if (b2x3 > 127) { b2x3 = b2x3 - 256; }
+            packed[ob + 267L] = (int8) b2x3;
+            Vector<int32,16> sv3 = q6 + q7;
+            int32 tsum3 = sv3[0] + sv3[1] + sv3[2] + sv3[3] + sv3[4] + sv3[5] + sv3[6] + sv3[7] + sv3[8] + sv3[9] + sv3[10] + sv3[11] + sv3[12] + sv3[13] + sv3[14] + sv3[15];
+            int32 b3x0 = (tsum3 >> 0) & 255;
+            if (b3x0 > 127) { b3x0 = b3x0 - 256; }
+            packed[ob + 268L] = (int8) b3x0;
+            int32 b3x1 = (tsum3 >> 8) & 255;
+            if (b3x1 > 127) { b3x1 = b3x1 - 256; }
+            packed[ob + 269L] = (int8) b3x1;
+            int32 b3x2 = (tsum3 >> 16) & 255;
+            if (b3x2 > 127) { b3x2 = b3x2 - 256; }
+            packed[ob + 270L] = (int8) b3x2;
+            int32 b3x3 = (tsum3 >> 24) & 255;
+            if (b3x3 > 127) { b3x3 = b3x3 - 256; }
+            packed[ob + 271L] = (int8) b3x3;
+            Vector<int32,16> sv4 = q8 + q9;
+            int32 tsum4 = sv4[0] + sv4[1] + sv4[2] + sv4[3] + sv4[4] + sv4[5] + sv4[6] + sv4[7] + sv4[8] + sv4[9] + sv4[10] + sv4[11] + sv4[12] + sv4[13] + sv4[14] + sv4[15];
+            int32 b4x0 = (tsum4 >> 0) & 255;
+            if (b4x0 > 127) { b4x0 = b4x0 - 256; }
+            packed[ob + 272L] = (int8) b4x0;
+            int32 b4x1 = (tsum4 >> 8) & 255;
+            if (b4x1 > 127) { b4x1 = b4x1 - 256; }
+            packed[ob + 273L] = (int8) b4x1;
+            int32 b4x2 = (tsum4 >> 16) & 255;
+            if (b4x2 > 127) { b4x2 = b4x2 - 256; }
+            packed[ob + 274L] = (int8) b4x2;
+            int32 b4x3 = (tsum4 >> 24) & 255;
+            if (b4x3 > 127) { b4x3 = b4x3 - 256; }
+            packed[ob + 275L] = (int8) b4x3;
+            Vector<int32,16> sv5 = q10 + q11;
+            int32 tsum5 = sv5[0] + sv5[1] + sv5[2] + sv5[3] + sv5[4] + sv5[5] + sv5[6] + sv5[7] + sv5[8] + sv5[9] + sv5[10] + sv5[11] + sv5[12] + sv5[13] + sv5[14] + sv5[15];
+            int32 b5x0 = (tsum5 >> 0) & 255;
+            if (b5x0 > 127) { b5x0 = b5x0 - 256; }
+            packed[ob + 276L] = (int8) b5x0;
+            int32 b5x1 = (tsum5 >> 8) & 255;
+            if (b5x1 > 127) { b5x1 = b5x1 - 256; }
+            packed[ob + 277L] = (int8) b5x1;
+            int32 b5x2 = (tsum5 >> 16) & 255;
+            if (b5x2 > 127) { b5x2 = b5x2 - 256; }
+            packed[ob + 278L] = (int8) b5x2;
+            int32 b5x3 = (tsum5 >> 24) & 255;
+            if (b5x3 > 127) { b5x3 = b5x3 - 256; }
+            packed[ob + 279L] = (int8) b5x3;
+            Vector<int32,16> sv6 = q12 + q13;
+            int32 tsum6 = sv6[0] + sv6[1] + sv6[2] + sv6[3] + sv6[4] + sv6[5] + sv6[6] + sv6[7] + sv6[8] + sv6[9] + sv6[10] + sv6[11] + sv6[12] + sv6[13] + sv6[14] + sv6[15];
+            int32 b6x0 = (tsum6 >> 0) & 255;
+            if (b6x0 > 127) { b6x0 = b6x0 - 256; }
+            packed[ob + 280L] = (int8) b6x0;
+            int32 b6x1 = (tsum6 >> 8) & 255;
+            if (b6x1 > 127) { b6x1 = b6x1 - 256; }
+            packed[ob + 281L] = (int8) b6x1;
+            int32 b6x2 = (tsum6 >> 16) & 255;
+            if (b6x2 > 127) { b6x2 = b6x2 - 256; }
+            packed[ob + 282L] = (int8) b6x2;
+            int32 b6x3 = (tsum6 >> 24) & 255;
+            if (b6x3 > 127) { b6x3 = b6x3 - 256; }
+            packed[ob + 283L] = (int8) b6x3;
+            Vector<int32,16> sv7 = q14 + q15;
+            int32 tsum7 = sv7[0] + sv7[1] + sv7[2] + sv7[3] + sv7[4] + sv7[5] + sv7[6] + sv7[7] + sv7[8] + sv7[9] + sv7[10] + sv7[11] + sv7[12] + sv7[13] + sv7[14] + sv7[15];
+            int32 b7x0 = (tsum7 >> 0) & 255;
+            if (b7x0 > 127) { b7x0 = b7x0 - 256; }
+            packed[ob + 284L] = (int8) b7x0;
+            int32 b7x1 = (tsum7 >> 8) & 255;
+            if (b7x1 > 127) { b7x1 = b7x1 - 256; }
+            packed[ob + 285L] = (int8) b7x1;
+            int32 b7x2 = (tsum7 >> 16) & 255;
+            if (b7x2 > 127) { b7x2 = b7x2 - 256; }
+            packed[ob + 286L] = (int8) b7x2;
+            int32 b7x3 = (tsum7 >> 24) & 255;
+            if (b7x3 > 127) { b7x3 = b7x3 - 256; }
+            packed[ob + 287L] = (int8) b7x3;
+            float32 dsc = bmax / 127.0f;
+            int32 db = Cajeta.f32ToBits(dsc);
+            int32 e0 = (db >> 0) & 255;
+            if (e0 > 127) { e0 = e0 - 256; }
+            packed[ob + 288L] = (int8) e0;
+            int32 e1 = (db >> 8) & 255;
+            if (e1 > 127) { e1 = e1 - 256; }
+            packed[ob + 289L] = (int8) e1;
+            int32 e2 = (db >> 16) & 255;
+            if (e2 > 127) { e2 = e2 - 256; }
+            packed[ob + 290L] = (int8) e2;
+            int32 e3 = (db >> 24) & 255;
+            if (e3 > 127) { e3 = e3 - 256; }
+            packed[ob + 291L] = (int8) e3;
+        }
+    }
+
     /** {@link #qkPrepKernel} for every row of a decode batch in one launch: workgroup
      *  `r * (nH + nKv) + head`, row r's slot base and position from `rowTab[4r]` and `[4r + 1]`. */
     @Kernel @Wave(width = 32)
@@ -5043,9 +5592,23 @@ public final class AttnKernel {
             KernelBuffer<float32> part, int32 nH, int32 splits) {
         KernelStream s = QuantKernel.stream();
         uint32 blocks = (uint32) (nH / 2);
+        if (AttnKernel.cpuReducePackHere()) {
+            attnReducePackQ8CpuKernel.launch(s, grid: [blocks], block: [1])
+                (packed, part, (uint32) nH, (uint32) splits);
+            return;
+        }
         attnReducePackQ8Kernel.launch(s, grid: [blocks], block: [256])
             (packed, part, (uint32) nH, (uint32) splits);
         return;
+    }
+
+    static boolean cpuReducePack = true;
+
+    /** Whether the cpu backend takes {@link #attnReducePackQ8CpuKernel} for the decode reduce + pack (the test's A/B). */
+    public static void setCpuReducePack(boolean on) { AttnKernel.cpuReducePack = on; }
+
+    static boolean cpuReducePackHere() {
+        return AttnKernel.cpuReducePack && Linear.onCpu() && KernelCap.usable("attnReducePackQ8CpuKernel");
     }
 
     /** The f32 twin of {@link #reducePackLaunchNoSync}: the same split
