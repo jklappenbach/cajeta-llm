@@ -595,6 +595,141 @@ public final class Linear extends InfModule {
         return w;
     }
 
+    static int32[] ctCounts = null;
+    static int64[] ctDecode = null;
+
+    /** Thread counts the probe times: half, three quarters and all of the physical cores, never above `online`. A
+     *  second thread on a core runs these kernels no faster and leaves cores doubled up afterwards (15.2.14.8.3). */
+    public static #int32[] cpuThreadCandidates(int32 physical, int32 online) {
+        int32 t = online < 1 ? 1 : online;
+        int32 p = physical < 1 ? 1 : (physical > t ? t : physical);
+        int32[] raw #= heap int32[3];
+        raw[0] = p / 2;
+        raw[1] = (p * 3) / 4;
+        raw[2] = p;
+        int32[] tmp #= heap int32[3];
+        int32 k = 0;
+        int32 i = 0;
+        while (i < 3) {
+            int32 v = raw[i];
+            if (v >= 1 && v <= t && (k == 0 || tmp[k - 1] < v)) { tmp[k] = v; k = k + 1; }
+            i = i + 1;
+        }
+        int32[] c #= heap int32[k];
+        i = 0;
+        while (i < k) { c[i] = tmp[i]; i = i + 1; }
+        return #c;
+    }
+
+    /** The count to run: the fastest of `ns` (0 or less = not timed), the default `dflt` unless at least 5% slower. */
+    public static int32 cpuThreadChoice(int32[] counts, int64[] ns, int32 dflt) {
+        int64 d = 0L;
+        int32 best = dflt;
+        int64 bestNs = 0L;
+        int32 i = 0;
+        while (i < (int32) counts.count()) {
+            if (counts[i] == dflt) { d = ns[i]; }
+            if (ns[i] > 0L && (bestNs == 0L || ns[i] < bestNs)) { bestNs = ns[i]; best = counts[i]; }
+            i = i + 1;
+        }
+        if (d <= 0L) { return dflt; }
+        return bestNs * 20L < d * 19L ? best : dflt;
+    }
+
+    /** This host's shape and the kernels' build, the key a stored thread count is kept under. */
+    static #String cpuThreadsKey() {
+        String k #= Linear.cpuWidthBuildId() + "/p" + Linear.hostCores(false) + "t" + Linear.hostCores(true)
+            + "L" + Device.cpuLevel();
+        return #k;
+    }
+
+    /** Physical cores, or every hardware thread when `online`, read through the worker cap and restored. */
+    static int32 hostCores(boolean online) {
+        int32 was = Device.cpuWorkerCap();
+        Device.setCpuWorkerCap(online ? 1048576 : 0);
+        int32 n = Device.multiprocessorCount();
+        Device.setCpuWorkerCap(was);
+        return n < 1 ? 1 : n;
+    }
+
+    /** The stored count, read under the physical-core device key (the key carries the worker cap). */
+    static int32 recalledThreads() {
+        if (Linear.tuneDir.byteLength() == 0) { return 0; }
+        String key #= Linear.cpuThreadsKey();
+        int32 was = Device.cpuWorkerCap();
+        Device.setCpuWorkerCap(0);
+        Optional<int32> t = Autotune.recallFor(Linear.tuneDir, "cpuThreads", key);
+        Device.setCpuWorkerCap(was);
+        if (t.isPresent() && t.get() >= 1) { return t.get(); }
+        return 0;
+    }
+
+    /** Whether the tune store holds a thread count for this host and build. */
+    public static boolean cpuThreadsRemembered() { return Linear.recalledThreads() > 0; }
+
+    /** Stores `n` as this host's thread count. */
+    public static void rememberCpuThreads(int32 n) {
+        if (Linear.tuneDir.byteLength() == 0 || n < 1) { return; }
+        String key #= Linear.cpuThreadsKey();
+        int32 was = Device.cpuWorkerCap();
+        Device.setCpuWorkerCap(0);
+        Autotune.rememberFor(Linear.tuneDir, "cpuThreads", n, key);
+        Device.setCpuWorkerCap(was);
+    }
+
+    /** Applies `explicit` when above 0, else a remembered count; returns what it applied, 0 when the probe must run. */
+    public static int32 applyCpuThreads(int32 explicit) {
+        int32 n = explicit > 0 ? explicit : Linear.recalledThreads();
+        if (n > 0) { Device.setCpuWorkerCap(n); }
+        return n;
+    }
+
+    public static int32 cpuThreadCandidateCount() { return Linear.ctCounts == null ? 0 : (int32) Linear.ctCounts.count(); }
+    public static int32 cpuThreadCandidate(int32 i) { return Linear.ctCounts[i]; }
+    public static int64 cpuThreadDecodeNs(int32 i) { return Linear.ctDecode[i]; }
+
+    /** Times real decode steps of `m` (one warm, best of three) at every candidate count, leaves the worker cap at
+     *  the choice and remembers it; the physical cores, untimed, without a tune store. */
+    public static int32 probeCpuThreads(CausalLM m) {
+        int32 physical = Linear.hostCores(false);
+        if (!Linear.onCpu() || TuneMode.skipTiming(Linear.tuneDir)) {
+            Device.setCpuWorkerCap(physical);
+            return physical;
+        }
+        Linear.ctCounts #= Linear.cpuThreadCandidates(physical, Linear.hostCores(true));
+        int32 n = (int32) Linear.ctCounts.count();
+        Linear.ctDecode #= heap int64[n];
+        int32[] one #= heap int32[1];
+        one[0] = 0;
+        int32 i = 0;
+        while (i < n) {
+            Device.setCpuWorkerCap(Linear.ctCounts[i]);
+            m.stepSeq(0, one, 0, 1);
+            int64 best = 0L;
+            int32 k = 0;
+            while (k < 3) {
+                int64 t0 = Clock.nanoTime();
+                m.stepSeq(0, one, 0, 1);
+                int64 dt = Clock.nanoTime() - t0;
+                if (best == 0L || dt < best) { best = dt; }
+                k = k + 1;
+            }
+            m.resetSeq(0);
+            Linear.ctDecode[i] = best;
+            i = i + 1;
+        }
+        int32 pick = Linear.cpuThreadChoice(Linear.ctCounts, Linear.ctDecode, physical);
+        Device.setCpuWorkerCap(pick);
+        Linear.rememberCpuThreads(pick);
+        i = 0;
+        while (i < n) {
+            Diag.emit("cpu-threads", 0 - 1, null, (int64) pick, (int64) Linear.ctCounts[i], Linear.ctDecode[i], 0L,
+                (int64) physical, 0L);
+            i = i + 1;
+        }
+        return pick;
+    }
+
     static void repackLayer(Linear[] layer, int32 rows) {
         int32 i = 0;
         while (i < (int32) layer.count()) { layer[i].repackCpuRows(rows); i = i + 1; }
@@ -2942,12 +3077,13 @@ public final class Linear extends InfModule {
     /** The store tileBeatsDeq and matrixCoresPay keep their answers in; "" keeps none. */
     public static void setTuneDir(String d) { Linear.tuneDir #= d.clone(); }
 
-    /** Drops the stored tile-versus-int8, matrix-core and cpu-width answers from the store. */
+    /** Drops the stored tile-versus-int8, matrix-core, cpu-width and cpu-thread answers from the store. */
     public static void forgetStoredChoices() {
         if (Linear.tuneDir.byteLength() == 0) { return; }
         Autotune.invalidate(Linear.tuneDir, "tileBeatsDeq");
         Autotune.invalidate(Linear.tuneDir, "matrixCoresPay");
         Autotune.invalidate(Linear.tuneDir, "cpuWidth");
+        Autotune.invalidate(Linear.tuneDir, "cpuThreads");
     }
 
     /** A stored answer (1 or 2) for `knob` under `bid`, 0 when the store has none. */
