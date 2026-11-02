@@ -1,6 +1,9 @@
 package dev.cajeta.llm.model;
 
 import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.TuneMode;
+import dev.cajeta.llm.Diag;
+import cajeta.xpu.Autotune;
 import cajeta.lang.Math;
 import cajeta.lang.String;
 import cajeta.lang.System;
@@ -3354,19 +3357,67 @@ public final class AttnKernel {
     public static int64 prefillTileProbeNs() { return AttnKernel.tileProbeNs; }
     public static int64 prefillWaveProbeNs() { return AttnKernel.waveProbeNs; }
 
+    static int64 tileProbeCount = 0L;
+
+    /** How many times the prefill tile probe has timed in this process. */
+    public static int64 prefillTileProbes() { return AttnKernel.tileProbeCount; }
+
+    /** The tune-store name of the answer for a model's heads. */
+    static #String tileKnob(int32 nH, int32 nKv, int32 hd) {
+        return "prefillTilePays-h" + nH + "k" + nKv + "d" + hd;
+    }
+
+    /** The tile's and the wave kernels' manifests, so a rebuilt kernel is timed again. */
+    static #String tileBuildId() {
+        String id #= Linear.choiceBuildId("attnFlashPrefillTileKernel", "attnFlashPrefillGqa4Kernel")
+            + "/" + Linear.manifestPrint("attnFlashPrefillKernel");
+        return #id;
+    }
+
+    /** Drops the stored answer for these heads, so the next ask times again (tests). */
+    public static void forgetPrefillTileStored(int32 nH, int32 nKv, int32 hd) {
+        if (Linear.tuneDir.byteLength() == 0) { return; }
+        String k #= AttnKernel.tileKnob(nH, nKv, hd);
+        Autotune.invalidate(Linear.tuneDir, k);
+        return;
+    }
+
     /**
      * Is the prefill tile faster HERE than the wave kernels on the same
-     * attend? Measured once per process, the first time a prefill asks, on
-     * the model's heads at the last 128-row chunk of a 512-token prompt. No
-     * backend is named: on Vulkan the tile's matrix ops are emulated and it
-     * lost by about 17x (2026-10-20), where on sm_89 it is the fast route.
+     * attend? Asked the first time a prefill attends, on the model's heads
+     * at the last 128-row chunk of a 512-token prompt. No backend is named
+     * for the measurement: on Vulkan the tile's matrix ops are emulated and
+     * it lost by about 17x (2026-10-20), where on sm_89 it is the fast route.
+     * The answer is remembered in the tune store per device, build and head
+     * shape (cajeta-llm 15.2.14.10.3). With the store off nothing is timed:
+     * the tile is taken where the tile GEMM would be (not Vulkan, and matrix
+     * cores pay), the wave kernels elsewhere.
      */
     public static boolean prefillTilePays(int32 nH, int32 nKv, int32 hd) {
         if (AttnKernel.tilePay == 0) {
-            AttnKernel.tilePay = 1;
-            boolean pays = AttnKernel.probePrefillTile(nH, nKv, hd);
-            AttnKernel.tilePay = 2;
-            if (pays) { AttnKernel.tilePay = 1; }
+            String knob #= AttnKernel.tileKnob(nH, nKv, hd);
+            String bid #= AttnKernel.tileBuildId();
+            int32 known = Linear.recalled(knob, bid);
+            if (known != 0) {
+                AttnKernel.tilePay = known;
+                Diag.emit("attn-tile-probe", 0 - 1, known == 1 ? "stored-tile" : "stored-wave",
+                    0L, 0L, (int64) nH, (int64) nKv, (int64) hd, 0L);
+            } else if (TuneMode.skipTiming(Linear.tuneDir)) {
+                boolean tile = !Linear.backendIsVulkan() && Linear.matrixCoresPay();
+                AttnKernel.tilePay = tile ? 1 : 2;
+                Diag.emit("attn-tile-probe", 0 - 1, tile ? "untimed-tile" : "untimed-wave",
+                    0L, 0L, (int64) nH, (int64) nKv, (int64) hd, 0L);
+            } else {
+                AttnKernel.tilePay = 1;
+                boolean pays = AttnKernel.probePrefillTile(nH, nKv, hd);
+                AttnKernel.tilePay = pays ? 1 : 2;
+                AttnKernel.tileProbeCount = AttnKernel.tileProbeCount + 1L;
+                Diag.emit("attn-tile-probe", 0 - 1, pays ? "tile" : "wave", AttnKernel.tileProbeNs,
+                    AttnKernel.waveProbeNs, (int64) nH, (int64) nKv, (int64) hd, 0L);
+                if (Linear.tuneDir.byteLength() > 0) {
+                    Autotune.rememberFor(Linear.tuneDir, knob, AttnKernel.tilePay, bid);
+                }
+            }
         }
         return AttnKernel.tilePay == 1;
     }
