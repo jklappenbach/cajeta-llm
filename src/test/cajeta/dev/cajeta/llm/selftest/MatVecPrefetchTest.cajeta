@@ -159,6 +159,125 @@ public class MatVecPrefetchTest {
         QuantKernel.setQ4Prefetch(0);
     }
 
+    /** Whether the two- and one-row Q4_K prefetch kernels run here too; skips by name when not. */
+    static boolean rowSlotKernels() {
+        if (!MatVecPrefetchTest.bothKernels()) { return false; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("q4kQ8WavePf2MatVecKernel")) {
+            DeviceSkip.noKernel("q4kQ8WavePf2MatVecKernel", be);
+            return false;
+        }
+        if (!KernelCap.usable("q4kQ8WavePf1MatVecKernel")) {
+            DeviceSkip.noKernel("q4kQ8WavePf1MatVecKernel", be);
+            return false;
+        }
+        return true;
+    }
+
+    /** Fails naming the first row where variant `pin` differs from the plain kernel at `rows` x `cols`. */
+    static void samePinned(int64 rows, int64 cols, boolean accum, int32 pin) {
+        float32[] plain #= MatVecPrefetchTest.run(rows, cols, accum, 2);
+        int64[] vc #= ValueCheck.mark();
+        float32[] got #= MatVecPrefetchTest.run(rows, cols, accum, pin);
+        QuantKernelTest.assertLive(plain, "plain q4k mat-vec");
+        int64 r = 0;
+        while (r < rows) {
+            if (plain[r] != got[r]) {
+                Assert.fail(rows + "x" + cols + (accum ? " accum" : "") + " row " + r
+                    + ": variant " + pin + " " + got[r] + " vs plain " + plain[r]);
+            }
+            r = r + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+
+    /** cajeta-llm 15.2.19.11.1: two and one rows a wave match the plain kernel bit for bit. */
+    @Test
+    public void fewerRowsAWaveMatchThePlainKernel() {
+        if (!MatVecPrefetchTest.rowSlotKernels()) { return; }
+        int32 pin = 3;
+        while (pin <= 4) {
+            MatVecPrefetchTest.samePinned(13L, 2048L, false, pin);
+            MatVecPrefetchTest.samePinned(64L, 4096L, false, pin);
+            MatVecPrefetchTest.samePinned(37L, 14336L, false, pin);
+            MatVecPrefetchTest.samePinned(19L, 4096L, true, pin);
+            MatVecPrefetchTest.samePinned(21L, 768L, false, pin);
+            pin = pin + 1;
+        }
+    }
+
+    /** FIRES: pinned to two rows a wave, the launcher launches that kernel; pinned to one, the other. */
+    @Test
+    public void theLauncherTakesTheRowSlotKernelItIsPinnedTo() {
+        if (!MatVecPrefetchTest.rowSlotKernels()) { return; }
+        int64 two = QuantKernel.q4RowSlotLaunches(2);
+        int64 one = QuantKernel.q4RowSlotLaunches(1);
+        MatVecPrefetchTest.run(8L, 2048L, false, 3);
+        Assert.isTrue(QuantKernel.q4RowSlotLaunches(2) == two + 1L);
+        MatVecPrefetchTest.run(8L, 2048L, false, 4);
+        Assert.isTrue(QuantKernel.q4RowSlotLaunches(1) == one + 1L);
+    }
+
+    /** DOES NOT FIRE: rows that share a wave keep the four-slot kernel whatever the pin. */
+    @Test
+    public void shortRowsKeepTheFourSlotKernel() {
+        if (!MatVecPrefetchTest.rowSlotKernels()) { return; }
+        int64 two = QuantKernel.q4RowSlotLaunches(2);
+        int64 one = QuantKernel.q4RowSlotLaunches(1);
+        MatVecPrefetchTest.run(21L, 256L, false, 3);
+        MatVecPrefetchTest.run(21L, 256L, false, 4);
+        Assert.isTrue(QuantKernel.q4RowSlotLaunches(2) == two);
+        Assert.isTrue(QuantKernel.q4RowSlotLaunches(1) == one);
+    }
+
+    /** Columns whose row takes more than half a wave's lanes and fewer than all of them (4 lanes a block), or 0 when the wave has no such width. */
+    static int64 nearlyFullCols() {
+        int64 wv = (int64) QuantKernel.waveWidth();
+        int64 bpr = wv / 4L - 1L;
+        if (bpr < 1L || 8L * bpr <= wv) { return 0L; }
+        return bpr * 256L;
+    }
+
+    /** FIRES on a host that launches four rows a wave where the kernel puts one: every row of the launch is written. */
+    @Test
+    public void everyRowIsWrittenWhenARowNearlyFillsAWave() {
+        if (!MatVecPrefetchTest.bothKernels()) { return; }
+        int64 cols = MatVecPrefetchTest.nearlyFullCols();
+        if (cols == 0L) { DeviceSkip.cannot("no row width between half a wave and a wave here"); return; }
+        int32 pin = 1;
+        while (pin <= 2) {
+            float32[] got #= MatVecPrefetchTest.run(21L, cols, false, pin);
+            int64 r = 0;
+            while (r < 21L) {
+                float32 seed = 0.25f * (float32) ((r % 9L) - 4L);
+                if (got[r] == seed) {
+                    Assert.fail("21x" + cols + " variant " + pin + " row " + r + " kept its seed " + seed);
+                }
+                r = r + 1;
+            }
+            pin = pin + 1;
+        }
+    }
+
+    /** The variant is chosen per shape: each new rows x cols is timed once, then answered from memory. */
+    @Test
+    public void theVariantIsTimedOncePerShape() {
+        if (!MatVecPrefetchTest.rowSlotKernels()) { return; }
+        QuantKernel.setMatVecTuneDir("");
+        TuneMode.setUntimed(false);
+        QuantKernel.setQ4Prefetch(0);
+        QuantKernel.clearQ4Variants();
+        int64 t0 = QuantKernel.q4VariantTimings();
+        int32 a = QuantKernel.q4WaveVariantFor(64L, 4096L);
+        int32 b = QuantKernel.q4WaveVariantFor(64L, 4096L);
+        Assert.isTrue(QuantKernel.q4VariantTimings() == t0 + 1L);
+        Assert.isTrue(a == b && a >= 1 && a <= 4);
+        int32 c = QuantKernel.q4WaveVariantFor(64L, 14336L);
+        Assert.isTrue(QuantKernel.q4VariantTimings() == t0 + 2L);
+        Assert.isTrue(c >= 1 && c <= 4);
+        QuantKernel.clearQ4Variants();
+    }
+
     /** Whether both Q6_K kernels run here; skips by name when not. */
     static boolean bothQ6Kernels() {
         String be #= Device.activeBackend();
