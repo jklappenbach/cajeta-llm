@@ -3341,9 +3341,9 @@ public final class AttnKernel {
     @Kernel @FastMath
     @Occupancy(maxThreads = 256)
     @Unlowered(backend = {"vulkan", "nvptx", "amdgpu"}, tracked = "llm-cpu-parity 4.3.1.6", hold = true)
-    public static void attnDecodeCpuGqa4Kernel(KernelBuffer<float32> part,
+    public static void attnDecodeCpuGqaKernel(KernelBuffer<float32> part,
             KernelBuffer<float32> q, KernelBuffer<float16> kPool,
-            KernelBuffer<float16> vPool, uint32 nKv, uint32 count,
+            KernelBuffer<float16> vPool, uint32 nKv, uint32 group, uint32 count,
             uint32 from, uint32 splits, float32 scale) {
         uint32 gi = KernelThread.globalIdX();
         if (gi < nKv * splits) {
@@ -3357,8 +3357,8 @@ public final class AttnKernel {
             int64 kvDim = (int64) (nKv * 128);
             int64 kOff0 = (int64) from * kvDim + (int64) (kvh * 128);
             uint32 h = 0;
-            while (h < 4) {
-                uint32 hh = kvh * 4 + h;
+            while (h < group) {
+                uint32 hh = kvh * group + h;
                 AttnKernel.cpuDecodeHead(part, q, kPool, vPool, (int64) (hh * 128), kOff0, kvDim, (int64) t0,
                     (int64) t1, (int64) ((hh * splits + sp) * 130), scale);
                 h = h + 1;
@@ -3366,14 +3366,14 @@ public final class AttnKernel {
         }
     }
 
-    /** {@link #attnFlashDecodeGqa4BatchKernel} on the cpu backend, as {@link #attnDecodeCpuGqa4Kernel}: work item
+    /** {@link #attnFlashDecodeGqa4BatchKernel} on the cpu backend, as {@link #attnDecodeCpuGqaKernel}: work item
      *  `r * nKv * maxSplits + w` for each of the `n` rows. */
     @Kernel @FastMath
     @Occupancy(maxThreads = 256)
     @Unlowered(backend = {"vulkan", "nvptx", "amdgpu"}, tracked = "llm-cpu-parity 4.3.1.6", hold = true)
-    public static void attnDecodeCpuGqa4BatchKernel(KernelBuffer<float32> part,
+    public static void attnDecodeCpuGqaBatchKernel(KernelBuffer<float32> part,
             KernelBuffer<float32> q, KernelBuffer<float16> kPool,
-            KernelBuffer<float16> vPool, uint32 nKv, KernelBuffer<int32> rowTab,
+            KernelBuffer<float16> vPool, uint32 nKv, uint32 group, KernelBuffer<int32> rowTab,
             uint32 maxSplits, uint32 qStride, uint32 partStride, float32 scale, uint32 n) {
         uint32 gi = KernelThread.globalIdX();
         uint32 r = gi / (nKv * maxSplits);
@@ -3393,8 +3393,8 @@ public final class AttnKernel {
                 int64 kvDim = (int64) (nKv * 128);
                 int64 kOff0 = (int64) slotBase + (int64) (kvh * 128);
                 uint32 h = 0;
-                while (h < 4) {
-                    uint32 hh = kvh * 4 + h;
+                while (h < group) {
+                    uint32 hh = kvh * group + h;
                     AttnKernel.cpuDecodeHead(part, q, kPool, vPool, (int64) (r * qStride + hh * 128), kOff0, kvDim,
                         (int64) t0, (int64) t1, (int64) (r * partStride + (hh * splits + sp) * 130), scale);
                     h = h + 1;
@@ -3405,18 +3405,24 @@ public final class AttnKernel {
 
     static int64 cpuDecodeCalls = 0L;
 
-    /** Launches of the cpu decode attends ({@link #attnDecodeCpuGqa4Kernel} and its batch form) so far. */
+    /** Launches of the cpu decode attends ({@link #attnDecodeCpuGqaKernel} and its batch form) so far. */
     public static int64 cpuDecodeCallCount() { return AttnKernel.cpuDecodeCalls; }
 
-    /** The GQA-4 flash decode's partials: {@link #attnDecodeCpuGqa4Kernel} on cpu, else {@link #attnFlashDecodeGqa4Kernel}. */
-    static void decodeGqa4LaunchNoSync(KernelStream s, KernelBuffer<float32> part, KernelBuffer<float32> q,
-            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool, int32 nKv, int32 count, int32 from,
+    /** The GQA-4 and GQA-8 flash decode's partials: {@link #attnDecodeCpuGqaKernel} on cpu, else the wave kernels. */
+    static void decodeGqaLaunchNoSync(KernelStream s, KernelBuffer<float32> part, KernelBuffer<float32> q,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool, int32 nH, int32 nKv, int32 count, int32 from,
             int32 splits, float32 scale) {
-        if (AttnKernel.cpuDecodeServes(nKv)) {
+        if (AttnKernel.cpuDecodeServes(nH, nKv)) {
             AttnKernel.cpuDecodeCalls = AttnKernel.cpuDecodeCalls + 1L;
             uint32 n = (uint32) (nKv * splits);
             uint32 blk = QuantKernel.scalarBlock();
-            attnDecodeCpuGqa4Kernel.launch(s, grid: [(n + blk - 1) / blk], block: [blk])
+            attnDecodeCpuGqaKernel.launch(s, grid: [(n + blk - 1) / blk], block: [blk])
+                (part, q, kPool, vPool, (uint32) nKv, (uint32) (nH / nKv), (uint32) count, (uint32) from,
+                 (uint32) splits, scale);
+            return;
+        }
+        if (nH == 8 * nKv) {
+            attnFlashDecodeGqa8Kernel.launch(s, grid: [(uint32) (nKv * 2 * splits)], block: [32])
                 (part, q, kPool, vPool, (uint32) nKv, (uint32) count, (uint32) from, (uint32) splits, scale);
             return;
         }
@@ -3425,8 +3431,8 @@ public final class AttnKernel {
         return;
     }
 
-    static boolean cpuDecodeServes(int32 nKv) {
-        return AttnKernel.cpuAttnServes(4 * nKv, nKv, 128) && KernelCap.usable("attnDecodeCpuGqa4Kernel");
+    static boolean cpuDecodeServes(int32 nH, int32 nKv) {
+        return AttnKernel.cpuAttnServes(nH, nKv, 128) && KernelCap.usable("attnDecodeCpuGqaKernel");
     }
 
     static boolean cpuAttnOn = true;
@@ -3972,15 +3978,7 @@ public final class AttnKernel {
         int32 splits = AttnKernel.decodeSplitsFor(count, 1, nKv);
         int64 need = (int64) nH * 64L * 130L;
         KernelBuffer<float32> part #= heap KernelBuffer<float32>((uint64) need);
-        if (nH == 8 * nKv) {
-            uint32 wg8 = (uint32) (nKv * 2 * splits);
-            attnFlashDecodeGqa8Kernel.launch(s, grid: [wg8], block: [32])
-                (part, q, kPool, vPool, (uint32) nKv, (uint32) count,
-                 (uint32) from, (uint32) splits, scale);
-        } else {
-            uint32 wg4 = (uint32) (nKv * splits);
-            AttnKernel.decodeGqa4LaunchNoSync(s, part, q, kPool, vPool, nKv, count, from, splits, scale);
-        }
+        AttnKernel.decodeGqaLaunchNoSync(s, part, q, kPool, vPool, nH, nKv, count, from, splits, scale);
         attnFlashDecodeReduceKernel.launch(s, grid: [(uint32) nH], block: [32])
             (out, part, (uint32) nH, (uint32) splits);
         s.sync();
@@ -4017,15 +4015,7 @@ public final class AttnKernel {
             AttnKernel.fdPart #= heap KernelBuffer<float32>((uint64) need);
             AttnKernel.fdPartCap = need;
         }
-        if (nH == 8 * nKv) {
-            uint32 wg8 = (uint32) (nKv * 2 * splits);
-            attnFlashDecodeGqa8Kernel.launch(s, grid: [wg8], block: [32])
-                (AttnKernel.fdPart, q, kPool, vPool, (uint32) nKv,
-                 (uint32) count, (uint32) from, (uint32) splits, scale);
-        } else {
-            uint32 wg4 = (uint32) (nKv * splits);
-            AttnKernel.decodeGqa4LaunchNoSync(s, AttnKernel.fdPart, q, kPool, vPool, nKv, count, from, splits, scale);
-        }
+        AttnKernel.decodeGqaLaunchNoSync(s, AttnKernel.fdPart, q, kPool, vPool, nH, nKv, count, from, splits, scale);
         AttnKernel.fdSplitsLast = splits;
         AttnKernel.fdCallCount = AttnKernel.fdCallCount + 1L;
         return true;
@@ -5558,17 +5548,17 @@ public final class AttnKernel {
             AttnKernel.fdPartBatch #= heap KernelBuffer<float32>((uint64) need);
             AttnKernel.fdPartBatchCap = need;
         }
-        if (nH == 8 * nKv) {
-            attnFlashDecodeGqa8BatchKernel.launch(s, grid: [(uint32) (n * nKv * 2 * maxSplits)], block: [32])
-                (AttnKernel.fdPartBatch, q, kPool, vPool, (uint32) nKv, rowTab,
-                 (uint32) maxSplits, (uint32) (nH * hd), (uint32) partStride, scale);
-        } else if (AttnKernel.cpuDecodeServes(nKv)) {
+        if (AttnKernel.cpuDecodeServes(nH, nKv)) {
             AttnKernel.cpuDecodeCalls = AttnKernel.cpuDecodeCalls + 1L;
             uint32 wn = (uint32) (n * nKv * maxSplits);
             uint32 blk = QuantKernel.scalarBlock();
-            attnDecodeCpuGqa4BatchKernel.launch(s, grid: [(wn + blk - 1) / blk], block: [blk])
-                (AttnKernel.fdPartBatch, q, kPool, vPool, (uint32) nKv, rowTab,
+            attnDecodeCpuGqaBatchKernel.launch(s, grid: [(wn + blk - 1) / blk], block: [blk])
+                (AttnKernel.fdPartBatch, q, kPool, vPool, (uint32) nKv, (uint32) (nH / nKv), rowTab,
                  (uint32) maxSplits, (uint32) (nH * hd), (uint32) partStride, scale, (uint32) n);
+        } else if (nH == 8 * nKv) {
+            attnFlashDecodeGqa8BatchKernel.launch(s, grid: [(uint32) (n * nKv * 2 * maxSplits)], block: [32])
+                (AttnKernel.fdPartBatch, q, kPool, vPool, (uint32) nKv, rowTab,
+                 (uint32) maxSplits, (uint32) (nH * hd), (uint32) partStride, scale);
         } else {
             attnFlashDecodeGqa4BatchKernel.launch(s, grid: [(uint32) (n * nKv * maxSplits)], block: [32])
                 (AttnKernel.fdPartBatch, q, kPool, vPool, (uint32) nKv, rowTab,
@@ -5649,17 +5639,7 @@ public final class AttnKernel {
                     (uint64) need);
                 AttnKernel.fdPartCap = need;
             }
-            if (nH == 8 * nKv) {
-                uint32 wg8 = (uint32) (nKv * 2 * splits);
-                attnFlashDecodeGqa8Kernel.launch(s, grid: [wg8],
-                    block: [32])
-                    (AttnKernel.fdPart, q, kPool, vPool, (uint32) nKv,
-                     (uint32) count, (uint32) from, (uint32) splits,
-                     scale);
-            } else {
-                uint32 wg1 = (uint32) (nKv * splits);
-                AttnKernel.decodeGqa4LaunchNoSync(s, AttnKernel.fdPart, q, kPool, vPool, nKv, count, from, splits, scale);
-            }
+            AttnKernel.decodeGqaLaunchNoSync(s, AttnKernel.fdPart, q, kPool, vPool, nH, nKv, count, from, splits, scale);
             attnFlashDecodeReduceKernel.launch(s, grid: [(uint32) nH],
                 block: [32])
                 (out, AttnKernel.fdPart, (uint32) nH, (uint32) splits);
