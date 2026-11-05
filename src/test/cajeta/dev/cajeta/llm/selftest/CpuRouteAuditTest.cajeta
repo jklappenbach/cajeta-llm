@@ -1,0 +1,139 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.model.AttnKernel;
+import dev.cajeta.llm.model.Linear;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.lang.Math;
+
+/**
+ * cajeta-llm 15.2.20.3.9: on the cpu backend every shipped model's shapes resolve to cpu kernels, so no projection or
+ * attend runs a wave, coop, WMMA or Mw8 kernel as cpu blocks. MoE experts are not model projections here.
+ */
+public class CpuRouteAuditTest {
+
+    static boolean here() {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("the cpu route audit is the cpu backend's"); return false; }
+        return true;
+    }
+
+    /** Why a model projection of `ty` at `inDim` has no cpu int8 route for batches or decode; null when it has. */
+    static #String projectionGap(int32 ty, String fixture, int32 inDim) {
+        Linear lin #= LinearKernelRouteTest.tiledAt(ty, fixture, inDim, 128);
+        lin.allowInterleave();
+        String why = lin.batchRefusal(128L);
+        if (why != null) { return "type " + ty + " at inDim " + inDim + " batches: " + why; }
+        if (!lin.cpuInt8ForTest()) { return "type " + ty + " at inDim " + inDim + " decodes without a cpu int8 kernel"; }
+        return null;
+    }
+
+    /** Why `nH` query heads over `nKv` at head size `hd` run no cpu attend, prefill or decode; null when both do. Each
+     *  launch is held to the host floor, so the audit also checks what it routes. */
+    static #String attendGap(int32 nH, int32 nKv, int32 hd) {
+        int32 rows = 4;
+        int32 sp = 3;
+        int32 tMax = sp + rows;
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        float32[] q #= AttnKernelTest.spread(qn, 31);
+        float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 37);
+        float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim, 41);
+        AttnKernel.roundHalf(k);
+        AttnKernel.roundHalf(v);
+        int64[] vc #= ValueCheck.mark();
+        float32[] want #= heap float32[qn];
+        AttnKernel.attendPrefillHost(want, q, k, v, rows, nH, nKv, hd, sp, scale);
+        float32[] got #= heap float32[qn];
+        int64 p0 = AttnKernel.cpuPrefillCalls();
+        AttnKernel.attendPrefillInto(got, q, k, v, rows, nH, nKv, hd, sp, scale);
+        boolean pCpu = AttnKernel.cpuPrefillCalls() > p0;
+        AttnKernelTest.assertClose(want, got, "audit prefill " + nH + "/" + nKv + " hd " + hd);
+        int64 hq = (int64) (nH * hd);
+        float32[] dWant #= heap float32[hq];
+        AttnKernel.attendDecodeHost(dWant, q, k, v, nH, nKv, hd, tMax, scale);
+        float32[] dGot #= heap float32[hq];
+        int64 d0 = AttnKernel.cpuDecodeCallCount();
+        AttnKernel.attendDecodeInto(dGot, q, k, v, nH, nKv, hd, tMax, scale);
+        boolean dCpu = AttnKernel.cpuDecodeCallCount() > d0;
+        AttnKernelTest.assertClose(dWant, dGot, "audit decode " + nH + "/" + nKv + " hd " + hd);
+        ValueCheck.credit(vc);
+        if (!pCpu) { return "prefill attend " + nH + "/" + nKv + " hd " + hd + " runs no cpu kernel"; }
+        if (!dCpu) { return "decode attend " + nH + "/" + nKv + " hd " + hd + " runs no cpu kernel"; }
+        return null;
+    }
+
+    static void projection(String model, int32 ty, String fixture, int32 inDim) {
+        String gap #= CpuRouteAuditTest.projectionGap(ty, fixture, inDim);
+        if (gap != null) { Assert.fail(model + ": " + gap); }
+    }
+
+    static void attend(String model, int32 nH, int32 nKv, int32 hd) {
+        String gap #= CpuRouteAuditTest.attendGap(nH, nKv, hd);
+        if (gap != null) { Assert.fail(model + ": " + gap); }
+    }
+
+    /** Llama-3.1-8B in every quantization proton measures: hidden 4096, ffn 14336, 32 heads over 8. */
+    @Test
+    public void llama31EightBResolvesEveryRouteOnTheCpu() {
+        if (!CpuRouteAuditTest.here()) { return; }
+        CpuRouteAuditTest.attend("Llama-3.1-8B", 32, 8, 128);
+        int32[] dims = [4096, 14336];
+        int32 d = 0;
+        while (d < 2) {
+            CpuRouteAuditTest.projection("Llama-3.1-8B", Quant.GG_Q4_K, "q4_k.bin", dims[d]);
+            CpuRouteAuditTest.projection("Llama-3.1-8B", Quant.GG_Q6_K, "q6_k.bin", dims[d]);
+            CpuRouteAuditTest.projection("Llama-3.1-8B", Quant.GG_Q5_K, "q5_k.bin", dims[d]);
+            CpuRouteAuditTest.projection("Llama-3.1-8B", Quant.GG_Q3_K, "q3_k.bin", dims[d]);
+            CpuRouteAuditTest.projection("Llama-3.1-8B", Quant.GG_Q2_K, "q2_k.bin", dims[d]);
+            CpuRouteAuditTest.projection("Llama-3.1-8B", Quant.GG_Q8_0, "q8_0.bin", dims[d]);
+            d = d + 1;
+        }
+    }
+
+    /** Qwen2.5-72B Q4_K_M: hidden 8192 in Q4_K, Q5_K and Q6_K, ffn_down Q8_0 and Q5_0 at 29568, 64 heads over 8. */
+    @Test
+    public void qwen72BResolvesEveryRouteOnTheCpu() {
+        if (!CpuRouteAuditTest.here()) { return; }
+        CpuRouteAuditTest.attend("Qwen2.5-72B", 64, 8, 128);
+        CpuRouteAuditTest.projection("Qwen2.5-72B", Quant.GG_Q4_K, "q4_k.bin", 8192);
+        CpuRouteAuditTest.projection("Qwen2.5-72B", Quant.GG_Q5_K, "q5_k.bin", 8192);
+        CpuRouteAuditTest.projection("Qwen2.5-72B", Quant.GG_Q6_K, "q6_k.bin", 8192);
+        CpuRouteAuditTest.projection("Qwen2.5-72B", Quant.GG_Q8_0, "q8_0.bin", 29568);
+        CpuRouteAuditTest.projection("Qwen2.5-72B", Quant.GG_Q5_0, "q5_0.bin", 29568);
+    }
+
+    /** Qwen3-30B-A3B's dense side: attention projections in Q4_K and Q6_K at 2048 and 4096, 32 heads over 4. */
+    @Test
+    public void qwen3ThirtyBResolvesItsDenseRoutesOnTheCpu() {
+        if (!CpuRouteAuditTest.here()) { return; }
+        CpuRouteAuditTest.attend("Qwen3-30B-A3B", 32, 4, 128);
+        CpuRouteAuditTest.projection("Qwen3-30B-A3B", Quant.GG_Q4_K, "q4_k.bin", 2048);
+        CpuRouteAuditTest.projection("Qwen3-30B-A3B", Quant.GG_Q4_K, "q4_k.bin", 4096);
+        CpuRouteAuditTest.projection("Qwen3-30B-A3B", Quant.GG_Q6_K, "q6_k.bin", 2048);
+    }
+
+    /** Gemma 3 27B: hidden 5376, ffn 21504, 32 heads over 16. */
+    @Test
+    public void gemma3TwentySevenBResolvesEveryRouteOnTheCpu() {
+        if (!CpuRouteAuditTest.here()) { return; }
+        CpuRouteAuditTest.attend("Gemma-3-27B", 32, 16, 128);
+        CpuRouteAuditTest.projection("Gemma-3-27B", Quant.GG_Q4_K, "q4_k.bin", 5376);
+        CpuRouteAuditTest.projection("Gemma-3-27B", Quant.GG_Q4_K, "q4_k.bin", 21504);
+        CpuRouteAuditTest.projection("Gemma-3-27B", Quant.GG_Q6_K, "q6_k.bin", 21504);
+    }
+
+    /** The audit FIRES: Gemma 3 4B's head size 256 has no cpu attend (cajeta-llm 15.2.20.3.10), nor Q4_0 a cpu kernel. */
+    @Test
+    public void theAuditFiresWhereTheCpuHasNoKernel() {
+        if (!CpuRouteAuditTest.here()) { return; }
+        String hd256 #= CpuRouteAuditTest.attendGap(8, 4, 256);
+        if (hd256 == null) { Assert.fail("the audit passed head size 256, which has no cpu attend"); }
+        String q40 #= CpuRouteAuditTest.projectionGap(Quant.GG_Q4_0, "q4_0.bin", 512);
+        if (q40 == null) { Assert.fail("the audit passed a Q4_0 projection, which has no cpu int8 kernel"); }
+    }
+}
