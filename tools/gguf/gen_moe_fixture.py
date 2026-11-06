@@ -449,3 +449,49 @@ for name, ne, ty, pay in tensors:
         qtensors.append((name, ne, ty, pay))
 assert any(t[2] == GG_Q8_0 for t in qtensors), "no Q8_0 expert slab emitted"
 write_gguf(os.path.join(OUT, "toy-moe-q8exp.gguf"), kvs, qtensors)
+
+
+# ── toy-moe-{q5,q6,q3,q2}kexp.gguf ──────────────────────────────────────
+# One fixture per K-quant expert format, every expert slab in it (gate, up
+# and down), for the cpu MoE route audit (cajeta xpu-kernel-targets 8.1.4).
+# Real blocks tiled like q8exp, with d (and dmin) scaled x16 like the Q4_K
+# slabs so the experts' share of the output is not lost in the residual.
+def kq_scaled_blocks(raw, block_bytes, offsets, k):
+    out = bytearray(raw)
+    for b in range(len(raw) // block_bytes):
+        for off in offsets:
+            o = b * block_bytes + off
+            v = np.frombuffer(bytes(out[o:o + 2]), dtype=np.float16)[0]
+            w = np.float16(np.float32(v) * np.float32(k))
+            assert np.isfinite(w), (b, off, v)
+            out[o:o + 2] = w.tobytes()
+    return bytes(out)
+
+
+def kq_rank3(src, block_bytes, cols, rows, experts):
+    assert cols % BLOCK_ELEMS == 0, (cols, rows, experts)
+    nsrc = len(src) // block_bytes
+    per = rows * (cols // BLOCK_ELEMS)
+    return b"".join(
+        src[((i + e) % nsrc) * block_bytes:(((i + e) % nsrc) + 1) * block_bytes]
+        for e in range(experts) for i in range(per))
+
+
+for fname, ty, block_bytes, offsets in [
+        ("q5kexp", 13, 176, (0, 2)),
+        ("q6kexp", 14, 210, (208,)),
+        ("q3kexp", 11, 110, (108,)),
+        ("q2kexp", 10, 84, (80, 82))]:
+    src = kq_scaled_blocks(open(os.path.join(KQ, fname[:2] + "_k.bin"), "rb").read(),
+                           block_bytes, offsets, 16)
+    qtensors = []
+    for name, ne, t, pay in tensors:
+        if name.endswith("ffn_down_exps.weight"):
+            qtensors.append((name, ne, ty, kq_rank3(src, block_bytes, IT_E, H, E)))
+        elif name.endswith("ffn_gate_exps.weight") or name.endswith("ffn_up_exps.weight"):
+            qtensors.append((name, ne, ty, kq_rank3(src, block_bytes, H, IT_E, E)))
+        else:
+            qtensors.append((name, ne, t, pay))
+    assert sum(1 for q in qtensors if q[2] == ty) == 3 * sum(
+        1 for n in tensors if n[0].endswith("ffn_down_exps.weight")), fname
+    write_gguf(os.path.join(OUT, "toy-moe-%s.gguf" % fname), kvs, qtensors)
