@@ -1,0 +1,179 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.File;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.io.GgufFile;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.io.WmmaKernel;
+import dev.cajeta.llm.model.KernelCap;
+
+/**
+ * The K-quant widens and the pad zeroing checked on their own (cajeta xpu-kernel-targets 8.1.3). The deq
+ * GEMMs that checked them are GPU-only, and the cpu backend still widens at load and in chunked prefill.
+ */
+public class WidenKernelTest {
+
+    static final int64 OUT = 32L;
+    static final int64 COLS = 512L;
+
+    public WidenKernelTest() { return; }
+
+    @Test
+    public void theQ2WidenRebuildsTheHostDequant() {
+        WidenKernelTest.check(Quant.GG_Q2_K, "q2kWidenKernel", "q2_k.bin", 84L, 0, 3);
+    }
+
+    @Test
+    public void theQ3WidenRebuildsTheHostDequant() {
+        WidenKernelTest.check(Quant.GG_Q3_K, "q3kWidenKernel", "q3_k.bin", 110L, -4, 3);
+    }
+
+    @Test
+    public void theQ5WidenRebuildsTheHostDequant() {
+        WidenKernelTest.check(Quant.GG_Q5_K, "q5kWidenKernel", "q5_k.bin", 176L, 0, 31);
+    }
+
+    /** The pad tiles of a padded deq come back zero and the real tiles are untouched. */
+    @Test
+    public void thePadZeroClearsOnlyThePadTiles() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable("deqPadZeroKernel")) { DeviceSkip.noKernel("deqPadZeroKernel", be); return; }
+        int64 cols = 64L;
+        int64 colsPad = 128L;
+        int64 n = WidenKernelTest.OUT * colsPad;
+        int8[] host #= heap int8[n];
+        int64 i = 0;
+        while (i < n) { host[i] = (int8) 90; i = i + 1L; }
+        KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>((uint64) n);
+        deqDev.upload(host);
+        int64[] vc #= ValueCheck.mark();
+        WmmaKernel.deqPadZeroLaunch(deqDev, WidenKernelTest.OUT, cols, colsPad);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int8[] got #= heap int8[n];
+        deqDev.download(got, n);
+        int64 tilesK = colsPad / 16L;
+        int64 tilesKReal = cols / 16L;
+        int64 bad = 0L;
+        i = 0;
+        while (i < n) {
+            int64 t = (i / 256L) % tilesK;
+            int32 want = t >= tilesKReal ? 0 : 90;
+            if ((int32) got[i] != want) { bad = bad + 1L; }
+            i = i + 1L;
+        }
+        Assert.equals(0L, bad);
+        ValueCheck.credit(vc);
+    }
+
+    /** Widens an OUT x COLS weight of `ty` on the device and holds every element, with the host-decoded
+     *  block scales, to Quant.dequantize; each widened value must also lie in [lo, hi]. */
+    static void check(int32 ty, String kernel, String fixture, int64 bb, int32 lo, int32 hi) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable(kernel)) { DeviceSkip.noKernel(kernel, be); return; }
+        int64 out = WidenKernelTest.OUT;
+        int64 cols = WidenKernelTest.COLS;
+        int64 bpr = cols / 256L;
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + fixture);
+        int8[] raw #= QuantKernelTest.tiled(one, (out * bpr * bb) / (int64) one.count() + 1L);
+        KernelBuffer<int8> wDev #= heap KernelBuffer<int8>((uint64) (out * Quant.rowResidentBytes(ty, bpr) + 4L));
+        if (ty == Quant.GG_Q3_K) {
+            int8[] split #= heap int8[out * Quant.rowResidentBytes(ty, bpr)];
+            Quant.splitInto(ty, raw, 0L, out, bpr, split, 0L);
+            wDev.upload(split);
+        } else {
+            wDev.upload(raw, out * bpr * bb);
+        }
+        KernelBuffer<int8> deqDev #= heap KernelBuffer<int8>((uint64) (out * cols));
+        int64[] vc #= ValueCheck.mark();
+        if (ty == Quant.GG_Q2_K) {
+            WmmaKernel.q2kWidenLaunch(deqDev, wDev, out, cols);
+        } else if (ty == Quant.GG_Q3_K) {
+            WmmaKernel.q3kWidenLaunch(deqDev, wDev, out, cols);
+        } else {
+            WmmaKernel.q5kWidenLaunch(deqDev, wDev, out, cols);
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        int8[] deq #= heap int8[out * cols];
+        deqDev.download(deq, out * cols);
+        float32[] want #= heap float32[out * cols];
+        Quant.dequantize(ty, raw, 0L, out * bpr, want, 0L);
+        float32[] ab #= heap float32[2];
+        int64 tilesK = cols / 16L;
+        int64 bad = 0L;
+        int64 outOfRange = 0L;
+        int64 scaled = 0L;
+        int64 i = 0;
+        while (i < out) {
+            int64 k = 0;
+            while (k < cols) {
+                int32 q = (int32) deq[((i / 16L) * tilesK + k / 16L) * 256L + (i % 16L) * 16L + k % 16L];
+                if (q < lo || q > hi) { outOfRange = outOfRange + 1L; }
+                int64 ro = (i * bpr + k / 256L) * bb;
+                WidenKernelTest.affine(ty, raw, ro, (int32) (k % 256L), ab);
+                float32 step = ab[0] < 0.0f ? -ab[0] : ab[0];
+                if (step > 0.0f) { scaled = scaled + 1L; }
+                float32 diff = ab[0] * (float32) q - ab[1] - want[i * cols + k];
+                if (diff < 0.0f) { diff = -diff; }
+                float32 off = ab[1] < 0.0f ? -ab[1] : ab[1];
+                if (diff > step * 0.001f + off * 0.000001f) { bad = bad + 1L; }
+                k = k + 1L;
+            }
+            i = i + 1L;
+        }
+        Assert.equals(0L, outOfRange);
+        Assert.equals(0L, bad);
+        Assert.isTrue(scaled * 10L >= out * cols * 9L);
+        ValueCheck.credit(vc);
+    }
+
+    /** The element's value as `ab[0] * q - ab[1]`, from the block header at `raw[ro]`. */
+    static void affine(int32 ty, int8[] raw, int64 ro, int32 e, float32[] ab) {
+        if (ty == Quant.GG_Q2_K) {
+            int32 sb = WidenKernelTest.u8(raw, ro + (int64) (e / 16));
+            ab[0] = WidenKernelTest.f16(raw, ro + 80L) * (float32) (sb & 15);
+            ab[1] = WidenKernelTest.f16(raw, ro + 82L) * (float32) (sb >> 4);
+            return;
+        }
+        if (ty == Quant.GG_Q3_K) {
+            int32 j = e / 16;
+            int32 low = WidenKernelTest.u8(raw, ro + (int64) (96 + j % 8));
+            int32 sc = j < 8 ? (low & 15) : (low >> 4);
+            int32 hb = WidenKernelTest.u8(raw, ro + (int64) (104 + (j & 3)));
+            sc = (sc | (((hb >> (2 * (j / 4))) & 3) << 4)) - 32;
+            ab[0] = WidenKernelTest.f16(raw, ro + 108L) * (float32) sc;
+            ab[1] = 0.0f;
+            return;
+        }
+        int32 j = e / 32;
+        int32 sc = 0;
+        int32 m = 0;
+        if (j < 4) {
+            sc = WidenKernelTest.u8(raw, ro + (int64) (4 + j)) & 63;
+            m = WidenKernelTest.u8(raw, ro + (int64) (8 + j)) & 63;
+        } else {
+            int32 c = WidenKernelTest.u8(raw, ro + (int64) (8 + j));
+            sc = (c & 15) | ((WidenKernelTest.u8(raw, ro + (int64) (j)) >> 6) << 4);
+            m = (c >> 4) | ((WidenKernelTest.u8(raw, ro + (int64) (j + 4)) >> 6) << 4);
+        }
+        ab[0] = WidenKernelTest.f16(raw, ro) * (float32) sc;
+        ab[1] = WidenKernelTest.f16(raw, ro + 2L) * (float32) m;
+    }
+
+    static int32 u8(int8[] raw, int64 off) {
+        return (int32) raw[off] & 255;
+    }
+
+    static float32 f16(int8[] raw, int64 off) {
+        return GgufFile.halfBitsToF32(WidenKernelTest.u8(raw, off) | (WidenKernelTest.u8(raw, off + 1L) << 8));
+    }
+}
