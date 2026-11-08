@@ -10,7 +10,8 @@ what runs, or what describes itself:
 XPU_BACKEND=nvptx ./run-tests.sh && cp build/census-nvptx.tsv census/nvptx.tsv
 ```
 
-Columns: `backend  kernel  class  launches  checks  manifest  note`.
+Columns: `backend  kernel  class  launches  checks  manifest  level  note`; `level` is the ISA
+level a cpu kernel resolved to (`host` for a native build), `-` on a device backend.
 
 | class | meaning |
 |---|---|

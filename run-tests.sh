@@ -11,6 +11,8 @@
 #               MappedFile + the int64 file path (cajeta main ≥ 2026-08-13);
 #               until that ships in a release, point CAJETA at a main build.
 #   UNIT_REPO — path to the cajeta-unit checkout (default: ../cajeta-unit)
+#   KERNELS_REPO — the dev.cajeta.ml.kernels checkout (default: ../cajeta-ml/kernels);
+#               its `testing` classes gate the suite (cajeta-ml-gpu 32)
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -488,6 +490,37 @@ if [[ ! -f "$logging_cja" ]]; then
 fi
 echo ">> dev.cajeta.logging: $logging_cja"
 
+# dev.cajeta.ml.kernels (the census gate, ValueCheck, DeviceSkip and the launch
+# budget this suite runs under; a dev-dependency): the same ladder.
+KERNELS_VER="$(sed -n 's/.*"dev\.cajeta\.ml\.kernels"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$here/cajeta.json" | head -1)"
+KERNELS_REPO="${KERNELS_REPO:-$here/../cajeta-ml/kernels}"
+kernels_cja="${KERNELS_CJA:-}"
+if [[ -z "$kernels_cja" && -d "$KERNELS_REPO" ]]; then
+    echo ">> building dev.cajeta.ml.kernels from checkout ($KERNELS_REPO)"
+    phase "building dev.cajeta.ml.kernels"
+    ( cd "$KERNELS_REPO" && "$CAJETA" build >/dev/null )
+    phase_end
+    kernels_cja="$(cajeta_artifact_path "$KERNELS_REPO" dev.cajeta.ml.kernels 2>/dev/null)"
+fi
+if [[ -z "$kernels_cja" ]]; then
+    kernels_cja="$OLLA_HOME/dev.cajeta.ml.kernels/$KERNELS_VER/dev.cajeta.ml.kernels-$KERNELS_VER.cja"
+fi
+if [[ ! -f "$kernels_cja" ]]; then
+    kernels_cja="$here/build/.unit-cache/dev.cajeta.ml.kernels-$KERNELS_VER.cja"
+    if [[ ! -f "$kernels_cja" ]]; then
+        echo ">> fetching dev.cajeta.ml.kernels $KERNELS_VER from $OLLA_URL"
+        meta="$(curl -fsS "$OLLA_URL/v2/resolve?name=dev.cajeta.ml.kernels&version=$KERNELS_VER")"
+        sha="$(printf '%s' "$meta" | sed -n 's/.*"sha256":"sha256:\([0-9a-f]*\)".*/\1/p')"
+        [[ -n "$sha" ]] || { echo "/v2/resolve gave no sha256 for kernels" >&2; exit 1; }
+        mkdir -p "$(dirname "$kernels_cja")"
+        curl -fsS -o "$kernels_cja" "$OLLA_URL/v2/blob/$sha"
+        got="$(sha256_of "$kernels_cja")"
+        [[ "$got" == "$sha" ]] || { rm -f "$kernels_cja"; echo "sha256 mismatch fetching kernels" >&2; exit 1; }
+    fi
+fi
+echo ">> dev.cajeta.ml.kernels: $kernels_cja"
+
 # 1.4.5 — the static arity sweep, before the build. The compiler stops at the
 # FIRST call whose argument count disagrees with a library signature, so
 # drift between the test tree and a library is otherwise found one site per
@@ -550,7 +583,7 @@ export CAJETA_XPU_POISON="${CAJETA_XPU_POISON:-1}"
 export CAJETA_LLM_TUNE_DIR="${CAJETA_LLM_TUNE_DIR:-off}"
 echo ">> device buffers: CAJETA_XPU_POISON=${CAJETA_XPU_POISON}"
 "$CAJETA" --emit=exe --profile=test --xpu-backend="${XPU_BACKEND:-cpu}" ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} \
-    --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja,$logging_cja" \
+    --classpath="$out/llama.cja,$unit_cja,$kernels_cja,$codec_cja,$jinja_cja,$logging_cja" \
     -o "$out/llamatests" \
     dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" \
     >/dev/null 2>"$out/test.err" || { cat "$out/test.err" >&2; exit 1; }
@@ -573,7 +606,7 @@ phase "building the release test binary"
 # codegen with the bounded live-set discipline — not only the test profile.
 "$CAJETA" --emit=exe --profile=test --release --live-set=bounded \
     --xpu-backend="${XPU_BACKEND:-cpu}" ${CPU_FLAGS[@]+"${CPU_FLAGS[@]}"} \
-    --classpath="$out/llama.cja,$unit_cja,$codec_cja,$jinja_cja,$logging_cja" \
+    --classpath="$out/llama.cja,$unit_cja,$kernels_cja,$codec_cja,$jinja_cja,$logging_cja" \
     -o "$out/llamatests-release" \
     dev.cajeta.llm.selftest.TestMain.run "$here/src/test/cajeta" "$out" >/dev/null
 
