@@ -256,10 +256,14 @@ run_leg() {
 # are the right ones. This gate repeats the warning rather than second-guess
 # it with one vendor's register cap (1.5.2.4).
 #
-# One "<kernel>|<plan item>" per line. Empty today: the stdlib tiles that
-# spilled on sm_89 (Ewise.matmulF32/F64/Bf16, 1.5.4.1) are distributed across
-# the warp since cajeta's nvptx change of 2026-09-24 and no longer spill.
+# One "<kernel>|<plan item>" per line. The stdlib tiles that spilled on sm_89
+# (Ewise.matmulF32/F64/Bf16, 1.5.4.1) are distributed across the warp since
+# cajeta's nvptx change of 2026-09-24 and no longer spill. The kernel package's
+# 256x128 bf16 and f16 tiles are hip's shape; on sm_89 they spill 8 bytes at
+# 128 registers since cajeta v0.53.3 fuses a * b + c (measured 2026-11-11).
 SPILL_TRACKED=(
+    "dev.cajeta.ml.kernels.Gemm.gemm256Bf16|cajeta-ml-gpu 23.2.2"
+    "dev.cajeta.ml.kernels.Gemm.gemm256<float16>|cajeta-ml-gpu 23.2.2"
 )
 spill_tracked_item() {
     local k="$1" e
@@ -491,7 +495,8 @@ fi
 echo ">> dev.cajeta.logging: $logging_cja"
 
 # dev.cajeta.ml.kernels (the census gate, ValueCheck, DeviceSkip and the launch
-# budget this suite runs under; a dev-dependency): the same ladder.
+# budget this suite runs under, and the tile families and tune mode the library
+# itself builds on): the same ladder.
 KERNELS_VER="$(sed -n 's/.*"dev\.cajeta\.ml\.kernels"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
     "$here/cajeta.json" | head -1)"
 KERNELS_REPO="${KERNELS_REPO:-$here/../cajeta-ml/kernels}"
@@ -539,7 +544,7 @@ fi
 echo ">> building llama library .cja"
 phase "building the llama library"
 "$CAJETA" --emit=cja -o "$out/llama.cja" \
-    --classpath="$codec_cja,$jinja_cja,$logging_cja" \
+    --classpath="$codec_cja,$jinja_cja,$logging_cja,$kernels_cja" \
     dev.cajeta.llm.Llm.run "$here/src/main/cajeta" "$out" \
     >/dev/null 2>"$out/lib.err" || { cat "$out/lib.err" >&2; exit 1; }
 cat "$out/lib.err" >&2
