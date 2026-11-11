@@ -495,3 +495,19 @@ for fname, ty, block_bytes, offsets in [
     assert sum(1 for q in qtensors if q[2] == ty) == 3 * sum(
         1 for n in tensors if n[0].endswith("ffn_down_exps.weight")), fname
     write_gguf(os.path.join(OUT, "toy-moe-%s.gguf" % fname), kvs, qtensors)
+
+
+# ── toy-moe-q8all.gguf ──────────────────────────────────────────────────
+# Every quantized tensor Q8_0 (attention, experts, shared expert, head), as
+# Qwen3-Coder-30B-A3B Q8_0 ships: its prefill batches on the cpu only when the
+# dense projections take the 8-row interleave too (cajeta-llm 15.2.20.3.14).
+qtensors = []
+for i, (name, ne, t, pay) in enumerate(tensors):
+    if t != GG_Q4_K:
+        qtensors.append((name, ne, t, pay))
+    elif len(ne) == 3:
+        qtensors.append((name, ne, GG_Q8_0, q8_rank3(ne[0], ne[1], ne[2])))
+    else:
+        qtensors.append((name, ne, GG_Q8_0, q8_rank2(ne[1], ne[0], phase=i)))
+assert not any(q[2] == GG_Q4_K for q in qtensors)
+write_gguf(os.path.join(OUT, "toy-moe-q8all.gguf"), kvs, qtensors)
