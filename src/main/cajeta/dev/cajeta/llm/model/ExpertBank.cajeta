@@ -70,6 +70,8 @@ public final class ExpertBank {
     }
     boolean slabRefused;
     int64 stride;      // bytes per expert
+    boolean x8Slab;    // the slab holds each expert as the cpu 8-row interleave
+    int64 slabStride;  // bytes per expert in the slab
     int64[] touched;   // bytes served per expert (15.16's instrument)
     Linear winLin;     // unit 28: the device expert window (lazy)
     // moe-expert-cache T1 (spec 3.1/3.2): device-resident slots.
@@ -102,6 +104,8 @@ public final class ExpertBank {
         this.mapOff = 0L;
         this.eStage = null;
         this.stride = 0L;
+        this.x8Slab = false;
+        this.slabStride = 0L;
         this.touched = null;
         this.winLin = null;
         this.slotOwn = null;
@@ -496,7 +500,10 @@ public final class ExpertBank {
         if (this.slabDev != null || this.deqSlabDev != null) { return true; }
         if (this.slabRefused) { return false; }
         if (this.map == null) { return false; }
-        int64 charge = (int64) this.expertsN * this.stride;
+        boolean x8 = this.x8Bank();
+        int64 per = this.stride;
+        if (x8) { per = (int64) ((this.rowsN + 7) / 8) * Linear.x8GroupBytes(this.packedTy, (int64) this.colsN); }
+        int64 charge = (int64) this.expertsN * per;
         if (ExpertBank.budget() <= 0L
                 || ExpertBank.resUsed + charge > ExpertBank.budget()) {
             this.slabRefused = true;
@@ -523,7 +530,9 @@ public final class ExpertBank {
         // Four spare bytes past the last block: the Q6_K multi-wave
         // id-GEMM assembles its unaligned words through a funnel that
         // reads the aligned word after the bytes it wants.
-        if (Quant.splitOn(this.packedTy)) {
+        if (x8) {
+            this.uploadX8Slab(per);
+        } else if (Quant.splitOn(this.packedTy)) {
             int64 bpr = this.blocksPerRow();
             this.slabDev #= heap KernelBuffer<int8>((uint64)
                 (Linear.residentBytesOf(this.packedTy, charge, bpr) + 4L));
@@ -536,12 +545,59 @@ public final class ExpertBank {
             this.slabDev.upload(hostSlab, charge);
         }
         this.slabW #= this.slabDev.wordView();
+        this.x8Slab = x8;
+        this.slabStride = per;
         this.residentB = this.residentB + charge;
         ExpertBank.resUsed = ExpertBank.resUsed + charge;
         ExpertBank.resAdmissions = ExpertBank.resAdmissions + 1L;
         ExpertBank.resAdmissionBytes =
             ExpertBank.resAdmissionBytes + charge;
         return true;
+    }
+
+    /** Whether this bank's slab takes the cpu 8-row interleave (Linear.x8ExpertFormat): such a slab is read only
+     *  through its slots' X8 kernels, so every id, widen and wide route refuses it. */
+    boolean x8Bank() {
+        if (this.x8Slab) { return true; }
+        if (this.slabDev != null || this.slabRefused || this.map == null) { return false; }
+        return this.rowsN % 8 == 0 && Linear.x8ExpertFormat(this.packedTy, (int64) this.colsN);
+    }
+
+    /** Whether a batched GEMM serves this bank's experts here: the interleaved cpu slab's X8 rows kernels, else
+     *  the format's device batch kernel. */
+    public boolean batchGemmHere() {
+        if (this.x8Bank()) { return true; }
+        return KernelCap.batchGemmHere(this.packedTy);
+    }
+
+    /** Builds the interleaved slab expert by expert from the mapping, `per` bytes an expert. */
+    void uploadX8Slab(int64 per) {
+        int64 rowBytes = this.stride / (int64) this.rowsN;
+        int64 gb = Linear.x8GroupBytes(this.packedTy, (int64) this.colsN);
+        int64 groups = ((int64) this.rowsN + 7L) / 8L;
+        this.slabDev #= heap KernelBuffer<int8>((uint64) ((int64) this.expertsN * per + 4L));
+        int8[] src #= heap int8[8L * rowBytes];
+        int8[] grp #= heap int8[gb];
+        int32 e = 0;
+        while (e < this.expertsN) {
+            int64 g = 0;
+            while (g < groups) {
+                int64 r0 = g * 8L;
+                int64 nr = (int64) this.rowsN - r0 < 8L ? (int64) this.rowsN - r0 : 8L;
+                int64 at = this.mapOff + (int64) e * this.stride + r0 * rowBytes;
+                int64 got = this.map.read(at, src, 0L, nr * rowBytes);
+                if (got != nr * rowBytes) {
+                    throw heap LlmException("moe: mapped read of expert " + e + " at " + at + " returned " + got
+                        + " of " + (nr * rowBytes) + " bytes");
+                }
+                Linear.x8Interleave(this.packedTy, src, nr, (int64) this.colsN, grp);
+                KernelBuffer<int8> sl #= this.slabDev.slice((uint64) ((int64) e * per + g * gb), (uint64) gb);
+                sl.upload(grp, gb);
+                g = g + 1L;
+            }
+            e = e + 1;
+        }
+        return;
     }
 
     /** Whether the bank slab is bound (the zero-sync dispatch's gate). */
@@ -555,7 +611,7 @@ public final class ExpertBank {
     public int64 slabBytes() {
         int64 b = this.widenSlabBytes();
         if (this.slabDev != null) {
-            b = b + (int64) this.expertsN * this.stride;
+            b = b + (int64) this.expertsN * this.slabStride;
         }
         return b;
     }
@@ -860,6 +916,7 @@ public final class ExpertBank {
      *  kernels derive blocks-per-row from cols/256; a remainder width
      *  would silently drop its last columns). Says nothing about kernels. */
     boolean idShapeOk() {
+        if (this.x8Bank()) { return false; }
         if (this.rowsN % 128 != 0) { return false; }
         if (this.deqSlabDev != null) { return true; }
         if (this.slabDev == null || this.slabW == null) { return false; }
@@ -901,6 +958,7 @@ public final class ExpertBank {
      */
     public boolean ensureWidenSlab() {
         if (this.deqSlabDev != null) { return true; }
+        if (this.x8Bank()) { return false; }
         if (this.widenRefused || !ExpertBank.widenSlabOn) { return false; }
         if (this.slabDev == null) { return false; }
         if (this.rowsN % 128 != 0) { return false; }
@@ -1068,7 +1126,7 @@ public final class ExpertBank {
     /** 6.4.4: whether the grouped coop GEMM serves this bank — its
      *  format has a coop id kernel and the slab is bound. */
     public boolean coopIdReady() {
-        if (this.slabDev == null) { return false; }
+        if (this.slabDev == null || this.x8Bank()) { return false; }
         if (!QuantKernel.hasCoopIdKernel(this.packedTy)) { return false; }
         if (!QuantKernel.coopColsOk(this.packedTy, (int64) this.colsN)) { return false; }
         if (this.rowsN % 128 != 0) { return false; }
@@ -1100,7 +1158,7 @@ public final class ExpertBank {
      *  is the Mw8 shape alone (10.12.45.D), and answering true here used
      *  to send it to a launch that returned false. */
     public boolean idGemmReady() {
-        if (this.deqSlabDev != null) { return false; }
+        if (this.deqSlabDev != null || this.x8Bank()) { return false; }
         if (this.slabDev == null) { return false; }
         if (this.colsN % 256 != 0) { return false; }
         if (this.packedTy == 12) { return KernelCap.usable("q4kWmmaIdEpiKernel"); }
@@ -1112,6 +1170,7 @@ public final class ExpertBank {
      *  the k-quants read their slab, the symmetric formats their
      *  widened one (9.6) — unless the widen is off or was refused. */
     public boolean idReady() {
+        if (this.x8Bank()) { return false; }
         // 12 Q4_K, 14 Q6_K, 13 Q5_K (15.2.15.4): the k-quants with an id mat-vec.
         if (this.packedTy == 12 || this.packedTy == 14 || this.packedTy == 13) { return true; }
         if (ExpertBank.codebookId(this.packedTy)) { return true; }
@@ -1131,6 +1190,7 @@ public final class ExpertBank {
     /** With the slab bound: whether the id kernels' weight is ready —
      *  a k-quant slab as is, a symmetric one once widened. */
     public boolean idRowReady() {
+        if (this.x8Bank()) { return false; }
         if (this.packedTy == 12 || this.packedTy == 14 || this.packedTy == 13
                 || ExpertBank.codebookId(this.packedTy)) {
             return this.slabDev != null;
@@ -1188,11 +1248,17 @@ public final class ExpertBank {
             this.slotCharge #= heap int64[this.expertsN];
         }
         Linear sl = heap Linear(this.colsN, this.rowsN);
-        int64 sp = Linear.residentBytesOf(this.packedTy, this.stride,
-            this.blocksPerRow());
-        KernelBuffer<int8> sliceV #= this.slabDev.slice(
-            (uint64) ((int64) e * sp), (uint64) sp);
-        sl.bindExpertSlice(this.packedTy, this.stride, #sliceV);
+        if (this.x8Slab) {
+            KernelBuffer<int8> x8V #= this.slabDev.slice(
+                (uint64) ((int64) e * this.slabStride), (uint64) this.slabStride);
+            sl.bindExpertSliceX8(this.packedTy, this.stride, #x8V);
+        } else {
+            int64 sp = Linear.residentBytesOf(this.packedTy, this.stride,
+                this.blocksPerRow());
+            KernelBuffer<int8> sliceV #= this.slabDev.slice(
+                (uint64) ((int64) e * sp), (uint64) sp);
+            sl.bindExpertSlice(this.packedTy, this.stride, #sliceV);
+        }
         this.slotOwn.add(#sl);
         this.slots[e] #= sl;
         this.slotCharge[e] = sl.devWeightBytes();

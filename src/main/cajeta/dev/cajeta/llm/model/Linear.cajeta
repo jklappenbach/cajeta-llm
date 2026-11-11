@@ -915,6 +915,47 @@ public final class Linear extends InfModule {
         return this.cpuX8Here() && (this.packedTy == Quant.GG_Q4_K || this.packedTy == Quant.GG_Q6_K);
     }
 
+    /** Whether a cpu expert bank of format `ty` and width `inDim` takes the 8-row interleave: the formats with no
+     *  plain-layout cpu batch kernel (Q5_K, Q3_K, Q2_K, Q8_0, Q5_0), under the same switches as {@link #cpuX8Here}. */
+    static boolean x8ExpertFormat(int32 ty, int64 inDim) {
+        if (!(Linear.onCpu() && Linear.cpuX8Want && Linear.cpuInt8Want && Linear.packedActivations()
+                && Linear.q8Route())) {
+            return false;
+        }
+        if (ty == Quant.GG_Q8_0) {
+            return inDim % 32L == 0L && KernelCap.usable("q80Q8X8VecKernel") && KernelCap.usable("q80Q8X8RowsKernel");
+        }
+        if (ty == Quant.GG_Q5_0) {
+            return inDim % 32L == 0L && KernelCap.usable("q50Q8X8VecKernel") && KernelCap.usable("q50Q8X8RowsKernel");
+        }
+        if (inDim % 256L != 0L) { return false; }
+        if (ty == Quant.GG_Q5_K) { return KernelCap.usable("q5kQ8X8VecKernel") && KernelCap.usable("q5kQ8X8RowsKernel"); }
+        if (ty == Quant.GG_Q3_K) { return KernelCap.usable("q3kQ8X8VecKernel") && KernelCap.usable("q3kQ8X8RowsKernel"); }
+        if (ty == Quant.GG_Q2_K) { return KernelCap.usable("q2kQ8X8VecKernel") && KernelCap.usable("q2kQ8X8RowsKernel"); }
+        return false;
+    }
+
+    /** Bytes of one 8-row interleaved group of an `inDim`-wide weight of format `ty` (Q5_K, Q3_K, Q2_K, Q8_0, Q5_0). */
+    static int64 x8GroupBytes(int32 ty, int64 inDim) {
+        int64 bpr = (inDim + 255L) / 256L;
+        if (ty == Quant.GG_Q8_0) { return bpr * 2176L; }
+        if (ty == Quant.GG_Q5_0) { return bpr * 1408L; }
+        if (ty == Quant.GG_Q5_K) { return bpr * 1472L; }
+        if (ty == Quant.GG_Q3_K) { return bpr * 928L; }
+        return bpr * 704L;
+    }
+
+    /** Interleave `nr` (at most 8) file-layout rows from `src` into one group at `dst` (the formats of {@link #x8GroupBytes}). */
+    static void x8Interleave(int32 ty, int8[] src, int64 nr, int64 inDim, int8[] dst) {
+        int64 bpr = (inDim + 255L) / 256L;
+        if (ty == Quant.GG_Q8_0) { Quant.q80Interleave8Pad(src, 0L, nr, inDim / 32L, dst, 0L); }
+        else if (ty == Quant.GG_Q5_0) { Quant.q50Interleave8Pad(src, 0L, nr, inDim / 32L, dst, 0L); }
+        else if (ty == Quant.GG_Q5_K) { Quant.q5kInterleave8(src, 0L, nr, bpr, dst, 0L); }
+        else if (ty == Quant.GG_Q3_K) { Quant.q3kInterleave8(src, 0L, nr, bpr, dst, 0L); }
+        else { Quant.q2kInterleave8(src, 0L, nr, bpr, dst, 0L); }
+        return;
+    }
+
     /** Streams this weight into payloadDev as the interleave of {@link #cpuXWidth} rows; returns its bytes. */
     int64 uploadX8() {
         if (!this.widthPlastic()) { return this.uploadX8At(8); }
@@ -961,11 +1002,7 @@ public final class Linear extends InfModule {
                         + " - wanted " + n + ", got " + got);
                 }
             }
-            if (q80) { Quant.q80Interleave8Pad(src, 0L, nr, (int64) this.inDim / 32L, dst, 0L); }
-            else if (q50) { Quant.q50Interleave8Pad(src, 0L, nr, (int64) this.inDim / 32L, dst, 0L); }
-            else if (q5) { Quant.q5kInterleave8(src, 0L, nr, bpr, dst, 0L); }
-            else if (q3) { Quant.q3kInterleave8(src, 0L, nr, bpr, dst, 0L); }
-            else if (q2) { Quant.q2kInterleave8(src, 0L, nr, bpr, dst, 0L); }
+            if (q80 || q50 || q5 || q3 || q2) { Linear.x8Interleave(this.packedTy, src, nr, (int64) this.inDim, dst); }
             else if (q6 && L == 16) { Quant.q6kInterleave16(src, 0L, nr, bpr, dst, 0L); }
             else if (q6) { Quant.q6kInterleave8(src, 0L, nr, bpr, dst, 0L); }
             else if (L == 16) { Quant.q4kInterleave16(src, 0L, nr, bpr, dst, 0L); }
@@ -2306,6 +2343,20 @@ public final class Linear extends InfModule {
         this.winLen = len;
         this.slotMode = true;
         this.payloadDev #= #sliceV;
+        this.finishDeviceSetup();
+        return;
+    }
+
+    /** Bind an expert slot as a slice of its bank's 8-row interleaved cpu slab, so its decode and batch take the
+     *  X8 kernels. */
+    void bindExpertSliceX8(int32 ty, int64 len, #KernelBuffer<int8> sliceV) {
+        this.packedTy = ty;
+        this.winLen = len;
+        this.slotMode = true;
+        this.xRows = 8;
+        this.payloadDev #= #sliceV;
+        if (ty == Quant.GG_Q8_0 || ty == Quant.GG_Q5_0) { this.payloadHalf #= this.payloadDev.halfView(); }
+        this.x8Resident = true;
         this.finishDeviceSetup();
         return;
     }
