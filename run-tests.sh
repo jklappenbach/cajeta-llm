@@ -261,9 +261,12 @@ run_leg() {
 # cajeta's nvptx change of 2026-09-24 and no longer spill. The kernel package's
 # 256x128 bf16 and f16 tiles are hip's shape; on sm_89 they spill 8 bytes at
 # 128 registers since cajeta v0.53.3 fuses a * b + c (measured 2026-11-11).
+# The unrolled wide bf16 tile needs 256 VGPRs on gfx1151 and spills there; the
+# package's router takes it only where KernelFacts reports no spill (23.2.4).
 SPILL_TRACKED=(
     "dev.cajeta.ml.kernels.Gemm.gemm256Bf16|cajeta-ml-gpu 23.2.2"
     "dev.cajeta.ml.kernels.Gemm.gemm256<float16>|cajeta-ml-gpu 23.2.2"
+    "dev.cajeta.ml.kernels.Gemm.gemmWideUnrolled<bfloat16>|cajeta-ml-gpu 23.2.4"
 )
 spill_tracked_item() {
     local k="$1" e
