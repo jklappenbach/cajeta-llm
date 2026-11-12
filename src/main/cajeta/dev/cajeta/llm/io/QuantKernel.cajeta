@@ -38540,6 +38540,200 @@ public final class QuantKernel {
         return;
     }
 
+    /** The router's [experts x dim] row-major f32 weights in {@link #routerTopKCpuKernel}'s order: expert e's 2048 floats hold element 256w + 8l + j at (8l + j) * 8 + w, zero past dim. */
+    public static #float32[] routerCpuLayout(float32[] rw, int64 experts, int64 dim) {
+        float32[] t #= heap float32[experts * 2048L];
+        int64 e = 0;
+        while (e < experts) {
+            int64 i = 0;
+            while (i < dim) {
+                int64 wv = i / 256L;
+                int64 l = (i % 256L) / 8L;
+                int64 j = i % 8L;
+                t[e * 2048L + (l * 8L + j) * 8L + wv] = rw[e * dim + i];
+                i = i + 1L;
+            }
+            e = e + 1L;
+        }
+        return #t;
+    }
+
+    /** The scratch floats {@link #routerTopKCpuLaunchNoSync} needs for `experts`. */
+    public static int64 routerCpuScratch(int64 experts) {
+        return (experts + 7L) / 8L * 2048L;
+    }
+
+    /** Lane l's eight products summed in order, one lane of a wave for each of the eight waves. */
+    @Device
+    static Vector<float32,8> routerLaneCpu(KernelBuffer<float32> wt, int64 rb,
+            KernelBuffer<float32> vt, int64 vo, int64 l) {
+        int64 o = l * 64L;
+        Vector<float32,8> a = wt.vload<8>(rb + o) * vt.vload<8>(vo + o);
+        a = a + wt.vload<8>(rb + o + 8L) * vt.vload<8>(vo + o + 8L);
+        a = a + wt.vload<8>(rb + o + 16L) * vt.vload<8>(vo + o + 16L);
+        a = a + wt.vload<8>(rb + o + 24L) * vt.vload<8>(vo + o + 24L);
+        a = a + wt.vload<8>(rb + o + 32L) * vt.vload<8>(vo + o + 32L);
+        a = a + wt.vload<8>(rb + o + 40L) * vt.vload<8>(vo + o + 40L);
+        a = a + wt.vload<8>(rb + o + 48L) * vt.vload<8>(vo + o + 48L);
+        a = a + wt.vload<8>(rb + o + 56L) * vt.vload<8>(vo + o + 56L);
+        return a;
+    }
+
+    /** Lanes l .. l+3 as the wave butterfly's first two levels pair them. */
+    @Device
+    static Vector<float32,8> routerQuadCpu(KernelBuffer<float32> wt, int64 rb,
+            KernelBuffer<float32> vt, int64 vo, int64 l) {
+        Vector<float32,8> a = QuantKernel.routerLaneCpu(wt, rb, vt, vo, l)
+            + QuantKernel.routerLaneCpu(wt, rb, vt, vo, l + 1L);
+        Vector<float32,8> b = QuantKernel.routerLaneCpu(wt, rb, vt, vo, l + 2L)
+            + QuantKernel.routerLaneCpu(wt, rb, vt, vo, l + 3L);
+        return a + b;
+    }
+
+    /** {@link #rmsnormRouterTopKKernel}'s router and top-k on the cpu, bit for bit, over the normed row `xn`: a work item takes `per` experts, the last to finish selects. */
+    @Kernel(targets = {"cpu"})
+    public static void routerTopKCpuKernel(KernelBuffer<int32> sel,
+            KernelBuffer<float32> w, KernelBuffer<float32> logits,
+            KernelBuffer<float32> wt, KernelBuffer<float32> xn,
+            KernelBuffer<float32> scratch, KernelBuffer<int32> counter,
+            uint32 experts, uint32 dim, uint32 used, uint32 per, uint32 items,
+            uint32 normTopk, float32 wScale) {
+        uint32 g = KernelThread.globalIdX();
+        if (g >= items) { return; }
+        int64 vo = (int64) g * 2048L;
+        int64 blocks = (int64) (dim / 256);
+        int64 wv = 0;
+        while (wv < 8L) {
+            int64 i = 0;
+            while (i < 256L) {
+                float32 v = 0.0f;
+                if (wv < blocks) { v = xn[wv * 256L + i]; }
+                scratch[vo + i * 8L + wv] = v;
+                i = i + 1L;
+            }
+            wv = wv + 1L;
+        }
+        int64 e = (int64) g * (int64) per;
+        int64 eEnd = e + (int64) per;
+        if (eEnd > (int64) experts) { eEnd = (int64) experts; }
+        while (e < eEnd) {
+            int64 rb = e * 2048L;
+            Vector<float32,8> h0 = QuantKernel.routerQuadCpu(wt, rb, scratch, vo, 0L)
+                + QuantKernel.routerQuadCpu(wt, rb, scratch, vo, 4L);
+            Vector<float32,8> h1 = QuantKernel.routerQuadCpu(wt, rb, scratch, vo, 8L)
+                + QuantKernel.routerQuadCpu(wt, rb, scratch, vo, 12L);
+            Vector<float32,8> h2 = QuantKernel.routerQuadCpu(wt, rb, scratch, vo, 16L)
+                + QuantKernel.routerQuadCpu(wt, rb, scratch, vo, 20L);
+            Vector<float32,8> h3 = QuantKernel.routerQuadCpu(wt, rb, scratch, vo, 24L)
+                + QuantKernel.routerQuadCpu(wt, rb, scratch, vo, 28L);
+            Vector<float32,8> sw = (h0 + h1) + (h2 + h3);
+            float32 t = 0.0f + sw[0];
+            t = t + sw[1];
+            t = t + sw[2];
+            t = t + sw[3];
+            t = t + sw[4];
+            t = t + sw[5];
+            t = t + sw[6];
+            t = t + sw[7];
+            logits[e] = t;
+            e = e + 1L;
+        }
+        Barrier.deviceMemory(MemoryOrder.Release);
+        int32 old = counter.atomicAdd(0L, 1, MemoryOrder.AcqRel);
+        if ((uint32) old != items - 1) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        int64 en = (int64) experts;
+        float32 mx = 0.0f - 340282346638528859811704183484516925440.0f;
+        e = 0;
+        while (e < en) {
+            float32 lv = logits[e];
+            if (lv > mx) { mx = lv; }
+            e = e + 1L;
+        }
+        int64 lo = vo + 128L;
+        e = 0;
+        while (e < en) {
+            scratch[vo + e] = Math.exp(logits[e] - mx);
+            e = e + 1L;
+        }
+        int64 ln = 0;
+        while (ln < 32L) {
+            float32 p0 = 0.0f; float32 p1 = 0.0f; float32 p2 = 0.0f; float32 p3 = 0.0f;
+            if (ln < en) { p0 = scratch[vo + ln]; }
+            if (ln + 32L < en) { p1 = scratch[vo + ln + 32L]; }
+            if (ln + 64L < en) { p2 = scratch[vo + ln + 64L]; }
+            if (ln + 96L < en) { p3 = scratch[vo + ln + 96L]; }
+            scratch[lo + ln] = p0 + p1 + p2 + p3;
+            ln = ln + 1L;
+        }
+        int64 d = 1;
+        while (d < 32L) {
+            ln = 0;
+            while (ln < 32L) {
+                scratch[lo + ln] = scratch[lo + ln] + scratch[lo + ln + d];
+                ln = ln + 2L * d;
+            }
+            d = d * 2L;
+        }
+        float32 sum = scratch[lo];
+        float32 vLast = 340282346638528859811704183484516925440.0f;
+        int64 iLast = en;
+        int64 k = 0;
+        while (k < (int64) used) {
+            float32 bv = 0.0f - 1.0f;
+            int64 bi = en;
+            e = 0;
+            while (e < en) {
+                float32 p = scratch[vo + e];
+                boolean ok = p < vLast || (p == vLast && e > iLast);
+                if (ok && p > bv) { bv = p; bi = e; }
+                e = e + 1L;
+            }
+            sel[k] = (int32) bi;
+            w[k] = bv / sum;
+            vLast = bv;
+            iLast = bi;
+            k = k + 1L;
+        }
+        if (normTopk != 0) {
+            float32 ws = 0.0f;
+            k = 0;
+            while (k < (int64) used) { ws = ws + w[k]; k = k + 1L; }
+            if (ws < 0.00006103515625f) { ws = 0.00006103515625f; }
+            k = 0;
+            while (k < (int64) used) {
+                w[k] = w[k] / ws;
+                k = k + 1L;
+            }
+        }
+        if (wScale != 0.0f && wScale != 1.0f) {
+            k = 0;
+            while (k < (int64) used) {
+                w[k] = w[k] * wScale;
+                k = k + 1L;
+            }
+        }
+        counter[0L] = 0;
+    }
+
+    /** {@link #routerTopKCpuKernel} over `xn`; `wt` is {@link #routerCpuLayout}'s, `scratch` holds {@link #routerCpuScratch} floats. */
+    public static void routerTopKCpuLaunchNoSync(KernelBuffer<int32> sel,
+            KernelBuffer<float32> w, KernelBuffer<float32> logits,
+            KernelBuffer<float32> wt, KernelBuffer<float32> xn,
+            KernelBuffer<float32> scratch, KernelBuffer<int32> counter,
+            int64 experts, int64 dim, int64 used, boolean normTopk,
+            float32 wScale) {
+        KernelStream s = QuantKernel.stream();
+        uint32 nt = 0;
+        if (normTopk) { nt = 1; }
+        int64 per = 8L;
+        uint32 items = (uint32) ((experts + per - 1L) / per);
+        routerTopKCpuKernel.launch(s, grid: [items], block: [1])
+            (sel, w, logits, wt, xn, scratch, counter, (uint32) experts,
+             (uint32) dim, (uint32) used, (uint32) per, items, nt, wScale);
+        return;
+    }
+
     public static void routerTopKWaveLaunchNoSync(KernelBuffer<int32> sel,
             KernelBuffer<float32> w, KernelBuffer<float32> logits,
             KernelBuffer<float32> wRouter, KernelBuffer<float32> x,

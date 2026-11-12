@@ -667,6 +667,145 @@ public class MoeIdKernelTest {
         ValueCheck.credit(vc);
     }
 
+    /** 15.2.20.3.16.11: the cpu norm + pack and router + top-k are the fused kernel bit for bit (normed row, pack, logits, sel, w) on four shapes, toy-moe's among them. */
+    @Test
+    public void cpuRouterTopKMatchesTheFusedKernel() {
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("routerTopKCpuKernel")) {
+            DeviceSkip.noKernel("routerTopKCpuKernel", be);
+            return;
+        }
+        if (!KernelCap.usable("rmsnormRouterTopKKernel")) {
+            DeviceSkip.noKernel("rmsnormRouterTopKKernel", be);
+            return;
+        }
+        MoeIdKernelTest.cpuRouterCase(128, 2048, 8, true, 0.0f, 0);
+        MoeIdKernelTest.cpuRouterCase(60, 2048, 4, false, 0.0f, 0);
+        MoeIdKernelTest.cpuRouterCase(4, 512, 2, false, 0.0f, 0);
+        MoeIdKernelTest.cpuRouterCase(37, 1280, 6, true, 2.5f, 1);
+    }
+
+    static void cpuRouterCase(int32 E, int32 H, int32 K, boolean normTopk,
+            float32 wScale, int32 form) {
+        float32[] wr = heap float32[E * H];
+        float32[] xh = heap float32[H];
+        float32[] nwh = heap float32[H];
+        int32 i = 0;
+        while (i < H) {
+            xh[i] = (float32) ((i * 13 % 29) - 14) / 9.0f + 0.21f;
+            nwh[i] = 0.9f + (float32) (i % 7) * 0.03f;
+            i = i + 1;
+        }
+        int32 tieA = 1;
+        int32 tieB = E - 1;
+        int32 e = 0;
+        while (e < E) {
+            float32 sc = 0.003f * (float32) ((e * 5) % E) - 0.05f;
+            int32 en = e;
+            if (e == tieA || e == tieB) { sc = 0.6f; en = tieA; }
+            i = 0;
+            while (i < H) {
+                float32 nz = (float32) (((en * 31 + i * 7) % 11) - 5) * 0.0003f;
+                wr[e * H + i] = xh[i] * nwh[i] * sc * 0.02f + nz;
+                i = i + 1;
+            }
+            e = e + 1;
+        }
+        float32[] wtH #= QuantKernel.routerCpuLayout(wr, (int64) E, (int64) H);
+        KernelBuffer<float32> wDev #= heap KernelBuffer<float32>((uint64) (E * H));
+        KernelBuffer<float32> wtDev #= heap KernelBuffer<float32>((uint64) (E * 2048));
+        KernelBuffer<float32> hs #= heap KernelBuffer<float32>((uint64) H);
+        KernelBuffer<float32> nw #= heap KernelBuffer<float32>((uint64) H);
+        wDev.upload(wr, (int64) (E * H));
+        wtDev.upload(wtH, (int64) (E * 2048));
+        hs.upload(xh, (int64) H);
+        nw.upload(nwh, (int64) H);
+        int64 pb = (int64) (H / 256) * 320L;
+        int64 scn = QuantKernel.routerCpuScratch((int64) E);
+        KernelBuffer<float32> out1 #= heap KernelBuffer<float32>((uint64) H);
+        KernelBuffer<float32> out2 #= heap KernelBuffer<float32>((uint64) H);
+        KernelBuffer<int8> p1 #= heap KernelBuffer<int8>((uint64) pb);
+        KernelBuffer<int8> p2 #= heap KernelBuffer<int8>((uint64) pb);
+        KernelBuffer<float32> lg1 #= heap KernelBuffer<float32>((uint64) E);
+        KernelBuffer<float32> lg2 #= heap KernelBuffer<float32>((uint64) E);
+        KernelBuffer<int32> s1 #= heap KernelBuffer<int32>((uint64) K);
+        KernelBuffer<int32> s2 #= heap KernelBuffer<int32>((uint64) K);
+        KernelBuffer<float32> w1 #= heap KernelBuffer<float32>((uint64) K);
+        KernelBuffer<float32> w2 #= heap KernelBuffer<float32>((uint64) K);
+        KernelBuffer<float32> scr #= heap KernelBuffer<float32>((uint64) scn);
+        KernelBuffer<int32> counter #= heap KernelBuffer<int32>((uint64) 4);
+        int32[] z = heap int32[4];
+        counter.upload(z, 4L);
+        KernelStream s = QuantKernel.stream();
+        QuantKernel.rmsnormRouterTopKLaunchNoSync(out1, p1, hs, nw, (int64) H,
+            0.000001f, form, s1, w1, lg1, wDev, counter, (int64) E, (int64) K,
+            normTopk, wScale);
+        s.sync();
+        int64[] vc #= ValueCheck.mark();
+        Assert.isTrue(Prim.rmsnormPackDevice(out2, p2, hs, nw, (int64) H,
+            0.000001f, form));
+        QuantKernel.routerTopKCpuLaunchNoSync(s2, w2, lg2, wtDev, out2, scr,
+            counter, (int64) E, (int64) H, (int64) K, normTopk, wScale);
+        s.sync();
+        String tag #= "e" + E + "h" + H + ": ";
+        float32[] o1 = heap float32[H];
+        float32[] o2 = heap float32[H];
+        out1.download(o1, (int64) H);
+        out2.download(o2, (int64) H);
+        i = 0;
+        while (i < H) {
+            if (o1[i] != o2[i]) {
+                Assert.fail(tag + "normed " + i + ": fused " + o1[i] + " vs cpu " + o2[i]);
+            }
+            i = i + 1;
+        }
+        int8[] b1 = heap int8[pb];
+        int8[] b2 = heap int8[pb];
+        p1.download(b1, pb);
+        p2.download(b2, pb);
+        int64 j = 0;
+        while (j < pb) {
+            if (j % 320L < 292L && b1[j] != b2[j]) {
+                Assert.fail(tag + "packed byte " + j + ": fused " + (int32) b1[j]
+                    + " vs cpu " + (int32) b2[j]);
+            }
+            j = j + 1L;
+        }
+        float32[] a = heap float32[E];
+        float32[] b = heap float32[E];
+        lg1.download(a, (int64) E);
+        lg2.download(b, (int64) E);
+        i = 0;
+        while (i < E) {
+            if (a[i] != b[i]) {
+                Assert.fail(tag + "logit " + i + ": fused " + a[i] + " vs cpu " + b[i]);
+            }
+            i = i + 1;
+        }
+        int32[] sa = heap int32[K];
+        int32[] sb = heap int32[K];
+        float32[] wa = heap float32[K];
+        float32[] wb = heap float32[K];
+        s1.download(sa, (int64) K);
+        s2.download(sb, (int64) K);
+        w1.download(wa, (int64) K);
+        w2.download(wb, (int64) K);
+        int32 k = 0;
+        while (k < K) {
+            if (sa[k] != sb[k] || wa[k] != wb[k]) {
+                Assert.fail(tag + "pick " + k + ": fused " + sa[k] + "/" + wa[k]
+                    + " vs cpu " + sb[k] + "/" + wb[k]);
+            }
+            k = k + 1;
+        }
+        Assert.equals((int64) tieA, (int64) sb[0]);
+        Assert.equals((int64) tieB, (int64) sb[1]);
+        int32[] cnt = heap int32[4];
+        counter.download(cnt, 4L);
+        Assert.equals(0L, (int64) cnt[0]);
+        ValueCheck.credit(vc);
+    }
+
     /** 51.1.1 — down + combine in one launch vs down-id then
      *  combineAdd: hs identical to a relative 1e-5 (the weight rides
      *  each partial, so the association differs), on the toy's Q4_K

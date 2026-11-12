@@ -57,6 +57,8 @@ public final class MoeFfn extends InfModule {
     KernelBuffer<int32> shPackCounters; // the shared expert's, [sharedW/256]
     KernelBuffer<float32> routerWDev;  // router weight, f32 [in x E]
     boolean routerWUp;
+    KernelBuffer<float32> routerWTDev;   // QuantKernel.routerCpuLayout's order
+    KernelBuffer<float32> routerScrDev;
     KernelBuffer<float32> lgBatchDev;  // unit 41: [rows x E] logits
     float32[] lgBatchH;                // host twin for the select
     KernelBuffer<float32> xRowsDev;    // unit 41: [rows x H] upload
@@ -116,6 +118,8 @@ public final class MoeFfn extends InfModule {
     static boolean fusedRouterOn = true;   // unit 50 A/B arm
     static boolean fusedDownOn = true;     // unit 51 A/B arm
     static boolean fusedNormRouterOn = true;   // unit 59 A/B arm
+    static boolean cpuRouterOn = true;         // 15.2.20.3.16.11 A/B arm
+    static int64 cpuRoutes;
     static boolean routerWaveOn = true;        // workgroup-reduce 7.1.2 arm
     static boolean sharedBatchOn = true;       // unit 9 A/B arm
     static boolean sharedRowOn = true;         // unit 9.6 A/B arm
@@ -299,6 +303,10 @@ public final class MoeFfn extends InfModule {
     public static void setFusedDown(boolean on) { MoeFfn.fusedDownOn = on; }
     public static void setFusedRouter(boolean on) { MoeFfn.fusedRouterOn = on; }
     public static void setFusedNormRouter(boolean on) { MoeFfn.fusedNormRouterOn = on; }
+    /** False sends the cpu backend's decode norm and route to the fused kernel instead of the cpu norm-pack and routerTopKCpuKernel. */
+    public static void setCpuRouter(boolean on) { MoeFfn.cpuRouterOn = on; }
+    /** Decode rows the cpu router has selected for, process-wide. */
+    public static int64 cpuRouterRoutes() { return MoeFfn.cpuRoutes; }
     /** False sends the fused router to its LDS form, `routerTopKKernel`, where the wave form would serve. */
     public static void setRouterWave(boolean on) { MoeFfn.routerWaveOn = on; }
     public static int64 batchZeroSyncRoutes() { return MoeFfn.fbZeroSyncRoutes; }
@@ -1292,6 +1300,19 @@ public final class MoeFfn extends InfModule {
         return;
     }
 
+    void ensureRouterCpu() {
+        if (this.routerWTDev != null) { return; }
+        int64 hid = (int64) this.hidden;
+        int64 en = (int64) this.expertsN;
+        float32[] rw #= heap float32[hid * en];
+        this.routerWDev.download(rw, hid * en);
+        float32[] rt #= QuantKernel.routerCpuLayout(rw, en, hid);
+        this.routerWTDev #= heap KernelBuffer<float32>((uint64) (en * 2048L));
+        this.routerWTDev.upload(rt, en * 2048L);
+        this.routerScrDev #= heap KernelBuffer<float32>((uint64) QuantKernel.routerCpuScratch(en));
+        return;
+    }
+
     void ensureZeroSyncBufs() {
         if (this.logitsDev != null) { return; }
         int64 e = (int64) this.expertsN;
@@ -1626,10 +1647,20 @@ public final class MoeFfn extends InfModule {
         this.ensureZeroSyncBufs();
         this.ensureRouterDev();
         this.ensureRtCounter();
-        QuantKernel.rmsnormRouterTopKLaunchNoSync(xn, this.xpXnDev, hs, nw,
-            hid, eps, form, this.selDev, this.wSelDev, this.logitsDev,
-            this.routerWDev, this.rtCounter, (int64) this.expertsN,
-            (int64) this.usedN, this.normTopk, this.wScale);
+        if (MoeFfn.cpuRouterOn && Linear.onCpu() && KernelCap.usable("routerTopKCpuKernel")
+                && Prim.rmsnormPackDevice(xn, this.xpXnDev, hs, nw, hid, eps, form)) {
+            this.ensureRouterCpu();
+            QuantKernel.routerTopKCpuLaunchNoSync(this.selDev, this.wSelDev,
+                this.logitsDev, this.routerWTDev, xn, this.routerScrDev,
+                this.rtCounter, (int64) this.expertsN, hid, (int64) this.usedN,
+                this.normTopk, this.wScale);
+            MoeFfn.cpuRoutes = MoeFfn.cpuRoutes + 1L;
+        } else {
+            QuantKernel.rmsnormRouterTopKLaunchNoSync(xn, this.xpXnDev, hs, nw,
+                hid, eps, form, this.selDev, this.wSelDev, this.logitsDev,
+                this.routerWDev, this.rtCounter, (int64) this.expertsN,
+                (int64) this.usedN, this.normTopk, this.wScale);
+        }
         this.pinRoutesDev();
         this.tapRouterDev();
         this.noteRoutesDev(this.selDev, 1L);
