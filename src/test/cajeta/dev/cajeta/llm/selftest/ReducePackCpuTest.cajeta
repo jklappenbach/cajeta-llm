@@ -1,5 +1,6 @@
 package dev.cajeta.llm.selftest;
 
+import cajeta.lang.Math;
 import cajeta.lang.String;
 import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
@@ -8,6 +9,8 @@ import dev.cajeta.unit.Test;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.model.AttnKernel;
 import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.ml.kernels.testing.ValueCheck;
 
 /**
  * cajeta-llm 15.2.14.6.2: the decode's split reduce + q8 pack on the cpu backend takes a work item a pack block;
@@ -117,5 +120,77 @@ public class ReducePackCpuTest {
             i = i + 1;
         }
         ReducePackCpuTest.same(h, nH, 1);
+    }
+
+    /** cajeta-llm 15.2.20.3.16.15.2: the decode attend with the reduce + pack in its tail writes the attend then the
+     *  reduce-pack launch's bytes into the staged activation, GQA-4 and GQA-8, twice so the counters re-arm. */
+    @Test
+    public void theFusedDecodePackIsTheAttendThenTheReducePack() {
+        if (!ReducePackCpuTest.cpuHere()) { return; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable("attnDecodePackCpuGqaKernel")) { DeviceSkip.noKernel("attnDecodePackCpuGqaKernel", be); return; }
+        int64[] vc #= ValueCheck.mark();
+        ReducePackCpuTest.fusedCase(32, 8, 7);
+        ReducePackCpuTest.fusedCase(32, 8, 513);
+        ReducePackCpuTest.fusedCase(32, 4, 300);
+        ReducePackCpuTest.fusedCase(64, 8, 2000);
+        ValueCheck.credit(vc);
+    }
+
+    static void fusedCase(int32 nH, int32 nKv, int32 count) {
+        int32 hd = 128;
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) (nH * hd);
+        int64 kn = (int64) count * kvDim;
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        float32[] qh #= heap float32[qn];
+        float32[] kh #= heap float32[kn];
+        float32[] vh #= heap float32[kn];
+        int64 i = 0;
+        while (i < qn) { qh[i] = (float32) (((i * 29L + 7L) % 53L) - 26L) / 13.0f; i = i + 1L; }
+        i = 0;
+        while (i < kn) {
+            kh[i] = (float32) (((i * 31L + 3L) % 61L) - 30L) / 17.0f;
+            vh[i] = (float32) (((i * 23L + 5L) % 47L) - 23L) / 11.0f;
+            i = i + 1L;
+        }
+        KernelBuffer<float32> qb #= heap KernelBuffer<float32>((uint64) qn);
+        qb.upload(qh);
+        float16[] kf #= AttnKernel.halfOf(kh, kn);
+        float16[] vf #= AttnKernel.halfOf(vh, kn);
+        KernelBuffer<float16> kb #= heap KernelBuffer<float16>((uint64) kn);
+        KernelBuffer<float16> vb #= heap KernelBuffer<float16>((uint64) kn);
+        kb.upload(kf);
+        vb.upload(vf);
+        int64 pb = (int64) (nH / 2) * 320L;
+        AttnKernel.setCpuDecodePack(false);
+        Assert.isTrue(AttnKernel.attendDecodePartialsLaunchNoSync(qb, kb, vb, nH, nKv, hd, count, 0, scale));
+        KernelBuffer<int8> rb #= heap KernelBuffer<int8>((uint64) pb);
+        AttnKernel.reducePackLaunchNoSync(rb, nH);
+        QuantKernel.stream().sync();
+        AttnKernel.setCpuDecodePack(true);
+        int8[] want #= heap int8[pb];
+        rb.download(want, pb);
+        int32 pass = 0;
+        while (pass < 2) {
+            KernelBuffer<int8> st = Linear.stagedPacked(qn);
+            int8[] z #= heap int8[pb];
+            st.upload(z, pb);
+            AttnKernel.armDecodePack();
+            Assert.isTrue(AttnKernel.attendDecodePartialsLaunchNoSync(qb, kb, vb, nH, nKv, hd, count, 0, scale));
+            AttnKernel.reducePackLaunchNoSync(st, nH);
+            QuantKernel.stream().sync();
+            int8[] got #= heap int8[pb];
+            st.download(got, pb);
+            i = 0;
+            while (i < pb) {
+                if (i % 320L < 292L && got[i] != want[i]) {
+                    Assert.fail("nH " + nH + " nKv " + nKv + " count " + count + " pass " + pass + ": packed byte " + i
+                        + " is " + (int32) got[i] + ", the two launches' " + (int32) want[i]);
+                }
+                i = i + 1L;
+            }
+            pass = pass + 1;
+        }
     }
 }

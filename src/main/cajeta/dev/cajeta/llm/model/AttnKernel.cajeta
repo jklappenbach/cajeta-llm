@@ -3402,6 +3402,47 @@ public final class AttnKernel {
 
     static int64 cpuDecodeCalls = 0L;
 
+    /** {@link #attnDecodeCpuGqaKernel} with {@link #attnReducePackQ8CpuKernel} in its tail: the last split of a kv head
+     *  to finish reduces and packs that head's blocks into `packed`, the same bytes as the two launches. */
+    @Kernel(targets = {"cpu"})
+    @Occupancy(maxThreads = 256)
+    public static void attnDecodePackCpuGqaKernel(KernelBuffer<float32> part,
+            KernelBuffer<float32> q, KernelBuffer<float16> kPool,
+            KernelBuffer<float16> vPool, KernelBuffer<int8> packed, KernelBuffer<int32> counters, uint32 nKv,
+            uint32 group, uint32 count, uint32 from, uint32 splits, float32 scale) {
+        uint32 gi = KernelThread.globalIdX();
+        if (gi < nKv * splits) {
+            uint32 kvh = gi / splits;
+            uint32 sp = gi % splits;
+            uint32 chunk = (count + splits - 1) / splits;
+            uint32 t0 = sp * chunk;
+            uint32 t1 = t0 + chunk;
+            if (t1 > count) { t1 = count; }
+            if (t0 > count) { t0 = count; }
+            int64 kvDim = (int64) (nKv * 128);
+            int64 kOff0 = (int64) from * kvDim + (int64) (kvh * 128);
+            uint32 h = 0;
+            while (h < group) {
+                uint32 hh = kvh * group + h;
+                AttnKernel.cpuDecodeHead(part, q, kPool, vPool, (int64) (hh * 128), kOff0, kvDim, (int64) t0,
+                    (int64) t1, (int64) ((hh * splits + sp) * 130), scale);
+                h = h + 1;
+            }
+            Barrier.deviceMemory(MemoryOrder.Release);
+            int32 old = counters.atomicAdd((int64) kvh, 1, MemoryOrder.AcqRel);
+            if ((uint32) old == splits - 1) {
+                Barrier.deviceMemory(MemoryOrder.Acquire);
+                counters[(int64) kvh] = 0;
+                uint32 b = kvh * group / 2;
+                uint32 bEnd = b + group / 2;
+                while (b < bEnd) {
+                    AttnKernel.reducePackBlockCpu(packed, part, b, nKv * group, splits);
+                    b = b + 1;
+                }
+            }
+        }
+    }
+
     /** Launches of the cpu decode attends ({@link #attnDecodeCpuGqaKernel} and its batch form) so far. */
     public static int64 cpuDecodeCallCount() { return AttnKernel.cpuDecodeCalls; }
 
@@ -4007,6 +4048,9 @@ public final class AttnKernel {
             KernelBuffer<float32> q, KernelBuffer<float16> kPool,
             KernelBuffer<float16> vPool, int32 nH, int32 nKv, int32 hd,
             int32 count, int32 from, float32 scale) {
+        boolean armed = AttnKernel.fdPackArmed;
+        AttnKernel.fdPackArmed = false;
+        AttnKernel.fdPacked = false;
         if (AttnKernel.flashDecOn && AttnKernel.reducePackOn && hd == 128
                 && nH == nKv && nH % 2 == 0 && !AttnKernel.cpuDecodeServes(nH, nKv)) {
             AttnKernel.flashDecodeGqa1LaunchNoSync(q, kPool, vPool, nH,
@@ -4026,11 +4070,39 @@ public final class AttnKernel {
             AttnKernel.fdPart #= heap KernelBuffer<float32>((uint64) need);
             AttnKernel.fdPartCap = need;
         }
-        AttnKernel.decodeGqaLaunchNoSync(s, AttnKernel.fdPart, q, kPool, vPool, nH, nKv, count, from, splits, scale);
+        if (armed && AttnKernel.cpuDecodePackOn && (nH / nKv) % 2 == 0 && AttnKernel.cpuDecodeServes(nH, nKv)
+                && AttnKernel.cpuReducePackHere() && KernelCap.usable("attnDecodePackCpuGqaKernel")) {
+            if (AttnKernel.fdCounters == null || AttnKernel.fdCountersN < (int64) nKv) {
+                AttnKernel.fdCounters #= heap KernelBuffer<int32>((uint64) nKv);
+                int32[] z = heap int32[nKv];
+                AttnKernel.fdCounters.upload(z, (int64) nKv);
+                AttnKernel.fdCountersN = (int64) nKv;
+            }
+            AttnKernel.cpuDecodeCalls = AttnKernel.cpuDecodeCalls + 1L;
+            attnDecodePackCpuGqaKernel.launch(s, grid: [(uint32) (nKv * splits)], block: [1])
+                (AttnKernel.fdPart, q, kPool, vPool, Linear.stagedPacked((int64) (nH * hd)), AttnKernel.fdCounters,
+                 (uint32) nKv, (uint32) (nH / nKv), (uint32) count, (uint32) from, (uint32) splits, scale);
+            AttnKernel.fdPacked = true;
+        } else {
+            AttnKernel.decodeGqaLaunchNoSync(s, AttnKernel.fdPart, q, kPool, vPool, nH, nKv, count, from, splits, scale);
+        }
         AttnKernel.fdSplitsLast = splits;
         AttnKernel.fdCallCount = AttnKernel.fdCallCount + 1L;
         return true;
     }
+
+    static boolean fdPacked;
+    static boolean fdPackArmed;
+
+    /** Let the next decode partials launch also reduce and pack into the staged activation (Linear.stagedPacked),
+     *  for a caller that stages it next with {@link Linear#stageDeviceActivationFromAttnPartials}. */
+    public static void armDecodePack() { AttnKernel.fdPackArmed = true; }
+    static KernelBuffer<int32> fdCounters;
+    static int64 fdCountersN;
+    static boolean cpuDecodePackOn = true;
+
+    /** False keeps the cpu decode's reduce + pack a launch of its own (the A/B arm). */
+    public static void setCpuDecodePack(boolean on) { AttnKernel.cpuDecodePackOn = on; }
 
     /**
      * Unit 50: the split reduce AND the Q8_K pack of the attention
@@ -4148,6 +4220,13 @@ public final class AttnKernel {
     public static void attnReducePackQ8CpuKernel(KernelBuffer<int8> packed,
             KernelBuffer<float32> part, uint32 nH, uint32 splits) {
         uint32 blk = KernelThread.globalIdX();
+        AttnKernel.reducePackBlockCpu(packed, part, blk, nH, splits);
+    }
+
+    /** Pack block `blk` (heads 2blk and 2blk+1) of {@link #attnReducePackQ8CpuKernel}: the splits reduced and packed. */
+    @Device
+    static void reducePackBlockCpu(KernelBuffer<int8> packed, KernelBuffer<float32> part, uint32 blk, uint32 nH,
+            uint32 splits) {
         if (blk * 2 < nH) {
             Vector<float32,16> zf = heap Vector<float32,16>(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
             Vector<float32,16> x0 = zf;
@@ -5582,6 +5661,10 @@ public final class AttnKernel {
 
     public static void reducePackLaunchNoSync(KernelBuffer<int8> packed,
             int32 nH) {
+        if (AttnKernel.fdPacked) {
+            AttnKernel.fdPacked = false;
+            return;
+        }
         AttnKernel.reducePackFromLaunchNoSync(packed, AttnKernel.fdPart, nH,
             AttnKernel.fdSplitsLast);
         return;
