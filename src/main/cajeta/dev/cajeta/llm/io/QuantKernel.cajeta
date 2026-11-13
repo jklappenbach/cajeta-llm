@@ -583,6 +583,28 @@ public final class QuantKernel {
     /** Workgroup size for the scalar per-row family. */
     public static uint32 scalarBlock() { return (uint32) QuantKernel.rowsPerBlock(); }
 
+    static boolean cpuEvenOn = true;
+
+    public static void setCpuEvenBlock(boolean on) { QuantKernel.cpuEvenOn = on; }
+
+    /** The cpu block size for `items` work items: at most {@link #scalarBlock}, chosen so the last round of blocks
+     *  over the workers is as full as it can be. */
+    public static uint32 cpuEvenBlock(uint32 items) {
+        uint32 blk = QuantKernel.scalarBlock();
+        int64 w = (int64) Device.multiprocessorCount();
+        if (!QuantKernel.cpuEvenOn || w < 2L || items == 0) { return blk; }
+        uint32 best = blk;
+        int64 bestCost = -1L;
+        uint32 b = blk;
+        while (b >= 1 && b * 2 > blk) {
+            int64 nb = ((int64) items + (int64) b - 1L) / (int64) b;
+            int64 cost = (nb + w - 1L) / w * (int64) b;
+            if (bestCost < 0L || cost < bestCost) { bestCost = cost; best = b; }
+            b = b - 1;
+        }
+        return best;
+    }
+
     /** How many times a launcher derived its grid through
      *  {@link #scalarGrid}: the counter ScalarGeometryTest reads to prove a
      *  launcher took the derived geometry rather than a literal. */
@@ -18087,7 +18109,7 @@ public final class QuantKernel {
         uint32 gB = (uint32) ((rowsB + 7L) / 8L);
         uint32 gC = wC == null ? 0 : (uint32) ((rowsC + 7L) / 8L);
         uint32 n = gA + gB + gC;
-        uint32 blk = QuantKernel.scalarBlock();
+        uint32 blk = QuantKernel.cpuEvenBlock(n);
         KernelStream s = QuantKernel.stream();
         q80Q8X8Vec3Kernel.launch(s, grid: [(n + blk - 1) / blk], block: [blk])
             (yA, yB, wC == null ? yB : yC, wA, wB, wC == null ? wB : wC, hA, hB, wC == null ? hB : hC, xp, (uint32) rowsA, (uint32) rowsB,
@@ -18118,10 +18140,192 @@ public final class QuantKernel {
         QuantKernel.cpuInt8N = QuantKernel.cpuInt8N + 1L;
         uint32 groups = (uint32) ((rows + 7L) / 8L);
         uint32 n = groups * (uint32) used;
-        uint32 blk = QuantKernel.scalarBlock();
+        uint32 blk = QuantKernel.cpuEvenBlock(n);
         KernelStream s = QuantKernel.stream();
         q80Q8X8IdVecKernel.launch(s, grid: [(n + blk - 1) / blk], block: [blk])
             (y, w, wh, xp, sel, (uint32) rows, groups, (uint32) used, (cols + 255L) / 256L, expertStride, xpStride, yStride);
+        return;
+    }
+
+    /** One 8-row group of interleave format `fmt` (0 Q8_0, 1 Q5_0, 2 Q4_K, 3 Q5_K) into `y[yBase..)`. */
+    @Device
+    static void x8GroupOf(uint32 fmt, KernelBuffer<float32> y, KernelBuffer<int8> w, KernelBuffer<float16> wh,
+            KernelBuffer<int8> xp, uint32 rows, uint32 gr, int64 blocksPerRow, int64 wBase, int64 xBase, int64 yBase) {
+        if (fmt == 0) {
+            QuantKernel.q80X8VecGroup(y, w, wh, xp, rows, gr, blocksPerRow, 0, wBase, xBase, yBase);
+        } else if (fmt == 1) {
+            QuantKernel.q50X8VecGroup(y, w, wh, xp, rows, gr, blocksPerRow, 0, wBase, xBase, yBase);
+        } else if (fmt == 2) {
+            QuantKernel.q4kX8VecGroup(y, w, xp, rows, gr, blocksPerRow, 0, wBase, xBase, yBase);
+        } else {
+            QuantKernel.q5kX8VecGroup(y, w, xp, rows, gr, blocksPerRow, 0, wBase, xBase, yBase);
+        }
+    }
+
+    /** The q8_K pack of `n` (at most 256) elements of `x[xb..)` into the 320-byte block at `pk[ob..)`, zero past `n`:
+     *  q8kPackKernel's bytes. */
+    @Device
+    static void q8kPackBlockSerial(KernelBuffer<int8> pk, int64 ob, KernelBuffer<float32> x, int64 xb, int64 n) {
+        float32 amax = 0.0f;
+        int64 i = 0;
+        while (i < n) {
+            float32 av = x[xb + i];
+            if (av < 0.0f) { av = 0.0f - av; }
+            if (av > amax) { amax = av; }
+            i = i + 1L;
+        }
+        float32 inv = 0.0f;
+        if (amax > 0.0f) { inv = 127.0f / amax; }
+        int64 j = 0;
+        while (j < 8L) {
+            int32 sm = 0;
+            int64 t = 0;
+            while (t < 32L) {
+                int64 e = j * 32L + t;
+                float32 fv = 0.0f;
+                if (e < n) { fv = x[xb + e] * inv; }
+                int32 qi = (int32) Math.round(fv);
+                pk[ob + e] = (int8) qi;
+                sm = sm + qi;
+                t = t + 1L;
+            }
+            int32 b0 = sm & 255;
+            int32 b1 = (sm >> 8) & 255;
+            int32 b2 = (sm >> 16) & 255;
+            int32 b3 = (sm >> 24) & 255;
+            if (b0 > 127) { b0 = b0 - 256; }
+            if (b1 > 127) { b1 = b1 - 256; }
+            if (b2 > 127) { b2 = b2 - 256; }
+            if (b3 > 127) { b3 = b3 - 256; }
+            int64 so = ob + 256L + j * 4L;
+            pk[so] = (int8) b0;
+            pk[so + 1L] = (int8) b1;
+            pk[so + 2L] = (int8) b2;
+            pk[so + 3L] = (int8) b3;
+            j = j + 1L;
+        }
+        int32 db = Cajeta.f32ToBits(amax / 127.0f);
+        int32 e1 = db & 255;
+        int32 e2 = (db >> 8) & 255;
+        int32 e3 = (db >> 16) & 255;
+        int32 e4 = (db >> 24) & 255;
+        if (e1 > 127) { e1 = e1 - 256; }
+        if (e2 > 127) { e2 = e2 - 256; }
+        if (e3 > 127) { e3 = e3 - 256; }
+        if (e4 > 127) { e4 = e4 - 256; }
+        pk[ob + 288L] = (int8) e1;
+        pk[ob + 289L] = (int8) e2;
+        pk[ob + 290L] = (int8) e3;
+        pk[ob + 291L] = (int8) e4;
+    }
+
+    /** Gate and up of each selected expert of two interleaved banks, the GLU in place into `gy`, and the q8_K pack of
+     *  each expert's GLU row into `pk` (`nbRow` blocks a row) by the last group to finish a 256-row block. Item `gi` is
+     *  selection `gi / groups`'s group `gi % groups`; `counters` is one zeroed word a block. */
+    @Kernel(targets = {"cpu"})
+    @Occupancy(maxThreads = 256)
+    public static void x8IdGateUpGluCpuKernel(KernelBuffer<float32> gy, KernelBuffer<float32> uy,
+            KernelBuffer<int8> wG, KernelBuffer<float16> hG, KernelBuffer<int8> wU, KernelBuffer<float16> hU,
+            KernelBuffer<int8> xp, KernelBuffer<int32> sel, KernelBuffer<int8> pk, KernelBuffer<int32> counters,
+            uint32 fmt, uint32 rows, uint32 groups, uint32 used, int64 blocksPerRow, int64 expertStride,
+            uint32 nbRow, int32 act) {
+        uint32 gi = KernelThread.globalIdX();
+        uint32 k = gi / groups;
+        if (k >= used) { return; }
+        uint32 gr = gi % groups;
+        int64 e = (int64) sel[(int64) k];
+        int64 yb = (int64) k * (int64) rows;
+        QuantKernel.x8GroupOf(fmt, gy, wG, hG, xp, rows, gr, blocksPerRow, e * expertStride, 0L, yb);
+        QuantKernel.x8GroupOf(fmt, uy, wU, hU, xp, rows, gr, blocksPerRow, e * expertStride, 0L, yb);
+        uint32 r0 = gr * 8;
+        uint32 r = r0;
+        while (r < r0 + 8 && r < rows) {
+            float32 x = gy[yb + (int64) r];
+            float32 a = 0.0f;
+            if (act == 1) {
+                float32 t = 0.7978845608f * (x + 0.044715f * x * x * x);
+                float32 th = 1.0f - 2.0f / (Math.exp(2.0f * t) + 1.0f);
+                a = 0.5f * x * (1.0f + th);
+            } else {
+                a = x / (1.0f + Math.exp(0.0f - x));
+            }
+            gy[yb + (int64) r] = a * uy[yb + (int64) r];
+            r = r + 1;
+        }
+        uint32 pblk = r0 / 256;
+        uint32 pstart = pblk * 256;
+        uint32 pcount = rows - pstart;
+        if (pcount > 256) { pcount = 256; }
+        int64 pci = (int64) k * (int64) nbRow + (int64) pblk;
+        Barrier.deviceMemory(MemoryOrder.Release);
+        int32 old = counters.atomicAdd(pci, 1, MemoryOrder.AcqRel);
+        if ((uint32) old != (pcount + 7) / 8 - 1) { return; }
+        Barrier.deviceMemory(MemoryOrder.Acquire);
+        counters[pci] = 0;
+        QuantKernel.q8kPackBlockSerial(pk, pci * 320L, gy, yb + (int64) pstart, (int64) pcount);
+    }
+
+    /** The down mat-vec of each selected expert of an interleaved bank against its own packed row
+     *  (`xp[k * xpStride..)`) into `dy`, then `acc[i] += sum_k wSel[k] * dy[k * rows + i]` over the item's 8 rows:
+     *  moeCombineAddKernel's arithmetic. Item `gi` is output group `gi`. */
+    @Kernel(targets = {"cpu"})
+    @Occupancy(maxThreads = 256)
+    public static void x8IdDownCombineCpuKernel(KernelBuffer<float32> acc, KernelBuffer<float32> dy,
+            KernelBuffer<int8> w, KernelBuffer<float16> wh, KernelBuffer<int8> xp, KernelBuffer<int32> sel,
+            KernelBuffer<float32> wSel, uint32 fmt, uint32 rows, uint32 groups, uint32 used, int64 blocksPerRow,
+            int64 expertStride, int64 xpStride) {
+        uint32 gr = KernelThread.globalIdX();
+        if (gr >= groups) { return; }
+        uint32 k = 0;
+        while (k < used) {
+            int64 e = (int64) sel[(int64) k];
+            QuantKernel.x8GroupOf(fmt, dy, w, wh, xp, rows, gr, blocksPerRow, e * expertStride,
+                (int64) k * xpStride, (int64) k * (int64) rows);
+            k = k + 1;
+        }
+        uint32 r = gr * 8;
+        while (r < gr * 8 + 8 && r < rows) {
+            float32 a = 0.0f;
+            uint32 j = 0;
+            while (j < used) {
+                a = a + wSel[(int64) j] * dy[(int64) j * (int64) rows + (int64) r];
+                j = j + 1;
+            }
+            acc[(int64) r] = acc[(int64) r] + a;
+            r = r + 1;
+        }
+    }
+
+    /** {@link #x8IdDownCombineCpuKernel} over `used` selections of a `rows` x `cols` bank `expertStride` bytes apart. */
+    public static void x8IdDownCombineCpuLaunchNoSync(int32 ty, KernelBuffer<float32> acc, KernelBuffer<float32> dy,
+            KernelBuffer<int8> w, KernelBuffer<float16> wh, KernelBuffer<int8> xp, KernelBuffer<int32> sel,
+            KernelBuffer<float32> wSel, int64 rows, int64 cols, int64 used, int64 expertStride, int64 xpStride) {
+        QuantKernel.cpuInt8N = QuantKernel.cpuInt8N + 1L;
+        uint32 fmt = ty == Quant.GG_Q8_0 ? 0 : ty == Quant.GG_Q5_0 ? 1 : ty == Quant.GG_Q4_K ? 2 : 3;
+        uint32 groups = (uint32) ((rows + 7L) / 8L);
+        uint32 blk = QuantKernel.cpuEvenBlock(groups);
+        KernelStream s = QuantKernel.stream();
+        x8IdDownCombineCpuKernel.launch(s, grid: [(groups + blk - 1) / blk], block: [blk])
+            (acc, dy, w, wh, xp, sel, wSel, fmt, (uint32) rows, groups, (uint32) used, (cols + 255L) / 256L,
+             expertStride, xpStride);
+        return;
+    }
+
+    /** {@link #x8IdGateUpGluCpuKernel} over `used` selections of two `rows` x `cols` banks `expertStride` bytes apart
+     *  (`hG`, `hU` the half views, or the slabs' own for Q4_K and Q5_K). */
+    public static void x8IdGateUpGluCpuLaunchNoSync(int32 ty, KernelBuffer<float32> gy, KernelBuffer<float32> uy,
+            KernelBuffer<int8> wG, KernelBuffer<float16> hG, KernelBuffer<int8> wU, KernelBuffer<float16> hU,
+            KernelBuffer<int8> xp, KernelBuffer<int32> sel, KernelBuffer<int8> pk, KernelBuffer<int32> counters,
+            int64 rows, int64 cols, int64 used, int64 expertStride, int64 nbRow, int32 act) {
+        QuantKernel.cpuInt8N = QuantKernel.cpuInt8N + 1L;
+        uint32 fmt = ty == Quant.GG_Q8_0 ? 0 : ty == Quant.GG_Q5_0 ? 1 : ty == Quant.GG_Q4_K ? 2 : 3;
+        uint32 groups = (uint32) ((rows + 7L) / 8L);
+        uint32 n = groups * (uint32) used;
+        uint32 blk = QuantKernel.cpuEvenBlock(n);
+        KernelStream s = QuantKernel.stream();
+        x8IdGateUpGluCpuKernel.launch(s, grid: [(n + blk - 1) / blk], block: [blk])
+            (gy, uy, wG, hG, wU, hU, xp, sel, pk, counters, fmt, (uint32) rows, groups, (uint32) used,
+             (cols + 255L) / 256L, expertStride, (uint32) nbRow, act);
         return;
     }
 

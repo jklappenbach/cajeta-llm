@@ -9,6 +9,9 @@ import dev.cajeta.llm.model.Linear;
 import cajeta.math.Tensor;
 import cajeta.lang.String;
 import cajeta.xpu.Device;
+import dev.cajeta.llm.model.Prim;
+import cajeta.xpu.KernelStream;
+import cajeta.xpu.KernelBuffer;
 import dev.cajeta.ml.kernels.testing.ValueCheck;
 
 /** llm-cpu-parity Unit 2: the Q4_K and Q6_K int8 mat-vecs against their q8_K host oracles. */
@@ -781,6 +784,229 @@ public class CpuInt8MatVecTest {
         CpuInt8MatVecTest.idOf(Quant.GG_Q4_K, "q4_k.bin", 72L, true);
         CpuInt8MatVecTest.idOf(Quant.GG_Q4_K, "q4_k.bin", 70L, false);
         ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void theFusedGateUpGluPackIsTheFourLaunchChain() {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("the interleave is the cpu backend's"); return; }
+        int64[] vc #= ValueCheck.mark();
+        CpuInt8MatVecTest.gateUpOf(Quant.GG_Q8_0, "q8_0.bin", 768L, 0);
+        CpuInt8MatVecTest.gateUpOf(Quant.GG_Q8_0, "q8_0.bin", 72L, 1);
+        CpuInt8MatVecTest.gateUpOf(Quant.GG_Q5_0, "q5_0.bin", 520L, 0);
+        CpuInt8MatVecTest.gateUpOf(Quant.GG_Q4_K, "q4_k.bin", 264L, 0);
+        CpuInt8MatVecTest.gateUpOf(Quant.GG_Q5_K, "q5_k.bin", 512L, 1);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void theFusedDownCombineIsTheIdLaunchAndTheCombine() {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("the interleave is the cpu backend's"); return; }
+        int64[] vc #= ValueCheck.mark();
+        CpuInt8MatVecTest.downOf(Quant.GG_Q8_0, "q8_0.bin", 512L);
+        CpuInt8MatVecTest.downOf(Quant.GG_Q8_0, "q8_0.bin", 70L);
+        CpuInt8MatVecTest.downOf(Quant.GG_Q5_0, "q5_0.bin", 72L);
+        CpuInt8MatVecTest.downOf(Quant.GG_Q4_K, "q4_k.bin", 136L);
+        CpuInt8MatVecTest.downOf(Quant.GG_Q5_K, "q5_k.bin", 64L);
+        ValueCheck.credit(vc);
+    }
+
+    /** A down bank of `ty`: the fused launch onto a residual against the id launch then moeCombineAdd. */
+    static void downOf(int32 ty, String fixture, int64 rows) {
+        int64 experts = 5L;
+        int64 cols = BPR * 256L;
+        int64 bpr = CpuInt8MatVecTest.blocksOf(ty);
+        int8[] raw #= WaveGeometryTest.rowsOf(fixture, ty, experts * rows, bpr);
+        int64 rowBytes = (int64) raw.count() / (experts * rows);
+        int64 per = ty == Quant.GG_Q8_0 ? Quant.q80Interleave8Bytes(rows, cols / 256L)
+            : ty == Quant.GG_Q5_0 ? Quant.q50Interleave8Bytes(rows, cols / 256L)
+            : ty == Quant.GG_Q4_K ? Quant.q4kInterleave8Bytes(rows, cols / 256L) : Quant.q5kInterleave8Bytes(rows, cols / 256L);
+        int8[] slab #= heap int8[experts * per];
+        int64 e = 0;
+        while (e < experts) {
+            if (ty == Quant.GG_Q8_0) { Quant.q80Interleave8(raw, e * rows * rowBytes, rows, cols / 256L, slab, e * per); }
+            else if (ty == Quant.GG_Q5_0) { Quant.q50Interleave8Pad(raw, e * rows * rowBytes, rows, cols / 32L, slab, e * per); }
+            else if (ty == Quant.GG_Q4_K) { Quant.q4kInterleave8(raw, e * rows * rowBytes, rows, cols / 256L, slab, e * per); }
+            else { Quant.q5kInterleave8(raw, e * rows * rowBytes, rows, cols / 256L, slab, e * per); }
+            e = e + 1L;
+        }
+        KernelBuffer<int8> w #= heap KernelBuffer<int8>((uint64) slab.count());
+        w.upload(slab);
+        KernelBuffer<float16> wh #= w.halfView();
+        int32[] sel = [2, 4, 0, 2, 1, 3];
+        int64 used = 6L;
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int8[] xh #= heap int8[used * pb];
+        int8[] one #= heap int8[pb];
+        float32[] x0 #= QuantKernelTest.activationsVaried(cols);
+        float32[] xk #= heap float32[cols];
+        int64 k = 0;
+        while (k < used) {
+            int64 j = 0;
+            while (j < cols) { xk[j] = x0[(j + k * 37L) % cols] * (1.0f - 0.125f * (float32) k); j = j + 1L; }
+            Quant.q8kPack(xk, 0L, cols, one);
+            j = 0;
+            while (j < pb) { xh[k * pb + j] = one[j]; j = j + 1L; }
+            k = k + 1L;
+        }
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) xh.count());
+        xp.upload(xh);
+        KernelBuffer<int32> sb #= heap KernelBuffer<int32>((uint64) used);
+        sb.upload(sel, used);
+        float32[] wv = [0.31f, 0.17f, 0.22f, 0.05f, 0.13f, 0.12f];
+        KernelBuffer<float32> wb #= heap KernelBuffer<float32>((uint64) used);
+        wb.upload(wv, used);
+        float32[] res #= heap float32[rows];
+        int64 i = 0;
+        while (i < rows) { res[i] = 0.5f - 0.003f * (float32) i; i = i + 1L; }
+        KernelBuffer<float32> a1 #= heap KernelBuffer<float32>((uint64) rows);
+        a1.upload(res);
+        KernelBuffer<float32> a2 #= heap KernelBuffer<float32>((uint64) rows);
+        a2.upload(res);
+        KernelBuffer<float32> d1 #= heap KernelBuffer<float32>((uint64) (used * rows));
+        KernelBuffer<float32> d2 #= heap KernelBuffer<float32>((uint64) (used * rows));
+        if (ty == Quant.GG_Q8_0) {
+            QuantKernel.q80Q8X8IdVecLaunchNoSync(d1, w, wh, xp, sb, rows, cols, used, per, pb, rows);
+        } else if (ty == Quant.GG_Q5_0) {
+            QuantKernel.q50Q8X8IdVecLaunchNoSync(d1, w, wh, xp, sb, rows, cols, used, per, pb, rows);
+        } else if (ty == Quant.GG_Q4_K) {
+            QuantKernel.q4kQ8X8IdVecLaunchNoSync(d1, w, xp, sb, rows, cols, used, per, pb, rows);
+        } else {
+            QuantKernel.q5kQ8X8IdVecLaunchNoSync(d1, w, xp, sb, rows, cols, used, per, pb, rows);
+        }
+        QuantKernel.moeCombineAddLaunchNoSync(a1, d1, wb, used, rows);
+        QuantKernel.x8IdDownCombineCpuLaunchNoSync(ty, a2, d2, w, wh, xp, sb, wb, rows, cols, used, per, pb);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] ya #= heap float32[rows];
+        float32[] yc #= heap float32[rows];
+        a1.download(ya);
+        a2.download(yc);
+        i = 0;
+        while (i < rows) {
+            if (ya[i] != yc[i]) {
+                Assert.fail(fixture + " rows " + rows + " row " + i + ": fused " + yc[i] + " vs chain " + ya[i]);
+            }
+            i = i + 1L;
+        }
+    }
+
+    /** Gate and up banks of `ty`, the fused launch against id, id, GLU and pack, twice so the counters re-arm. */
+    static void gateUpOf(int32 ty, String fixture, int64 rows, int32 act) {
+        int64 experts = 5L;
+        int64 cols = BPR * 256L;
+        int64 bpr = CpuInt8MatVecTest.blocksOf(ty);
+        int8[] raw #= WaveGeometryTest.rowsOf(fixture, ty, experts * rows, bpr);
+        int64 rowBytes = (int64) raw.count() / (experts * rows);
+        int64 bb = (int64) Quant.blockBytes(ty);
+        int64 q0 = ty == Quant.GG_Q8_0 ? 2L : ty == Quant.GG_Q5_0 ? 6L : ty == Quant.GG_Q4_K ? 16L : 48L;
+        int64 per = ty == Quant.GG_Q8_0 ? Quant.q80Interleave8Bytes(rows, cols / 256L)
+            : ty == Quant.GG_Q5_0 ? Quant.q50Interleave8Bytes(rows, cols / 256L)
+            : ty == Quant.GG_Q4_K ? Quant.q4kInterleave8Bytes(rows, cols / 256L) : Quant.q5kInterleave8Bytes(rows, cols / 256L);
+        int8[] slabG #= heap int8[experts * per];
+        int8[] slabU #= heap int8[experts * per];
+        int32 bank = 0;
+        while (bank < 2) {
+            int8[] mod #= heap int8[raw.count()];
+            int64 b = 0;
+            while (b < (int64) raw.count()) { mod[b] = raw[b]; b = b + 1L; }
+            int64 blk = 0;
+            while (blk < (int64) raw.count() / bb) {
+                int64 e = blk * bb / (rows * rowBytes);
+                int64 at = blk * bb + q0 + (blk + e * 5L + (int64) bank * 3L) % 16L;
+                mod[at] = (int8) ((int32) mod[at] + (int32) e * 13 + bank * 7);
+                blk = blk + 1L;
+            }
+            int8[] slab = bank == 0 ? slabG : slabU;
+            int64 e = 0;
+            while (e < experts) {
+                if (ty == Quant.GG_Q8_0) { Quant.q80Interleave8(mod, e * rows * rowBytes, rows, cols / 256L, slab, e * per); }
+                else if (ty == Quant.GG_Q5_0) { Quant.q50Interleave8Pad(mod, e * rows * rowBytes, rows, cols / 32L, slab, e * per); }
+                else if (ty == Quant.GG_Q4_K) { Quant.q4kInterleave8(mod, e * rows * rowBytes, rows, cols / 256L, slab, e * per); }
+                else { Quant.q5kInterleave8(mod, e * rows * rowBytes, rows, cols / 256L, slab, e * per); }
+                e = e + 1L;
+            }
+            bank = bank + 1;
+        }
+        KernelBuffer<int8> wg #= heap KernelBuffer<int8>((uint64) slabG.count());
+        wg.upload(slabG);
+        KernelBuffer<int8> wu #= heap KernelBuffer<int8>((uint64) slabU.count());
+        wu.upload(slabU);
+        KernelBuffer<float16> hg #= wg.halfView();
+        KernelBuffer<float16> hu #= wu.halfView();
+        int64 pb = Quant.q8kPackedBytes(cols);
+        int8[] xh #= heap int8[pb];
+        Quant.q8kPack(QuantKernelTest.activationsVaried(cols), 0L, cols, xh);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) pb);
+        xp.upload(xh);
+        int32[] sel = [3, 0, 4, 1, 2, 0, 3, 4];
+        int64 used = 8L;
+        KernelBuffer<int32> sb #= heap KernelBuffer<int32>((uint64) used);
+        sb.upload(sel, used);
+        int64 nbRow = Quant.q8kPadCols(rows) / 256L;
+        int64 pkBytes = used * nbRow * 320L;
+        KernelBuffer<float32> g1 #= heap KernelBuffer<float32>((uint64) (used * rows));
+        KernelBuffer<float32> u1 #= heap KernelBuffer<float32>((uint64) (used * rows));
+        KernelBuffer<int8> p1 #= heap KernelBuffer<int8>((uint64) pkBytes);
+        KernelBuffer<float32> g2 #= heap KernelBuffer<float32>((uint64) (used * rows));
+        KernelBuffer<float32> u2 #= heap KernelBuffer<float32>((uint64) (used * rows));
+        KernelBuffer<int8> p2 #= heap KernelBuffer<int8>((uint64) pkBytes);
+        KernelBuffer<int32> ctr #= heap KernelBuffer<int32>((uint64) (used * nbRow));
+        int32[] zc #= heap int32[used * nbRow];
+        ctr.upload(zc, used * nbRow);
+        if (ty == Quant.GG_Q8_0) {
+            QuantKernel.q80Q8X8IdVecLaunchNoSync(g1, wg, hg, xp, sb, rows, cols, used, per, 0L, rows);
+            QuantKernel.q80Q8X8IdVecLaunchNoSync(u1, wu, hu, xp, sb, rows, cols, used, per, 0L, rows);
+        } else if (ty == Quant.GG_Q5_0) {
+            QuantKernel.q50Q8X8IdVecLaunchNoSync(g1, wg, hg, xp, sb, rows, cols, used, per, 0L, rows);
+            QuantKernel.q50Q8X8IdVecLaunchNoSync(u1, wu, hu, xp, sb, rows, cols, used, per, 0L, rows);
+        } else if (ty == Quant.GG_Q4_K) {
+            QuantKernel.q4kQ8X8IdVecLaunchNoSync(g1, wg, xp, sb, rows, cols, used, per, 0L, rows);
+            QuantKernel.q4kQ8X8IdVecLaunchNoSync(u1, wu, xp, sb, rows, cols, used, per, 0L, rows);
+        } else {
+            QuantKernel.q5kQ8X8IdVecLaunchNoSync(g1, wg, xp, sb, rows, cols, used, per, 0L, rows);
+            QuantKernel.q5kQ8X8IdVecLaunchNoSync(u1, wu, xp, sb, rows, cols, used, per, 0L, rows);
+        }
+        Prim.gluDevice(g1, u1, used * rows, act);
+        QuantKernel.q8kPackRowsLaunchNoSync(p1, g1, used, rows, nbRow * 256L);
+        int32 pass = 0;
+        while (pass < 2) {
+            QuantKernel.x8IdGateUpGluCpuLaunchNoSync(ty, g2, u2, wg, hg, wu, hu, xp, sb, p2, ctr, rows, cols, used,
+                per, nbRow, act);
+            pass = pass + 1;
+        }
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a #= heap float32[used * rows];
+        float32[] c #= heap float32[used * rows];
+        g1.download(a);
+        g2.download(c);
+        int64 i = 0;
+        while (i < used * rows) {
+            if (a[i] != c[i]) {
+                Assert.fail(fixture + " rows " + rows + " glu " + i + ": fused " + c[i] + " vs chain " + a[i]);
+            }
+            i = i + 1L;
+        }
+        int8[] pa #= heap int8[pkBytes];
+        int8[] pc #= heap int8[pkBytes];
+        p1.download(pa);
+        p2.download(pc);
+        i = 0;
+        while (i < pkBytes) {
+            if (pa[i] != pc[i]) {
+                Assert.fail(fixture + " rows " + rows + " pack byte " + i + ": fused " + pc[i] + " vs chain " + pa[i]);
+            }
+            i = i + 1L;
+        }
+        int32[] ca #= heap int32[used * nbRow];
+        ctr.download(ca);
+        i = 0;
+        while (i < used * nbRow) {
+            if (ca[i] != 0) { Assert.fail(fixture + " rows " + rows + " counter " + i + " left at " + ca[i]); }
+            i = i + 1L;
+        }
     }
 
     static void idOf(int32 ty, String fixture, int64 rows, boolean shared) {
