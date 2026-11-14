@@ -1577,7 +1577,7 @@ public final class CausalLM extends InfModule {
             Prim.rmsnormDevice(this.xnDev, this.hsDev,
                 this.model.norm.deviceWeight(), (int64) h,
                 this.model.norm.eps, this.cfg.normForm);
-            Linear.stageDeviceActivation(this.xnDev, (int64) h);
+            Linear.stageDeviceActivation(this.xnDev, (int64) h, this.lmHead.act32());
             this.lmHead.matvecStagedKeep();
             boolean devAm = CausalLM.deviceArgmax;
             if (devAm) {
@@ -1774,10 +1774,14 @@ public final class CausalLM extends InfModule {
 
     /** The resident prefill's norm of hs into xn AND its q8_K pack in one
      *  launch where the fused kernel serves (1.8.3), else the norm then
-     *  the staged pack; the batch stage is set either way. */
-    void normAndStage(RMSNorm norm, int32 form, int32 rows, int32 h) {
+     *  the staged pack; the batch stage is set either way. `per32` packs one scale per 32 values. */
+    void normAndStage(RMSNorm norm, int32 form, int32 rows, int32 h, boolean per32) {
         boolean fused = false;
-        if ((int64) h % 256L == 0L && KernelCap.usable("rmsnormPackRowF32")) {
+        if (per32 && (int64) h % 256L == 0L) {
+            Linear.ensureBatchPack(rows, h);
+            fused = Prim.rmsnormPack32RowsDevice(this.pfXnDev, Linear.batchPack(), this.pfHsDev,
+                norm.deviceWeight(), (int64) rows, (int64) h, norm.eps, form);
+        } else if ((int64) h % 256L == 0L && KernelCap.usable("rmsnormPackRowF32")) {
             Linear.ensureBatchPack(rows, h);
             fused = Prim.rmsnormPackRowsDevice(this.pfXnDev,
                 Linear.batchPack(), this.pfHsDev,
@@ -1789,7 +1793,7 @@ public final class CausalLM extends InfModule {
         }
         this.stageTag = Linear.nextStageTag();
         if (fused) {
-            Linear.stageBatchPacked(this.pfXnDev, rows, h, this.stageTag);
+            Linear.stageBatchPacked(this.pfXnDev, rows, h, this.stageTag, per32);
         } else {
             Linear.stageBatchFromDevice(this.pfXnDev, rows, h, this.stageTag);
         }
@@ -2873,7 +2877,7 @@ public final class CausalLM extends InfModule {
             // ── attention sublayer ──────────────────────────────────────
             if (res) {
                 int64 tm0 = CausalLM.pfMark();
-                this.normAndStage(d.inputLayernorm, d.normForm, rows, h);
+                this.normAndStage(d.inputLayernorm, d.normForm, rows, h, Linear.all32(a.qProj, a.kProj, a.vProj));
                 CausalLM.pfPrimNs = CausalLM.pfPrimNs + (CausalLM.pfMark() - tm0);
             } else {
                 int64 tp0 = Clock.nanoTime();
@@ -3099,7 +3103,8 @@ public final class CausalLM extends InfModule {
                 this.sniff("attn", l, nHs);
                 RMSNorm preA = d.postAttentionLayernorm;
                 if (d.fourNorm) { preA = d.preFeedforwardLayernorm; }
-                this.normAndStage(preA, d.normForm, rows, h);
+                this.normAndStage(preA, d.normForm, rows, h,
+                    d.moe == null && Linear.all32(d.mlp.gateProj, d.mlp.upProj, null));
                 CausalLM.pfPrimNs = CausalLM.pfPrimNs + (CausalLM.pfMark() - tn2);
             } else {
                 a.oProj.matmulInto(rows, proj, 0L);
@@ -3341,7 +3346,7 @@ public final class CausalLM extends InfModule {
                     Prim.rmsnormDevice(this.pfXnDev, this.pfLastDev,
                         this.model.norm.deviceWeight(), (int64) h,
                         this.model.norm.eps, this.cfg.normForm);
-                    Linear.stageDeviceActivation(this.pfXnDev, (int64) h);
+                    Linear.stageDeviceActivation(this.pfXnDev, (int64) h, this.lmHead.act32());
                     this.lmHead.matvecStagedKeep();
                     QuantKernel.argmaxRowLaunchNoSync(this.tokDev,
                         this.lmHead.out(), (int64) this.cfg.vocabSize, this.amPv,
@@ -3369,7 +3374,7 @@ public final class CausalLM extends InfModule {
                 Prim.rmsnormDevice(this.pfXnDev, this.pfLastDev,
                     this.model.norm.deviceWeight(), (int64) h,
                     this.model.norm.eps, this.cfg.normForm);
-                Linear.stageDeviceActivation(this.pfXnDev, (int64) h);
+                Linear.stageDeviceActivation(this.pfXnDev, (int64) h, this.lmHead.act32());
                 this.lmHead.matvecStagedKeep();
                 this.ensureArgmaxBuffers();
                 QuantKernel.argmaxRowLaunchNoSync(this.tokDev,
@@ -3544,16 +3549,17 @@ public final class CausalLM extends InfModule {
         boolean oAdded = false;
         // Unit 48: norm + pack in one launch where the width allows.
         // Unit 59b: or already done by the previous layer's down tail.
+        boolean qkv32 = Linear.all32(a.qProj, a.kProj, a.vProj);
         if (this.preNormedNext) {
             this.preNormedNext = false;
             Linear.stageDeviceActivationPreNormed(this.xnDev, (int64) h);
         } else if (!Linear.stageDeviceActivationNormed(this.xnDev, this.hsDev,
                 d.inputLayernorm.deviceWeight(), (int64) h,
-                d.inputLayernorm.eps, d.normForm)) {
+                d.inputLayernorm.eps, d.normForm, qkv32)) {
             Prim.rmsnormDevice(this.xnDev, this.hsDev,
                 d.inputLayernorm.deviceWeight(), (int64) h,
                 d.inputLayernorm.eps, d.normForm);
-            Linear.stageDeviceActivation(this.xnDev, (int64) h);
+            Linear.stageDeviceActivation(this.xnDev, (int64) h, qkv32);
         }
         CausalLM.aSync();
         int64 ta1 = Clock.nanoTime();
@@ -3630,9 +3636,9 @@ public final class CausalLM extends InfModule {
                     d.attnSubNorm.deviceWeight(), (int64) qd,
                     d.attnSubNorm.eps, d.normForm);
                 this.sniffBuf("ao-normed", li, this.subDev, (int64) qd);
-                Linear.stageDeviceActivation(this.subDev, (int64) qd);
+                Linear.stageDeviceActivation(this.subDev, (int64) qd, a.oProj.act32());
             } else {
-                Linear.stageDeviceActivation(dkv.out(), (int64) qd);
+                Linear.stageDeviceActivation(dkv.out(), (int64) qd, a.oProj.act32());
             }
 
             // Unit 48: the residual add rides the o-projection's store.
@@ -3718,11 +3724,12 @@ public final class CausalLM extends InfModule {
         // route above takes; `denseNormStaged` tells the FFN below not
         // to stage a second time.
         boolean denseNormStaged = false;
+        boolean gu32 = d.moe == null && Linear.all32(d.mlp.gateProj, d.mlp.upProj, null);
         if (!normPacked && d.moe == null) {
             denseNormStaged = Linear.stageDeviceActivationNormed(
                 this.xnDev, this.hsDev,
                 preR.deviceWeight(), (int64) h,
-                preR.eps, d.normForm);
+                preR.eps, d.normForm, gu32);
         }
         if (!normPacked && !denseNormStaged) {
             Prim.rmsnormDevice(this.xnDev, this.hsDev,
@@ -3794,14 +3801,19 @@ public final class CausalLM extends InfModule {
             return;
         }
         if (!denseNormStaged) {
-            Linear.stageDeviceActivation(this.xnDev, (int64) h);
+            Linear.stageDeviceActivation(this.xnDev, (int64) h, gu32);
         }
         Linear.matvecStagedKeep3(d.mlp.gateProj, d.mlp.upProj, null);
         // The GLU packs its own result into the down-projection's
         // stage; the sub-norm shape has a norm between the two and
         // takes the pair.
         boolean gluStaged = false;
-        if (!d.subNorm) {
+        boolean down32 = d.mlp.downProj.act32();
+        if (!d.subNorm && down32) {
+            gluStaged = Prim.gluPack32Device(d.mlp.gateProj.out(),
+                Linear.stagedPacked((int64) inter),
+                d.mlp.upProj.out(), (int64) inter, d.activation);
+        } else if (!d.subNorm) {
             gluStaged = Prim.gluPackDevice(d.mlp.gateProj.out(),
                 Linear.stagedPacked((int64) inter),
                 d.mlp.upProj.out(), (int64) inter, d.activation);
@@ -3816,13 +3828,13 @@ public final class CausalLM extends InfModule {
                 d.ffnSubNorm.deviceWeight(), (int64) inter,
                 d.ffnSubNorm.eps, d.normForm);
             this.sniffBuf("g-normed", li, this.subDev, (int64) inter);
-            Linear.stageDeviceActivation(this.subDev, (int64) inter);
+            Linear.stageDeviceActivation(this.subDev, (int64) inter, down32);
         } else if (gluStaged) {
             Linear.stageDeviceActivationPreNormed(d.mlp.gateProj.out(),
-                (int64) inter);
+                (int64) inter, down32);
         } else {
             Linear.stageDeviceActivation(d.mlp.gateProj.out(),
-                (int64) inter);
+                (int64) inter, down32);
         }
         // Unit 48's accumulate form on the MLP tail too: the residual
         // add rides the down-projection's store where the route has it.

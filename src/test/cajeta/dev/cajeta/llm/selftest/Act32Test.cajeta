@@ -1,0 +1,675 @@
+package dev.cajeta.llm.selftest;
+
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.LlmException;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.Prim;
+import cajeta.math.Tensor;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.ml.kernels.testing.ValueCheck;
+
+/** cajeta-llm 15.2.21.4.3.3: activations packed at one scale per 32 values and the cpu Q8_0 kernels that read them. */
+public class Act32Test {
+    static final int64 ROWS = 70L;
+    static final int64 COLS = 768L;
+
+    public Act32Test() { return; }
+
+    /** Values whose magnitude steps by four from one 32-value sub-block to the next, over five steps. */
+    static #float32[] stepped(int64 n) {
+        float32[] x #= heap float32[n];
+        int64 c = 0;
+        while (c < n) {
+            float32 amp = 0.01f;
+            int64 e = (c / 32L) % 5L;
+            while (e > 0L) { amp = amp * 4.0f; e = e - 1L; }
+            x[c] = (float32) (((c * 7L) % 23L) - 11L) * amp;
+            c = c + 1;
+        }
+        return #x;
+    }
+
+    /** One sub-block a 256-value block holds only 2, 0 and -2; the other seven hold values near 0.02. */
+    static #float32[] spiky(int64 n) {
+        float32[] x #= heap float32[n];
+        int64 c = 0;
+        while (c < n) {
+            x[c] = (float32) (((c * 7L) % 23L) - 11L) * 0.02f;
+            if ((c / 32L) % 8L == (c / 256L) % 8L) { x[c] = (float32) ((c % 3L) - 1L) * 2.0f; }
+            c = c + 1;
+        }
+        return #x;
+    }
+
+    /** Whether the backend is the cpu and `kernel` lowers here; says why not otherwise. */
+    static boolean cpuHas(String kernel) {
+        String be #= Device.activeBackend();
+        if (!be.equals("cpu")) { DeviceSkip.cannot("per-32 activation scales are the cpu backend's"); return false; }
+        if (!KernelCap.usable(kernel)) { DeviceSkip.noKernel(kernel, be); return false; }
+        return true;
+    }
+
+    /** The quants and the eight-a-block scales of a per-32 pack of `cols` values. */
+    static void split(int8[] p, int64 cols, int8[] xq, float32[] xs) {
+        int64 b = 0;
+        while (b < cols / 256L) {
+            int64 k = 0;
+            while (k < 256L) { xq[b * 256L + k] = p[b * 320L + k]; k = k + 1; }
+            int64 sb = 0;
+            while (sb < 8L) { xs[b * 8L + sb] = Quant.q8kPackedScale32(p, b, sb); sb = sb + 1; }
+            b = b + 1;
+        }
+    }
+
+    static void sameBytes(int8[] got, int8[] want, String what) {
+        boolean live = false;
+        int64 i = 0;
+        while (i < (int64) want.count()) {
+            if (got[i] != want[i]) {
+                Assert.fail(what + " byte " + i + " (block offset " + (i % 320L) + "): " + (int32) got[i] + " vs "
+                    + (int32) want[i]);
+            }
+            if (want[i] != 0) { live = true; }
+            i = i + 1;
+        }
+        if (!live) { Assert.fail(what + ": every packed byte is zero"); }
+    }
+
+    static void sameFloats(float32[] got, float32[] want, int64 n, String what) {
+        int64 i = 0;
+        while (i < n) {
+            if (got[i] != want[i]) { Assert.fail(what + " at " + i + ": " + got[i] + " vs " + want[i]); }
+            i = i + 1;
+        }
+    }
+
+    /** Every sub-block's scale is its own largest magnitude over 127, its quants round against that scale, and its sum word
+     *  is their sum; an all-zero sub-block packs to zeros. */
+    @Test
+    public void theHostPackScalesEachSubBlockAgainstItsOwnMaximum() {
+        int64 n = COLS;
+        float32[] x #= Act32Test.stepped(n);
+        int64 i = 320L;
+        while (i < 352L) { x[i] = 0.0f; i = i + 1; }
+        int8[] p #= heap int8[Quant.q8kPackedBytes(n)];
+        Quant.q8kPack32(x, 0L, n, p);
+        int32 distinct = 0;
+        int64 b = 0;
+        while (b < n / 256L) {
+            int64 sb = 0;
+            while (sb < 8L) {
+                int64 e0 = b * 256L + sb * 32L;
+                float32 amax = 0.0f;
+                int64 k = 0;
+                while (k < 32L) {
+                    float32 av = x[e0 + k] < 0.0f ? 0.0f - x[e0 + k] : x[e0 + k];
+                    if (av > amax) { amax = av; }
+                    k = k + 1;
+                }
+                float32 sc = Quant.q8kPackedScale32(p, b, sb);
+                if (sc != amax / 127.0f) {
+                    Assert.fail("block " + b + " sub-block " + sb + ": scale " + sc + " vs " + (amax / 127.0f));
+                }
+                if (sb > 0L && sc != Quant.q8kPackedScale32(p, b, sb - 1L)) { distinct = distinct + 1; }
+                int32 sum = 0;
+                int32 top = 0;
+                k = 0;
+                while (k < 32L) {
+                    int32 q = (int32) p[b * 320L + sb * 32L + k];
+                    sum = sum + q;
+                    int32 aq = q < 0 ? 0 - q : q;
+                    if (aq > top) { top = aq; }
+                    float32 err = (float32) q * sc - x[e0 + k];
+                    if (err < 0.0f) { err = 0.0f - err; }
+                    if (err > sc * 0.51f) {
+                        Assert.fail("value " + (e0 + k) + ": " + x[e0 + k] + " packed as " + q + " at scale " + sc);
+                    }
+                    k = k + 1;
+                }
+                if (Quant.q8kPackedSum(p, b, sb) != sum) {
+                    Assert.fail("block " + b + " sub-block " + sb + ": sum word " + Quant.q8kPackedSum(p, b, sb) + " vs " + sum);
+                }
+                if (amax > 0.0f && top != 127) { Assert.fail("block " + b + " sub-block " + sb + ": largest quant " + top); }
+                if (amax == 0.0f && (top != 0 || sc != 0.0f)) {
+                    Assert.fail("the zero sub-block packed to quant " + top + " at scale " + sc);
+                }
+                sb = sb + 1;
+            }
+            b = b + 1;
+        }
+        Assert.isTrue(Quant.q8kPackedScale32(p, 1L, 2L) == 0.0f);
+        Assert.isTrue(distinct >= 12);
+    }
+
+    /** A row that ends inside a block packs zeros past its end, with scale zero in the sub-blocks wholly past it. */
+    @Test
+    public void theHostPackZeroesARaggedRowsPad() {
+        float32[] x #= Act32Test.stepped(300L);
+        int8[] p #= heap int8[Quant.q8kPackedBytes(512L)];
+        int64 i = 0;
+        while (i < (int64) p.count()) { p[i] = (int8) 99; i = i + 1; }
+        Quant.q8kPack32Pad(x, 0L, 300L, 512L, p, 0L);
+        int64 e = 300L;
+        while (e < 512L) {
+            if (p[(e / 256L) * 320L + e % 256L] != 0) { Assert.fail("pad value " + e + " packed as " + (int32) p[(e / 256L) * 320L + e % 256L]); }
+            e = e + 1;
+        }
+        Assert.isTrue(Quant.q8kPackedScale32(p, 1L, 0L) != 0.0f);
+        Assert.isTrue(Quant.q8kPackedScale32(p, 1L, 1L) != 0.0f);
+        int64 sb = 2L;
+        while (sb < 8L) {
+            Assert.isTrue(Quant.q8kPackedScale32(p, 1L, sb) == 0.0f);
+            Assert.equals(0L, (int64) Quant.q8kPackedSum(p, 1L, sb));
+            sb = sb + 1;
+        }
+    }
+
+    /** The sub-block oracle at eight scales a block is the dot product of the dequantized weights and the dequantized
+     *  activations. */
+    @Test
+    public void theSubBlockOracleIsTheDequantizedDotProduct() {
+        int64 nb = COLS / 32L;
+        int8[] raw #= WaveGeometryTest.rowsOf("q8_0.bin", Quant.GG_Q8_0, ROWS, nb);
+        float32[] x #= Act32Test.stepped(COLS);
+        int8[] p #= heap int8[Quant.q8kPackedBytes(COLS)];
+        Quant.q8kPack32(x, 0L, COLS, p);
+        int8[] xq #= heap int8[COLS];
+        float32[] xs #= heap float32[COLS / 32L];
+        Act32Test.split(p, COLS, xq, xs);
+        float32[] y #= heap float32[ROWS];
+        Quant.q80MatVecIntoQ8Sub(raw, ROWS, COLS, xq, xs, 8L, y, 0L);
+        QuantKernelTest.assertLive(y, "sub-block oracle");
+        float32[] wr #= heap float32[COLS];
+        int64 rowBytes = nb * (int64) Quant.blockBytes(Quant.GG_Q8_0);
+        int64 r = 0;
+        while (r < ROWS) {
+            Quant.dequantize(Quant.GG_Q8_0, raw, r * rowBytes, nb, wr, 0L);
+            float64 ref = 0.0;
+            float64 mag = 0.0;
+            int64 k = 0;
+            while (k < COLS) {
+                float64 t = (float64) wr[k] * ((float64) xq[k] * (float64) xs[k / 32L]);
+                ref = ref + t;
+                mag = mag + (t < 0.0 ? 0.0 - t : t);
+                k = k + 1;
+            }
+            float64 d = (float64) y[r] - ref;
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > mag * 0.00001 + 0.000001) { Assert.fail("row " + r + ": oracle " + y[r] + " vs " + ref); }
+            r = r + 1;
+        }
+    }
+
+    static void devicePack(int64 rows, int64 n, boolean ties) {
+        float32[] x #= Act32Test.stepped(rows * n);
+        int64 i = 0;
+        while (ties && i < rows * n) {
+            x[i] = (float32) ((i % 253L) - 126L) + 0.5f;
+            if (i % 32L == 0L) { x[i] = 127.0f; }
+            i = i + 1;
+        }
+        int64 nPad = Quant.q8kPadCols(n);
+        int64 stride = Quant.q8kPackedBytes(nPad);
+        int8[] want #= heap int8[rows * stride];
+        int8[] got #= heap int8[rows * stride];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q8kPack32Pad(x, r * n, n, nPad, want, r * stride);
+            r = r + 1;
+        }
+        int64[] vc #= ValueCheck.mark();
+        QuantKernel.q8kPack32IntoDevice(x, rows, n, got);
+        Act32Test.sameBytes(got, want, "device pack " + rows + " x " + n);
+        ValueCheck.credit(vc);
+    }
+
+    /** The cpu pack kernel writes the host pack's bytes, all 320 of every block, for one row, many rows and ragged rows. */
+    @Test
+    public void theDevicePackMatchesTheHostPack() {
+        if (!Act32Test.cpuHas("q8kPack32Kernel")) { return; }
+        Act32Test.devicePack(1L, 512L, false);
+        Act32Test.devicePack(3L, 2560L, false);
+        Act32Test.devicePack(5L, 300L, false);
+        Act32Test.devicePack(64L, 256L, false);
+    }
+
+    /** A product that lands half way between two quants rounds the same way on the device as on the host. */
+    @Test
+    public void theDevicePackRoundsTiesAsTheHostPack() {
+        if (!Act32Test.cpuHas("q8kPack32Kernel")) { return; }
+        Act32Test.devicePack(2L, 512L, true);
+    }
+
+    static void normPack(int64 rows, int64 dim, int32 form) {
+        int64 n = rows * dim;
+        float32[] hx #= Act32Test.stepped(n);
+        float32[] hw #= heap float32[dim];
+        int64 i = 0;
+        while (i < dim) {
+            hw[i] = 1.0f + (float32) (i % 13L) * 0.01f;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < n) {
+            if (i % dim >= 256L && i % dim < 288L) { hx[i] = 0.0f; }
+            i = i + 1;
+        }
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> w #= heap KernelBuffer<float32>((uint64) dim);
+        x.upload(hx, n);
+        w.upload(hw, dim);
+        int64 pb = rows * (dim / 256L) * 320L;
+        KernelBuffer<float32> o1 #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> o2 #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<int8> p1 #= heap KernelBuffer<int8>((uint64) pb);
+        KernelBuffer<int8> p2 #= heap KernelBuffer<int8>((uint64) pb);
+        float32 eps = 0.00001f;
+        Assert.isTrue(Prim.rmsnormPackRowsDevice(o1, p1, x, w, rows, dim, eps, form));
+        int64[] vc #= ValueCheck.mark();
+        Assert.isTrue(Prim.rmsnormPack32RowsDevice(o2, p2, x, w, rows, dim, eps, form));
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a #= heap float32[n];
+        float32[] b #= heap float32[n];
+        o1.download(a, n);
+        o2.download(b, n);
+        QuantKernelTest.assertLive(b, "normed rows");
+        Act32Test.sameFloats(b, a, n, "normed row, form " + form);
+        int8[] want #= heap int8[pb];
+        int8[] got #= heap int8[pb];
+        int64 r = 0;
+        while (r < rows) {
+            Quant.q8kPack32Pad(b, r * dim, dim, dim, want, r * (dim / 256L) * 320L);
+            r = r + 1;
+        }
+        p2.download(got, pb);
+        Act32Test.sameBytes(got, want, "norm pack, form " + form);
+        ValueCheck.credit(vc);
+    }
+
+    /** The row norm packing per 32 writes the per-256 form's normed rows and the host per-32 pack of them. */
+    @Test
+    public void theRowNormPacksPer32() {
+        if (!NormPackTest.cpuRowFormHere()) { return; }
+        Prim.setCpuRowNorm(true);
+        Act32Test.normPack(1L, 2560L, 0);
+        Act32Test.normPack(3L, 2560L, 1);
+        Act32Test.normPack(5L, 512L, 0);
+    }
+
+    static void gluPack(int64 n, int32 act) {
+        float32[] hg #= heap float32[n];
+        float32[] hu #= Act32Test.stepped(n);
+        int64 i = 0;
+        while (i < n) {
+            hg[i] = (float32) (((i * 37L + 11L) % 197L) - 98L) / 11.0f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> g1 #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> g2 #= heap KernelBuffer<float32>((uint64) n);
+        KernelBuffer<float32> u #= heap KernelBuffer<float32>((uint64) n);
+        g1.upload(hg, n);
+        g2.upload(hg, n);
+        u.upload(hu, n);
+        int64 pb = (n / 256L) * 320L;
+        KernelBuffer<int8> p2 #= heap KernelBuffer<int8>((uint64) pb);
+        Prim.gluDevice(g1, u, n, act);
+        int64[] vc #= ValueCheck.mark();
+        Assert.isTrue(Prim.gluPack32Device(g2, p2, u, n, act));
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] a #= heap float32[n];
+        float32[] b #= heap float32[n];
+        g1.download(a, n);
+        g2.download(b, n);
+        QuantKernelTest.assertLive(b, "glu");
+        Act32Test.sameFloats(b, a, n, "glu, act " + act);
+        int8[] want #= heap int8[pb];
+        int8[] got #= heap int8[pb];
+        Quant.q8kPack32(b, 0L, n, want);
+        p2.download(got, pb);
+        Act32Test.sameBytes(got, want, "glu pack, act " + act);
+        ValueCheck.credit(vc);
+    }
+
+    /** The GLU packing per 32 writes the plain GLU's values and the host per-32 pack of them, for both activations. */
+    @Test
+    public void theGluPacksPer32() {
+        if (!Act32Test.cpuHas("gluPack32CpuKernel")) { return; }
+        Act32Test.gluPack(512L, 0);
+        Act32Test.gluPack(512L, 1);
+        Act32Test.gluPack(10240L, 0);
+        Act32Test.gluPack(10240L, 1);
+    }
+
+    /** The eight-row Q8_0 kernels on per-32 packs against the sub-block oracle, bit for bit, plain and accumulating. */
+    @Test
+    public void theQ80KernelsReadEightScalesABlock() {
+        if (!Act32Test.cpuHas("q80Q8X8VecKernel")) { return; }
+        int8[] raw #= WaveGeometryTest.rowsOf("q8_0.bin", Quant.GG_Q8_0, ROWS, COLS / 32L);
+        int64[] ncs = [1L, 5L, 16L, 130L];
+        int8[] p #= heap int8[Quant.q8kPackedBytes(COLS)];
+        int8[] xq #= heap int8[COLS];
+        float32[] xs #= heap float32[COLS / 32L];
+        float32[] one #= heap float32[ROWS];
+        int64[] vc #= ValueCheck.mark();
+        int32 t = 0;
+        while (t < 4) {
+            int64 nc = ncs[t];
+            float32[] x #= Act32Test.stepped(nc * COLS);
+            int32 pass = 0;
+            while (pass < 2) {
+                boolean accum = pass == 1;
+                int64 n = (nc + 1L) * ROWS;
+                float32[] want #= heap float32[n];
+                float32[] got #= heap float32[n];
+                int64 j = 0;
+                while (j < n) {
+                    float32 seed = accum || j >= nc * ROWS ? 0.25f * (float32) (j % 9L - 4L) : 0.0f;
+                    want[j] = seed;
+                    got[j] = seed;
+                    j = j + 1;
+                }
+                int64 c = 0;
+                while (c < nc) {
+                    Quant.q8kPack32(x, c * COLS, COLS, p);
+                    Act32Test.split(p, COLS, xq, xs);
+                    Quant.q80MatVecIntoQ8Sub(raw, ROWS, COLS, xq, xs, 8L, one, 0L);
+                    int64 k = 0;
+                    while (k < ROWS) {
+                        want[c * ROWS + k] = accum ? want[c * ROWS + k] + one[k] : one[k];
+                        k = k + 1;
+                    }
+                    c = c + 1;
+                }
+                QuantKernel.q80Q8X8IntoDevice(raw, ROWS, COLS, x, nc, got, accum, true);
+                QuantKernelTest.assertLive(got, "per-32 Q8_0 at " + nc + " columns");
+                Act32Test.sameFloats(got, want, n, "per-32 Q8_0, " + nc + " columns, accum " + accum);
+                pass = pass + 1;
+            }
+            t = t + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+
+    /** Three Q8_0 weights in one launch on a per-32 pack give each one's own launch, bit for bit. */
+    @Test
+    public void threeQ80WeightsInOneLaunchReadEightScalesABlock() {
+        if (!Act32Test.cpuHas("q80Q8X8Vec3Kernel")) { return; }
+        int64 nb = COLS / 32L;
+        int64[] rows = [70L, 13L, 40L];
+        int8[] ra #= WaveGeometryTest.rowsOf("q8_0.bin", Quant.GG_Q8_0, rows[0], nb);
+        int8[] rb #= WaveGeometryTest.rowsOf("q8_0.bin", Quant.GG_Q8_0, rows[1], nb);
+        int8[] rc #= WaveGeometryTest.rowsOf("q8_0.bin", Quant.GG_Q8_0, rows[2], nb);
+        float32[] x #= Act32Test.stepped(COLS);
+        float32[] ya #= heap float32[rows[0]];
+        float32[] yb #= heap float32[rows[1]];
+        float32[] yc #= heap float32[rows[2]];
+        int64[] vc #= ValueCheck.mark();
+        QuantKernel.x8Vec3IntoDevice(Quant.GG_Q8_0, ra, rows[0], rb, rows[1], rc, rows[2], COLS, x, ya, yb, yc, true);
+        ValueCheck.credit(vc);
+        int32 m = 0;
+        while (m < 3) {
+            float32[] want #= heap float32[rows[m] * 2L];
+            int8[] raw = m == 0 ? ra : m == 1 ? rb : rc;
+            float32[] got = m == 0 ? ya : m == 1 ? yb : yc;
+            QuantKernel.q80Q8X8IntoDevice(raw, rows[m], COLS, x, 1L, want, false, true);
+            QuantKernelTest.assertLive(want, "weight " + m);
+            Act32Test.sameFloats(got, want, rows[m], "weight " + m + " in the three-way launch");
+            m = m + 1;
+        }
+    }
+
+    /** On activations with one loud sub-block a block, the per-32 pack lands far closer to the f32 product. */
+    @Test
+    public void eightScalesABlockAreCloserToTheF32Product() {
+        if (!Act32Test.cpuHas("q80Q8X8VecKernel")) { return; }
+        int64 nb = COLS / 32L;
+        int8[] raw #= WaveGeometryTest.rowsOf("q8_0.bin", Quant.GG_Q8_0, ROWS, nb);
+        float32[] x #= Act32Test.spiky(COLS);
+        float32[] y32 #= heap float32[ROWS * 2L];
+        float32[] y256 #= heap float32[ROWS * 2L];
+        QuantKernel.q80Q8X8IntoDevice(raw, ROWS, COLS, x, 1L, y32, false, true);
+        QuantKernel.q80Q8X8IntoDevice(raw, ROWS, COLS, x, 1L, y256, false, false);
+        float32[] wr #= heap float32[COLS];
+        int64 rowBytes = nb * (int64) Quant.blockBytes(Quant.GG_Q8_0);
+        float64 e32 = 0.0;
+        float64 e256 = 0.0;
+        int64 r = 0;
+        while (r < ROWS) {
+            Quant.dequantize(Quant.GG_Q8_0, raw, r * rowBytes, nb, wr, 0L);
+            float64 ref = 0.0;
+            int64 k = 0;
+            while (k < COLS) { ref = ref + (float64) wr[k] * (float64) x[k]; k = k + 1; }
+            float64 a = (float64) y32[r] - ref;
+            float64 b = (float64) y256[r] - ref;
+            e32 = e32 + (a < 0.0 ? 0.0 - a : a);
+            e256 = e256 + (b < 0.0 ? 0.0 - b : b);
+            r = r + 1;
+        }
+        if (e32 * 4.0 >= e256) { Assert.fail("summed error per-32 " + e32 + " vs per-256 " + e256); }
+    }
+
+    /** A cpu Q8_0 interleave reads per-32 scales; a Q4_K one does not; the switch turns it off. */
+    @Test
+    public void onlyACpuQ80InterleaveReadsPer32() {
+        if (!Act32Test.cpuHas("q8kPack32Kernel")) { return; }
+        Linear.setQ8Route(true);
+        Linear q8 #= LinearKernelRouteTest.tiledAt(Quant.GG_Q8_0, "q8_0.bin", 512, 70);
+        q8.allowInterleave();
+        Linear q4 #= LinearKernelRouteTest.tiledAt(Quant.GG_Q4_K, "q4_k.bin", 512, 70);
+        q4.allowInterleave();
+        Assert.isTrue(q8.act32());
+        Assert.isTrue(!q4.act32());
+        Assert.isTrue(Linear.all32(q8, q8, null));
+        Assert.isTrue(Linear.all32(q8, q8, q8));
+        Assert.isTrue(!Linear.all32(q8, q4, null));
+        Assert.isTrue(!Linear.all32(q8, q8, q4));
+        Linear.setAct32(false);
+        boolean off = q8.act32();
+        Linear.setAct32(true);
+        Assert.isTrue(!off);
+        Assert.isTrue(q8.act32());
+    }
+
+    /** A staged decode activation packed per 32 gives the per-32 product; packed per 256 it gives the per-256 product. */
+    @Test
+    public void aStagedDecodeFollowsThePacksMode() {
+        if (!Act32Test.cpuHas("q8kPack32Kernel")) { return; }
+        Linear.setQ8Route(true);
+        int64 ci = 512L;
+        int64 co = 70L;
+        Linear q8 #= LinearKernelRouteTest.tiledAt(Quant.GG_Q8_0, "q8_0.bin", 512, 70);
+        q8.allowInterleave();
+        Linear two #= LinearKernelRouteTest.tiledAt(Quant.GG_Q8_0, "q8_0.bin", 512, 13);
+        two.allowInterleave();
+        Assert.isTrue(q8.act32());
+        float32[] x #= Act32Test.spiky(ci);
+        KernelBuffer<float32> xDev #= heap KernelBuffer<float32>((uint64) ci);
+        xDev.upload(x, ci);
+        int8[] raw #= q8.hostPackedCopyForTest();
+        int8[] raw2 #= two.hostPackedCopyForTest();
+        float32[] want32 #= heap float32[co * 2L];
+        float32[] want256 #= heap float32[co * 2L];
+        float32[] wantTwo #= heap float32[26L];
+        QuantKernel.q80Q8X8IntoDevice(raw, co, ci, x, 1L, want32, false, true);
+        QuantKernel.q80Q8X8IntoDevice(raw, co, ci, x, 1L, want256, false, false);
+        QuantKernel.q80Q8X8IntoDevice(raw2, 13L, ci, x, 1L, wantTwo, false, true);
+        QuantKernelTest.assertLive(want32, "per-32 reference");
+        boolean differ = false;
+        int64 i = 0;
+        while (i < co) {
+            if (want32[i] != want256[i]) { differ = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(differ);
+        KernelStream s = QuantKernel.stream();
+        float32[] got #= heap float32[co];
+        float32[] got2 #= heap float32[13L];
+        Linear.stageDeviceActivation(xDev, ci, true);
+        q8.matvecStagedKeep();
+        s.sync();
+        q8.out().download(got, co);
+        Act32Test.sameFloats(got, want32, co, "staged per-32");
+        Linear.stageDeviceActivation(xDev, ci, true);
+        Linear.matvecStagedKeep3(q8, two, null);
+        s.sync();
+        q8.out().download(got, co);
+        two.out().download(got2, 13L);
+        Act32Test.sameFloats(got, want32, co, "staged per-32, pair, first");
+        Act32Test.sameFloats(got2, wantTwo, 13L, "staged per-32, pair, second");
+        Linear.stageDeviceActivation(xDev, ci);
+        q8.matvecStagedKeep();
+        s.sync();
+        q8.out().download(got, co);
+        Act32Test.sameFloats(got, want256, co, "staged per-256");
+    }
+
+    /** A per-32 staged activation reaching a weight that reads one scale per block is refused by name. */
+    @Test
+    public void aPer32StageRefusesAPer256Consumer() {
+        if (!Act32Test.cpuHas("q8kPack32Kernel")) { return; }
+        Linear.setQ8Route(true);
+        Linear q4 #= LinearKernelRouteTest.tiledAt(Quant.GG_Q4_K, "q4_k.bin", 512, 70);
+        q4.allowInterleave();
+        float32[] x #= Act32Test.stepped(512L);
+        KernelBuffer<float32> xDev #= heap KernelBuffer<float32>((uint64) 512);
+        xDev.upload(x, 512L);
+        Linear.stageDeviceActivation(xDev, 512L, true);
+        String msg = "";
+        try {
+            q4.matvecStagedKeep();
+        } catch (LlmException e) {
+            String em #= e.getMessage();
+            msg = "" + em;
+        }
+        Linear.stageDeviceActivation(xDev, 512L);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        if (!msg.contains("per-32")) { Assert.fail("no refusal, or one that does not name the pack: '" + msg + "'"); }
+    }
+
+    /** A weight that reads the f32 stage, not the pack, runs beside a Q8_0 weight on a per-32 stage. */
+    @Test
+    public void aPer32StageServesAWeightThatReadsTheF32Stage() {
+        if (!Act32Test.cpuHas("q8kPack32Kernel")) { return; }
+        Linear.setQ8Route(true);
+        int64 ci = 512L;
+        int64 co = 70L;
+        int64 cf = 13L;
+        Linear q8 #= LinearKernelRouteTest.tiledAt(Quant.GG_Q8_0, "q8_0.bin", 512, 70);
+        q8.allowInterleave();
+        int32[] hi #= heap int32[6];
+        float32[] hv #= heap float32[6];
+        hi[0] = 60; hv[0] = 1.0f;
+        hi[1] = 188; hv[1] = -1.0f;
+        hi[2] = 56; hv[2] = 0.5f;
+        hi[3] = 184; hv[3] = -0.5f;
+        hi[4] = 64; hv[4] = 2.0f;
+        hi[5] = 0; hv[5] = 0.0f;
+        int8[] fraw #= heap int8[cf * ci * 2L];
+        float32[] wf #= heap float32[cf * ci];
+        int64 e = 0;
+        while (e < cf * ci) {
+            int32 k = (int32) ((e * 5L + e / ci) % 6L);
+            int32 hb = hi[k] > 127 ? hi[k] - 256 : hi[k];
+            fraw[e * 2L] = (int8) 0;
+            fraw[e * 2L + 1L] = (int8) hb;
+            wf[e] = hv[k];
+            e = e + 1;
+        }
+        Linear f16 = heap Linear(512, 13);
+        f16.bindPacked(#fraw, Quant.GG_F16);
+        float32[] x #= Act32Test.spiky(ci);
+        KernelBuffer<float32> xDev #= heap KernelBuffer<float32>((uint64) ci);
+        xDev.upload(x, ci);
+        int8[] raw #= q8.hostPackedCopyForTest();
+        float32[] want #= heap float32[co * 2L];
+        QuantKernel.q80Q8X8IntoDevice(raw, co, ci, x, 1L, want, false, true);
+        Linear.stageDeviceActivation(xDev, ci, true);
+        Linear.matvecStagedKeep3(q8, f16, null);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] got #= heap float32[co];
+        float32[] gotF #= heap float32[cf];
+        q8.out().download(got, co);
+        f16.out().download(gotF, cf);
+        Linear.stageDeviceActivation(xDev, ci);
+        s.sync();
+        Act32Test.sameFloats(got, want, co, "Q8_0 beside an F16 weight");
+        int64 r = 0;
+        while (r < cf) {
+            float64 ref = 0.0;
+            float64 mag = 0.0;
+            int64 c = 0;
+            while (c < ci) {
+                float64 t = (float64) wf[r * ci + c] * (float64) x[c];
+                ref = ref + t;
+                mag = mag + (t < 0.0 ? 0.0 - t : t);
+                c = c + 1;
+            }
+            float64 d = (float64) gotF[r] - ref;
+            if (d < 0.0) { d = 0.0 - d; }
+            if (d > mag * 0.00001 + 0.000001) { Assert.fail("F16 row " + r + ": " + gotF[r] + " vs " + ref); }
+            r = r + 1;
+        }
+    }
+
+    /** The batch stage packs for its first consumer: per 32 for Q8_0, repacked per 256 when a Q4_K weight follows, and a
+     *  Q8_0 weight after that reads the per-256 pack. */
+    @Test
+    public void theBatchStagePacksForItsConsumer() {
+        if (!Act32Test.cpuHas("q8kPack32Kernel")) { return; }
+        if (!Linear.devicePackOn()) { DeviceSkip.cannot("the batch stage packs on the host here"); return; }
+        Linear.setQ8Route(true);
+        int32 rows = 5;
+        int32 ci = 512;
+        int32 co = 70;
+        int64 n = (int64) rows * (int64) co;
+        Linear q8 #= LinearKernelRouteTest.tiledAt(Quant.GG_Q8_0, "q8_0.bin", ci, co);
+        q8.allowInterleave();
+        Linear q4 #= LinearKernelRouteTest.tiledAt(Quant.GG_Q4_K, "q4_k.bin", ci, co);
+        q4.allowInterleave();
+        float32[] x #= Act32Test.spiky((int64) rows * (int64) ci);
+        KernelBuffer<float32> xDev #= heap KernelBuffer<float32>((uint64) ((int64) rows * (int64) ci));
+        xDev.upload(x, (int64) rows * (int64) ci);
+        int8[] raw #= q8.hostPackedCopyForTest();
+        float32[] want32 #= heap float32[n + (int64) co];
+        float32[] want256 #= heap float32[n + (int64) co];
+        QuantKernel.q80Q8X8IntoDevice(raw, (int64) co, (int64) ci, x, (int64) rows, want32, false, true);
+        QuantKernel.q80Q8X8IntoDevice(raw, (int64) co, (int64) ci, x, (int64) rows, want256, false, false);
+        Tensor<float32> g8 #= LinearKernelRouteTest.ramp(0L, n);
+        Tensor<float32> g4 #= LinearKernelRouteTest.ramp(0L, n);
+        Tensor<float32> g8b #= LinearKernelRouteTest.ramp(0L, n);
+        Tensor<float32> w4 #= LinearKernelRouteTest.ramp(0L, n);
+        Linear.stageBatchFromDevice(xDev, rows, ci, Linear.nextStageTag());
+        q8.matmulInto(rows, g8, 0L);
+        q4.matmulInto(rows, g4, 0L);
+        q8.matmulInto(rows, g8b, 0L);
+        Linear.stageBatchFromDevice(xDev, rows, ci, Linear.nextStageTag());
+        q4.matmulInto(rows, w4, 0L);
+        boolean live = false;
+        int64 i = 0;
+        while (i < n) {
+            if (g8.flatGet(i) != want32[i]) {
+                Assert.fail("first Q8_0 consumer at " + i + ": " + g8.flatGet(i) + " vs per-32 " + want32[i]);
+            }
+            if (g4.flatGet(i) != w4.flatGet(i)) {
+                Assert.fail("Q4_K after a per-32 pack at " + i + ": " + g4.flatGet(i) + " vs a fresh stage's " + w4.flatGet(i));
+            }
+            if (g8b.flatGet(i) != want256[i]) {
+                Assert.fail("Q8_0 after the repack at " + i + ": " + g8b.flatGet(i) + " vs per-256 " + want256[i]);
+            }
+            if (w4.flatGet(i) != 0.0f) { live = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(live);
+    }
+}
