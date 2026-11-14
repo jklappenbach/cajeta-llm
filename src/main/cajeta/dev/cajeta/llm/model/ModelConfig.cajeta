@@ -83,6 +83,10 @@ public final class ModelConfig {
      *  layer at `slidingWindow` (spec §5 preamble: layers inherit the
      *  model default). */
     public int32[] layerWindows;
+    /** RoPE base of the sliding-window layers, unscaled; 0 = every layer takes `ropeTheta` (Gemma 3's `rope_local_base_freq`). */
+    public float32 ropeLocalTheta;
+    /** Multiplier on each embedding row before the first layer; 0 = none (Gemma's `sqrt(hidden_size)`). */
+    public float32 embedScale;
     /** KV-cache block size in tokens (spec 6.3). Engine tuning knob, not
      *  an HF key; the CLI exposes it in Unit 19. */
     public int32 blockTokens;
@@ -137,6 +141,8 @@ public final class ModelConfig {
         this.fourNorm = false;
         this.subNorm = false;
         this.layerWindows = null;
+        this.ropeLocalTheta = 0.0f;
+        this.embedScale = 0.0f;
         this.blockTokens = 16;
     }
 
@@ -332,6 +338,15 @@ public final class ModelConfig {
                 + "' declares no architectures");
         }
         String arch #= archs.array().get(0).asString();
+        if (arch.equals("Gemma3ForConditionalGeneration") || arch.equals("Gemma3ForCausalLM")) {
+            JsonValue tc = root.get("text_config");
+            JsonObject text = root;
+            if (tc != null && !tc.isNull()) {
+                text = tc.object();
+            }
+            ModelConfig g #= ModelConfig.parseGemma3(text, arch, path);
+            return #g;
+        }
         // The HF config's `architectures` value — EXTERNAL vocabulary,
         // not our driver class (that is CausalLM; the checkpoints say
         // LlamaForCausalLM and always will).
@@ -443,6 +458,108 @@ public final class ModelConfig {
             c.layerWindows #= lw;
         }
         return #c;
+    }
+
+    /** Gemma 3's text stack from a `text_config` (or a flat Gemma3ForCausalLM config), absent keys at
+     *  transformers' Gemma3TextConfig defaults. */
+    static #ModelConfig parseGemma3(JsonObject t, String arch, String path) {
+        ModelConfig c = heap ModelConfig();
+        c.architecture #= arch.clone();
+        c.hiddenSize = ModelConfig.optInt(t, "hidden_size", 2304);
+        c.intermediateSize = ModelConfig.optInt(t, "intermediate_size", 9216);
+        c.numLayers = ModelConfig.optInt(t, "num_hidden_layers", 26);
+        c.numHeads = ModelConfig.optInt(t, "num_attention_heads", 8);
+        c.numKvHeads = ModelConfig.optInt(t, "num_key_value_heads", 4);
+        c.headDim = ModelConfig.optInt(t, "head_dim", 256);
+        c.vocabSize = ModelConfig.optInt(t, "vocab_size", 262208);
+        c.maxPositionEmbeddings = ModelConfig.optInt(t, "max_position_embeddings", 131072);
+        c.rmsNormEps = ModelConfig.optFloat(t, "rms_norm_eps", 0.000001f);
+        c.slidingWindow = ModelConfig.optInt(t, "sliding_window", 4096);
+        c.queryScale = 1.0f / Math.sqrt(ModelConfig.optFloat(t, "query_pre_attn_scalar", 256.0f));
+        c.tieWordEmbeddings = true;
+        JsonValue tie = t.get("tie_word_embeddings");
+        if (tie != null && !tie.isNull()) {
+            c.tieWordEmbeddings = tie.asBoolean();
+        }
+        JsonValue act = t.get("hidden_activation");
+        if (act != null && !act.isNull()) {
+            String a #= act.asString();
+            if (!a.equals("gelu_pytorch_tanh")) {
+                throw heap LlmException("model config: Gemma 3 activation '" + a
+                    + "' is not supported; supported: gelu_pytorch_tanh");
+            }
+        }
+        c.activation = 1;
+        c.normForm = 1;
+        c.qkNorm = true;
+        c.fourNorm = true;
+        c.embedScale = Math.sqrt((float32) c.hiddenSize);
+        ModelConfig.gemma3Rope(c, t);
+        ModelConfig.gemma3Windows(c, t);
+        return #c;
+    }
+
+    /** Global layers take `rope_theta` and `rope_scaling`; local layers `rope_local_base_freq`, unscaled.
+     *  A transformers 5 config states both under `rope_parameters`, keyed by layer type. */
+    static void gemma3Rope(ModelConfig c, JsonObject t) {
+        c.ropeTheta = ModelConfig.optFloat(t, "rope_theta", 1000000.0f);
+        c.ropeLocalTheta = ModelConfig.optFloat(t, "rope_local_base_freq", 10000.0f);
+        JsonValue rp = t.get("rope_parameters");
+        JsonValue scaling = t.get("rope_scaling");
+        if (rp != null && !rp.isNull()) {
+            JsonValue full = rp.object().get("full_attention");
+            JsonValue local = rp.object().get("sliding_attention");
+            if (local != null && !local.isNull()) {
+                c.ropeLocalTheta = ModelConfig.optFloat(local.object(), "rope_theta", c.ropeLocalTheta);
+            }
+            if (full != null && !full.isNull()) {
+                c.ropeTheta = ModelConfig.optFloat(full.object(), "rope_theta", c.ropeTheta);
+                scaling = full;
+            }
+        }
+        if (scaling == null || scaling.isNull()) {
+            return;
+        }
+        JsonObject so = scaling.object();
+        JsonValue ty = so.get("rope_type");
+        if (ty == null) {
+            ty = so.get("type");
+        }
+        if (ty == null) {
+            return;
+        }
+        String tn #= ty.asString();
+        if (tn.equals("linear")) {
+            c.ropeScalingType = 1;
+            c.ropeScalingFactor = ModelConfig.optFloat(so, "factor", 1.0f);
+        } else if (!tn.equals("default")) {
+            throw heap LlmException("model config: Gemma 3 rope_scaling type '" + tn
+                + "' is not supported; supported: linear, default");
+        }
+        return;
+    }
+
+    /** `layer_types` when stated, else every `sliding_window_pattern`-th layer global (default 6). */
+    static void gemma3Windows(ModelConfig c, JsonObject t) {
+        int32[] lw = heap int32[c.numLayers];
+        JsonValue lt = t.get("layer_types");
+        int32 pattern = ModelConfig.optInt(t, "sliding_window_pattern", 6);
+        if (lt != null && !lt.isNull() && lt.array().count() != c.numLayers) {
+            throw heap LlmException("model config: layer_types has " + lt.array().count()
+                + " entries for " + c.numLayers + " layers");
+        }
+        int32 li = 0;
+        while (li < c.numLayers) {
+            boolean global = ((li + 1) % pattern) == 0;
+            if (lt != null && !lt.isNull()) {
+                String tname #= lt.array().get(li).asString();
+                global = tname.equals("full_attention");
+            }
+            lw[li] = global ? 0 : c.slidingWindow;
+            li = li + 1;
+        }
+        c.layerWindows #= lw;
+        return;
     }
 
     static int32 reqInt(JsonObject root, String key, String path) {

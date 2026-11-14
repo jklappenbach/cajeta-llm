@@ -4,7 +4,9 @@
 # checkpoint and the transformers fp32 fixture. Release + bounded live-set:
 # the shipping configuration (§12.10's compiler-mode axis).
 #
-#   CAJETA=…/build/src/cajeta tools/parity/run-parity.sh
+#   CAJETA=…/build/src/cajeta tools/parity/run-parity.sh [modelDir fixtureDir]
+#
+# With no arguments it runs the Llama 3.1 8B f32 pair below; XPU_BACKEND picks the backend (cpu).
 #
 # Prereqs on this box: tools/parity/fixtures/llama31-8b (gen_fixture.py),
 # /home/julian/models/Meta-Llama-3.1-8B-Instruct-f32 (convert_f32.py),
@@ -60,17 +62,29 @@ cajeta_artifact_path() {
     fi
 }
 
-CODEC_CJA="${CODEC_CJA:-$(cajeta_artifact_path "$here"/../cajeta-codec dev.cajeta.codec)}"
-JINJA_CJA="${JINJA_CJA:-$(cajeta_artifact_path "$here"/../cajeta-jinja dev.cajeta.jinja)}"
+# A pinned dependency's archive: the Olla store, then run-tests.sh's cache, then a sibling checkout.
+pinned_cja() {
+    local name="$1" sib="$2" ver
+    ver="$(sed -n "s/.*\"$name\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$here/cajeta.json" | head -1)"
+    for p in "${OLLA_HOME:-$HOME/.olla}/$name/$ver/$name-$ver.cja" "$here/build/.unit-cache/$name-$ver.cja"; do
+        [[ -n "$ver" && -f "$p" ]] && { printf '%s\n' "$p"; return 0; }
+    done
+    cajeta_artifact_path "$here/../$sib" "$name"
+}
+CODEC_CJA="${CODEC_CJA:-$(pinned_cja dev.cajeta.codec cajeta-codec)}"
+JINJA_CJA="${JINJA_CJA:-$(pinned_cja dev.cajeta.jinja cajeta-jinja)}"
+LOGGING_CJA="${LOGGING_CJA:-$(pinned_cja dev.cajeta.logging cajeta-logging)}"
+KERNELS_CJA="${KERNELS_CJA:-$(pinned_cja dev.cajeta.ml.kernels cajeta-ml/kernels)}"
+UNIT_CJA="${UNIT_CJA:-$(pinned_cja dev.cajeta.unit cajeta-unit)}"
 out="$here/tmp/parity-build"
 mkdir -p "$out"
 
 echo ">> building parity runner (release, bounded live-set)"
-"$CAJETA" --emit=exe --release --live-set=bounded --xpu-backend=cpu \
-    --classpath="$CODEC_CJA,$JINJA_CJA" \
+"$CAJETA" --emit=exe --release --live-set=bounded --xpu-backend="${XPU_BACKEND:-cpu}" \
+    --classpath="$CODEC_CJA,$JINJA_CJA,$LOGGING_CJA,$KERNELS_CJA,$UNIT_CJA" \
     -o "$out/parity" \
     dev.cajeta.llm.bench.ParityRun.run "$here/src/main/cajeta" "$out" >/dev/null
 
 echo ">> running (8B f32 on host — expect minutes)"
 cd "$here"
-exec "$out/parity"
+exec "$out/parity" "$@"

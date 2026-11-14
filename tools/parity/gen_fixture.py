@@ -15,6 +15,8 @@
 #   greedy.json      the 32-token greedy continuation (argmax loop)
 #
 # The prompt is FIXED and recorded; changing it invalidates the fixture.
+# --prompt-file replaces it with a file's text (prompts/past-window.txt is
+# 1693 Gemma 3 tokens, past a 1024 window, for spec 12.6).
 import argparse, hashlib, json, os, struct, sys
 
 PROMPT = ("The three complementary detectors of the parity gate are cosine "
@@ -25,7 +27,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--prompt-file")
     args = ap.parse_args()
+    prompt = open(args.prompt_file).read() if args.prompt_file else PROMPT
 
     import torch
     import transformers
@@ -39,7 +43,7 @@ def main():
         args.model, torch_dtype=torch.float32, device_map="cpu")
     model.eval()
 
-    ids = tok(PROMPT, return_tensors="pt", add_special_tokens=True)["input_ids"]
+    ids = tok(prompt, return_tensors="pt", add_special_tokens=True)["input_ids"]
     with torch.no_grad():
         out = model(ids)
         logits = out.logits[0, -1, :].to(torch.float32).contiguous()
@@ -68,7 +72,8 @@ def main():
         "torch": torch.__version__,
         "dtype": "float32",
         "device": "cpu",
-        "prompt": PROMPT,
+        "prompt": prompt,
+        "prompt_file": os.path.basename(args.prompt_file) if args.prompt_file else None,
         "add_special_tokens": True,
         "prompt_token_ids": ids[0].tolist(),
         "vocab_size": int(logits.numel()),

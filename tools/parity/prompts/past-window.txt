@@ -1,0 +1,94 @@
+# cajeta-llm — decoder-only LLM inference engine
+
+## 1. Definition
+
+**1.1 Purpose.** A self-contained LLM inference engine written in Cajeta,
+modeled on llama.cpp's architecture: load open weights, build a decoder
+graph, run KV-cached incremental decode, sample, detokenize. Target models
+are Llama 3.x, Mistral and Qwen2/3, loaded from Hugging
+Face safetensors and from GGUF, executing on CPU and on all four XPU backends.
+Gemma 3 is included deliberately: it exercises per-layer attention config
+(§5) and the windowed ring-buffer cache (§6) that the others do not, so it
+keeps those abstractions honest rather than speculative.
+Deferred 2026-10-16 (Julian): not in this release; Gemma 3 (text path) moves to a later release (§1.5).
+
+**1.2 Why a rewrite and not a binding.** `@Native` marshals scalars,
+opaque `pointer` handles, and Cajeta array headers only — no C structs by
+value, no callbacks, no varargs
+(`docs/specification/buildtool/native-deps-spec.md:41`). llama.cpp's API is
+struct- and callback-shaped, so binding it is not expressible in the
+language. The engine is rewritten against `cajeta.math.Tensor` and
+`cajeta.xpu`.
+
+**1.3 What it consumes, and what it deliberately does not.**
+- Consumes `cajeta.math.Tensor` (numpy surface), `cajeta.xpu`
+  (`@Kernel`, `KernelBuffer`, `KernelStream`, `CooperativeMatrix`), the
+  `dev.cajeta.ml` checkpoint layer (`io/Safetensors`, `io/PtReader`,
+  `io/Checkpoints` name reconciliation), `dev.cajeta.codec.protobuf` for raw
+  SentencePiece `tokenizer.model` files, `dev.cajeta.codec.json` for tokenizer
+  metadata and as the chat-template interpreter's value model (§13.18), and
+  `cajeta.collection.ltm` (`LtmPager`, `LtmBPlusTree`) for the block store
+  (§13.17).
+- Does **not** consume `dev.cajeta.ml`'s `nn.Module.forward` or `GradTape`.
+  That stack is training-first and tape-mandatory, `Module` is f32-pinned
+  and non-generic (`nn/Module.cajeta:36-41`), and `grad/Ops.cajeta:31`
+  returns `hasGpu() == false` with `requireCpu` throwing on any
+  device-resident input. Only `Module`'s parameter naming and `state_dict`
+  reconciliation are reused.
+- Traces to `research-platform-roadmap-spec` §3.1 (tensor surface), §3.2
+  (multi-vendor GPU), §8.5 (quantization).
+
+**1.4 Constraints imposed by the language.**
+- The integer ladder is 8/16/32/64/128 with no sub-byte and no arbitrary
+  width; `float8*`/`float6*`/`float4e2m1` are opaque `iN` storage with no
+  arithmetic or conversions (`src/cajeta/type/CajetaType.cpp:597-599`). This
+  does **not** block sub-byte weight formats: they are storage, not
+  arithmetic — see §10 and §13.5.
+- Structured concurrency (`async`/`spawn`) has real limits — fibers pinned to
+  their first carrier, ~9–25 µs spawn, a 16-carrier cap. **These do not apply
+  to kernel execution.** XPU dispatch uses its own persistent worker pool
+  (`runtime/native/cajeta_xpu_dispatch.c:435-454`): a launch is a broadcast
+  plus barrier with no per-launch thread spawn, grid blocks chunk across
+  `min(gridX, cores)` workers, barriers resolve by fission inside a per-block
+  wrapper so blocks stay embarrassingly parallel, and `wave` maps to the host
+  SIMD vector. The engine therefore writes kernels once and runs them on any
+  backend including CPU.
+- Every heap allocation and free registers into one process-global live-set
+  table under a single mutex once a second thread exists
+  (`runtime/native/cajeta_rt_core.c:867-869`), and the kernel pool makes the
+  process multithreaded. Pooling does not remove that lock — nothing in this
+  spec does. It removes the *allocations that would take it*: §4.3 allocates
+  scratch once at load and reuses it, so a decode step performs no allocation
+  and therefore never acquires the mutex. The lock stays untouched rather than
+  contended, which makes "zero allocations per decode step" a load-bearing
+  invariant rather than a tidiness goal.
+- `--release` does **not** switch the live set off. `CompilerMode.h:225,239`
+  set `LiveSet::Bounded` for both Release and Fast — still registered, still
+  locked. Only `Minimal` (`:254`) sets `LiveSet::Off`, which is the one mode
+  that removes the registration from codegen. A shipped inference build that
+  assumes release-mode builds skip this is wrong.
+- No `unsafe`, no pointer arithmetic, and no way to adopt a foreign address
+  as a Cajeta buffer (`docs/specification/lang/MemoryModel.md:37`).
+
+**1.5 Non-goals (v1).**
+- No training, fine-tuning, or runtime LoRA application; adapters are merged
+  offline.
+- No codebook/lattice quantization (the `IQ*` i-quants). Those resolve weights
+  through learned grid tables rather than bit-field extraction and are a
+  different mechanism from the block quants in §10.
+- No Gemma 3 in this release; its requirements below stay for a later one.
+  Deferred 2026-10-16 (Julian): not in this release.
+- No cross-process or cross-machine scheduling. In-process continuous
+  batching, the paged cache and preemption are **in** v1 — this bullet
+  originally excluded them and 14.3 reversed it (§13.13, §13.15).
+  `specs/xpu-tile-workload-profiles-spec.md` §3 (which superseded
+  `llm-kernel-scheduling` on 2026-09-06) owns the multi-tenant
+  scheduling surface that sits above this engine.
+- No concurrent multi-process access to the block store. One engine process
+  owns it at a time; `LtmPager` has no locking (§13.17).
+- No tensor/pipeline parallelism, no collectives, no multi-device.
+- No HTTP serving surface; a CLI and a library API only.
+- No MoE routing, no speculative decoding, no ONNX.
+- No vision or multimodal input. Gemma 3 at 4B and above pairs the decoder
+  with a SigLIP encoder; only the text path is in scope, and the 1B is
+  text-only regardless.
