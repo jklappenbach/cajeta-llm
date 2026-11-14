@@ -872,13 +872,35 @@ public final class Linear extends InfModule {
         return;
     }
 
-    /** Whether the cpu backend has an int8 kernel for this weight: its interleave, or the packed Q4_K and Q6_K forms.
+    /** Whether the cpu backend has a batch kernel for this weight: F16, its interleave, or the packed Q4_K and Q6_K forms.
      *  A model's projections ({@link #allowInterleave}) without one run per row, never a GPU GEMM as cpu blocks. */
     boolean cpuBatchHere() {
+        if (this.packedTy == Quant.GG_F16) { return Linear.cpuF16Here() && Linear.devPack; }
         if (this.payloadDev != null) { return this.cpuInt8; }
         if (this.cpuX8Here()) { return true; }
         return Linear.cpuInt8Want && Linear.packedActivations() && Linear.q8Route() && this.inDim % 256 == 0
             && (this.packedTy == Quant.GG_Q4_K || this.packedTy == Quant.GG_Q6_K);
+    }
+
+    boolean cpuF16;
+    static boolean cpuF16Want = true;
+
+    /** Pins the cpu backend's F16 kernel off (the wave kernel, and prefill a row at a time) or back on, for weights
+     *  bound afterwards. */
+    public static void setCpuF16(boolean on) { Linear.cpuF16Want = on; }
+
+    /** Whether an F16 weight runs on {@code f16CpuMatKernel} here: the cpu backend with that kernel registered. */
+    static boolean cpuF16Here() {
+        return Linear.cpuF16Want && Linear.onCpu() && KernelCap.usable("f16CpuMatKernel");
+    }
+
+    /** `y[c * yStride + r] (+)= W[r] . x[c * xStride ..)` for `nc` f32 columns through the cpu F16 kernel. */
+    void cpuF16Launch(KernelBuffer<float32> y, KernelBuffer<float32> x, int64 nc, int64 xStride, int64 yStride,
+            boolean accum) {
+        if (this.payloadHalf == null) { this.payloadHalf #= this.payloadDev.halfView(); }
+        QuantKernel.f16CpuMatLaunchNoSync(y, this.payloadDev, this.payloadHalf, x, (int64) this.outDim,
+            (int64) this.inDim, nc, xStride, yStride, accum);
+        return;
     }
 
     /** Lets this weight hold the cpu 8-row interleave as its one resident copy; a model's dense projections set it. */
@@ -3587,7 +3609,11 @@ public final class Linear extends InfModule {
             && Linear.btXhSrc != null
             && QuantKernel.coopColsOk(this.packedTy, (int64) this.inDim)
             && (int64) this.outDim % 128L == 0L;
-        if (!coopHere || this.x8Resident) { Linear.ensureBtXp(this.act32Here()); }
+        boolean f16Cpu = this.cpuF16;
+        if (f16Cpu && Linear.btXhSrc == null) {
+            throw heap LlmException("matmulBatchKeep: a cpu F16 weight needs the batch staged as f32 on the device");
+        }
+        if ((!coopHere || this.x8Resident) && !f16Cpu) { Linear.ensureBtXp(this.act32Here()); }
         int64 t0 = Clock.nanoTime();
         // MATRIX CORES when the shape tiles and the format has a kernel
         // (plan 10.12.14). Only Q4_K has one, so a Q4_K_M checkpoint runs
@@ -3742,7 +3768,10 @@ public final class Linear extends InfModule {
             && WmmaKernel.fitsMw8(mw8Rows, (int64) this.outDim)
             && this.deqAdmitted();
         if (!this.x8Resident && (useWmma || useWmma6)) { this.ensureBatchOut((int32) tRows); }
-        if (this.x8Resident) {
+        if (f16Cpu) {
+            this.sayRoute(4503599627370496L, "cpu f16");
+            this.cpuF16Launch(this.yBatch, Linear.btXhSrc, (int64) rows, (int64) this.inDim, (int64) this.outDim, false);
+        } else if (this.x8Resident) {
             this.sayRoute(8192L, "cpu int8 rows ty=" + this.packedTy);
             this.cpuInt8Rows(Linear.btXp, Quant.q8kPackedBytes(Quant.q8kPadCols((int64) this.inDim)),
                 (int64) rows, this.yBatch, (int64) this.outDim, false, Linear.btXp32);
@@ -6366,6 +6395,7 @@ public final class Linear extends InfModule {
                 && q8kDims && this.packedTy == Quant.GG_IQ4_NL;
             this.waveH = KernelCap.here(KernelCap.K_WAVE_F16)
                 && this.packedTy == Quant.GG_F16;
+            this.cpuF16 = this.waveH && Linear.cpuF16Here();
             this.waveIq = KernelCap.waveIntHere(this.packedTy)
                 && this.packed1 && Linear.q8Route()
                 && q8kDims && (this.packedTy == Quant.GG_IQ2_XXS
@@ -6614,6 +6644,12 @@ public final class Linear extends InfModule {
                 QuantKernel.iqQ8WaveMatVecLaunch(this.packedTy, this.yDev, w,
                     Linear.stXp, nr, (int64) this.inDim, r0);
             }
+        } else if (this.cpuF16) {
+            if (nr != (int64) this.outDim || r0 != 0L) {
+                throw heap LlmException("launchOne: a row slice of a cpu F16 weight (" + nr + " of " + this.outDim + ")");
+            }
+            this.cpuF16Launch(this.yDev, Linear.xF32(), 1L, (int64) this.inDim, nr, false);
+            if (!Linear.oneSync) { QuantKernel.stream().sync(); }
         } else if (this.waveH) {
             if (Linear.oneSync) {
                 QuantKernel.f16F32WaveMatVecLaunchNoSync(this.yDev, w,
