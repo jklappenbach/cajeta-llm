@@ -28,7 +28,7 @@ import dev.cajeta.llm.tok.Tokenizer;
  *
  *   pplprobe <model.gguf> <text-file> [pre=N] [eval=N] [attncheck] [nocoop]
  *            [klsave=<path>|klref=<path>] [noroute] [tile|int8gemm] [plainmv]
- *            [nof16attn] ...
+ *            [nof16attn] [seqs=N] ...
  */
 public final class PplProbe {
 
@@ -42,6 +42,7 @@ public final class PplProbe {
         }
         int32 pre = 512;
         int32 eval = 256;
+        int32 seqs = 1;
         int32 pinMode = 0;
         String pinPath #= "";
         String klSave #= "";
@@ -113,6 +114,10 @@ public final class PplProbe {
             if (args[ai].equals("hostattn")) { CausalLM.setDeviceAttention(false); }
             if (args[ai].equals("plainmv")) { QuantKernel.setQ4Prefetch(2); QuantKernel.setQ6Prefetch(2); }
             if (args[ai].startsWith("klsave=")) { klSave #= args[ai].substring(7, args[ai].byteLength()); }
+            if (args[ai].startsWith("seqs=")) {
+                String sv #= args[ai].substring(5, args[ai].byteLength());
+                seqs = Integer.parseInt(sv);
+            }
             if (args[ai].startsWith("klref=")) { klRef #= args[ai].substring(6, args[ai].byteLength()); }
             if (args[ai].startsWith("pinreplay=")) {
                 pinPath #= args[ai].substring(10, args[ai].byteLength());
@@ -144,13 +149,22 @@ public final class PplProbe {
         // route comparison this probe makes is between two runs of the
         // same host path.
         ExpertBank.setResidencyBudget(Device.memoryBytes() / 2L);
-        CausalLM m = heap CausalLM(#cfg, pre + eval + 8, 1, 0);
+        CausalLM m = heap CausalLM(#cfg, pre + eval + 8, seqs, 0);
         m.bind(ck, false);
         ck.close();
         m.prewarmPrefillWeights();
 
         int64 t0 = Clock.nanoTime();
         m.prefill(ids, pre);
+        int32 sp = 1;
+        while (sp < seqs) {
+            m.stepSeq(sp, ids, 0, pre);
+            sp = sp + 1;
+        }
+        if (seqs > 1 && !m.decodeBatchReady()) {
+            System.stdout.println("pplprobe: seqs=" + seqs + " but the batched decode does not serve this model");
+            return 2;
+        }
         System.stdout.println("prefill ms: "
             + ((float64) (Clock.nanoTime() - t0) / 1000000.0));
         int32 cap = eval + 8;
@@ -179,27 +193,49 @@ public final class PplProbe {
         float32[] refRow #= heap float32[vocab];
         KlCensus kc = heap KlCensus();
         int32[] one #= heap int32[1];
+        int32[] bSeq #= heap int32[seqs];
+        int32[] bTok #= heap int32[seqs];
+        int32[] bOut #= heap int32[seqs];
+        sp = 0;
+        while (sp < seqs) {
+            bSeq[sp] = sp;
+            sp = sp + 1;
+        }
         t0 = Clock.nanoTime();
         int32 i = 0;
         while (i < eval) {
-            // The logits row currently held predicts position pre+i.
-            Tensor<float32> lg = m.logits();
-            float32[] lb = lg.hostBuffer();
-            int64 lbase = lg.hostBase();
-            int32 c #= 0;
-            while (c < vocab) {
-                row[c] = lb[lbase + (int64) c];
-                c = c + 1;
-            }
-            ppl.add(row, vocab, ids[pre + i]);
-            if (klSave.byteLength() > 0) { KlCensus.putRow(row, vocab, saved, (int64) i * rowBytes); }
-            if (klRef.byteLength() > 0) {
-                KlCensus.getRow(refRows, (int64) i * rowBytes, refRow, vocab);
-                kc.add(refRow, row, vocab);
+            int32 rb = 0;
+            while (rb < seqs) {
+                if (seqs > 1 && i > 0) { m.selectBatchLogits(rb); }
+                // The logits row currently held predicts position pre+i.
+                Tensor<float32> lg = m.logits();
+                float32[] lb = lg.hostBuffer();
+                int64 lbase = lg.hostBase();
+                int32 c #= 0;
+                while (c < vocab) {
+                    row[c] = lb[lbase + (int64) c];
+                    c = c + 1;
+                }
+                if (rb == 0) { ppl.add(row, vocab, ids[pre + i]); }
+                if (rb == 0 && klSave.byteLength() > 0) { KlCensus.putRow(row, vocab, saved, (int64) i * rowBytes); }
+                if (klRef.byteLength() > 0) {
+                    KlCensus.getRow(refRows, (int64) i * rowBytes, refRow, vocab);
+                    kc.add(refRow, row, vocab);
+                }
+                rb = rb + 1;
             }
             // Teacher-force the TRUE corpus token.
             one[0] = ids[pre + i];
-            m.stepSeq(0, one, 0, 1);
+            if (seqs > 1) {
+                sp = 0;
+                while (sp < seqs) {
+                    bTok[sp] = ids[pre + i];
+                    sp = sp + 1;
+                }
+                m.stepDecodeBatch(bSeq, bTok, seqs, bOut);
+            } else {
+                m.stepSeq(0, one, 0, 1);
+            }
             i = i + 1;
         }
         System.stdout.println("eval ms: "
