@@ -1,5 +1,6 @@
 package dev.cajeta.llm.selftest;
 
+import cajeta.lang.Math;
 import cajeta.lang.String;
 import cajeta.lang.System;
 import cajeta.xpu.Device;
@@ -163,8 +164,18 @@ public class F16HeadTest {
         F16HeadTest.checkWave(3L, 40L, 9L);
     }
 
-    /** `f16CpuMatKernel` on `nc` columns against the float64 dot, with strides wider than the shape, then accumulating. */
-    static void checkCpuMat(int64 rows, int64 cols, int64 nc, int64 seed) {
+    /** One cpu F16 launch: `which` 0 is the launcher's own choice, 1 the row kernel, 2 the tile kernel. */
+    static void cpuMatLaunch(int32 which, KernelBuffer<float32> yd, KernelBuffer<int8> w, KernelBuffer<float16> wh,
+            KernelBuffer<float32> xd, int64 rows, int64 cols, int64 nc, int64 xs, int64 ys, boolean accum) {
+        if (which == 1) { QuantKernel.f16CpuRowsLaunchNoSync(yd, w, wh, xd, rows, cols, nc, xs, ys, accum); return; }
+        if (which == 2) { QuantKernel.f16CpuTileLaunchNoSync(yd, w, wh, xd, rows, cols, nc, xs, ys, accum); return; }
+        QuantKernel.f16CpuMatLaunchNoSync(yd, w, wh, xd, rows, cols, nc, xs, ys, accum);
+        return;
+    }
+
+    /** A cpu F16 kernel ({@link #cpuMatLaunch}'s `which`) on `nc` columns against the float64 dot, with strides wider
+     *  than the shape, then accumulating. */
+    static void checkCpuMat(int32 which, int64 rows, int64 cols, int64 nc, int64 seed) {
         int8[] raw = heap int8[rows * cols * 2L];
         float32[] vals = heap float32[rows * cols];
         F16HeadTest.fill(raw, vals, rows * cols, seed);
@@ -185,11 +196,11 @@ public class F16HeadTest {
         yd.upload(pre, nc * ys);
         KernelStream s = QuantKernel.stream();
         int64[] vc #= ValueCheck.mark();
-        QuantKernel.f16CpuMatLaunchNoSync(yd, w, wh, xd, rows, cols, nc, xs, ys, false);
+        F16HeadTest.cpuMatLaunch(which, yd, w, wh, xd, rows, cols, nc, xs, ys, false);
         s.sync();
         float32[] y = heap float32[nc * ys];
         yd.download(y, nc * ys);
-        QuantKernel.f16CpuMatLaunchNoSync(yd, w, wh, xd, rows, cols, nc, xs, ys, true);
+        F16HeadTest.cpuMatLaunch(which, yd, w, wh, xd, rows, cols, nc, xs, ys, true);
         s.sync();
         float32[] y2 = heap float32[nc * ys];
         yd.download(y2, nc * ys);
@@ -201,12 +212,13 @@ public class F16HeadTest {
             while (i < cols) { xc[i] = x[c * xs + i]; i = i + 1; }
             i = 0;
             while (i < rows) { yc[i] = y[c * ys + i]; i = i + 1; }
-            F16HeadTest.checkRows("f16 cpu " + rows + "x" + cols + " column " + c, vals, xc, yc, rows, cols);
+            F16HeadTest.checkRows("f16 cpu " + which + " " + rows + "x" + cols + " column " + c, vals, xc, yc, rows, cols);
             i = 0;
             while (i < ys) {
                 float32 want = i < rows ? yc[i] + yc[i] : canary;
-                if (y2[c * ys + i] != want) {
-                    Assert.fail("f16 cpu " + rows + "x" + cols + " column " + c + " cell " + i + ": "
+                float32 slack = i < rows ? 0.00002f * (Math.abs(want) + 1.0f) : 0.0f;
+                if (Math.abs(y2[c * ys + i] - want) > slack) {
+                    Assert.fail("f16 cpu " + which + " " + rows + "x" + cols + " column " + c + " cell " + i + ": "
                         + y2[c * ys + i] + " after the accumulate, expected " + want);
                 }
                 i = i + 1;
@@ -217,17 +229,28 @@ public class F16HeadTest {
         return;
     }
 
+    /** Each cpu F16 kernel, and the launcher's choice between them, over shapes with ragged rows, columns and tiles. */
     @Test
     public void f16CpuMatMatchesTheHostDot() {
         String be #= Device.activeBackend();
         if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
         if (!KernelCap.usable("f16CpuMatKernel")) { DeviceSkip.noKernel("f16CpuMatKernel", be); return; }
-        F16HeadTest.checkCpuMat(64L, 1536L, 1L, 5L);
-        F16HeadTest.checkCpuMat(3L, 40L, 1L, 9L);
-        F16HeadTest.checkCpuMat(13L, 77L, 3L, 21L);
-        F16HeadTest.checkCpuMat(8L, 32L, 2L, 33L);
-        F16HeadTest.checkCpuMat(17L, 2560L, 5L, 45L);
-        F16HeadTest.checkCpuMat(1L, 5L, 2L, 57L);
+        if (!KernelCap.usable("f16CpuTileKernel")) { DeviceSkip.noKernel("f16CpuTileKernel", be); return; }
+        int32 which = 0;
+        while (which < 3) {
+            F16HeadTest.checkCpuMat(which, 64L, 1536L, 1L, 5L);
+            F16HeadTest.checkCpuMat(which, 3L, 40L, 1L, 9L);
+            F16HeadTest.checkCpuMat(which, 13L, 77L, 3L, 21L);
+            F16HeadTest.checkCpuMat(which, 8L, 32L, 2L, 33L);
+            F16HeadTest.checkCpuMat(which, 17L, 2560L, 5L, 45L);
+            F16HeadTest.checkCpuMat(which, 1L, 5L, 2L, 57L);
+            F16HeadTest.checkCpuMat(which, 4L, 16L, 6L, 69L);
+            F16HeadTest.checkCpuMat(which, 301L, 100L, 7L, 81L);
+            F16HeadTest.checkCpuMat(which, 130L, 48L, 13L, 93L);
+            F16HeadTest.checkCpuMat(which, 9L, 5211L, 3L, 105L);
+            F16HeadTest.checkCpuMat(which, 6L, 10240L, 7L, 117L);
+            which = which + 1;
+        }
     }
 
     /** An all-F16 file where f16CpuMatKernel is registered: a one-token prefill launches it, a five-token prefill

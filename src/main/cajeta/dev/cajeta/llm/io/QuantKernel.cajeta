@@ -43889,13 +43889,14 @@ public final class QuantKernel {
         return;
     }
 
-    /** The eight lanes of `s`, summed in pairs. */
+    /** The sixteen lanes of `s`, summed in pairs. */
     @Device
-    static float32 f16Sum8(Vector<float32,8> s) {
-        return ((s[0] + s[4]) + (s[1] + s[5])) + ((s[2] + s[6]) + (s[3] + s[7]));
+    static float32 f16Sum16(Vector<float32,16> s) {
+        return (((s[0] + s[8]) + (s[4] + s[12])) + ((s[2] + s[10]) + (s[6] + s[14])))
+            + (((s[1] + s[9]) + (s[5] + s[13])) + ((s[3] + s[11]) + (s[7] + s[15])));
     }
 
-    /** `W[wb + from .. wb + cols) . x[xb + from ..)` one half at a time (`wb` in halves): the columns past the last whole eight. */
+    /** `W[wb + from .. wb + cols) . x[xb + from ..)` one half at a time (`wb` in halves): the columns past the last whole sixteen. */
     @Device
     static float32 f16TailDot(KernelBuffer<int8> w, KernelBuffer<float32> x, int64 wb, int64 xb, int64 from, int64 cols) {
         float32 t = 0.0f;
@@ -43915,81 +43916,178 @@ public final class QuantKernel {
     }
 
     /** The cpu backend's F16 projection: `y[c * yStride + r] (+)= W[r] . x[c * xStride ..)` for `nc` f32 columns, W row-major
-     *  halves (`wh` is `w`'s half view). A thread takes eight rows and reads each column once for all of them. */
+     *  halves (`wh` is `w`'s half view). A thread takes `slabRows` rows and reads them front to back, one row at a time. */
     @Kernel(targets = {"cpu"})
     @Occupancy(maxThreads = 256)
     public static void f16CpuMatKernel(KernelBuffer<float32> y, KernelBuffer<int8> w, KernelBuffer<float16> wh,
-            KernelBuffer<float32> x, uint32 rows, uint32 groups, int64 cols, uint32 nc, int64 xStride, int64 yStride,
-            uint32 accum) {
+            KernelBuffer<float32> x, uint32 rows, uint32 slabs, uint32 slabRows, int64 cols, uint32 nc, int64 xStride,
+            int64 yStride, uint32 accum) {
         uint32 g = KernelThread.globalIdX();
-        if (g < groups) {
-            int64 last = (int64) rows - 1L;
-            int64 r0 = (int64) g * 8L;
-            int64 b0 = r0 * cols;
-            int64 b1 = (r0 + 1L > last ? last : r0 + 1L) * cols;
-            int64 b2 = (r0 + 2L > last ? last : r0 + 2L) * cols;
-            int64 b3 = (r0 + 3L > last ? last : r0 + 3L) * cols;
-            int64 b4 = (r0 + 4L > last ? last : r0 + 4L) * cols;
-            int64 b5 = (r0 + 5L > last ? last : r0 + 5L) * cols;
-            int64 b6 = (r0 + 6L > last ? last : r0 + 6L) * cols;
-            int64 b7 = (r0 + 7L > last ? last : r0 + 7L) * cols;
-            int64 full = cols / 8L * 8L;
-            Vector<float32,8> zf = heap Vector<int32,8>(0, 0, 0, 0, 0, 0, 0, 0).toF32();
-            uint32 c = 0;
-            while (c < nc) {
-                int64 xb = (int64) c * xStride;
-                Vector<float32,8> a0 = zf;
-                Vector<float32,8> a1 = zf;
-                Vector<float32,8> a2 = zf;
-                Vector<float32,8> a3 = zf;
-                Vector<float32,8> a4 = zf;
-                Vector<float32,8> a5 = zf;
-                Vector<float32,8> a6 = zf;
-                Vector<float32,8> a7 = zf;
-                int64 j = 0;
-                while (j < full) {
-                    Vector<float32,8> xv = x.vload<8>(xb + j);
-                    a0 = a0 + wh.vload<8>(b0 + j).toF32() * xv;
-                    a1 = a1 + wh.vload<8>(b1 + j).toF32() * xv;
-                    a2 = a2 + wh.vload<8>(b2 + j).toF32() * xv;
-                    a3 = a3 + wh.vload<8>(b3 + j).toF32() * xv;
-                    a4 = a4 + wh.vload<8>(b4 + j).toF32() * xv;
-                    a5 = a5 + wh.vload<8>(b5 + j).toF32() * xv;
-                    a6 = a6 + wh.vload<8>(b6 + j).toF32() * xv;
-                    a7 = a7 + wh.vload<8>(b7 + j).toF32() * xv;
-                    j = j + 8L;
+        if (g < slabs) {
+            int64 r = (int64) g * (int64) slabRows;
+            int64 rHi = r + (int64) slabRows;
+            if (rHi > (int64) rows) { rHi = (int64) rows; }
+            int64 full64 = cols / 64L * 64L;
+            int64 full = cols / 16L * 16L;
+            Vector<float32,16> zf = heap Vector<int32,16>(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0).toF32();
+            while (r < rHi) {
+                int64 b = r * cols;
+                uint32 c = 0;
+                while (c < nc) {
+                    int64 xb = (int64) c * xStride;
+                    Vector<float32,16> a0 = zf;
+                    Vector<float32,16> a1 = zf;
+                    Vector<float32,16> a2 = zf;
+                    Vector<float32,16> a3 = zf;
+                    int64 j = 0;
+                    while (j < full64) {
+                        a0 = Math.fma(wh.vload<16>(b + j).toF32(), x.vload<16>(xb + j), a0);
+                        a1 = Math.fma(wh.vload<16>(b + j + 16L).toF32(), x.vload<16>(xb + j + 16L), a1);
+                        a2 = Math.fma(wh.vload<16>(b + j + 32L).toF32(), x.vload<16>(xb + j + 32L), a2);
+                        a3 = Math.fma(wh.vload<16>(b + j + 48L).toF32(), x.vload<16>(xb + j + 48L), a3);
+                        j = j + 64L;
+                    }
+                    while (j < full) {
+                        a0 = Math.fma(wh.vload<16>(b + j).toF32(), x.vload<16>(xb + j), a0);
+                        j = j + 16L;
+                    }
+                    QuantKernel.f16Put(y, (int64) c * yStride + r,
+                        QuantKernel.f16Sum16((a0 + a1) + (a2 + a3)) + QuantKernel.f16TailDot(w, x, b, xb, full, cols), accum);
+                    c = c + 1;
                 }
-                int64 yo = (int64) c * yStride + r0;
-                QuantKernel.f16Put(y, yo, QuantKernel.f16Sum8(a0) + QuantKernel.f16TailDot(w, x, b0, xb, full, cols), accum);
-                if (r0 + 1L <= last) {
-                    QuantKernel.f16Put(y, yo + 1L, QuantKernel.f16Sum8(a1) + QuantKernel.f16TailDot(w, x, b1, xb, full, cols), accum);
+                r = r + 1L;
+            }
+        }
+    }
+
+    /** {@link #f16CpuMatKernel}'s product over W's columns `[kLo, kHi)`, in 4-row by 6-column register tiles of sixteen
+     *  lanes. A thread takes `slabRows` rows of W, a block that stays in its cache, and walks every x column over it. */
+    @Kernel(targets = {"cpu"})
+    @Occupancy(maxThreads = 256)
+    public static void f16CpuTileKernel(KernelBuffer<float32> y, KernelBuffer<int8> w, KernelBuffer<float16> wh,
+            KernelBuffer<float32> x, uint32 rows, uint32 slabs, uint32 slabRows, int64 cols, uint32 nc, int64 xStride,
+            int64 yStride, uint32 accum, int64 kLo, int64 kHi) {
+        uint32 g = KernelThread.globalIdX();
+        if (g < slabs) {
+            int64 rLo = (int64) g * (int64) slabRows;
+            int64 rHi = rLo + (int64) slabRows;
+            if (rHi > (int64) rows) { rHi = (int64) rows; }
+            int64 lastR = rHi - 1L;
+            int64 lastC = (int64) nc - 1L;
+            int64 full = cols / 16L * 16L;
+            int64 jHi = kHi < full ? kHi : full;
+            int64 tail = kHi < cols ? cols : full;
+            Vector<float32,16> zf = heap Vector<int32,16>(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0).toF32();
+            int64 c0 = 0L;
+            while (c0 < (int64) nc) {
+                int64 x0 = c0 * xStride;
+                int64 x1 = (c0 + 1L > lastC ? lastC : c0 + 1L) * xStride;
+                int64 x2 = (c0 + 2L > lastC ? lastC : c0 + 2L) * xStride;
+                int64 x3 = (c0 + 3L > lastC ? lastC : c0 + 3L) * xStride;
+                int64 x4 = (c0 + 4L > lastC ? lastC : c0 + 4L) * xStride;
+                int64 x5 = (c0 + 5L > lastC ? lastC : c0 + 5L) * xStride;
+                int64 r0 = rLo;
+                while (r0 < rHi) {
+                    int64 b0 = r0 * cols;
+                    int64 b1 = (r0 + 1L > lastR ? lastR : r0 + 1L) * cols;
+                    int64 b2 = (r0 + 2L > lastR ? lastR : r0 + 2L) * cols;
+                    int64 b3 = (r0 + 3L > lastR ? lastR : r0 + 3L) * cols;
+                    Vector<float32,16> a00 = zf;
+                    Vector<float32,16> a01 = zf;
+                    Vector<float32,16> a02 = zf;
+                    Vector<float32,16> a03 = zf;
+                    Vector<float32,16> a04 = zf;
+                    Vector<float32,16> a05 = zf;
+                    Vector<float32,16> a10 = zf;
+                    Vector<float32,16> a11 = zf;
+                    Vector<float32,16> a12 = zf;
+                    Vector<float32,16> a13 = zf;
+                    Vector<float32,16> a14 = zf;
+                    Vector<float32,16> a15 = zf;
+                    Vector<float32,16> a20 = zf;
+                    Vector<float32,16> a21 = zf;
+                    Vector<float32,16> a22 = zf;
+                    Vector<float32,16> a23 = zf;
+                    Vector<float32,16> a24 = zf;
+                    Vector<float32,16> a25 = zf;
+                    Vector<float32,16> a30 = zf;
+                    Vector<float32,16> a31 = zf;
+                    Vector<float32,16> a32 = zf;
+                    Vector<float32,16> a33 = zf;
+                    Vector<float32,16> a34 = zf;
+                    Vector<float32,16> a35 = zf;
+                    int64 j = kLo;
+                    while (j < jHi) {
+                        Vector<float32,16> w0 = wh.vload<16>(b0 + j).toF32();
+                        Vector<float32,16> w1 = wh.vload<16>(b1 + j).toF32();
+                        Vector<float32,16> w2 = wh.vload<16>(b2 + j).toF32();
+                        Vector<float32,16> w3 = wh.vload<16>(b3 + j).toF32();
+                        Vector<float32,16> v0 = x.vload<16>(x0 + j);
+                        Vector<float32,16> v1 = x.vload<16>(x1 + j);
+                        Vector<float32,16> v2 = x.vload<16>(x2 + j);
+                        Vector<float32,16> v3 = x.vload<16>(x3 + j);
+                        Vector<float32,16> v4 = x.vload<16>(x4 + j);
+                        Vector<float32,16> v5 = x.vload<16>(x5 + j);
+                        a00 = Math.fma(w0, v0, a00);
+                        a01 = Math.fma(w0, v1, a01);
+                        a02 = Math.fma(w0, v2, a02);
+                        a03 = Math.fma(w0, v3, a03);
+                        a04 = Math.fma(w0, v4, a04);
+                        a05 = Math.fma(w0, v5, a05);
+                        a10 = Math.fma(w1, v0, a10);
+                        a11 = Math.fma(w1, v1, a11);
+                        a12 = Math.fma(w1, v2, a12);
+                        a13 = Math.fma(w1, v3, a13);
+                        a14 = Math.fma(w1, v4, a14);
+                        a15 = Math.fma(w1, v5, a15);
+                        a20 = Math.fma(w2, v0, a20);
+                        a21 = Math.fma(w2, v1, a21);
+                        a22 = Math.fma(w2, v2, a22);
+                        a23 = Math.fma(w2, v3, a23);
+                        a24 = Math.fma(w2, v4, a24);
+                        a25 = Math.fma(w2, v5, a25);
+                        a30 = Math.fma(w3, v0, a30);
+                        a31 = Math.fma(w3, v1, a31);
+                        a32 = Math.fma(w3, v2, a32);
+                        a33 = Math.fma(w3, v3, a33);
+                        a34 = Math.fma(w3, v4, a34);
+                        a35 = Math.fma(w3, v5, a35);
+                        j = j + 16L;
+                    }
+                    QuantKernel.f16Put(y, (c0 + 0L) * yStride + r0 + 0L, QuantKernel.f16Sum16(a00) + QuantKernel.f16TailDot(w, x, b0, x0, tail, cols), accum);
+                    if (c0 + 1L <= lastC) { QuantKernel.f16Put(y, (c0 + 1L) * yStride + r0 + 0L, QuantKernel.f16Sum16(a01) + QuantKernel.f16TailDot(w, x, b0, x1, tail, cols), accum); }
+                    if (c0 + 2L <= lastC) { QuantKernel.f16Put(y, (c0 + 2L) * yStride + r0 + 0L, QuantKernel.f16Sum16(a02) + QuantKernel.f16TailDot(w, x, b0, x2, tail, cols), accum); }
+                    if (c0 + 3L <= lastC) { QuantKernel.f16Put(y, (c0 + 3L) * yStride + r0 + 0L, QuantKernel.f16Sum16(a03) + QuantKernel.f16TailDot(w, x, b0, x3, tail, cols), accum); }
+                    if (c0 + 4L <= lastC) { QuantKernel.f16Put(y, (c0 + 4L) * yStride + r0 + 0L, QuantKernel.f16Sum16(a04) + QuantKernel.f16TailDot(w, x, b0, x4, tail, cols), accum); }
+                    if (c0 + 5L <= lastC) { QuantKernel.f16Put(y, (c0 + 5L) * yStride + r0 + 0L, QuantKernel.f16Sum16(a05) + QuantKernel.f16TailDot(w, x, b0, x5, tail, cols), accum); }
+                    if (r0 + 1L <= lastR) { QuantKernel.f16Put(y, (c0 + 0L) * yStride + r0 + 1L, QuantKernel.f16Sum16(a10) + QuantKernel.f16TailDot(w, x, b1, x0, tail, cols), accum); }
+                    if (r0 + 1L <= lastR && c0 + 1L <= lastC) { QuantKernel.f16Put(y, (c0 + 1L) * yStride + r0 + 1L, QuantKernel.f16Sum16(a11) + QuantKernel.f16TailDot(w, x, b1, x1, tail, cols), accum); }
+                    if (r0 + 1L <= lastR && c0 + 2L <= lastC) { QuantKernel.f16Put(y, (c0 + 2L) * yStride + r0 + 1L, QuantKernel.f16Sum16(a12) + QuantKernel.f16TailDot(w, x, b1, x2, tail, cols), accum); }
+                    if (r0 + 1L <= lastR && c0 + 3L <= lastC) { QuantKernel.f16Put(y, (c0 + 3L) * yStride + r0 + 1L, QuantKernel.f16Sum16(a13) + QuantKernel.f16TailDot(w, x, b1, x3, tail, cols), accum); }
+                    if (r0 + 1L <= lastR && c0 + 4L <= lastC) { QuantKernel.f16Put(y, (c0 + 4L) * yStride + r0 + 1L, QuantKernel.f16Sum16(a14) + QuantKernel.f16TailDot(w, x, b1, x4, tail, cols), accum); }
+                    if (r0 + 1L <= lastR && c0 + 5L <= lastC) { QuantKernel.f16Put(y, (c0 + 5L) * yStride + r0 + 1L, QuantKernel.f16Sum16(a15) + QuantKernel.f16TailDot(w, x, b1, x5, tail, cols), accum); }
+                    if (r0 + 2L <= lastR) { QuantKernel.f16Put(y, (c0 + 0L) * yStride + r0 + 2L, QuantKernel.f16Sum16(a20) + QuantKernel.f16TailDot(w, x, b2, x0, tail, cols), accum); }
+                    if (r0 + 2L <= lastR && c0 + 1L <= lastC) { QuantKernel.f16Put(y, (c0 + 1L) * yStride + r0 + 2L, QuantKernel.f16Sum16(a21) + QuantKernel.f16TailDot(w, x, b2, x1, tail, cols), accum); }
+                    if (r0 + 2L <= lastR && c0 + 2L <= lastC) { QuantKernel.f16Put(y, (c0 + 2L) * yStride + r0 + 2L, QuantKernel.f16Sum16(a22) + QuantKernel.f16TailDot(w, x, b2, x2, tail, cols), accum); }
+                    if (r0 + 2L <= lastR && c0 + 3L <= lastC) { QuantKernel.f16Put(y, (c0 + 3L) * yStride + r0 + 2L, QuantKernel.f16Sum16(a23) + QuantKernel.f16TailDot(w, x, b2, x3, tail, cols), accum); }
+                    if (r0 + 2L <= lastR && c0 + 4L <= lastC) { QuantKernel.f16Put(y, (c0 + 4L) * yStride + r0 + 2L, QuantKernel.f16Sum16(a24) + QuantKernel.f16TailDot(w, x, b2, x4, tail, cols), accum); }
+                    if (r0 + 2L <= lastR && c0 + 5L <= lastC) { QuantKernel.f16Put(y, (c0 + 5L) * yStride + r0 + 2L, QuantKernel.f16Sum16(a25) + QuantKernel.f16TailDot(w, x, b2, x5, tail, cols), accum); }
+                    if (r0 + 3L <= lastR) { QuantKernel.f16Put(y, (c0 + 0L) * yStride + r0 + 3L, QuantKernel.f16Sum16(a30) + QuantKernel.f16TailDot(w, x, b3, x0, tail, cols), accum); }
+                    if (r0 + 3L <= lastR && c0 + 1L <= lastC) { QuantKernel.f16Put(y, (c0 + 1L) * yStride + r0 + 3L, QuantKernel.f16Sum16(a31) + QuantKernel.f16TailDot(w, x, b3, x1, tail, cols), accum); }
+                    if (r0 + 3L <= lastR && c0 + 2L <= lastC) { QuantKernel.f16Put(y, (c0 + 2L) * yStride + r0 + 3L, QuantKernel.f16Sum16(a32) + QuantKernel.f16TailDot(w, x, b3, x2, tail, cols), accum); }
+                    if (r0 + 3L <= lastR && c0 + 3L <= lastC) { QuantKernel.f16Put(y, (c0 + 3L) * yStride + r0 + 3L, QuantKernel.f16Sum16(a33) + QuantKernel.f16TailDot(w, x, b3, x3, tail, cols), accum); }
+                    if (r0 + 3L <= lastR && c0 + 4L <= lastC) { QuantKernel.f16Put(y, (c0 + 4L) * yStride + r0 + 3L, QuantKernel.f16Sum16(a34) + QuantKernel.f16TailDot(w, x, b3, x4, tail, cols), accum); }
+                    if (r0 + 3L <= lastR && c0 + 5L <= lastC) { QuantKernel.f16Put(y, (c0 + 5L) * yStride + r0 + 3L, QuantKernel.f16Sum16(a35) + QuantKernel.f16TailDot(w, x, b3, x5, tail, cols), accum); }
+                    r0 = r0 + 4L;
                 }
-                if (r0 + 2L <= last) {
-                    QuantKernel.f16Put(y, yo + 2L, QuantKernel.f16Sum8(a2) + QuantKernel.f16TailDot(w, x, b2, xb, full, cols), accum);
-                }
-                if (r0 + 3L <= last) {
-                    QuantKernel.f16Put(y, yo + 3L, QuantKernel.f16Sum8(a3) + QuantKernel.f16TailDot(w, x, b3, xb, full, cols), accum);
-                }
-                if (r0 + 4L <= last) {
-                    QuantKernel.f16Put(y, yo + 4L, QuantKernel.f16Sum8(a4) + QuantKernel.f16TailDot(w, x, b4, xb, full, cols), accum);
-                }
-                if (r0 + 5L <= last) {
-                    QuantKernel.f16Put(y, yo + 5L, QuantKernel.f16Sum8(a5) + QuantKernel.f16TailDot(w, x, b5, xb, full, cols), accum);
-                }
-                if (r0 + 6L <= last) {
-                    QuantKernel.f16Put(y, yo + 6L, QuantKernel.f16Sum8(a6) + QuantKernel.f16TailDot(w, x, b6, xb, full, cols), accum);
-                }
-                if (r0 + 7L <= last) {
-                    QuantKernel.f16Put(y, yo + 7L, QuantKernel.f16Sum8(a7) + QuantKernel.f16TailDot(w, x, b7, xb, full, cols), accum);
-                }
-                c = c + 1;
+                c0 = c0 + 6L;
             }
         }
     }
 
     static int64 cpuF16N = 0L;
 
-    /** How many {@link #f16CpuMatKernel} launches this process has made. */
+    /** How many cpu F16 launches ({@link #f16CpuMatKernel} or {@link #f16CpuTileKernel}) this process has made. */
     public static int64 cpuF16Launches() { return QuantKernel.cpuF16N; }
 
     static int64 cpuF16BatchN = 0L;
@@ -43997,17 +44095,65 @@ public final class QuantKernel {
     /** How many of those launches carried more than one column. */
     public static int64 cpuF16BatchLaunches() { return QuantKernel.cpuF16BatchN; }
 
+    /** Rows per work item for a cpu F16 launch: a multiple of `tile`, half a megabyte of W at most, and small enough
+     *  that every worker gets about four. */
+    static int64 f16CpuSlabRows(int64 rows, int64 cols, int64 tile) {
+        int64 workers = (int64) Device.multiprocessorCount();
+        if (workers < 1L) { workers = 1L; }
+        int64 sr = 524288L / (cols * 2L);
+        int64 even = (rows + workers * 4L - 1L) / (workers * 4L);
+        if (sr > even) { sr = even; }
+        sr = sr / tile * tile;
+        return sr < tile ? tile : sr;
+    }
+
     /** {@link #f16CpuMatKernel} over a `rows` x `cols` F16 weight for `nc` columns `xStride` floats apart, into rows of
      *  `y` `yStride` apart. */
+    public static void f16CpuRowsLaunchNoSync(KernelBuffer<float32> y, KernelBuffer<int8> w, KernelBuffer<float16> wh,
+            KernelBuffer<float32> x, int64 rows, int64 cols, int64 nc, int64 xStride, int64 yStride, boolean accum) {
+        int64 sr = QuantKernel.f16CpuSlabRows(rows, cols, 1L);
+        uint32 slabs = (uint32) ((rows + sr - 1L) / sr);
+        KernelStream s = QuantKernel.stream();
+        f16CpuMatKernel.launch(s, grid: [slabs], block: [1])
+            (y, w, wh, x, (uint32) rows, slabs, (uint32) sr, cols, (uint32) nc, xStride, yStride, accum ? 1 : 0);
+        return;
+    }
+
+    /** Columns of W per tile-kernel launch: all of them up to 5120, else the fewest equal spans under that. */
+    static int64 f16CpuSpan(int64 cols) {
+        int64 n = (cols + 5119L) / 5120L;
+        return ((cols + n - 1L) / n + 15L) / 16L * 16L;
+    }
+
+    /** {@link #f16CpuTileKernel} over the same product, in slabs of whole tile rows, one launch per span of W's
+     *  columns so the x block a launch reads stays in the shared cache. */
+    public static void f16CpuTileLaunchNoSync(KernelBuffer<float32> y, KernelBuffer<int8> w, KernelBuffer<float16> wh,
+            KernelBuffer<float32> x, int64 rows, int64 cols, int64 nc, int64 xStride, int64 yStride, boolean accum) {
+        int64 span = QuantKernel.f16CpuSpan(cols);
+        int64 sr = QuantKernel.f16CpuSlabRows(rows, span < cols ? span : cols, 4L);
+        uint32 slabs = (uint32) ((rows + sr - 1L) / sr);
+        KernelStream s = QuantKernel.stream();
+        int64 k0 = 0L;
+        while (k0 < cols) {
+            int64 k1 = k0 + span < cols ? k0 + span : cols;
+            f16CpuTileKernel.launch(s, grid: [slabs], block: [1])
+                (y, w, wh, x, (uint32) rows, slabs, (uint32) sr, cols, (uint32) nc, xStride, yStride,
+                 (accum || k0 > 0L) ? 1 : 0, k0, k1);
+            k0 = k1;
+        }
+        return;
+    }
+
+    /** The cpu F16 product: the row kernel for one column, the tile kernel for a batch. */
     public static void f16CpuMatLaunchNoSync(KernelBuffer<float32> y, KernelBuffer<int8> w, KernelBuffer<float16> wh,
             KernelBuffer<float32> x, int64 rows, int64 cols, int64 nc, int64 xStride, int64 yStride, boolean accum) {
         QuantKernel.cpuF16N = QuantKernel.cpuF16N + 1L;
-        if (nc > 1L) { QuantKernel.cpuF16BatchN = QuantKernel.cpuF16BatchN + 1L; }
-        uint32 groups = (uint32) ((rows + 7L) / 8L);
-        uint32 blk = QuantKernel.cpuEvenBlock(groups);
-        KernelStream s = QuantKernel.stream();
-        f16CpuMatKernel.launch(s, grid: [(groups + blk - 1) / blk], block: [blk])
-            (y, w, wh, x, (uint32) rows, groups, cols, (uint32) nc, xStride, yStride, accum ? 1 : 0);
+        if (nc > 1L) {
+            QuantKernel.cpuF16BatchN = QuantKernel.cpuF16BatchN + 1L;
+            QuantKernel.f16CpuTileLaunchNoSync(y, w, wh, x, rows, cols, nc, xStride, yStride, accum);
+            return;
+        }
+        QuantKernel.f16CpuRowsLaunchNoSync(y, w, wh, x, rows, cols, nc, xStride, yStride, accum);
         return;
     }
 

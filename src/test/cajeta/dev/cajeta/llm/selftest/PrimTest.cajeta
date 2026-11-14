@@ -7,6 +7,9 @@ import dev.cajeta.llm.model.Prim;
 import cajeta.lang.Math;
 import cajeta.lang.String;
 import cajeta.math.Tensor;
+import cajeta.xpu.Device;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.ml.kernels.testing.ValueCheck;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelStream;
 import dev.cajeta.llm.io.QuantKernel;
@@ -340,6 +343,145 @@ public class PrimTest {
             }
             d = d + 1;
         }
+    }
+
+    /** cajeta-llm 15.2.21.4.2.1: the cpu GLU kernel agrees with the scalar kernel for both activations, a ragged tail
+     *  and saturated inputs included. */
+    @Test
+    public void theCpuGluKernelMatchesTheScalarKernel() {
+        String be = Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable("gluCpuKernel")) { DeviceSkip.noKernel("gluCpuKernel", be); return; }
+        int64 n = 9037L;
+        float32[] gv = heap float32[n];
+        float32[] uv = heap float32[n];
+        int64 i = 0;
+        while (i < n) {
+            gv[i] = (float32) ((i * 37L) % 2001L) * 0.04f - 40.0f;
+            uv[i] = (float32) ((i * 13L) % 101L) * 0.02f - 1.0f;
+            i = i + 1;
+        }
+        gv[0] = 100000000000000000000.0f;
+        gv[1] = 0.0f - 100000000000000000000.0f;
+        gv[2] = 0.0f;
+        gv[3] = 0.00000000000000000001f;
+        KernelBuffer<float32> u = heap KernelBuffer<float32>((uint64) n);
+        u.upload(uv, n);
+        KernelStream s = QuantKernel.stream();
+        int64[] vc #= ValueCheck.mark();
+        int32 act = 0;
+        while (act < 2) {
+            KernelBuffer<float32> ga = heap KernelBuffer<float32>((uint64) n);
+            KernelBuffer<float32> gb = heap KernelBuffer<float32>((uint64) n);
+            ga.upload(gv, n);
+            gb.upload(gv, n);
+            Prim.setCpuVecPrim(false);
+            Prim.gluDevice(ga, u, n, act);
+            s.sync();
+            Prim.setCpuVecPrim(true);
+            Prim.gluDevice(gb, u, n, act);
+            s.sync();
+            float32[] a = heap float32[n];
+            float32[] b = heap float32[n];
+            ga.download(a, n);
+            gb.download(b, n);
+            i = 0;
+            while (i < n) {
+                float64 want = (float64) a[i];
+                if (PrimTest.fabs((float64) b[i] - want) > 0.000005 * (1.0 + PrimTest.fabs(want))) {
+                    Assert.fail("cpu glu act " + act + " cell " + i + " of input " + gv[i] + ": " + b[i] + ", scalar kernel " + a[i]);
+                }
+                i = i + 1;
+            }
+            act = act + 1;
+        }
+        ValueCheck.credit(vc);
+        return;
+    }
+
+    static #KernelBuffer<float32> devOf(float32[] v, int64 n) {
+        KernelBuffer<float32> b = heap KernelBuffer<float32>((uint64) n);
+        b.upload(v, n);
+        return #b;
+    }
+
+    static void sameBits(String what, KernelBuffer<float32> a, KernelBuffer<float32> b, int64 n) {
+        float32[] av = heap float32[n];
+        float32[] bv = heap float32[n];
+        a.download(av, n);
+        b.download(bv, n);
+        int64 i = 0;
+        while (i < n) {
+            if (av[i] != bv[i]) { Assert.fail(what + " cell " + i + ": " + bv[i] + ", workgroup kernels " + av[i]); }
+            i = i + 1;
+        }
+        return;
+    }
+
+    /** cajeta-llm 15.2.21.4.2.2: the cpu row norm, alone, on one row and with the residual add, and the cpu add
+     *  give the workgroup kernels' values bit for bit. */
+    @Test
+    public void theCpuNormAndAddKernelsMatchTheWorkgroupKernels() {
+        String be = Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable("rmsnormRowsCpuKernel")) { DeviceSkip.noKernel("rmsnormRowsCpuKernel", be); return; }
+        if (!KernelCap.usable("addCpuKernel")) { DeviceSkip.noKernel("addCpuKernel", be); return; }
+        int64 rows = 5L;
+        int64 dim = 768L;
+        int64 n = rows * dim;
+        float32[] xv = heap float32[n];
+        float32[] hv = heap float32[n];
+        float32[] wv = heap float32[dim];
+        int64 i = 0;
+        while (i < n) {
+            xv[i] = (float32) ((i * 37L) % 2001L) * 0.02f - 20.0f + (float32) (i % 7L) * 0.001f;
+            hv[i] = (float32) ((i * 11L) % 509L) * 0.03f - 7.0f;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < dim) { wv[i] = (float32) ((i * 13L) % 101L) * 0.02f - 1.0f; i = i + 1; }
+        KernelBuffer<float32> x #= PrimTest.devOf(xv, n);
+        KernelBuffer<float32> w #= PrimTest.devOf(wv, dim);
+        KernelStream s = QuantKernel.stream();
+        float32 eps = 0.000001f;
+        int64[] vc #= ValueCheck.mark();
+        int32 form = 0;
+        while (form < 2) {
+            KernelBuffer<float32> oa #= PrimTest.devOf(hv, n);
+            KernelBuffer<float32> ob #= PrimTest.devOf(hv, n);
+            KernelBuffer<float32> oc #= PrimTest.devOf(hv, n);
+            KernelBuffer<float32> ha #= PrimTest.devOf(hv, n);
+            KernelBuffer<float32> hb #= PrimTest.devOf(hv, n);
+            KernelBuffer<float32> ra #= PrimTest.devOf(hv, n);
+            KernelBuffer<float32> rb #= PrimTest.devOf(hv, n);
+            KernelBuffer<float32> pa #= PrimTest.devOf(hv, n);
+            KernelBuffer<float32> pb #= PrimTest.devOf(hv, n);
+            KernelBuffer<float32> ia #= PrimTest.devOf(xv, n);
+            KernelBuffer<float32> ib #= PrimTest.devOf(xv, n);
+            Prim.setCpuVecPrim(false);
+            Prim.rmsnormBatchDevice(oa, x, w, rows, dim, eps, form);
+            Prim.addDevice(ha, oa, n);
+            Prim.rmsnormDevice(ra, x, w, dim, eps, form);
+            Prim.addDevice(pa, x, n - 5L);
+            Prim.rmsnormBatchDevice(ia, ia, w, rows, dim, eps, form);
+            s.sync();
+            Prim.setCpuVecPrim(true);
+            Prim.rmsnormBatchDevice(ob, x, w, rows, dim, eps, form);
+            Prim.rmsnormAddBatchDevice(oc, x, w, hb, rows, dim, eps, form);
+            Prim.rmsnormDevice(rb, x, w, dim, eps, form);
+            Prim.addDevice(pb, x, n - 5L);
+            Prim.rmsnormBatchDevice(ib, ib, w, rows, dim, eps, form);
+            s.sync();
+            PrimTest.sameBits("cpu row norm form " + form, oa, ob, n);
+            PrimTest.sameBits("cpu row norm with the add, form " + form, oa, oc, n);
+            PrimTest.sameBits("cpu row norm's residual, form " + form, ha, hb, n);
+            PrimTest.sameBits("cpu one-row norm form " + form, ra, rb, n);
+            PrimTest.sameBits("cpu add", pa, pb, n);
+            PrimTest.sameBits("cpu row norm in place, form " + form, ia, ib, n);
+            form = form + 1;
+        }
+        ValueCheck.credit(vc);
+        return;
     }
 
     // ── 7.1.4 — SwiGLU and GeGLU, selected by config ────────────────────
