@@ -1,0 +1,119 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import dev.cajeta.unit.AfterEach;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.DeviceKv;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.ml.kernels.testing.ValueCheck;
+
+/** cajeta-llm plan 15.2.21.7: a head size of 256 attends on the device, prefill and decode, to the host path's answer. */
+public class HeadDim256DeviceTest {
+
+    static final String DIR = "tmp/cajeta_llm_hd256_dev";
+    static boolean written = false;
+
+    public HeadDim256DeviceTest() { return; }
+
+    @AfterEach
+    public void restore() {
+        Diag.register(null);
+        QuantKernel.setRoutingEnabled(true);
+        return;
+    }
+
+    /** The Gemma 3 toy at hd 256: H 512, two q heads over one kv head, no window. */
+    static #ToyModel spec() {
+        return ToyModel.specVariant(2, 512, 512, 2, 1, 256, 256, true, true, true);
+    }
+
+    static void writeFixture() {
+        if (HeadDim256DeviceTest.written) { return; }
+        Path dir #= Path.of(HeadDim256DeviceTest.DIR);
+        dir.mkdirs();
+        ToyModel.writeConfigX(HeadDim256DeviceTest.DIR + "/config.json", "Gemma3ForCausalLM", 512, 512, 2, 2, 1,
+            256, 256, 128, true,
+            "\"layer_types\":[\"full_attention\",\"full_attention\"],\"hidden_activation\":\"gelu_pytorch_tanh\","
+            + "\"query_pre_attn_scalar\":256,\"rope_local_base_freq\":10000.0,");
+        ToyModel s #= HeadDim256DeviceTest.spec();
+        ToyModel.writeWeights(HeadDim256DeviceTest.DIR + "/model.safetensors", s);
+        HeadDim256DeviceTest.written = true;
+        return;
+    }
+
+    static #CausalLM mk() {
+        HeadDim256DeviceTest.writeFixture();
+        ModelConfig cfg #= ModelConfig.parse(HeadDim256DeviceTest.DIR + "/config.json");
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        Checkpoint ck #= Checkpoint.open(HeadDim256DeviceTest.DIR + "/model.safetensors");
+        m.bind(ck, false);
+        ck.close();
+        ToyModel s #= HeadDim256DeviceTest.spec();
+        FourNormDeviceTest.packQ8(m, s);
+        return #m;
+    }
+
+    @Test
+    public void theDeviceKvTakesAHeadOf256() {
+        HeadDim256DeviceTest.writeFixture();
+        ModelConfig cfg #= ModelConfig.parse(HeadDim256DeviceTest.DIR + "/config.json");
+        Assert.equals(256, cfg.headDim);
+        Assert.isTrue(DeviceKv.supports(cfg));
+    }
+
+    @Test
+    public void aHeadOf256PrefillsAndDecodesOnTheDeviceToTheHostAnswer() {
+        if (!FourNormDeviceTest.deviceHere()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 v = 256;
+        CausalLM dev #= HeadDim256DeviceTest.mk();
+        System.stdout.println("  15.2.21.7 hd 256 batchRoutedFor(8) " + dev.batchRoutedFor(8) + " deviceRoutable "
+            + dev.deviceRoutable());
+        Assert.isTrue(dev.batchRoutedFor(8));
+        Assert.isTrue(dev.deviceRoutable());
+        int64[] vc #= ValueCheck.mark();
+        int32[] td = heap int32[7];
+        float32[] pd = heap float32[v];
+        float32[] ld = heap float32[v];
+        DecodeModeCapture dc = heap DecodeModeCapture();
+        Diag.register(dc);
+        FourNormDeviceTest.gen(dev, td, pd, ld);
+        Diag.register(null);
+        Assert.isTrue(dc.saw);
+        Assert.isTrue(dc.mode.equals("resident"));
+
+        QuantKernel.setRoutingEnabled(false);
+        CausalLM host #= HeadDim256DeviceTest.mk();
+        int32[] th = heap int32[7];
+        float32[] ph = heap float32[v];
+        float32[] lh = heap float32[v];
+        FourNormDeviceTest.gen(host, th, ph, lh);
+        QuantKernel.setRoutingEnabled(true);
+
+        float64 cosP = Metrics.cosine(ph, pd, v);
+        float64 klP = Metrics.softmaxKl(ph, pd, v);
+        float64 cosD = Metrics.cosine(lh, ld, v);
+        float64 klD = Metrics.softmaxKl(lh, ld, v);
+        System.stdout.println("  15.2.21.7 hd 256 prefill cosine " + cosP + " kl " + klP + "; decode cosine " + cosD
+            + " kl " + klD);
+        Assert.isTrue(cosP >= 0.99998);
+        Assert.isTrue(klP <= 1.0e-6);
+        Assert.isTrue(cosD >= 0.99998);
+        Assert.isTrue(klD <= 1.0e-6);
+        int32 t = 0;
+        while (t < 7) {
+            Assert.equals((int64) th[t], (int64) td[t]);
+            t = t + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+}
