@@ -1241,12 +1241,7 @@ public final class CausalLM extends InfModule {
         int32 hd = this.cfg.headDim;
         Tensor<float32> scores = this.pool.scores;
 
-        // FULL LAYER RESIDENCY (plan 10.2), when the layout allows it.
-        // Gated on the Llama shape — no QK-norm, no four-norm — because the
-        // extra norms in the other layouts have no device path yet, and a
-        // half-resident layer that silently used a stale `hs` would be the
-        // worst of both. rows==1 because only decode has a residual chain
-        // short enough for one buffer.
+        // FULL LAYER RESIDENCY (plan 10.2), when every projection routes; rows==1 only.
         boolean resident = rows == 1 && this.deviceResidentReady();
         this.logitsStale = false;
         if (rows == 1 && !this.decSaid) {
@@ -1798,6 +1793,13 @@ public final class CausalLM extends InfModule {
         } else {
             Linear.stageBatchFromDevice(this.pfXnDev, rows, h, this.stageTag);
         }
+        return;
+    }
+
+    /** Four-norm residual: norms `y`'s rows into xn, then adds them onto the resident hs. */
+    void postNormAddBatch(RMSNorm norm, int32 form, KernelBuffer<float32> y, int32 rows, int32 h) {
+        Prim.rmsnormBatchDevice(this.pfXnDev, y, norm.deviceWeight(), (int64) rows, (int64) h, norm.eps, form);
+        Prim.addDevice(this.pfHsDev, this.pfXnDev, (int64) rows * (int64) h);
         return;
     }
 
@@ -2570,7 +2572,7 @@ public final class CausalLM extends InfModule {
             // slots or windowed), so only the four attention
             // projections must route. Before this, the 30B decoded on
             // the host attention path: 110 ms of a 211 ms token.
-            if (d.fourNorm) { return false; }
+            if (d.fourNorm && d.moe != null) { return false; }
             if (!a.qProj.isDeviceRouted() || !a.kProj.isDeviceRouted()
                     || !a.vProj.isDeviceRouted()
                     || !a.oProj.isDeviceRouted()) {
@@ -2605,9 +2607,9 @@ public final class CausalLM extends InfModule {
             // Unit 29: qNorm no longer disqualifies — the batched path
             // applies the per-head norms between projection and rope
             // (llama.cpp's build_qwen3 order, read rather than assumed).
-            if (d.fourNorm) {
+            if (d.fourNorm && d.moe != null) {
                 refusals = refusals + this.refuse(l, "layer", 0 - 1,
-                    "fourNorm layer: the batched path has no 4-norm order",
+                    "fourNorm MoE layer: the batched MoE FFN has no post-feedforward norm",
                     rows);
             }
             refusals = refusals + this.refuseIf(l, "attn_q", a.qProj, rows);
@@ -3082,31 +3084,42 @@ public final class CausalLM extends InfModule {
                 int64 tg1 = CausalLM.pfMark();
                 // The tile adds its product into hs (1.8.3); any other
                 // route writes its own output and the add follows.
-                boolean oAcc = a.oProj.matmulBatchAccum(rows, this.pfHsDev);
+                boolean oAcc = !d.fourNorm && a.oProj.matmulBatchAccum(rows, this.pfHsDev);
                 if (!oAcc) { a.oProj.matmulBatchKeep(rows); }
                 int64 tn2 = CausalLM.pfMark();
                 CausalLM.pfGemmNs = CausalLM.pfGemmNs + (tn2 - tg1);
                 CausalLM.pfGONs = CausalLM.pfGONs + (tn2 - tg1);
-                if (!oAcc) { Prim.addDevice(this.pfHsDev, a.oProj.yBatch, nHs); }
+                if (d.fourNorm) {
+                    this.postNormAddBatch(d.postAttentionLayernorm, d.normForm, a.oProj.yBatch, rows, h);
+                } else if (!oAcc) {
+                    Prim.addDevice(this.pfHsDev, a.oProj.yBatch, nHs);
+                }
                 this.sniff("attn", l, nHs);
-                this.normAndStage(d.postAttentionLayernorm, d.normForm, rows, h);
+                RMSNorm preA = d.postAttentionLayernorm;
+                if (d.fourNorm) { preA = d.preFeedforwardLayernorm; }
+                this.normAndStage(preA, d.normForm, rows, h);
                 CausalLM.pfPrimNs = CausalLM.pfPrimNs + (CausalLM.pfMark() - tn2);
             } else {
                 a.oProj.matmulInto(rows, proj, 0L);
                 int64 tp1 = Clock.nanoTime();
                 r = 0;
                 while (r < rows) {
-                    HostOps.addRow(hs, (int64) r * (int64) h, proj,
-                        (int64) r * (int64) h, h);
+                    int64 rh = (int64) r * (int64) h;
+                    if (d.fourNorm) {
+                        Prim.rmsnormRowHost(proj, rh, d.postAttentionLayernorm.weight,
+                            d.postAttentionLayernorm.eps, proj, rh, h, d.normForm);
+                    }
+                    HostOps.addRow(hs, rh, proj, rh, h);
                     r = r + 1;
                 }
 
                 // ── MLP sublayer ────────────────────────────────────────
+                RMSNorm preB = d.postAttentionLayernorm;
+                if (d.fourNorm) { preB = d.preFeedforwardLayernorm; }
                 r = 0;
                 while (r < rows) {
                     Prim.rmsnormRowHost(hs, (int64) r * (int64) h,
-                        d.postAttentionLayernorm.weight,
-                        d.postAttentionLayernorm.eps, xn,
+                        preB.weight, preB.eps, xn,
                         (int64) r * (int64) h, h, d.normForm);
                     r = r + 1;
                 }
@@ -3241,14 +3254,16 @@ public final class CausalLM extends InfModule {
                 // With hs resident (.b) the down projection joins it on
                 // the device; devicePackOn == res here, so both arms of
                 // the residual agree on where hs lives.
-                boolean dAcc = d.mlp.downProj.matmulBatchAccum(rows,
+                boolean dAcc = !d.fourNorm && d.mlp.downProj.matmulBatchAccum(rows,
                     this.pfHsDev);
                 if (!dAcc) { d.mlp.downProj.matmulBatchKeep(rows); }
                 int64 ta2 = CausalLM.pfMark();
                 CausalLM.pfGemmNs = CausalLM.pfGemmNs + (ta2 - ts4);
                 CausalLM.pfGDownNs = CausalLM.pfGDownNs + (ta2 - ts4);
 
-                if (!dAcc) {
+                if (d.fourNorm) {
+                    this.postNormAddBatch(d.postFeedforwardLayernorm, d.normForm, d.mlp.downProj.yBatch, rows, h);
+                } else if (!dAcc) {
                     Prim.addDevice(this.pfHsDev, d.mlp.downProj.yBatch,
                         nHs);
                 }
@@ -3290,8 +3305,12 @@ public final class CausalLM extends InfModule {
                 int64 tp3 = Clock.nanoTime();
                 r = 0;
                 while (r < rows) {
-                    HostOps.addRow(hs, (int64) r * (int64) h, mlpOut,
-                        (int64) r * (int64) h, h);
+                    int64 rh3 = (int64) r * (int64) h;
+                    if (d.fourNorm) {
+                        Prim.rmsnormRowHost(mlpOut, rh3, d.postFeedforwardLayernorm.weight,
+                            d.postFeedforwardLayernorm.eps, mlpOut, rh3, h, d.normForm);
+                    }
+                    HostOps.addRow(hs, rh3, mlpOut, rh3, h);
                     r = r + 1;
                 }
                 CausalLM.pfPrimNs = CausalLM.pfPrimNs
@@ -3642,7 +3661,7 @@ public final class CausalLM extends InfModule {
             }
 
             // Unit 48: the residual add rides the o-projection's store.
-            if (a.oProj.matvecStagedAccum(this.hsDev)) {
+            if (!d.fourNorm && a.oProj.matvecStagedAccum(this.hsDev)) {
                 oAdded = true;
             } else {
                 a.oProj.matvecStagedKeep();
@@ -3685,9 +3704,13 @@ public final class CausalLM extends InfModule {
             }
             a.oProj.matvecKeepOnDevice(ao, 0L);
         }
-        if (!oAdded) {
+        if (d.fourNorm) {
+            this.postNormAdd(d.postAttentionLayernorm, d.normForm, a.oProj.out(), h);
+        } else if (!oAdded) {
             Prim.addDevice(this.hsDev, a.oProj.out(), (int64) h);
         }
+        RMSNorm preR = d.postAttentionLayernorm;
+        if (d.fourNorm) { preR = d.preFeedforwardLayernorm; }
         this.sniffRow("attn", li, h);
         if (CausalLM.phaseSyncOn) {
             KernelStream ps = QuantKernel.stream();
@@ -3723,13 +3746,13 @@ public final class CausalLM extends InfModule {
         if (!normPacked && d.moe == null) {
             denseNormStaged = Linear.stageDeviceActivationNormed(
                 this.xnDev, this.hsDev,
-                d.postAttentionLayernorm.deviceWeight(), (int64) h,
-                d.postAttentionLayernorm.eps, d.normForm);
+                preR.deviceWeight(), (int64) h,
+                preR.eps, d.normForm);
         }
         if (!normPacked && !denseNormStaged) {
             Prim.rmsnormDevice(this.xnDev, this.hsDev,
-                d.postAttentionLayernorm.deviceWeight(), (int64) h,
-                d.postAttentionLayernorm.eps, d.normForm);
+                preR.deviceWeight(), (int64) h,
+                preR.eps, d.normForm);
         }
         if (d.moe != null) {
             // MoE FFN via the HOST CROSSING (unit 38; unit 39 keeps
@@ -3828,7 +3851,10 @@ public final class CausalLM extends InfModule {
         }
         // Unit 48's accumulate form on the MLP tail too: the residual
         // add rides the down-projection's store where the route has it.
-        if (!d.mlp.downProj.matvecStagedAccum(this.hsDev)) {
+        if (d.fourNorm) {
+            d.mlp.downProj.matvecStagedKeep();
+            this.postNormAdd(d.postFeedforwardLayernorm, d.normForm, d.mlp.downProj.out(), h);
+        } else if (!d.mlp.downProj.matvecStagedAccum(this.hsDev)) {
             d.mlp.downProj.matvecStagedKeep();
             Prim.addDevice(this.hsDev, d.mlp.downProj.out(), (int64) h);
         }
@@ -3836,6 +3862,13 @@ public final class CausalLM extends InfModule {
         return;
     }
 
+
+    /** Four-norm residual at decode: norms `y` into xn, then adds it onto hs. */
+    void postNormAdd(RMSNorm norm, int32 form, KernelBuffer<float32> y, int32 h) {
+        Prim.rmsnormDevice(this.xnDev, y, norm.deviceWeight(), (int64) h, norm.eps, form);
+        Prim.addDevice(this.hsDev, this.xnDev, (int64) h);
+        return;
+    }
 
     // ── batched decode (xpu-kernel-adaptor 13B) ─────────────────────────
     //

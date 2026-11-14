@@ -1,0 +1,247 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import dev.cajeta.unit.AfterEach;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.DecoderLayer;
+import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.ml.kernels.testing.ValueCheck;
+
+/** cajeta-llm plan 15.2.21.6: a Gemma 3 four-norm stack prefills batched and decodes resident, matching the host path. */
+public class FourNormDeviceTest {
+
+    static final String DIR = "tmp/cajeta_llm_fournorm_dev";
+    static final int32 H = 512;
+    static final int32 IT = 512;
+    static final int32 NH = 4;
+    static final int32 NKV = 1;
+    static final int32 HD = 128;
+    static final int32 V = 256;
+    static final int32 LAYERS = 2;
+    static boolean written = false;
+
+    public FourNormDeviceTest() { return; }
+
+    @AfterEach
+    public void restore() {
+        Diag.register(null);
+        QuantKernel.setRoutingEnabled(true);
+        return;
+    }
+
+    /** Writes the four-norm toy and its plain Llama twin once per process. */
+    static void writeFixtures() {
+        if (FourNormDeviceTest.written) { return; }
+        Path dir #= Path.of(FourNormDeviceTest.DIR);
+        dir.mkdirs();
+        ToyModel g #= FourNormDeviceTest.gemmaSpec();
+        ToyModel.writeConfigX(FourNormDeviceTest.DIR + "/gemma.json", "Gemma3ForCausalLM",
+            FourNormDeviceTest.H, FourNormDeviceTest.IT, FourNormDeviceTest.LAYERS, FourNormDeviceTest.NH,
+            FourNormDeviceTest.NKV, FourNormDeviceTest.HD, FourNormDeviceTest.V, 128, true,
+            "\"layer_types\":[\"full_attention\",\"full_attention\"],\"hidden_activation\":\"gelu_pytorch_tanh\","
+            + "\"query_pre_attn_scalar\":128,\"rope_local_base_freq\":10000.0,");
+        ToyModel.writeWeights(FourNormDeviceTest.DIR + "/gemma.safetensors", g);
+        ToyModel d #= FourNormDeviceTest.llamaSpec();
+        ToyModel.writeConfig(FourNormDeviceTest.DIR + "/llama.json", "LlamaForCausalLM",
+            FourNormDeviceTest.H, FourNormDeviceTest.IT, FourNormDeviceTest.LAYERS, FourNormDeviceTest.NH,
+            FourNormDeviceTest.NKV, FourNormDeviceTest.HD, FourNormDeviceTest.V, 128, true);
+        ToyModel.writeWeights(FourNormDeviceTest.DIR + "/llama.safetensors", d);
+        FourNormDeviceTest.written = true;
+        return;
+    }
+
+    static #ToyModel gemmaSpec() {
+        return ToyModel.specVariant(FourNormDeviceTest.LAYERS, FourNormDeviceTest.H, FourNormDeviceTest.IT,
+            FourNormDeviceTest.NH, FourNormDeviceTest.NKV, FourNormDeviceTest.HD, FourNormDeviceTest.V, true,
+            true, true);
+    }
+
+    static #ToyModel llamaSpec() {
+        return ToyModel.spec(FourNormDeviceTest.LAYERS, FourNormDeviceTest.H, FourNormDeviceTest.IT,
+            FourNormDeviceTest.NH, FourNormDeviceTest.NKV, FourNormDeviceTest.HD, FourNormDeviceTest.V, true);
+    }
+
+    /** The toy bound with its projections repacked as Q8_0; `fourNorm` false drops the feedforward norms. */
+    static #CausalLM mk(boolean gemma, boolean fourNorm) {
+        FourNormDeviceTest.writeFixtures();
+        String base #= gemma ? "/gemma" : "/llama";
+        ModelConfig cfg #= ModelConfig.parse(FourNormDeviceTest.DIR + base + ".json");
+        if (gemma) { cfg.fourNorm = fourNorm; }
+        CausalLM m #= heap CausalLM(#cfg, 128, 1, 0);
+        Checkpoint ck #= Checkpoint.open(FourNormDeviceTest.DIR + base + ".safetensors");
+        m.bind(ck, false);
+        ck.close();
+        ToyModel s #= gemma ? FourNormDeviceTest.gemmaSpec() : FourNormDeviceTest.llamaSpec();
+        FourNormDeviceTest.packQ8(m, s);
+        return #m;
+    }
+
+    /** Rebinds every layer projection as lossless Q8_0 (scale 1/64; each toy value is m/32 with |m| <= 6). */
+    static void packQ8(CausalLM m, ToyModel s) {
+        int32 l = 0;
+        while (l < FourNormDeviceTest.LAYERS) {
+            DecoderLayer d = m.model.layerArr[l];
+            String p #= "model.layers." + l + ".";
+            FourNormDeviceTest.rebind(d.selfAttn.qProj, s, p + "self_attn.q_proj.weight");
+            FourNormDeviceTest.rebind(d.selfAttn.kProj, s, p + "self_attn.k_proj.weight");
+            FourNormDeviceTest.rebind(d.selfAttn.vProj, s, p + "self_attn.v_proj.weight");
+            FourNormDeviceTest.rebind(d.selfAttn.oProj, s, p + "self_attn.o_proj.weight");
+            FourNormDeviceTest.rebind(d.mlp.gateProj, s, p + "mlp.gate_proj.weight");
+            FourNormDeviceTest.rebind(d.mlp.upProj, s, p + "mlp.up_proj.weight");
+            FourNormDeviceTest.rebind(d.mlp.downProj, s, p + "mlp.down_proj.weight");
+            l = l + 1;
+        }
+        return;
+    }
+
+    static void rebind(Linear lin, ToyModel s, String name) {
+        int32 k = s.kOf(name);
+        int64 rows = s.d0[k];
+        int64 cols = s.d1[k];
+        int64 bpr = cols / 32L;
+        int8[] raw #= heap int8[rows * bpr * 34L];
+        int64 o = 0L;
+        int64 r = 0L;
+        while (r < rows) {
+            int64 b = 0L;
+            while (b < bpr) {
+                raw[o] = (int8) 0;
+                raw[o + 1L] = (int8) 36;
+                int64 i = 0L;
+                while (i < 32L) {
+                    float32 v = ToyModel.valAt(k, r * cols + b * 32L + i);
+                    raw[o + 2L + i] = (int8) (int32) (v * 64.0f);
+                    i = i + 1L;
+                }
+                o = o + 34L;
+                b = b + 1L;
+            }
+            r = r + 1L;
+        }
+        lin.bindPacked(#raw, Quant.GG_Q8_0);
+        return;
+    }
+
+    /** Backend capability via the plain twin, never the four-norm model's own predicates. */
+    static boolean deviceHere() {
+        if (!Linear.residentEnabled() || !RoutableFixtureTest.attendHere()) { return false; }
+        CausalLM dense #= FourNormDeviceTest.mk(false, false);
+        return dense.deviceRoutable() && dense.batchRoutedFor(8);
+    }
+
+    /** Prefill 8 rows, then 6 greedy steps; tokens in `toks`, prefill logits in `pl`, last-step logits in `dl`. */
+    static void gen(CausalLM m, int32[] toks, float32[] pl, float32[] dl) {
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+        int32 nxt = m.prefill(p, 8);
+        FourNormDeviceTest.copyLogits(m, pl);
+        toks[0] = nxt;
+        int32[] one = heap int32[1];
+        int32 g = 0;
+        while (g < 6) {
+            one[0] = nxt;
+            nxt = m.stepSeq(0, one, 0, 1);
+            toks[g + 1] = nxt;
+            g = g + 1;
+        }
+        FourNormDeviceTest.copyLogits(m, dl);
+        return;
+    }
+
+    static void copyLogits(CausalLM m, float32[] out) {
+        float32[] l #= BackendParityTest.logitsOf(m);
+        int32 i = 0;
+        while (i < (int32) out.count()) {
+            out[i] = l[i];
+            i = i + 1;
+        }
+        return;
+    }
+
+    @Test
+    public void theToyParsesAsGemma3WithNoWindow() {
+        FourNormDeviceTest.writeFixtures();
+        ModelConfig c #= ModelConfig.parse(FourNormDeviceTest.DIR + "/gemma.json");
+        Assert.isTrue(c.fourNorm);
+        Assert.isTrue(c.qkNorm);
+        Assert.equals(128, c.headDim);
+        Assert.equals(0, c.windowForLayer(0));
+        Assert.equals(0, c.windowForLayer(1));
+    }
+
+    @Test
+    public void fourNormPrefillsBatchedAndDecodesResidentToTheHostAnswer() {
+        if (!FourNormDeviceTest.deviceHere()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int32 v = FourNormDeviceTest.V;
+        CausalLM dev #= FourNormDeviceTest.mk(true, true);
+        System.stdout.println("  15.2.21.6 four-norm batchRoutedFor(8) " + dev.batchRoutedFor(8) + " deviceRoutable "
+            + dev.deviceRoutable());
+        Assert.isTrue(dev.batchRoutedFor(8));
+        Assert.isTrue(dev.deviceRoutable());
+        int32[] td = heap int32[7];
+        float32[] pd = heap float32[v];
+        float32[] ld = heap float32[v];
+        PrefillModeCapture pc = heap PrefillModeCapture();
+        Diag.register(pc);
+        int64 before = Linear.batchCalls();
+        int64[] vc #= ValueCheck.mark();
+        int32[] p #= RoutableFixtureTest.promptOf(8, 3);
+        dev.prefill(p, 8);
+        Diag.register(null);
+        Assert.isTrue(pc.saw);
+        Assert.isTrue(pc.mode.equals("batched"));
+        Assert.isTrue(Linear.batchCalls() > before);
+
+        CausalLM dev2 #= FourNormDeviceTest.mk(true, true);
+        DecodeModeCapture dc = heap DecodeModeCapture();
+        Diag.register(dc);
+        FourNormDeviceTest.gen(dev2, td, pd, ld);
+        Diag.register(null);
+        Assert.isTrue(dc.saw);
+        Assert.isTrue(dc.mode.equals("resident"));
+
+        QuantKernel.setRoutingEnabled(false);
+        CausalLM host #= FourNormDeviceTest.mk(true, true);
+        int32[] th = heap int32[7];
+        float32[] ph = heap float32[v];
+        float32[] lh = heap float32[v];
+        FourNormDeviceTest.gen(host, th, ph, lh);
+        CausalLM two #= FourNormDeviceTest.mk(true, false);
+        int32[] tt = heap int32[7];
+        float32[] pt = heap float32[v];
+        float32[] lt = heap float32[v];
+        FourNormDeviceTest.gen(two, tt, pt, lt);
+        QuantKernel.setRoutingEnabled(true);
+
+        float64 cosP = Metrics.cosine(ph, pd, v);
+        float64 klP = Metrics.softmaxKl(ph, pd, v);
+        float64 cosD = Metrics.cosine(lh, ld, v);
+        float64 klD = Metrics.softmaxKl(lh, ld, v);
+        float64 cosN = Metrics.cosine(ph, pt, v);
+        System.stdout.println("  15.2.21.6 prefill cosine " + cosP + " kl " + klP + "; decode cosine " + cosD
+            + " kl " + klD + "; two-norm effect cosine " + cosN);
+        Assert.isTrue(cosP >= 0.99998);
+        Assert.isTrue(klP <= 1.0e-6);
+        Assert.isTrue(cosD >= 0.99998);
+        Assert.isTrue(klD <= 1.0e-6);
+        Assert.equals((int64) Metrics.argmax(ph, v), (int64) Metrics.argmax(pd, v));
+        int32 t = 0;
+        while (t < 7) {
+            Assert.equals((int64) th[t], (int64) td[t]);
+            t = t + 1;
+        }
+        Assert.isTrue(cosN < 0.999);
+        ValueCheck.credit(vc);
+    }
+}
