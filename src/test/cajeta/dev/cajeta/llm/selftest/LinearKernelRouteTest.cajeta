@@ -856,6 +856,103 @@ public class LinearKernelRouteTest {
         Assert.isTrue(!lin.f32WaveRouted());
     }
 
+    /** cajeta-llm 15.2.21.4.3.1: by default a Q8_0 weight decodes on the f32 wave kernel on hip and on the
+     *  integer one elsewhere. */
+    @Test
+    public void q80TakesTheF32WaveRouteByDefaultOnHip() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        LinearKernelRouteTest.needIntWave(Quant.GG_Q8_0, be);
+        if (!KernelCap.f32WaveHere(Quant.GG_Q8_0)) { DeviceSkip.noKernel("q80F32WaveMatVecKernel", be); return; }
+        Linear.setQ8Route(true);
+        Linear.setQ80IntRoute(Linear.q80IntDefault());
+        Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q8_0, "q8_0.bin");
+        boolean f32 = lin.f32WaveRouted();
+        boolean i8 = lin.intWaveRouted();
+        if (be.equals("hip")) {
+            if (!f32 || i8) { Assert.fail("Q8_0 on hip by default: f32 wave " + f32 + ", integer wave " + i8); }
+        } else {
+            if (f32 || !i8) { Assert.fail("Q8_0 on " + be + " by default: f32 wave " + f32 + ", integer wave " + i8); }
+        }
+    }
+
+    /** The switch brings Q8_0's integer route back, and with it off Q5_K keeps its own. */
+    @Test
+    public void q80IntegerWaveRouteFollowsItsSwitchAndQ5kDoesNot() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        LinearKernelRouteTest.needIntWave(Quant.GG_Q8_0, be);
+        LinearKernelRouteTest.needIntWave(Quant.GG_Q5_K, be);
+        if (!KernelCap.f32WaveHere(Quant.GG_Q8_0)) { DeviceSkip.noKernel("q80F32WaveMatVecKernel", be); return; }
+        Linear.setQ8Route(true);
+        Linear.setQ80IntRoute(true);
+        Linear on #= LinearKernelRouteTest.tiled(Quant.GG_Q8_0, "q8_0.bin");
+        boolean onInt = on.intWaveRouted();
+        boolean onF32 = on.f32WaveRouted();
+        Linear.setQ80IntRoute(false);
+        Linear off #= LinearKernelRouteTest.tiled(Quant.GG_Q8_0, "q8_0.bin");
+        boolean offInt = off.intWaveRouted();
+        boolean offF32 = off.f32WaveRouted();
+        Linear q5 #= LinearKernelRouteTest.tiled(Quant.GG_Q5_K, "q5_k.bin");
+        boolean q5Int = q5.intWaveRouted();
+        Linear.setQ80IntRoute(Linear.q80IntDefault());
+        if (!onInt || onF32) { Assert.fail("switched on: integer wave " + onInt + ", f32 wave " + onF32); }
+        if (offInt || !offF32) { Assert.fail("switched off: integer wave " + offInt + ", f32 wave " + offF32); }
+        if (!q5Int) { Assert.fail("Q5_K left the integer wave route with Q8_0's switch off"); }
+    }
+
+    /** With the integer route off a Q8_0 mat-vec agrees with the serial path to float rounding, and with it on
+     *  the answer carries the activation quantization. */
+    @Test
+    public void q80F32WaveRouteDoesNotQuantizeTheActivation() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        LinearKernelRouteTest.needIntWave(Quant.GG_Q8_0, be);
+        if (!KernelCap.f32WaveHere(Quant.GG_Q8_0)) { DeviceSkip.noKernel("q80F32WaveMatVecKernel", be); return; }
+        Linear.setQ8Route(true);
+        int64[] oshp #= heap int64[1];
+        oshp[0] = (int64) LinearKernelRouteTest.CO;
+        Tensor<float32> src #= LinearKernelRouteTest.ramp((int64) LinearKernelRouteTest.CI, 0L);
+        int64[] vc #= ValueCheck.mark();
+        int32 arm = 0;
+        while (arm < 2) {
+            Linear.setQ80IntRoute(arm == 1);
+            Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q8_0, "q8_0.bin");
+            Tensor<float32> want #= Tensor.zeros<float32>(oshp);
+            Tensor<float32> got #= Tensor.zeros<float32>(oshp);
+            QuantKernel.setRoutingEnabled(false);
+            lin.matvecInto(src, 0L, want, 0L);
+            QuantKernel.setRoutingEnabled(true);
+            lin.matvecInto(src, 0L, got, 0L);
+            LinearKernelRouteTest.assertLive(want, (int64) LinearKernelRouteTest.CO, "q8_0 serial");
+            int64 far = 0;
+            int64 o = 0;
+            while (o < (int64) LinearKernelRouteTest.CO) {
+                float32 a = want.flatGet(o);
+                float32 diff = a - got.flatGet(o);
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = a < 0.0f ? 0.0f - a : a;
+                if (diff > mag * 0.0001f + 0.0001f) { far = far + 1; }
+                if (diff > mag * 0.01f + 0.001f) {
+                    Linear.setQ80IntRoute(Linear.q80IntDefault());
+                    Assert.fail("arm " + arm + " row " + o + ": routed " + got.flatGet(o) + " vs serial " + a);
+                }
+                o = o + 1;
+            }
+            if (arm == 0 && far > 0) {
+                Linear.setQ80IntRoute(Linear.q80IntDefault());
+                Assert.fail("the f32 wave route left " + far + " rows past float rounding");
+            }
+            if (arm == 1 && far == 0) {
+                Linear.setQ80IntRoute(Linear.q80IntDefault());
+                Assert.fail("the integer route matched the serial path to float rounding: nothing was quantized");
+            }
+            arm = arm + 1;
+        }
+        Linear.setQ80IntRoute(Linear.q80IntDefault());
+        ValueCheck.credit(vc);
+    }
+
     /** Batched `matmulInto` over `rows` ramp rows against the serial path
      *  row by row: `tol` relative, with a 0.01 absolute floor. */
     static void checkBatched(Linear lin, int32 rows, float64 tol,
