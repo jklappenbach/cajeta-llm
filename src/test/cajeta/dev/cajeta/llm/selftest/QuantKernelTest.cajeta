@@ -795,6 +795,87 @@ public class QuantKernelTest {
         ValueCheck.credit(vc);
     }
 
+    /** 15.2.21.4.3.7: the f32-activation Q6_K wave agrees with the host mat-vec to reassociation, short and long rows. */
+    @Test
+    public void theQ6F32WaveKernelAgreesWithTheHostMatVecOnRaggedRows() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable("q6kF32WaveMatVecKernel")) { DeviceSkip.noKernel("q6kF32WaveMatVecKernel", be); return; }
+        int8[] one #= File.readAllBytes(QuantKernelTest.DIR + "q6_k.bin");
+        int64 bb = 210L;
+        int64 blocksOnDisk = (int64) one.count() / bb;
+        int64[] vc #= ValueCheck.mark();
+        int64[] widths #= heap int64[3];
+        widths[0] = 2L;
+        widths[1] = 10L;
+        widths[2] = 16L;
+        int64 wi = 0;
+        while (wi < 3L) {
+            int64 bpr = widths[wi];
+            int64 rows = 9L;
+            int64 cols = bpr * 256L;
+            int8[] raw #= heap int8[rows * bpr * bb];
+            int64 k = 0;
+            while (k < rows * bpr) {
+                int64 src = ((k * 7L + 3L) % blocksOnDisk) * bb;
+                int64 j = 0;
+                while (j < bb) { raw[k * bb + j] = one[src + j]; j = j + 1; }
+                k = k + 1;
+            }
+            float32[] x #= QuantKernelTest.activations(cols + 5L);
+            float32[] want #= heap float32[rows];
+            Quant.q6kMatVecInto(raw, rows, cols, x, 5L, want, 0L);
+            int8[] devW #= heap int8[rows * Quant.rowResidentBytes(Quant.GG_Q6_K, bpr)];
+            Quant.splitInto(Quant.GG_Q6_K, raw, 0L, rows, bpr, devW, 0L);
+            KernelBuffer<int8> pb #= heap KernelBuffer<int8>((uint64) devW.count());
+            pb.upload(devW);
+            KernelBuffer<float32> xb #= heap KernelBuffer<float32>((uint64) (cols + 5L));
+            xb.upload(x);
+            KernelBuffer<float32> yb #= heap KernelBuffer<float32>((uint64) (rows + 2L));
+            QuantKernel.q6kF32WaveMatVecLaunch(yb, pb, xb, rows, cols, 5L, 2L);
+            float32[] yh #= heap float32[rows + 2L];
+            yb.download(yh);
+            float32[] got #= heap float32[rows];
+            int64 r = 0;
+            while (r < rows) { got[r] = yh[r + 2L]; r = r + 1; }
+            QuantKernelTest.assertLive(want, "q6_k host mat-vec");
+            QuantKernelTest.assertLive(got, "q6_k f32 wave kernel");
+            r = 0;
+            while (r < rows) {
+                float32 a = want[r];
+                float32 b = got[r];
+                float32 diff = a - b;
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = a < 0.0f ? 0.0f - a : a;
+                if (!(diff <= mag * 0.0001f + 0.0001f)) {
+                    Assert.fail("q6_k f32 wave, " + bpr + "-block row " + r + ": kernel " + b
+                        + " vs host " + a + " - beyond reassociation");
+                }
+                r = r + 1;
+            }
+            WaveGolden.check("q6kF32WaveMatVecKernel", "bpr" + bpr, got, rows);
+            r = 0;
+            while (r < rows + 2L) { yh[r] = (float32) ((r % 5L) - 2L) * 0.5f; r = r + 1; }
+            yb.upload(yh);
+            QuantKernel.q6kF32WaveMatVecAccumLaunchNoSync(yb, pb, xb, rows, cols, 5L, 2L);
+            QuantKernel.stream().sync();
+            float32[] ya #= heap float32[rows + 2L];
+            yb.download(ya);
+            r = 0;
+            while (r < rows) {
+                float32 sum = yh[r + 2L] + got[r];
+                if (ya[r + 2L] != sum) {
+                    Assert.fail("q6_k f32 wave accumulating, " + bpr + "-block row " + r + ": " + ya[r + 2L]
+                        + " vs " + sum);
+                }
+                r = r + 1;
+            }
+            if (ya[0] != yh[0] || ya[1] != yh[1]) { Assert.fail("the accumulate form wrote ahead of yOff"); }
+            wi = wi + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+
     static void checkWaveVsHost(String name, int32 ty) {
         QuantKernelTest.checkWaveVsHostTiled(name, ty, 1L);
     }
@@ -2149,6 +2230,39 @@ public class QuantKernelTest {
         }
         // The bias is not a no-op: v's is tiny but k's is not.
         Assert.isTrue(c[0] != 0.0f);
+        ValueCheck.credit(vc);
+    }
+
+    /** `f32CopyKernel` copies exactly `n` values at a count off the block size and leaves the cells past it alone. */
+    @Test
+    public void f32CopyCopiesTheCountAndNoMore() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.usable("f32CopyKernel")) { DeviceSkip.noKernel("f32CopyKernel", be); return; }
+        int64 n = 300L;
+        int64 cap = 320L;
+        float32 canary = 0.0f - 7.5f;
+        float32[] src #= QuantKernelTest.activations(cap);
+        float32[] pre #= heap float32[cap];
+        int64 i = 0;
+        while (i < cap) { pre[i] = canary; i = i + 1; }
+        KernelBuffer<float32> sb #= heap KernelBuffer<float32>((uint64) cap);
+        sb.upload(src);
+        KernelBuffer<float32> db #= heap KernelBuffer<float32>((uint64) cap);
+        db.upload(pre);
+        int64[] vc #= ValueCheck.mark();
+        QuantKernel.f32CopyLaunchNoSync(db, sb, n);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        float32[] got #= heap float32[cap];
+        db.download(got);
+        QuantKernelTest.assertLive(src, "copy source");
+        i = 0;
+        while (i < cap) {
+            float32 want = i < n ? src[i] : canary;
+            if (got[i] != want) { Assert.fail("f32 copy cell " + i + ": " + got[i] + ", expected " + want); }
+            i = i + 1;
+        }
         ValueCheck.credit(vc);
     }
 }

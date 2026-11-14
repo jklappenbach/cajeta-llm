@@ -5,6 +5,7 @@ import dev.cajeta.unit.Assert;
 import dev.cajeta.llm.io.TcTile;
 import dev.cajeta.llm.io.Checkpoint;
 import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.LlmException;
 import cajeta.io.file.File;
 import cajeta.lang.System;
 import cajeta.xpu.Device;
@@ -13,6 +14,7 @@ import dev.cajeta.llm.io.Quant;
 import dev.cajeta.llm.io.QuantKernel;
 import dev.cajeta.llm.model.KernelCap;
 import dev.cajeta.llm.model.Linear;
+import dev.cajeta.llm.model.CausalLM;
 import cajeta.math.Tensor;
 import cajeta.lang.String;
 import cajeta.lang.Cajeta;
@@ -951,6 +953,320 @@ public class LinearKernelRouteTest {
         }
         Linear.setQ80IntRoute(Linear.q80IntDefault());
         ValueCheck.credit(vc);
+    }
+
+    /** With the integer route off a Q6_K mat-vec agrees with the serial path to float rounding, and with it on
+     *  the answer carries the activation quantization (cajeta-llm 15.2.21.4.3.7). */
+    @Test
+    public void q6kF32WaveRouteDoesNotQuantizeTheActivation() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        LinearKernelRouteTest.needIntWave(Quant.GG_Q6_K, be);
+        if (!KernelCap.f32WaveHere(Quant.GG_Q6_K)) { DeviceSkip.noKernel("q6kF32WaveMatVecKernel", be); return; }
+        Linear.setQ8Route(true);
+        int64[] oshp #= heap int64[1];
+        oshp[0] = (int64) LinearKernelRouteTest.CO;
+        Tensor<float32> src #= LinearKernelRouteTest.ramp((int64) LinearKernelRouteTest.CI, 0L);
+        int64[] vc #= ValueCheck.mark();
+        int32 arm = 0;
+        while (arm < 2) {
+            Linear.setQ6IntRoute(arm == 1);
+            Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q6_K, "q6_k.bin");
+            Tensor<float32> want #= Tensor.zeros<float32>(oshp);
+            Tensor<float32> got #= Tensor.zeros<float32>(oshp);
+            QuantKernel.setRoutingEnabled(false);
+            lin.matvecInto(src, 0L, want, 0L);
+            QuantKernel.setRoutingEnabled(true);
+            lin.matvecInto(src, 0L, got, 0L);
+            LinearKernelRouteTest.assertLive(want, (int64) LinearKernelRouteTest.CO, "q6_k serial");
+            int64 far = 0;
+            int64 o = 0;
+            while (o < (int64) LinearKernelRouteTest.CO) {
+                float32 a = want.flatGet(o);
+                float32 diff = a - got.flatGet(o);
+                if (diff < 0.0f) { diff = 0.0f - diff; }
+                float32 mag = a < 0.0f ? 0.0f - a : a;
+                if (diff > mag * 0.0001f + 0.0001f) { far = far + 1; }
+                if (diff > mag * 0.01f + 0.001f) {
+                    Linear.clearQ6IntRoute();
+                    Assert.fail("arm " + arm + " row " + o + ": routed " + got.flatGet(o) + " vs serial " + a);
+                }
+                o = o + 1;
+            }
+            if (arm == 0 && far > 0) {
+                Linear.clearQ6IntRoute();
+                Assert.fail("the f32 wave route left " + far + " rows past float rounding");
+            }
+            if (arm == 1 && far == 0) {
+                Linear.clearQ6IntRoute();
+                Assert.fail("the integer route matched the serial path to float rounding: nothing was quantized");
+            }
+            arm = arm + 1;
+        }
+        Linear.clearQ6IntRoute();
+        ValueCheck.credit(vc);
+    }
+
+    /** Launches of the activation pack kernels and the f32 copy so far. */
+    static int64 stagingLaunches() {
+        return Device.kernelLaunchCount("q8kPackKernel") + Device.kernelLaunchCount("q8kPack32Kernel")
+            + Device.kernelLaunchCount("f32CopyKernel");
+    }
+
+    /** A staging for a weight that reads the f32 activation launches no pack and no copy, where the plain
+     *  staging launches one pack, and both give the same mat-vec bit for bit. */
+    @Test
+    public void aStagingForAnF32ConsumerLaunchesNoPack() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.f32WaveHere(Quant.GG_Q6_K)) { DeviceSkip.noKernel("q6kF32WaveMatVecKernel", be); return; }
+        Linear.setQ8Route(true);
+        Linear.setQ6IntRoute(false);
+        Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q6_K, "q6_k.bin");
+        boolean f32 = lin.readsF32();
+        Linear.clearQ6IntRoute();
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        float32[] hx #= heap float32[ci];
+        int64 i = 0;
+        while (i < ci) {
+            hx[i] = (float32) (((i * 17L) % 53L) - 26L) / 8.0f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) ci);
+        x.upload(hx, ci);
+        KernelStream s = QuantKernel.stream();
+        float32[] got #= heap float32[co];
+        float32[] want #= heap float32[co];
+        int64[] vc #= ValueCheck.mark();
+        if (!f32) { Assert.fail("Q6_K with the integer route off does not read the f32 activation"); }
+        int64 n0 = LinearKernelRouteTest.stagingLaunches();
+        Linear.stageDeviceActivationFor(x, ci, lin);
+        lin.matvecStagedKeep();
+        s.sync();
+        int64 n1 = LinearKernelRouteTest.stagingLaunches();
+        lin.out().download(got, co);
+        Linear.stageDeviceActivation(x, ci);
+        lin.matvecStagedKeep();
+        s.sync();
+        int64 n2 = LinearKernelRouteTest.stagingLaunches();
+        lin.out().download(want, co);
+        if (n1 != n0) { Assert.fail("the f32 staging launched " + (n1 - n0) + " pack or copy kernels"); }
+        if (n2 != n1 + 1L) { Assert.fail("the plain staging launched " + (n2 - n1) + " pack or copy kernels, not 1"); }
+        boolean live = false;
+        i = 0;
+        while (i < co) {
+            if (got[i] != want[i]) { Assert.fail("row " + i + ": " + got[i] + " vs " + want[i]); }
+            if (want[i] != 0.0f) { live = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(live);
+        ValueCheck.credit(vc);
+    }
+
+    /** `dst += W x` on a format's f32 route is one launch of `kernel` that adds in its store: `dst` ends
+     *  at its start plus the kept product, bit for bit. */
+    static void checkF32Accum(int32 ty, String fixture, String kernel) {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        if (!KernelCap.f32WaveHere(ty)) { DeviceSkip.noKernel(kernel, be); return; }
+        Linear.setQ8Route(true);
+        if (ty == Quant.GG_Q6_K) { Linear.setQ6IntRoute(false); } else { Linear.setQ80IntRoute(false); }
+        Linear lin #= LinearKernelRouteTest.tiled(ty, fixture);
+        boolean f32 = lin.readsF32();
+        if (ty == Quant.GG_Q6_K) { Linear.clearQ6IntRoute(); } else { Linear.setQ80IntRoute(Linear.q80IntDefault()); }
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        int64 co = (int64) LinearKernelRouteTest.CO;
+        float32[] hx #= heap float32[ci];
+        int64 i = 0;
+        while (i < ci) {
+            hx[i] = (float32) (((i * 13L) % 47L) - 23L) / 8.0f;
+            i = i + 1;
+        }
+        float32[] base #= heap float32[co];
+        i = 0;
+        while (i < co) {
+            base[i] = (float32) ((i % 7L) - 3L) * 0.25f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) ci);
+        x.upload(hx, ci);
+        KernelBuffer<float32> dst #= heap KernelBuffer<float32>((uint64) co);
+        dst.upload(base, co);
+        KernelStream s = QuantKernel.stream();
+        float32[] kept #= heap float32[co];
+        float32[] got #= heap float32[co];
+        int64[] vc #= ValueCheck.mark();
+        if (!f32) { Assert.fail(kernel + ": the weight does not read the f32 activation with its integer route off"); }
+        Linear.stageDeviceActivationFor(x, ci, lin);
+        lin.matvecStagedKeep();
+        s.sync();
+        lin.out().download(kept, co);
+        int64 n0 = Device.kernelLaunchCount(kernel);
+        Linear.stageDeviceActivationFor(x, ci, lin);
+        boolean took = lin.matvecStagedAccum(dst);
+        s.sync();
+        int64 n1 = Device.kernelLaunchCount(kernel);
+        if (!took) { Assert.fail(kernel + ": the f32 route declined the accumulating mat-vec"); }
+        if (n1 != n0 + 1L) { Assert.fail("the accumulating mat-vec launched " + (n1 - n0) + " f32 wave kernels, not 1"); }
+        dst.download(got, co);
+        boolean live = false;
+        i = 0;
+        while (i < co) {
+            float32 w = base[i] + kept[i];
+            if (got[i] != w) { Assert.fail("row " + i + ": " + got[i] + " vs " + w); }
+            if (kept[i] != 0.0f) { live = true; }
+            i = i + 1;
+        }
+        Assert.isTrue(live);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void q6kF32StagedAccumAddsInTheKernel() {
+        LinearKernelRouteTest.checkF32Accum(Quant.GG_Q6_K, "q6_k.bin", "q6kF32WaveMatVecKernel");
+    }
+
+    @Test
+    public void q80F32StagedAccumAddsInTheKernel() {
+        LinearKernelRouteTest.checkF32Accum(Quant.GG_Q8_0, "q8_0.bin", "q80F32WaveMatVecKernel");
+    }
+
+    /** Whether both Q6_K decode routes exist here, with a skip line when one does not. */
+    static boolean bothQ6Routes(String be) {
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return false; }
+        if (!KernelCap.waveIntHere(Quant.GG_Q6_K) || !Linear.packedActivations()) {
+            LinearKernelRouteTest.needIntWave(Quant.GG_Q6_K, be);
+            return false;
+        }
+        if (!KernelCap.f32WaveHere(Quant.GG_Q6_K)) { DeviceSkip.noKernel("q6kF32WaveMatVecKernel", be); return false; }
+        return true;
+    }
+
+    /** With no pin, a Q6_K weight marked as its file's only format reads the f32 activation on hip and
+     *  the q8_K pack on the other backends. */
+    @Test
+    public void aSoloQ6kWeightReadsF32ByDefaultOnHipOnly() {
+        String be #= Device.activeBackend();
+        if (!LinearKernelRouteTest.bothQ6Routes(be)) { return; }
+        Linear.setQ8Route(true);
+        Linear.clearQ6IntRoute();
+        Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q6_K, "q6_k.bin");
+        lin.markSoloFormat(true);
+        Assert.isTrue(lin.soloFormat());
+        boolean want = be.equals("hip");
+        if (lin.readsF32() != want) {
+            Assert.fail("a solo Q6_K weight on " + be + " reads f32: " + lin.readsF32() + ", expected " + want);
+        }
+    }
+
+    /** With no pin, a Q6_K weight that is not its file's only format keeps the integer route. */
+    @Test
+    public void aQ6kWeightBesideOtherFormatsKeepsTheIntegerRoute() {
+        String be #= Device.activeBackend();
+        if (!LinearKernelRouteTest.bothQ6Routes(be)) { return; }
+        Linear.setQ8Route(true);
+        Linear.clearQ6IntRoute();
+        Linear lin #= LinearKernelRouteTest.tiled(Quant.GG_Q6_K, "q6_k.bin");
+        Assert.isTrue(!lin.soloFormat());
+        if (lin.readsF32()) { Assert.fail("an unmarked Q6_K weight left the integer route on " + be); }
+    }
+
+    /** A pin beats the solo default both ways, and clearing it brings the default back. */
+    @Test
+    public void aQ6kPinOverridesTheSoloDefault() {
+        String be #= Device.activeBackend();
+        if (!LinearKernelRouteTest.bothQ6Routes(be)) { return; }
+        Linear.setQ8Route(true);
+        Linear.setQ6IntRoute(true);
+        Linear solo #= LinearKernelRouteTest.tiled(Quant.GG_Q6_K, "q6_k.bin");
+        solo.markSoloFormat(true);
+        boolean soloF32 = solo.readsF32();
+        Linear.setQ6IntRoute(false);
+        Linear mixed #= LinearKernelRouteTest.tiled(Quant.GG_Q6_K, "q6_k.bin");
+        boolean mixedF32 = mixed.readsF32();
+        Linear.clearQ6IntRoute();
+        Linear after #= LinearKernelRouteTest.tiled(Quant.GG_Q6_K, "q6_k.bin");
+        boolean afterF32 = after.readsF32();
+        if (soloF32) { Assert.fail("the integer pin did not hold a solo weight on the integer route"); }
+        if (!mixedF32) { Assert.fail("the f32 pin did not move an unmarked weight to the f32 route"); }
+        if (afterF32) { Assert.fail("an unmarked weight read f32 after the pin was cleared"); }
+    }
+
+    /** A dense file whose projections are all one format marks them and its same-format head; an MoE
+     *  file marks nothing. */
+    @Test
+    public void aFileOfOneFormatMarksItsProjectionsSolo() {
+        CausalLM m #= RoutableFixtureTest.mk(1);
+        Linear[] ps #= m.probeLayer(0);
+        int32 i = 0;
+        while (i < 7) {
+            if (!ps[i].soloFormat()) { Assert.fail("projection " + i + " of a one-format file is not marked"); }
+            i = i + 1;
+        }
+        Assert.isTrue(m.headLinear().soloFormat());
+        CausalLM moe #= ResidentMoeDecodeTest.mk();
+        Assert.isTrue(!moe.qProjOf(0).soloFormat());
+        Assert.isTrue(!moe.headLinear().soloFormat());
+    }
+
+    /** The Q4_K_M 8B mixes Q4_K and Q6_K projections: nothing is marked, and with no pin its Q6_K
+     *  weights keep the integer route. */
+    @Test
+    public void aMixedFileKeepsItsQ6kOnTheIntegerRoute() {
+        String be #= Device.activeBackend();
+        if (!LinearKernelRouteTest.bothQ6Routes(be)) { return; }
+        CausalLM m #= HostWeightCopyTest.mk8B();
+        if (m == null) { DeviceSkip.cannot("8B witness not on this box"); return; }
+        Linear.setQ8Route(true);
+        Linear.clearQ6IntRoute();
+        Linear[] ps #= m.probeLayer(0);
+        int32 seen = 0;
+        int32 i = 0;
+        while (i < 7) {
+            if (ps[i].soloFormat()) { Assert.fail("projection " + i + " of a mixed file is marked solo"); }
+            if (ps[i].packedType() == Quant.GG_Q6_K) {
+                seen = seen + 1;
+                if (ps[i].readsF32()) { Assert.fail("Q6_K projection " + i + " of a mixed file left the integer route"); }
+            }
+            i = i + 1;
+        }
+        if (seen == 0) { Assert.fail("layer 0 of the Q4_K_M 8B carries no Q6_K projection"); }
+        Assert.isTrue(!m.headLinear().soloFormat());
+    }
+
+    /** An f32-only staging reaching a weight that reads the pack is refused by name, and the plain staging
+     *  that follows serves it. */
+    @Test
+    public void anF32OnlyStagingRefusesAPackedConsumer() {
+        String be #= Device.activeBackend();
+        if (be.equals("none")) { DeviceSkip.cannot("no XPU backend"); return; }
+        LinearKernelRouteTest.needIntWave(Quant.GG_Q4_K, be);
+        Linear.setQ8Route(true);
+        Linear q4 #= LinearKernelRouteTest.tiled(Quant.GG_Q4_K, "q4_k.bin");
+        int64 ci = (int64) LinearKernelRouteTest.CI;
+        float32[] hx #= heap float32[ci];
+        int64 i = 0;
+        while (i < ci) {
+            hx[i] = (float32) (((i * 7L) % 23L) - 11L) / 4.0f;
+            i = i + 1;
+        }
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) ci);
+        x.upload(hx, ci);
+        if (q4.readsF32()) { Assert.fail("Q4_K on the integer wave route reads the f32 activation"); }
+        Linear.stageDeviceActivationF32(x, ci);
+        String msg = "";
+        try {
+            q4.matvecStagedKeep();
+        } catch (LlmException e) {
+            String em #= e.getMessage();
+            msg = "" + em;
+        }
+        Linear.stageDeviceActivationFor(x, ci, q4);
+        q4.matvecStagedKeep();
+        KernelStream s = QuantKernel.stream();
+        s.sync();
+        if (!msg.contains("f32-only")) { Assert.fail("no refusal, or one that does not name the staging: '" + msg + "'"); }
     }
 
     /** Batched `matmulInto` over `rows` ramp rows against the serial path

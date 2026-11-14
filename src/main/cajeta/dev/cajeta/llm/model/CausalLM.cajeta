@@ -610,6 +610,39 @@ public final class CausalLM extends InfModule {
         } else {
             this.lmHead.bindTied(ckpt, "model.embed_tokens.weight", toDevice);
         }
+        this.markSoloFormat();
+    }
+
+    /** Marks every projection, and a head of the same format, when each layer is dense and all their
+     *  projections carry one packed format; an MoE layer or a second format marks nothing. */
+    void markSoloFormat() {
+        int32 ty = 0 - 1;
+        int32 l = 0;
+        while (l < this.model.numLayers) {
+            if (this.model.layerArr[l].mlp == null) { return; }
+            Linear[] ps #= this.probeLayer(l);
+            int32 i = 0;
+            while (i < 7) {
+                int32 t = ps[i].packedType();
+                if (t < 0) { return; }
+                if (ty < 0) { ty = t; }
+                if (t != ty) { return; }
+                i = i + 1;
+            }
+            l = l + 1;
+        }
+        if (ty < 0) { return; }
+        l = 0;
+        while (l < this.model.numLayers) {
+            Linear[] ps #= this.probeLayer(l);
+            int32 i = 0;
+            while (i < 7) {
+                ps[i].markSoloFormat(true);
+                i = i + 1;
+            }
+            l = l + 1;
+        }
+        if (this.lmHead.packedType() == ty) { this.lmHead.markSoloFormat(true); }
     }
 
     /** The first `n` floats of a device-gathered embedding times the model's embedding scale, if it has one. */
@@ -3636,9 +3669,9 @@ public final class CausalLM extends InfModule {
                     d.attnSubNorm.deviceWeight(), (int64) qd,
                     d.attnSubNorm.eps, d.normForm);
                 this.sniffBuf("ao-normed", li, this.subDev, (int64) qd);
-                Linear.stageDeviceActivation(this.subDev, (int64) qd, a.oProj.act32());
+                Linear.stageDeviceActivationFor(this.subDev, (int64) qd, a.oProj);
             } else {
-                Linear.stageDeviceActivation(dkv.out(), (int64) qd, a.oProj.act32());
+                Linear.stageDeviceActivationFor(dkv.out(), (int64) qd, a.oProj);
             }
 
             // Unit 48: the residual add rides the o-projection's store.
@@ -3809,11 +3842,12 @@ public final class CausalLM extends InfModule {
         // takes the pair.
         boolean gluStaged = false;
         boolean down32 = d.mlp.downProj.act32();
-        if (!d.subNorm && down32) {
+        boolean downF32 = d.mlp.downProj.readsF32();
+        if (!d.subNorm && !downF32 && down32) {
             gluStaged = Prim.gluPack32Device(d.mlp.gateProj.out(),
                 Linear.stagedPacked((int64) inter),
                 d.mlp.upProj.out(), (int64) inter, d.activation);
-        } else if (!d.subNorm) {
+        } else if (!d.subNorm && !downF32) {
             gluStaged = Prim.gluPackDevice(d.mlp.gateProj.out(),
                 Linear.stagedPacked((int64) inter),
                 d.mlp.upProj.out(), (int64) inter, d.activation);
@@ -3828,13 +3862,13 @@ public final class CausalLM extends InfModule {
                 d.ffnSubNorm.deviceWeight(), (int64) inter,
                 d.ffnSubNorm.eps, d.normForm);
             this.sniffBuf("g-normed", li, this.subDev, (int64) inter);
-            Linear.stageDeviceActivation(this.subDev, (int64) inter, down32);
+            Linear.stageDeviceActivationFor(this.subDev, (int64) inter, d.mlp.downProj);
         } else if (gluStaged) {
             Linear.stageDeviceActivationPreNormed(d.mlp.gateProj.out(),
                 (int64) inter, down32);
         } else {
-            Linear.stageDeviceActivation(d.mlp.gateProj.out(),
-                (int64) inter, down32);
+            Linear.stageDeviceActivationFor(d.mlp.gateProj.out(),
+                (int64) inter, d.mlp.downProj);
         }
         // Unit 48's accumulate form on the MLP tail too: the residual
         // add rides the down-projection's store where the route has it.
