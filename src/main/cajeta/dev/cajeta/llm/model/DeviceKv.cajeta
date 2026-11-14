@@ -12,12 +12,14 @@ import dev.cajeta.llm.io.QuantKernel;
  * decode attend needs (plan 10.11.2).
  *
  * Layout is deliberately NOT the paged pool's. Each layer gets flat
- * `[cap x kvDim]` K and V planes, so position `t` is at `t·kvDim` and a
- * kernel needs no block table, no ring modulo and no copy-on-write. The
+ * `[rows x kvDim]` K and V planes, so position `t` is at `t·kvDim` and a
+ * kernel needs no block table and no copy-on-write. The
  * paging in {@link PagedKvCache} exists to pack MANY sequences into a
  * fixed pool; a single decoding sequence has nothing to pack against,
  * and the indirection would cost a table upload per layer per token plus
  * a dependent load per position inside the hottest loop there is.
+ * A windowed layer's planes are a ring of its window (15.2.21.8): position `t` is at row `t % rows`, and the
+ * modulo is taken on the host.
  *
  * The price is that the two copies can disagree, and the rule that keeps
  * them honest is explicit rather than clever: while `owns()` is true the
@@ -50,6 +52,10 @@ public final class DeviceKv {
     float16[] stageV16;
 
     int32 cap;
+    /** Rows each layer's planes hold: `cap`, or a windowed layer's window when that is shorter. */
+    int32[] rows;
+    /** The longest ring shorter than `cap`; 0 when every layer is flat. */
+    int32 ringMax;
     int32 kvDim;
     int32 layers;
     int32 nH;
@@ -65,22 +71,65 @@ public final class DeviceKv {
     /** This slot's place in the shared {@link KvPool}; -1 when it owns its planes. */
     int32 poolSlot;
 
-    /**
-     * Can this configuration take the device attend at all?
-     *
-     * `headDim <= 256`: the combine kernels' 128 lanes take two output dimensions each at 256. A windowed layer
-     * needs ring indexing the flat planes do not have.
-     */
+    /** Whether this configuration can take the device attend: `headDim <= 256` (the combine kernels' 128 lanes
+     *  take two output dimensions each), and for a windowed layer the kernels its ring's prefill needs. */
     public static boolean supports(ModelConfig cfg) {
         if (cfg.headDim > 256) { return false; }
         if (cfg.headDim % 2 != 0) { return false; }
         if (cfg.numHeads % cfg.numKvHeads != 0) { return false; }
         int32 l = 0;
         while (l < cfg.numLayers) {
-            if (cfg.windowForLayer(l) > 0) { return false; }
+            if (cfg.windowForLayer(l) > 0) { return KernelCap.ringHere(); }
             l = l + 1;
         }
         return true;
+    }
+
+    /** Rows layer `l`'s planes hold at capacity `cap`: a windowed layer keeps a ring of its window. */
+    public static int32 planeRows(ModelConfig cfg, int32 cap, int32 l) {
+        int32 w = cfg.windowForLayer(l);
+        if (w > 0 && w < cap) { return w; }
+        return cap;
+    }
+
+    /** Rows over every layer: what one slot's K planes hold. */
+    public static int64 planeRowsAll(ModelConfig cfg, int32 cap) {
+        int64 n = 0L;
+        int32 l = 0;
+        while (l < cfg.numLayers) {
+            n = n + (int64) DeviceKv.planeRows(cfg, cap, l);
+            l = l + 1;
+        }
+        return n;
+    }
+
+    /** True when some layer's planes are a ring shorter than `cap`; such a slot owns its planes. */
+    public static boolean ringed(ModelConfig cfg, int32 cap) {
+        return DeviceKv.planeRowsAll(cfg, cap) < (int64) cfg.numLayers * (int64) cap;
+    }
+
+    /** Fill the per-layer row counts for `cfg` at this slot's capacity. */
+    void shape(ModelConfig cfg) {
+        this.rows #= heap int32[(int64) this.layers];
+        this.ringMax = 0;
+        int32 l = 0;
+        while (l < this.layers) {
+            int32 r = DeviceKv.planeRows(cfg, this.cap, l);
+            this.rows[(int64) l] = r;
+            if (r < this.cap && r > this.ringMax) { this.ringMax = r; }
+            l = l + 1;
+        }
+        return;
+    }
+
+    /** The plane row holding position `p` of layer `li`. */
+    public int32 rowOf(int32 li, int32 p) { return p % this.rows[(int64) li]; }
+
+    /** Positions layer `li` holds once `n` have been appended. */
+    int32 heldOf(int32 li, int32 n) {
+        int32 r = this.rows[(int64) li];
+        if (n < r) { return n; }
+        return r;
     }
 
     /** Forget everything the planes hold (warmup reset): the buffers
@@ -103,12 +152,13 @@ public final class DeviceKv {
         this.len = 0;
         this.hostLen = 0;
         this.seq = 0 - 1;
-        int64 plane = (int64) cap * (int64) this.kvDim;
+        this.shape(cfg);
         this.kDev #= heap KernelBuffer<float16>[(int64) this.layers];
         this.vDev #= heap KernelBuffer<float16>[(int64) this.layers];
         this.invDev #= heap KernelBuffer<float32>[(int64) this.layers];
         int32 l = 0;
         while (l < this.layers) {
+            int64 plane = (int64) this.rows[(int64) l] * (int64) this.kvDim;
             this.kDev[(int64) l] #= heap KernelBuffer<float16>(
                 (uint64) plane);
             this.vDev[(int64) l] #= heap KernelBuffer<float16>(
@@ -133,6 +183,10 @@ public final class DeviceKv {
         this.hostLen = 0;
         this.seq = 0 - 1;
         this.poolSlot = slot;
+        this.shape(cfg);
+        if (this.ringMax > 0) {
+            throw heap LlmException("device kv: a windowed layer's ring cannot live in the shared pool");
+        }
         this.kDev #= heap KernelBuffer<float16>[(int64) this.layers];
         this.vDev #= heap KernelBuffer<float16>[(int64) this.layers];
         this.invDev #= heap KernelBuffer<float32>[(int64) this.layers];
@@ -214,10 +268,11 @@ public final class DeviceKv {
             int32 n = cache.lengthOf(seq, l);
             if (n > 0) {
                 this.ensureHostStage();
-                cache.copyRowsTo(seq, l, 0, n, this.stageK, this.stageV);
-                int64 cnt = (int64) n * (int64) this.kvDim;
-                DeviceKv.narrow(this.stageK, this.stageK16, cnt);
-                DeviceKv.narrow(this.stageV, this.stageV16, cnt);
+                int32 held = this.heldOf(l, n);
+                cache.copyRowsTo(seq, l, n - held, n, this.stageK, this.stageV);
+                int64 cnt = (int64) held * (int64) this.kvDim;
+                this.narrowRows(l, this.stageK, this.stageK16, n - held, held);
+                this.narrowRows(l, this.stageV, this.stageV16, n - held, held);
                 this.kDev[(int64) l].upload(this.stageK16, cnt);
                 this.vDev[(int64) l].upload(this.stageV16, cnt);
             }
@@ -242,16 +297,28 @@ public final class DeviceKv {
      */
     public void writeback(PagedKvCache cache, int32 seq) {
         if (!this.owns()) { return; }
-        this.ensureHostStage();
         KernelStream s = QuantKernel.stream();
         s.sync();
+        this.copyOut(cache, seq, this.hostLen, this.len);
+        this.hostLen = this.len;
+        return;
+    }
+
+    /** Append positions `[from, to)` of every layer to `cache` from the planes, `to` being the planes' length; a
+     *  ring gives the positions it still holds and the cache skips the rest. The caller has synced the stream. */
+    public void copyOut(PagedKvCache cache, int32 seq, int32 from, int32 to) {
+        this.ensureHostStage();
         int32 l = 0;
         while (l < this.layers) {
-            int64 n = (int64) this.len * (int64) this.kvDim;
-            this.readPlanes(l, this.stageK, this.stageV, n);
-            int32 t = this.hostLen;
-            while (t < this.len) {
-                int64 off = (int64) t * (int64) this.kvDim;
+            int32 held = this.heldOf(l, to);
+            int32 t = from;
+            if (to - held > t) {
+                t = to - held;
+                cache.skipTo(seq, l, t);
+            }
+            this.readPlanes(l, this.stageK, this.stageV, (int64) held * (int64) this.kvDim);
+            while (t < to) {
+                int64 off = (int64) this.rowOf(l, t) * (int64) this.kvDim;
                 if (!cache.appendRowRaw(seq, l, this.stageK, off,
                         this.stageV, off, t)) {
                     throw heap LlmException("kv writeback: pool "
@@ -261,7 +328,6 @@ public final class DeviceKv {
             }
             l = l + 1;
         }
-        this.hostLen = this.len;
         return;
     }
 
@@ -300,7 +366,7 @@ public final class DeviceKv {
         if (!norm) { qwv = this.invDev[(int64) li]; kwv = qwv; }
         AttnKernel.qkPrepLaunchNoSync(q, k, v, this.kDev[(int64) li],
             this.vDev[(int64) li], qwv, kwv, this.invDev[(int64) li],
-            this.nH, this.nKv, this.hd, norm, eps, form, p, p);
+            this.nH, this.nKv, this.hd, norm, eps, form, this.rowOf(li, p), p);
         return true;
     }
 
@@ -313,16 +379,15 @@ public final class DeviceKv {
         }
         if ((AttnKernel.skipForMeasurement() & 2) != 0) { return; }
         AttnKernel.kvAppendLaunchNoSync(this.kDev[(int64) li],
-            this.vDev[(int64) li], k, v, this.kvDim, p);
+            this.vDev[(int64) li], k, v, this.kvDim, this.rowOf(li, p));
         return;
     }
 
-    /** Attend over positions `[0, p]`, leaving the result in
-     *  {@link #out}. */
+    /** Attend over the positions layer `li` holds up to `p`, leaving the result in {@link #out}. */
     public void attend(int32 li, KernelBuffer<float32> q, int32 p, float32 scale) {
         AttnKernel.attendDecodeLaunchNoSync(this.aoDev, this.scores, q,
             this.kDev[(int64) li], this.vDev[(int64) li], this.nH,
-            this.nKv, this.hd, p + 1, 0, this.cap, scale);
+            this.nKv, this.hd, this.heldOf(li, p + 1), 0, this.cap, scale);
         return;
     }
 
@@ -332,7 +397,7 @@ public final class DeviceKv {
             float32 scale) {
         return AttnKernel.attendDecodePartialsLaunchNoSync(q,
             this.kDev[(int64) li], this.vDev[(int64) li], this.nH,
-            this.nKv, this.hd, p + 1, 0, scale);
+            this.nKv, this.hd, this.heldOf(li, p + 1), 0, scale);
     }
 
     /** The attention output buffer — a BORROW, valid until the next
@@ -365,6 +430,94 @@ public final class DeviceKv {
             out[i] = hb[base + i];
             i = i + 1;
         }
+        return;
+    }
+
+    KernelBuffer<float16> lineK;
+    KernelBuffer<float16> lineV;
+    KernelBuffer<float32> lineScores;
+    int32 lineRows;
+
+    /** The linear K/V and scores a chunk of `rows` needs when it crosses a ring's end. */
+    void ensureLine(int32 rows) {
+        if (this.lineRows >= rows) { return; }
+        Diag.growth();
+        int64 span = (int64) (this.ringMax - 1 + rows);
+        this.lineK #= heap KernelBuffer<float16>((uint64) (span * (int64) this.kvDim));
+        this.lineV #= heap KernelBuffer<float16>((uint64) (span * (int64) this.kvDim));
+        this.lineScores #= heap KernelBuffer<float32>((uint64) ((int64) rows * (int64) this.nH * span));
+        this.lineRows = rows;
+        return;
+    }
+
+    /** Copy `count` K/V rows between layer `li`'s ring from row `slot` on (wrapping) and the line from row `row`
+     *  on; `out` reads the ring. NoSync. */
+    void ringCopy(int32 li, int32 slot, int32 row, int32 count, boolean out) {
+        int32 ring = this.rows[(int64) li];
+        int32 done = 0;
+        while (done < count) {
+            int32 at = (slot + done) % ring;
+            int32 n = count - done;
+            if (n > ring - at) { n = ring - at; }
+            int64 cnt = (int64) n * (int64) this.kvDim;
+            uint64 po = (uint64) ((int64) at * (int64) this.kvDim);
+            uint64 lo = (uint64) ((int64) (row + done) * (int64) this.kvDim);
+            KernelBuffer<float16> pk #= this.kDev[(int64) li].slice(po, (uint64) cnt);
+            KernelBuffer<float16> pv #= this.vDev[(int64) li].slice(po, (uint64) cnt);
+            KernelBuffer<float16> lk #= this.lineK.slice(lo, (uint64) cnt);
+            KernelBuffer<float16> lv #= this.lineV.slice(lo, (uint64) cnt);
+            if (out) {
+                KvPool.copyLaunchNoSync(lk, pk, cnt);
+                KvPool.copyLaunchNoSync(lv, pv, cnt);
+            } else {
+                KvPool.copyLaunchNoSync(pk, lk, cnt);
+                KvPool.copyLaunchNoSync(pv, lv, cnt);
+            }
+            done = done + n;
+        }
+        return;
+    }
+
+    /** Write `rows` K/V rows at plane row `row` of `kd`/`vd`; a non-null `inv` rotates q and k on the way. */
+    void place(KernelBuffer<float16> kd, KernelBuffer<float16> vd, KernelBuffer<float32> q,
+            KernelBuffer<float32> k, KernelBuffer<float32> v, KernelBuffer<float32> inv,
+            KernelBuffer<int32> pos, int32 rows, int32 row) {
+        if (inv != null) {
+            AttnKernel.ropeAppendRowsLaunchNoSync(q, k, v, kd, vd, inv, pos, rows, this.nH, this.nKv, this.hd, row);
+        } else {
+            AttnKernel.kvAppendRangeLaunchNoSync(kd, vd, k, v, this.kvDim, row, rows);
+        }
+        return;
+    }
+
+    /** Place `rows` K/V rows at `startPos` and attend them into `out`; NoSync. A chunk that crosses a ring's end
+     *  is attended in a linear copy of the window, and its last rows are then written back to the ring. */
+    void placeAndAttend(int32 li, KernelBuffer<float32> q, KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float32> inv, KernelBuffer<int32> pos, int32 rows, int32 startPos, float32 scale,
+            KernelBuffer<float32> out) {
+        int32 ring = this.rows[(int64) li];
+        KernelBuffer<float16> kd = this.kDev[(int64) li];
+        KernelBuffer<float16> vd = this.vDev[(int64) li];
+        if (startPos + rows <= ring) {
+            this.place(kd, vd, q, k, v, inv, pos, rows, startPos);
+            AttnKernel.attendPrefillLaunchNoSync(out, this.preScores, q, kd, vd, rows, this.nH, this.nKv,
+                this.hd, startPos, this.cap, scale);
+            return;
+        }
+        if (ring == this.cap) {
+            throw heap LlmException("device kv: positions " + startPos + " to " + (startPos + rows)
+                + " exceed the allocated capacity " + this.cap);
+        }
+        int32 prev = startPos;
+        if (prev > ring - 1) { prev = ring - 1; }
+        this.ensureLine(rows);
+        if (prev > 0) { this.ringCopy(li, (startPos - prev) % ring, 0, prev, true); }
+        this.place(this.lineK, this.lineV, q, k, v, inv, pos, rows, prev);
+        AttnKernel.attendPrefillWindowLaunchNoSync(out, this.lineScores, q, this.lineK, this.lineV, rows,
+            this.nH, this.nKv, this.hd, prev, prev + rows, scale, ring);
+        int32 keep = rows;
+        if (keep > ring) { keep = ring; }
+        this.ringCopy(li, (startPos + rows - keep) % ring, prev + rows - keep, keep, false);
         return;
     }
 
@@ -413,11 +566,7 @@ public final class DeviceKv {
             KernelBuffer<float32> v, int32 rows, int32 startPos,
             float32 scale) {
         this.ensurePrefill(rows);
-        AttnKernel.kvAppendRangeLaunchNoSync(this.kDev[(int64) li],
-            this.vDev[(int64) li], k, v, this.kvDim, startPos, rows);
-        AttnKernel.attendPrefillLaunchNoSync(this.preOut, this.preScores,
-            q, this.kDev[(int64) li], this.vDev[(int64) li], rows,
-            this.nH, this.nKv, this.hd, startPos, this.cap, scale);
+        this.placeAndAttend(li, q, k, v, null, null, rows, startPos, scale, this.preOut);
         return this.preOut;
     }
 
@@ -431,12 +580,7 @@ public final class DeviceKv {
             KernelBuffer<int32> pos, int32 rows, int32 startPos,
             float32 scale) {
         this.ensurePrefill(rows);
-        AttnKernel.ropeAppendRowsLaunchNoSync(q, k, v, this.kDev[(int64) li],
-            this.vDev[(int64) li], invFreq, pos, rows, this.nH, this.nKv,
-            this.hd, startPos);
-        AttnKernel.attendPrefillLaunchNoSync(this.preOut, this.preScores,
-            q, this.kDev[(int64) li], this.vDev[(int64) li], rows,
-            this.nH, this.nKv, this.hd, startPos, this.cap, scale);
+        this.placeAndAttend(li, q, k, v, invFreq, pos, rows, startPos, scale, this.preOut);
         return this.preOut;
     }
 
@@ -446,11 +590,7 @@ public final class DeviceKv {
             KernelBuffer<float32> k, KernelBuffer<float32> v, int32 rows,
             int32 startPos, float32 scale, KernelBuffer<float32> out) {
         this.ensurePrefill(rows);
-        AttnKernel.kvAppendRangeLaunchNoSync(this.kDev[(int64) li],
-            this.vDev[(int64) li], k, v, this.kvDim, startPos, rows);
-        AttnKernel.attendPrefillLaunchNoSync(out, this.preScores,
-            q, this.kDev[(int64) li], this.vDev[(int64) li], rows,
-            this.nH, this.nKv, this.hd, startPos, this.cap, scale);
+        this.placeAndAttend(li, q, k, v, null, null, rows, startPos, scale, out);
         return;
     }
 
@@ -460,12 +600,7 @@ public final class DeviceKv {
             KernelBuffer<float32> invFreq, KernelBuffer<int32> pos, int32 rows,
             int32 startPos, float32 scale, KernelBuffer<float32> out) {
         this.ensurePrefill(rows);
-        AttnKernel.ropeAppendRowsLaunchNoSync(q, k, v, this.kDev[(int64) li],
-            this.vDev[(int64) li], invFreq, pos, rows, this.nH, this.nKv,
-            this.hd, startPos);
-        AttnKernel.attendPrefillLaunchNoSync(out, this.preScores,
-            q, this.kDev[(int64) li], this.vDev[(int64) li], rows,
-            this.nH, this.nKv, this.hd, startPos, this.cap, scale);
+        this.placeAndAttend(li, q, k, v, invFreq, pos, rows, startPos, scale, out);
         return;
     }
 
@@ -491,10 +626,18 @@ public final class DeviceKv {
         return;
     }
 
-    static void narrow(float32[] src, float16[] dst, int64 n) {
-        int64 i = 0;
-        while (i < n) {
-            dst[i] = (float16) src[i];
+    /** Narrow `held` rows of `src`, positions `from` on, into `dst` at the plane rows layer `li` keeps them in. */
+    void narrowRows(int32 li, float32[] src, float16[] dst, int32 from, int32 held) {
+        int64 kvd = (int64) this.kvDim;
+        int32 i = 0;
+        while (i < held) {
+            int64 so = (int64) i * kvd;
+            int64 d0 = (int64) this.rowOf(li, from + i) * kvd;
+            int64 j = 0;
+            while (j < kvd) {
+                dst[d0 + j] = (float16) src[so + j];
+                j = j + 1;
+            }
             i = i + 1;
         }
         return;
@@ -527,12 +670,9 @@ public final class DeviceKv {
         this.preK.upload(this.preKH, kvn);
         this.preV.upload(this.preVH, kvn);
         this.preQ.upload(this.preQH, qn);
-        AttnKernel.kvAppendRangeLaunchNoSync(this.kDev[(int64) li],
-            this.vDev[(int64) li], this.preK, this.preV, this.kvDim,
-            startPos, rows);
-        AttnKernel.attendPrefillLaunch(this.preOut, this.preScores,
-            this.preQ, this.kDev[(int64) li], this.vDev[(int64) li],
-            rows, this.nH, this.nKv, this.hd, startPos, this.cap, scale);
+        this.placeAndAttend(li, this.preQ, this.preK, this.preV, null, null, rows, startPos, scale, this.preOut);
+        KernelStream s = QuantKernel.stream();
+        s.sync();
         this.preOut.download(this.preOutH, qn);
         float32[] ob = ao.hostBuffer();
         int64 obase = ao.hostBase();

@@ -657,7 +657,7 @@ public final class AttnKernel {
             KernelBuffer<float32> scores, KernelBuffer<float32> q,
             KernelBuffer<float16> kPool, uint32 rows, uint32 nH,
             uint32 nKv, uint32 hd, uint32 startPos, uint32 stride,
-            float32 scale) {
+            float32 scale, uint32 window) {
         uint32 lane = KernelThread.x();
         // `Workgroup.x()`, not `globalIdX() / 32`. The same value — the launch
         // is block: [32] — but the division writes the block width into the
@@ -682,6 +682,7 @@ public final class AttnKernel {
             if (lane + 64 < hd) { q2 = q[qBase + lane + 64]; }
             if (lane + 96 < hd) { q3 = q[qBase + lane + 96]; }
             uint32 t = 0;
+            if (window > 0 && count > window) { t = count - window; }
             while (t < count) {
                 uint32 kRow = t * kvDim + kvh * hd;
                 float32 s = 0.0f;
@@ -2237,13 +2238,13 @@ public final class AttnKernel {
         }
     }
 
-    /** Prefill softmax and V combine: one workgroup of 128 per
-     *  `(query row, head)`, over that row's causal range. */
+    /** Prefill softmax and V combine: one workgroup of 128 per `(query row, head)`, over that row's causal
+     *  range, or its last `window` positions when `window` is not 0. */
     @Kernel
     public static void attnCombinePrefillKernel(KernelBuffer<float32> out,
             KernelBuffer<float32> scores, KernelBuffer<float16> vPool,
             uint32 rows, uint32 nH, uint32 nKv, uint32 hd,
-            uint32 startPos, uint32 stride) {
+            uint32 startPos, uint32 stride, uint32 window) {
         Shared<float32> red = shared float32[128];
         uint32 lane = KernelThread.x();
         uint32 wg = KernelThread.globalIdX() / 128;
@@ -2253,16 +2254,18 @@ public final class AttnKernel {
         uint32 kvh = 0;
         uint32 sBase = 0;
         uint32 count = 1;
+        uint32 lo = 0;
         if (wg < rows * nH) {
             r = wg / nH;
             h = wg % nH;
             kvh = h / (nH / nKv);
             sBase = (r * nH + h) * stride;
             count = startPos + r + 1;
+            if (window > 0 && count > window) { lo = count - window; }
         }
         float32 mx = 0.0f - 3.0e38f;
         if (wg < rows * nH) {
-            uint32 t = lane;
+            uint32 t = lo + lane;
             while (t < count) {
                 float32 sv = scores[sBase + t];
                 if (sv > mx) { mx = sv; }
@@ -2283,7 +2286,7 @@ public final class AttnKernel {
         Barrier.workgroup();
         float32 sum = 0.0f;
         if (wg < rows * nH) {
-            uint32 t = lane;
+            uint32 t = lo + lane;
             while (t < count) {
                 float32 e = Math.exp(scores[sBase + t] - m);
                 scores[sBase + t] = e;
@@ -2306,7 +2309,7 @@ public final class AttnKernel {
             while (d < hd) {
                 float32 acc = 0.0f;
                 uint32 vBase = kvh * hd + d;
-                uint32 tt = 0;
+                uint32 tt = lo;
                 while (tt < count) {
                     acc = acc + scores[sBase + tt] * (float32) vPool[vBase + tt * kvDim];
                     tt = tt + 1;
@@ -3982,7 +3985,7 @@ public final class AttnKernel {
                 grid: [(uint32) wv], block: [32])
                 (scores, q, kPool, (uint32) rows, (uint32) nH,
                  (uint32) nKv, (uint32) hd, (uint32) startPos,
-                 (uint32) stride, scale);
+                 (uint32) stride, scale, (uint32) 0);
         } else {
             int64 waves = (int64) rows * (int64) nH * (int64) tMax;
             attnScorePrefillKernel.launch(s, grid: [(uint32) waves],
@@ -3995,8 +3998,25 @@ public final class AttnKernel {
             attnCombinePrefillKernel.launch(s,
                 grid: [(uint32) (rows * nH)], block: [128])
                 (out, scores, vPool, (uint32) rows, (uint32) nH, (uint32) nKv,
-                 (uint32) hd, (uint32) startPos, (uint32) stride);
+                 (uint32) hd, (uint32) startPos, (uint32) stride, (uint32) 0);
         }
+        return;
+    }
+
+    /** The score and combine pair with each row's range cut to its last `window` positions (15.2.21.8); NoSync. */
+    public static void attendPrefillWindowLaunchNoSync(KernelBuffer<float32> out,
+            KernelBuffer<float32> scores, KernelBuffer<float32> q,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool,
+            int32 rows, int32 nH, int32 nKv, int32 hd, int32 startPos,
+            int32 stride, float32 scale, int32 window) {
+        KernelStream s = QuantKernel.stream();
+        uint32 wv = (uint32) (rows * nH);
+        attnScorePrefillRowKernel.launch(s, grid: [wv], block: [32])
+            (scores, q, kPool, (uint32) rows, (uint32) nH, (uint32) nKv, (uint32) hd, (uint32) startPos,
+             (uint32) stride, scale, (uint32) window);
+        attnCombinePrefillKernel.launch(s, grid: [wv], block: [128])
+            (out, scores, vPool, (uint32) rows, (uint32) nH, (uint32) nKv, (uint32) hd, (uint32) startPos,
+             (uint32) stride, (uint32) window);
         return;
     }
 

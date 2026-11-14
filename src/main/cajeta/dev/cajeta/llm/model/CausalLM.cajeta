@@ -1964,12 +1964,13 @@ public final class CausalLM extends InfModule {
         }
         if (this.dkvs[(int64) seq] == null) {
             Diag.growth();
-            if (this.kvPool == null) {
+            boolean ringed = DeviceKv.ringed(this.cfg, this.maxSeq);
+            if (this.kvPool == null && !ringed) {
                 this.kvPool #= heap KvPool(this.cfg.numLayers,
                     (int64) this.maxSeq * (int64) this.cfg.kvDim());
             }
             int32 slot = this.kvPoolUsed;
-            if (this.kvPool.fits(slot + 1)) {
+            if (!ringed && this.kvPool.fits(slot + 1)) {
                 if (slot + 1 > this.kvPool.slots()) {
                     this.kvPool.ensureSlots(slot + 1);
                     this.rebindPooled();
@@ -2020,6 +2021,7 @@ public final class CausalLM extends InfModule {
                 || !DeviceKv.supports(this.cfg) || !this.residentRouted()) {
             return false;
         }
+        if (DeviceKv.ringed(this.cfg, this.maxSeq)) { return false; }
         int32 want = n;
         if (want > this.maxSeqsN) { want = this.maxSeqsN; }
         int32 have = 0;
@@ -2118,8 +2120,8 @@ public final class CausalLM extends InfModule {
      *  this into a pre-flight rejection. */
     /** The K/V pool's bytes at maxSeqs: f16 K and V planes, every layer, the context (15.2.15.4). */
     public int64 deviceKvPoolBytes() {
-        return (int64) this.maxSeqsN * 2L * (int64) this.cfg.numLayers
-            * (int64) this.maxSeq * (int64) this.cfg.kvDim() * 2L;
+        return (int64) this.maxSeqsN * 2L * DeviceKv.planeRowsAll(this.cfg, this.maxSeq)
+            * (int64) this.cfg.kvDim() * 2L;
     }
 
     /** The slots' prefill scratch at maxSeqs and a chunk: q, k, v and the output, f32 (15.2.15.4). */
@@ -2147,8 +2149,8 @@ public final class CausalLM extends InfModule {
     }
 
     public int64 deviceKvCeilingBytes() {
-        return (int64) this.maxSeqsN * 2L * (int64) this.cfg.numLayers
-            * (int64) this.maxSeq * (int64) this.cfg.kvDim() * 4L;
+        return (int64) this.maxSeqsN * 2L * DeviceKv.planeRowsAll(this.cfg, this.maxSeq)
+            * (int64) this.cfg.kvDim() * 4L;
     }
 
     static boolean devAttnOn = true;
@@ -2206,13 +2208,13 @@ public final class CausalLM extends InfModule {
         KernelStream ns = QuantKernel.stream();
         ns.sync();
         int64 kvDim = (int64) dkv.kvDim;
-        int64 n = (int64) (p + 1) * kvDim;
+        int64 n = (int64) dkv.heldOf(li, p + 1) * kvDim;
         dkv.ensureHostStage();
         dkv.readPlanes(li, dkv.stageK, dkv.stageV, n);
         float32[] row = heap float32[kvDim];
         int64 i = 0;
         while (i < kvDim) {
-            row[i] = dkv.stageV[(int64) p * kvDim + i];
+            row[i] = dkv.stageV[(int64) dkv.rowOf(li, p) * kvDim + i];
             i = i + 1;
         }
         System.stdout.println("[FP " + where + " " + li + " "
@@ -2508,7 +2510,7 @@ public final class CausalLM extends InfModule {
      * device-resident generation would emit the same position forever.
      */
     int32 seqLength(int32 seq) {
-        DeviceKv d = this.dkvOf(seq);
+        DeviceKv d = this.dkvRaw(seq);
         if (d != null && d.owns() && d.seq == seq) {
             return d.length();
         }
@@ -3406,34 +3408,10 @@ public final class CausalLM extends InfModule {
         if (segN <= 1 && resAttn && startPos == 0
                 && (CausalLM.eagerAuthOn
                     || CausalLM.forceReseed)) {
-            // The deferred cache-authority pass (10.12.30): ONE sync,
-            // then every layer's roped k/v out of the persistent
-            // planes into the paged cache. Position dr IS the row
-            // index here — that is what the startPos == 0 guard buys.
-            // 10.12.38 made it LAZY by default (adoptLazy below +
-            // on-demand writeback); this eager form remains for the
-            // `eagerauth` arm and for `reseed`, which seeds decode
-            // from the host cache and therefore needs it filled.
             int64 tda = Clock.nanoTime();
             KernelStream ks = QuantKernel.stream();
             ks.sync();
-            int64 kvnD = (int64) rows * (int64) kvd;
-            this.ensurePrefillKv(kvnD);
-            int32 dl = 0;
-            while (dl < this.model.numLayers) {
-                dkv.readPlanes(dl, this.pfKScr, this.pfVScr, kvnD);
-                int32 dr = 0;
-                while (dr < rows) {
-                    if (!this.cache.appendRowRaw(seq, dl, this.pfKScr,
-                            (int64) dr * (int64) kvd, this.pfVScr,
-                            (int64) dr * (int64) kvd, dr)) {
-                        throw heap LlmException("kv pool exhausted at "
-                            + "layer " + dl + " position " + dr);
-                    }
-                    dr = dr + 1;
-                }
-                dl = dl + 1;
-            }
+            dkv.copyOut(this.cache, seq, 0, rows);
             CausalLM.pfAttendNs = CausalLM.pfAttendNs
                 + (Clock.nanoTime() - tda);
         }
@@ -3496,11 +3474,8 @@ public final class CausalLM extends InfModule {
      * Allocate the device K/V planes on first use and make them agree
      * with the paged cache (plan 10.11.2).
      *
-     * A configuration the flat planes cannot serve — a windowed layer, a
-     * head wider than the combine kernel's workgroup — leaves `dkv` null,
-     * and `residentLayer` then runs its host attention tail. Falling back
-     * is checked rather than assumed: both of those produce a silently
-     * wrong answer, not a crash.
+     * A configuration the planes cannot serve (`DeviceKv.supports`) leaves `dkv` null, and `residentLayer`
+     * then runs its host attention tail.
      */
     void ensureDeviceKv(int32 seq) {
         if (!CausalLM.devAttnOn || !KernelCap.attendHere()
