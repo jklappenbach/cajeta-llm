@@ -3938,7 +3938,6 @@ public final class CausalLM extends InfModule {
         else if (!CausalLM.fuseTail) { why = "fused tail off"; }
         else if (!CausalLM.devAttnOn || !KernelCap.attendHere()) { why = "no device attention"; }
         else if (!DeviceKv.supports(this.cfg)) { why = "DeviceKv does not support the shape"; }
-        else if (this.cfg.headDim > 128) { why = "headDim over 128"; }
         else if (!this.lmHead.isDeviceRouted() || !this.lmHead.colsReady()) { why = "lm_head has no column route"; }
         else if (this.cfg.hiddenSize % 256 != 0) { why = "hidden not a multiple of 256"; }
         else if (this.cfg.qDim() % 256 != 0) { why = "qDim not a multiple of 256"; }
@@ -3947,9 +3946,12 @@ public final class CausalLM extends InfModule {
         while (ok && l < this.model.numLayers) {
             DecoderLayer d = this.model.layerArr[l];
             Attention a = d.selfAttn;
-            if (d.subNorm || d.fourNorm) {
+            if (d.subNorm) {
                 ok = false;
-                why = "layer " + l + " has sub/four norms";
+                why = "layer " + l + " has sub norms";
+            } else if (d.fourNorm && (d.moe != null || this.cfg.intermediateSize < this.cfg.hiddenSize)) {
+                ok = false;
+                why = "layer " + l + ": four norms need a dense FFN at least hidden wide";
             } else if (!a.qProj.colsReady() || !a.kProj.colsReady()
                     || !a.vProj.colsReady() || !a.oProj.colsReady()) {
                 ok = false;
@@ -4156,9 +4158,17 @@ public final class CausalLM extends InfModule {
                 }
                 b = b + 1;
             }
-            a.oProj.matvecCols(this.bdXp, pbQd, n, this.bdHs, (int64) h, true);
-            this.batchNormPack(n, d.postAttentionLayernorm.deviceWeight(),
-                d.postAttentionLayernorm.eps, d.normForm);
+            if (d.fourNorm) {
+                a.oProj.matvecCols(this.bdXp, pbQd, n, this.bdU, (int64) h, false);
+                Prim.rmsnormAddBatchDevice(this.bdXn, this.bdU, d.postAttentionLayernorm.deviceWeight(), this.bdHs,
+                    (int64) n, (int64) h, d.postAttentionLayernorm.eps, d.normForm);
+                this.batchNormPack(n, d.preFeedforwardLayernorm.deviceWeight(),
+                    d.preFeedforwardLayernorm.eps, d.normForm);
+            } else {
+                a.oProj.matvecCols(this.bdXp, pbQd, n, this.bdHs, (int64) h, true);
+                this.batchNormPack(n, d.postAttentionLayernorm.deviceWeight(),
+                    d.postAttentionLayernorm.eps, d.normForm);
+            }
             if (d.moe != null) {
                 // 15.2.15.4.1: every row's experts in one id mat-vec a bank;
                 // the combine accumulates onto the residual rows.
@@ -4178,7 +4188,13 @@ public final class CausalLM extends InfModule {
                 QuantKernel.q8kPackRowsLaunchNoSync(this.bdXp, this.bdG, (int64) n,
                     (int64) inter, (int64) inter);
             }
-            d.mlp.downProj.matvecCols(this.bdXp, pbI, n, this.bdHs, (int64) h, true);
+            if (d.fourNorm) {
+                d.mlp.downProj.matvecCols(this.bdXp, pbI, n, this.bdU, (int64) h, false);
+                Prim.rmsnormAddBatchDevice(this.bdXn, this.bdU, d.postFeedforwardLayernorm.deviceWeight(), this.bdHs,
+                    (int64) n, (int64) h, d.postFeedforwardLayernorm.eps, d.normForm);
+            } else {
+                d.mlp.downProj.matvecCols(this.bdXp, pbI, n, this.bdHs, (int64) h, true);
+            }
             li = li + 1;
         }
         b = 0;

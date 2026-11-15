@@ -1,0 +1,155 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import dev.cajeta.unit.AfterEach;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.Diag;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.io.Checkpoint;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.DecoderLayer;
+import dev.cajeta.llm.model.ModelConfig;
+import dev.cajeta.ml.kernels.testing.ValueCheck;
+
+/** cajeta-llm plan 15.2.21.7.1: the Gemma 3 toy decodes four sequences in one batched step to each one's tokens alone. */
+public class GemmaBatchDecodeTest {
+
+    static final int32 SEQS = 4;
+    static final int32 STEPS = 12;
+
+    public GemmaBatchDecodeTest() { return; }
+
+    @AfterEach
+    public void restore() {
+        Diag.register(null);
+        QuantKernel.setRoutingEnabled(true);
+        return;
+    }
+
+    /** WindowRingDeviceTest's toy at head size `hd` with room for `seqs` sequences; projections and head as Q8_0. */
+    static #CausalLM mk(int32 hd, boolean windowed, int32 seqs) {
+        WindowRingDeviceTest.writeFixture();
+        ModelConfig cfg #= ModelConfig.parse(WindowRingDeviceTest.configOf(hd, windowed));
+        CausalLM m #= heap CausalLM(#cfg, WindowRingDeviceTest.CAP, seqs, 0);
+        Checkpoint ck #= Checkpoint.open(WindowRingDeviceTest.DIR + "/m" + hd + ".safetensors");
+        m.bind(ck, false);
+        ck.close();
+        ToyModel s #= WindowRingDeviceTest.spec(hd);
+        int32 l = 0;
+        while (l < WindowRingDeviceTest.LAYERS) {
+            DecoderLayer d = m.model.layerArr[l];
+            String p #= "model.layers." + l + ".";
+            FourNormDeviceTest.rebind(d.selfAttn.qProj, s, p + "self_attn.q_proj.weight");
+            FourNormDeviceTest.rebind(d.selfAttn.kProj, s, p + "self_attn.k_proj.weight");
+            FourNormDeviceTest.rebind(d.selfAttn.vProj, s, p + "self_attn.v_proj.weight");
+            FourNormDeviceTest.rebind(d.selfAttn.oProj, s, p + "self_attn.o_proj.weight");
+            FourNormDeviceTest.rebind(d.mlp.gateProj, s, p + "mlp.gate_proj.weight");
+            FourNormDeviceTest.rebind(d.mlp.upProj, s, p + "mlp.up_proj.weight");
+            FourNormDeviceTest.rebind(d.mlp.downProj, s, p + "mlp.down_proj.weight");
+            l = l + 1;
+        }
+        FourNormDeviceTest.rebind(m.headLinear(), s, "model.embed_tokens.weight");
+        return #m;
+    }
+
+    static int32 promptLen(int32 q) { return 5 + 3 * q; }
+
+    /** Four prompts prefilled, then STEPS batched steps; each row's tokens held equal to the row decoded alone. */
+    static void check(int32 hd, boolean windowed) {
+        if (!FourNormDeviceTest.deviceHere()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int64[] vc #= ValueCheck.mark();
+        CausalLM all #= GemmaBatchDecodeTest.mk(hd, windowed, GemmaBatchDecodeTest.SEQS);
+        PrefillTap cap = heap PrefillTap();
+        Diag.register(cap);
+        boolean ready = all.decodeBatchReady();
+        Diag.register(null);
+        if (!ready) { Assert.fail("hd " + hd + ": batched decode refused: " + cap.namesOf("decode-batch")); }
+        int32 n = GemmaBatchDecodeTest.SEQS;
+        int32 steps = GemmaBatchDecodeTest.STEPS;
+        int32[] seqs #= heap int32[n];
+        int32[] cur #= heap int32[n];
+        int32[] out #= heap int32[n];
+        int32[] got #= heap int32[(int64) n * (int64) steps];
+        int32 q = 0;
+        while (q < n) {
+            int32[] p #= RoutableFixtureTest.promptOf(GemmaBatchDecodeTest.promptLen(q), 3 + 7 * q);
+            seqs[q] = q;
+            cur[q] = all.stepSeq(q, p, 0, GemmaBatchDecodeTest.promptLen(q));
+            q = q + 1;
+        }
+        int32 g = 0;
+        while (g < steps) {
+            all.stepDecodeBatch(seqs, cur, n, out);
+            q = 0;
+            while (q < n) {
+                got[(int64) q * (int64) steps + (int64) g] = out[q];
+                cur[q] = out[q];
+                q = q + 1;
+            }
+            g = g + 1;
+        }
+        int32 v = WindowRingDeviceTest.V;
+        float32[] bl #= heap float32[(int64) n * (int64) v];
+        float32[] row #= heap float32[v];
+        q = 0;
+        while (q < n) {
+            all.selectBatchLogits(q);
+            FourNormDeviceTest.copyLogits(all, row);
+            int32 c = 0;
+            while (c < v) { bl[(int64) q * (int64) v + (int64) c] = row[c]; c = c + 1; }
+            q = q + 1;
+        }
+        float32[] sl #= heap float32[v];
+        float64 worst = 0.0;
+        q = 0;
+        while (q < n) {
+            CausalLM one #= GemmaBatchDecodeTest.mk(hd, windowed, 1);
+            int32[] p #= RoutableFixtureTest.promptOf(GemmaBatchDecodeTest.promptLen(q), 3 + 7 * q);
+            int32 nxt = one.stepSeq(0, p, 0, GemmaBatchDecodeTest.promptLen(q));
+            int32[] tok = heap int32[1];
+            g = 0;
+            while (g < steps) {
+                tok[0] = nxt;
+                nxt = one.stepSeq(0, tok, 0, 1);
+                int32 b = got[(int64) q * (int64) steps + (int64) g];
+                if (b != nxt) {
+                    Assert.fail("hd " + hd + " sequence " + q + " step " + g + ": " + b + " in the batch, " + nxt
+                        + " decoded alone");
+                }
+                g = g + 1;
+            }
+            FourNormDeviceTest.copyLogits(one, sl);
+            int32 c = 0;
+            while (c < v) { row[c] = bl[(int64) q * (int64) v + (int64) c]; c = c + 1; }
+            float64 kl = Metrics.softmaxKl(sl, row, v);
+            if (kl > worst) { worst = kl; }
+            if (kl > 1.0e-5 || Metrics.cosine(sl, row, v) < 0.99998) {
+                Assert.fail("hd " + hd + " sequence " + q + ": last-step logits kl " + kl + " against the row alone");
+            }
+            q = q + 1;
+        }
+        System.stdout.println("  15.2.21.7.1 hd " + hd + " windowed " + windowed + ": " + n + " sequences x " + steps
+            + " batched steps match each decoded alone; worst last-step kl " + worst);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void aWindowedGemmaAtHead256BatchesToEachSequenceAlone() {
+        GemmaBatchDecodeTest.check(256, true);
+    }
+
+    @Test
+    public void aWindowedGemmaAtHead128BatchesToEachSequenceAlone() {
+        GemmaBatchDecodeTest.check(128, true);
+    }
+
+    @Test
+    public void aFullAttentionGemmaAtHead256BatchesToEachSequenceAlone() {
+        GemmaBatchDecodeTest.check(256, false);
+    }
+}
