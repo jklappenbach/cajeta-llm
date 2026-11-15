@@ -6238,6 +6238,69 @@ public final class AttnKernel {
         }
     }
 
+    /** {@link #attnReducePackQ8BatchKernel} writing each row's attention output as slot-major f16
+     *  ({@link QuantKernel#f16SlotOffset}) at `r * outStride`, for the batched f16 route (cajeta-llm 15.2.21.4.3.8.4). */
+    @Kernel @Wave(width = 32)
+    public static void attnReduceF16BatchKernel(KernelBuffer<float16> out,
+            KernelBuffer<float32> part, uint32 nH, KernelBuffer<int32> rowTab,
+            uint32 partStride, uint32 outStride) {
+        Shared<float32> vals = shared float32[1024];
+        Shared<float32> gls = shared float32[8];
+        uint32 tid = KernelThread.x();
+        uint32 r = Workgroup.x() / (nH / 2);
+        uint32 blk = Workgroup.x() % (nH / 2);
+        uint32 splits = (uint32) rowTab[(int64) (r * 4 + 3)];
+        uint32 pOff = r * partStride;
+        if (blk * 2 + 1 >= nH + 1) { return; }
+        uint32 w = tid / 32;
+        uint32 lane = tid % 32;
+        uint32 hl = w / 4;
+        uint32 sub = w % 4;
+        uint32 h = blk * 2 + hl;
+        uint32 base = pOff + h * splits * 130;
+        float32 mm = 0.0f - 3.0e38f;
+        if (lane < splits) { mm = part[base + lane * 130 + 128]; }
+        if (lane + 32 < splits) {
+            float32 m2 = part[base + (lane + 32) * 130 + 128];
+            if (m2 > mm) { mm = m2; }
+        }
+        float32 gm = Wave.reduceMaxF32(mm);
+        float32 gl = 0.0f;
+        float32 a0 = 0.0f; float32 a1 = 0.0f; float32 a2 = 0.0f; float32 a3 = 0.0f;
+        uint32 d0 = lane * 4;
+        uint32 sp = sub;
+        while (sp < splits) {
+            uint32 pb = base + sp * 130;
+            float32 ls = part[pb + 129];
+            if (ls > 0.0f) {
+                float32 wt = Math.exp(part[pb + 128] - gm);
+                gl = gl + wt * ls;
+                uint32 d = pb + d0;
+                a0 = a0 + wt * part[d];
+                a1 = a1 + wt * part[d + 1];
+                a2 = a2 + wt * part[d + 2];
+                a3 = a3 + wt * part[d + 3];
+            }
+            sp = sp + 4;
+        }
+        uint32 vb = w * 128 + d0;
+        vals[vb] = a0;
+        vals[vb + 1] = a1;
+        vals[vb + 2] = a2;
+        vals[vb + 3] = a3;
+        if (lane == 0) { gls[w] = gl; }
+        Barrier.workgroup();
+        uint32 hl2 = tid / 128;
+        uint32 dm = tid % 128;
+        uint32 g0 = hl2 * 4;
+        float32 g = gls[g0] + gls[g0 + 1] + gls[g0 + 2] + gls[g0 + 3];
+        float32 rs = 1.0f / g;
+        float32 x = (vals[g0 * 128 + dm] + vals[(g0 + 1) * 128 + dm]
+            + vals[(g0 + 2) * 128 + dm] + vals[(g0 + 3) * 128 + dm]) * rs;
+        out[(int64) r * (int64) outStride + QuantKernel.f16SlotOffset((int64) (blk * 256 + tid), (int64) (nH / 2))]
+            = (float16) x;
+    }
+
     /** {@link #attnReducePackQ8Kernel} for every row of a decode batch in one launch:
      *  workgroup `r * (nH / 2) + blk`, row r's splits from `rowTab[4r + 3]`, its packed row at `r * packStride`. */
     @Kernel @Wave(width = 32)
@@ -6379,6 +6442,41 @@ public final class AttnKernel {
             int32 nH, int32 nKv, int32 hd, boolean norm, float32 eps, int32 form,
             KernelBuffer<int32> rowTab, int32 n, int32 maxSplits, int64 packStride,
             float32 scale) {
+        int64 partStride = AttnKernel.attendDecodeBatchPartsNoSync(q, k, v, kPool, vPool, qw, kw, invFreq,
+            nH, nKv, hd, norm, eps, form, rowTab, n, maxSplits, scale);
+        KernelStream s = QuantKernel.stream();
+        attnReducePackQ8BatchKernel.launch(s, grid: [(uint32) (n * (nH / 2))], block: [256])
+            (packed, AttnKernel.fdPartBatch, (uint32) nH, rowTab, (uint32) partStride,
+             (uint32) packStride);
+        AttnKernel.batchCalls = AttnKernel.batchCalls + 1L;
+        return;
+    }
+
+    /** {@link #attendDecodeBatchLaunchNoSync} with each row's output as slot-major f16 at `r * outStride`. */
+    public static void attendDecodeBatchF16LaunchNoSync(KernelBuffer<float16> outH,
+            KernelBuffer<float32> q, KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool,
+            KernelBuffer<float32> qw, KernelBuffer<float32> kw, KernelBuffer<float32> invFreq,
+            int32 nH, int32 nKv, int32 hd, boolean norm, float32 eps, int32 form,
+            KernelBuffer<int32> rowTab, int32 n, int32 maxSplits, int64 outStride,
+            float32 scale) {
+        int64 partStride = AttnKernel.attendDecodeBatchPartsNoSync(q, k, v, kPool, vPool, qw, kw, invFreq,
+            nH, nKv, hd, norm, eps, form, rowTab, n, maxSplits, scale);
+        KernelStream s = QuantKernel.stream();
+        attnReduceF16BatchKernel.launch(s, grid: [(uint32) (n * (nH / 2))], block: [256])
+            (outH, AttnKernel.fdPartBatch, (uint32) nH, rowTab, (uint32) partStride,
+             (uint32) outStride);
+        AttnKernel.batchCalls = AttnKernel.batchCalls + 1L;
+        return;
+    }
+
+    /** The batched decode's prep and flash decode into `fdPartBatch`; returns the row stride of the partials. */
+    static int64 attendDecodeBatchPartsNoSync(
+            KernelBuffer<float32> q, KernelBuffer<float32> k, KernelBuffer<float32> v,
+            KernelBuffer<float16> kPool, KernelBuffer<float16> vPool,
+            KernelBuffer<float32> qw, KernelBuffer<float32> kw, KernelBuffer<float32> invFreq,
+            int32 nH, int32 nKv, int32 hd, boolean norm, float32 eps, int32 form,
+            KernelBuffer<int32> rowTab, int32 n, int32 maxSplits, float32 scale) {
         KernelStream s = QuantKernel.stream();
         uint32 nn = 0;
         if (norm) { nn = 1; }
@@ -6406,11 +6504,7 @@ public final class AttnKernel {
                 (AttnKernel.fdPartBatch, q, kPool, vPool, (uint32) nKv, rowTab,
                  (uint32) maxSplits, (uint32) (nH * hd), (uint32) partStride, scale);
         }
-        attnReducePackQ8BatchKernel.launch(s, grid: [(uint32) (n * (nH / 2))], block: [256])
-            (packed, AttnKernel.fdPartBatch, (uint32) nH, rowTab, (uint32) partStride,
-             (uint32) packStride);
-        AttnKernel.batchCalls = AttnKernel.batchCalls + 1L;
-        return;
+        return partStride;
     }
 
     public static void reducePackLaunchNoSync(KernelBuffer<int8> packed,

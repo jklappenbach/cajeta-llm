@@ -36976,6 +36976,179 @@ public final class QuantKernel {
         return;
     }
 
+    /** One column's share of {@link #q6kF16WaveMatVecColsKernel}: the lane's 64 slot values, all loaded first, against
+     *  its weights as f16 `q - 32` (`wl{j}` lanes 0 to 7 of sub-block j, `wh{j}` 8 to 15), a `dotSum` a pair. */
+    @Device
+    static float32 q6kF16ColAcc(float32 acc, KernelBuffer<float16> x, int64 base, int64 js,
+            Vector<float16,8> wl0, Vector<float16,8> wh0, Vector<float16,8> wl1, Vector<float16,8> wh1,
+            Vector<float16,8> wl2, Vector<float16,8> wh2, Vector<float16,8> wl3, Vector<float16,8> wh3,
+            int32 s0, int32 s1, int32 s2, int32 s3, float32 dsc) {
+        Vector<float16,8> ha0 = x.vload<8>(base + 0L * js);
+        Vector<float16,8> hb0 = x.vload<8>(base + 1L * js);
+        Vector<float16,8> ha1 = x.vload<8>(base + 2L * js);
+        Vector<float16,8> hb1 = x.vload<8>(base + 3L * js);
+        Vector<float16,8> ha2 = x.vload<8>(base + 4L * js);
+        Vector<float16,8> hb2 = x.vload<8>(base + 5L * js);
+        Vector<float16,8> ha3 = x.vload<8>(base + 6L * js);
+        Vector<float16,8> hb3 = x.vload<8>(base + 7L * js);
+        float32 t0 = wh0.dotSum(hb0, wl0.dotSum(ha0, 0.0f));
+        float32 r = acc + dsc * (float32) s0 * t0;
+        float32 t1 = wh1.dotSum(hb1, wl1.dotSum(ha1, 0.0f));
+        r = r + dsc * (float32) s1 * t1;
+        float32 t2 = wh2.dotSum(hb2, wl2.dotSum(ha2, 0.0f));
+        r = r + dsc * (float32) s2 * t2;
+        float32 t3 = wh3.dotSum(hb3, wl3.dotSum(ha3, 0.0f));
+        r = r + dsc * (float32) s3 * t3;
+        return r;
+    }
+
+    /**
+     * Q6_K (row-split resident layout) x f16 activations for up to {@link #WAVE_COLS_MAX} columns
+     * `xStride` halves apart, in the slot-major layout {@link #f16SlotOffset} names (cajeta-llm
+     * 15.2.21.4.3.8.4): the batched decode's route with no q8 rounding of the activations.
+     */
+    @Kernel(targets = {"gpu"})
+    @Occupancy(maxThreads = 256)
+    public static void q6kF16WaveMatVecColsKernel(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float16> x,
+            uint32 rows, int64 blocksPerRow, int64 xOff, int64 yOff, uint32 accum,
+            uint32 ncols, uint32 yStride, uint32 xStride) {
+        uint32 wv = (uint32) Group.width();
+        uint32 lane = KernelThread.x() % wv;
+        uint32 row = KernelThread.globalIdX() / wv;
+        uint32 prefix = (uint32) (((blocksPerRow * 2L + 3L) / 4L) * 4L);
+        uint32 rowBytes = prefix + (uint32) blocksPerRow * 208;
+        uint32 bpr = (uint32) blocksPerRow;
+        int64 xs = (int64) xStride;
+        float32 c0 = 0.0f;
+        float32 c1 = 0.0f;
+        float32 c2 = 0.0f;
+        float32 c3 = 0.0f;
+        float32 c4 = 0.0f;
+        float32 c5 = 0.0f;
+        float32 c6 = 0.0f;
+        float32 c7 = 0.0f;
+        if (row < rows) {
+            uint32 rb = row * rowBytes;
+            int32 m = (int32) (lane % 4);
+            int32 g = m / 2;
+            int32 a = m - g * 2;
+            uint32 b = lane / 4;
+            while (b < bpr) {
+                uint32 cb = (b / 8) * 8;
+                uint32 cw = bpr - cb;
+                if (cw > 8) { cw = 8; }
+                int64 js = (int64) (cw * 32);
+                int64 xa = xOff + (int64) (cb * 256) + (int64) ((b - cb) * 32) + (int64) (m * 8);
+                uint32 ro = rb + prefix + b * 208;
+                uint32 rqa = ro + (uint32) (64 * g + 16 * a);
+                uint32 rqh = ro + (uint32) (32 * g + 16 * a);
+                uint32 rsc = ro + (uint32) (8 * g);
+                Vector<int8,16> qlA = packed.vload<16>((int64) rqa);
+                Vector<int8,16> qlB = packed.vload<16>((int64) rqa + 32L);
+                Vector<int8,16> qh = packed.vload<16>((int64) rqh + 128L);
+                Vector<int8,8> scv = packed.vload<8>((int64) rsc + 192L);
+                float32 dsc = QuantKernel.scaleAtDev(packed,
+                    (int64) rb / 2L + (int64) b);
+                int32 s0 = (int32) scv[0];
+                int32 s1 = (int32) scv[2];
+                int32 s2 = (int32) scv[4];
+                int32 s3 = (int32) scv[6];
+                if (a != 0) {
+                    s0 = (int32) scv[1];
+                    s1 = (int32) scv[3];
+                    s2 = (int32) scv[5];
+                    s3 = (int32) scv[7];
+                }
+                Vector<int32,4> wA = qlA.asWords();
+                Vector<int32,4> wB = qlB.asWords();
+                Vector<int32,4> wH = qh.asWords();
+                Vector<int32,4> q0 = (wA & 252645135) | ((wH << 4) & 808464432);
+                Vector<int32,4> q1 = (wB & 252645135) | ((wH << 2) & 808464432);
+                Vector<int32,4> q2 = ((wA >> 4) & 252645135) | (wH & 808464432);
+                Vector<int32,4> q3 = ((wB >> 4) & 252645135) | ((wH >> 2) & 808464432);
+                Vector<float32,8> k32 = heap Vector<float32,8>(32.0f, 32.0f, 32.0f, 32.0f, 32.0f, 32.0f, 32.0f, 32.0f);
+                Vector<uint8,16> qb0 = q0.asBytes().asUnsigned();
+                Vector<float16,8> wl0 = (qb0.widenLo().toF32() - k32).toF16();
+                Vector<float16,8> wh0 = (qb0.widenHi().toF32() - k32).toF16();
+                Vector<uint8,16> qb1 = q1.asBytes().asUnsigned();
+                Vector<float16,8> wl1 = (qb1.widenLo().toF32() - k32).toF16();
+                Vector<float16,8> wh1 = (qb1.widenHi().toF32() - k32).toF16();
+                Vector<uint8,16> qb2 = q2.asBytes().asUnsigned();
+                Vector<float16,8> wl2 = (qb2.widenLo().toF32() - k32).toF16();
+                Vector<float16,8> wh2 = (qb2.widenHi().toF32() - k32).toF16();
+                Vector<uint8,16> qb3 = q3.asBytes().asUnsigned();
+                Vector<float16,8> wl3 = (qb3.widenLo().toF32() - k32).toF16();
+                Vector<float16,8> wh3 = (qb3.widenHi().toF32() - k32).toF16();
+                c0 = QuantKernel.q6kF16ColAcc(c0, x, xa, js, wl0, wh0, wl1, wh1, wl2, wh2, wl3, wh3, s0, s1, s2, s3, dsc);
+                if (ncols > 1) { c1 = QuantKernel.q6kF16ColAcc(c1, x, xa + 1L * xs, js, wl0, wh0, wl1, wh1, wl2, wh2, wl3, wh3, s0, s1, s2, s3, dsc); }
+                if (ncols > 2) { c2 = QuantKernel.q6kF16ColAcc(c2, x, xa + 2L * xs, js, wl0, wh0, wl1, wh1, wl2, wh2, wl3, wh3, s0, s1, s2, s3, dsc); }
+                if (ncols > 3) { c3 = QuantKernel.q6kF16ColAcc(c3, x, xa + 3L * xs, js, wl0, wh0, wl1, wh1, wl2, wh2, wl3, wh3, s0, s1, s2, s3, dsc); }
+                if (ncols > 4) { c4 = QuantKernel.q6kF16ColAcc(c4, x, xa + 4L * xs, js, wl0, wh0, wl1, wh1, wl2, wh2, wl3, wh3, s0, s1, s2, s3, dsc); }
+                if (ncols > 5) { c5 = QuantKernel.q6kF16ColAcc(c5, x, xa + 5L * xs, js, wl0, wh0, wl1, wh1, wl2, wh2, wl3, wh3, s0, s1, s2, s3, dsc); }
+                if (ncols > 6) { c6 = QuantKernel.q6kF16ColAcc(c6, x, xa + 6L * xs, js, wl0, wh0, wl1, wh1, wl2, wh2, wl3, wh3, s0, s1, s2, s3, dsc); }
+                if (ncols > 7) { c7 = QuantKernel.q6kF16ColAcc(c7, x, xa + 7L * xs, js, wl0, wh0, wl1, wh1, wl2, wh2, wl3, wh3, s0, s1, s2, s3, dsc); }
+                b = b + wv / 4;
+            }
+        }
+        QuantKernel.colsStore(y, row, rows, yOff, yStride, accum, ncols, lane,
+            c0, c1, c2, c3, c4, c5, c6, c7);
+    }
+
+    /** `y[yOff + c*yStride + row] (+)= W[row] . x_c` for `ncols` slot-major f16 columns at `xOff + c*xStride`. */
+    public static void q6kF16WaveMatVecColsLaunchNoSync(KernelBuffer<float32> y,
+            KernelBuffer<int8> packed, KernelBuffer<float16> x, int64 rows, int64 cols,
+            int64 xOff, int64 xStride, int64 yOff, int32 ncols, int64 yStride, boolean accum) {
+        QuantKernel.requireOffsets32(packed, "q6kF16WaveMatVecCols");
+        uint32 acc = 0;
+        if (accum) { acc = 1; }
+        KernelStream s = QuantKernel.stream();
+        q6kF16WaveMatVecColsKernel.launch(s, grid: [QuantKernel.waveGrid(rows)],
+                block: [QuantKernel.waveRowBlock()])
+            (y, packed, x, (uint32) rows, cols / 256L, xOff, yOff, acc,
+             (uint32) ncols, (uint32) yStride, (uint32) xStride);
+        return;
+    }
+
+
+    /** Offset of element `e` of a row of `bpr` 256-blocks in the slot-major f16 layout: chunks of 8 blocks (`cw`
+     *  wide at the row's end), in each the 8-half vector `j` of lane slot `m` of block `b` at `j*cw*32 + (b - chunk)*32 + m*8`. */
+    @Device
+    public static int64 f16SlotOffset(int64 e, int64 bpr) {
+        int64 b = e / 256L;
+        int64 n = e - b * 256L;
+        int64 m = 2L * ((n >> 7) & 1L) + ((n >> 4) & 1L);
+        int64 j = 2L * ((n >> 5) & 3L) + ((n >> 3) & 1L);
+        int64 cb = (b / 8L) * 8L;
+        int64 cw = bpr - cb;
+        if (cw > 8L) { cw = 8L; }
+        return cb * 256L + j * cw * 32L + (b - cb) * 32L + m * 8L + (n & 7L);
+    }
+
+    /** f32 rows (row r at `r*xStride`, `n` values, `n % 256 == 0`) to slot-major f16 rows at `r*outStride`. */
+    @Kernel(targets = {"gpu"})
+    @Occupancy(maxThreads = 256)
+    public static void f16SlotPackRowsKernel(KernelBuffer<float16> out, KernelBuffer<float32> x,
+            uint32 n, uint32 rows, uint32 xStride, uint32 outStride) {
+        uint32 i = KernelThread.globalIdX();
+        uint32 r = i / n;
+        uint32 e = i - r * n;
+        if (r < rows) {
+            out[(int64) r * (int64) outStride + QuantKernel.f16SlotOffset((int64) e, (int64) (n / 256))]
+                = (float16) x[(int64) r * (int64) xStride + (int64) e];
+        }
+    }
+
+    /** {@link #f16SlotPackRowsKernel} over `rows` rows of `n`. */
+    public static void f16SlotPackRowsLaunchNoSync(KernelBuffer<float16> out, KernelBuffer<float32> x,
+            int64 rows, int64 n, int64 xStride, int64 outStride) {
+        KernelStream s = QuantKernel.stream();
+        int64 total = rows * n;
+        f16SlotPackRowsKernel.launch(s, grid: [(uint32) ((total + 255L) / 256L)], block: [256])
+            (out, x, (uint32) n, (uint32) rows, (uint32) xStride, (uint32) outStride);
+        return;
+    }
+
     /** As {@link #q6kF32WaveMatVecLaunchNoSync}, then syncs the stream. */
     public static void q6kF32WaveMatVecLaunch(KernelBuffer<float32> y,
             KernelBuffer<int8> packed, KernelBuffer<float32> x,

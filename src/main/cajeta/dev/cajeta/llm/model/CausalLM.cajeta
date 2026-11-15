@@ -3900,12 +3900,16 @@ public final class CausalLM extends InfModule {
 
     /** The most sequences one {@link #stepDecodeBatch} call carries. */
     public static final int32 DECODE_BATCH_MAX = 8;
+    static int64 bdF16Sites;
+    /** Layers whose q, k and v took the batched f16 column route in this process (cajeta-llm 15.2.21.4.3.8.4). */
+    public static int64 batchF16Layers() { return CausalLM.bdF16Sites; }
     static boolean decodeBatchOn = true;
     public static void setDecodeBatch(boolean on) { CausalLM.decodeBatchOn = on; }
     int32 bdReady;
     KernelBuffer<float32> bdHs;
     KernelBuffer<float32> bdXn;
     KernelBuffer<int8> bdXp;
+    KernelBuffer<float16> bdXh;
     KernelBuffer<float32> bdQ;
     KernelBuffer<float32> bdK;
     KernelBuffer<float32> bdV;
@@ -4002,6 +4006,7 @@ public final class CausalLM extends InfModule {
         this.bdHs #= heap KernelBuffer<float32>((uint64) (n * h));
         this.bdXn #= heap KernelBuffer<float32>((uint64) (n * h));
         this.bdXp #= heap KernelBuffer<int8>((uint64) (n * Quant.q8kPackedBytes(wide)));
+        this.bdXh #= heap KernelBuffer<float16>((uint64) (n * wide));
         this.bdQ #= heap KernelBuffer<float32>((uint64) (n * qd));
         this.bdK #= heap KernelBuffer<float32>((uint64) (n * kvd));
         this.bdV #= heap KernelBuffer<float32>((uint64) (n * kvd));
@@ -4111,8 +4116,17 @@ public final class CausalLM extends InfModule {
             Attention a = d.selfAttn;
             this.batchNormPack(n, d.inputLayernorm.deviceWeight(),
                 d.inputLayernorm.eps, d.normForm);
-            Linear.matvecQkvCols(a.qProj, a.kProj, a.vProj, this.bdXp, pbH, n, this.bdQ,
-                this.bdK, this.bdV, (int64) qd, (int64) kvd);
+            if (a.qProj.colsF16Ready() && a.kProj.colsF16Ready() && a.vProj.colsF16Ready()) {
+                QuantKernel.f16SlotPackRowsLaunchNoSync(this.bdXh, this.bdXn, (int64) n, (int64) h,
+                    (int64) h, (int64) h);
+                a.qProj.matvecColsF16(this.bdXh, (int64) h, n, this.bdQ, (int64) qd, false);
+                a.kProj.matvecColsF16(this.bdXh, (int64) h, n, this.bdK, (int64) kvd, false);
+                a.vProj.matvecColsF16(this.bdXh, (int64) h, n, this.bdV, (int64) kvd, false);
+                CausalLM.bdF16Sites = CausalLM.bdF16Sites + 1L;
+            } else {
+                Linear.matvecQkvCols(a.qProj, a.kProj, a.vProj, this.bdXp, pbH, n, this.bdQ,
+                    this.bdK, this.bdV, (int64) qd, (int64) kvd);
+            }
             KernelBuffer<float32> qnw = null;
             KernelBuffer<float32> knw = null;
             float32 qnEps = 0.0f;
@@ -4121,15 +4135,23 @@ public final class CausalLM extends InfModule {
                 knw = a.kNorm.deviceWeight();
                 qnEps = a.qNorm.eps;
             }
+            boolean oF16 = bAttn && a.oProj.colsF16Ready();
             if (bAttn) {
                 DeviceKv d0 = this.dkvOf(seqs[0L]);
                 KernelBuffer<float32> qwv = qnw;
                 KernelBuffer<float32> kwv = knw;
                 if (qnw == null) { qwv = d0.inv(li); kwv = qwv; }
-                AttnKernel.attendDecodeBatchLaunchNoSync(this.bdXp, this.bdQ, this.bdK, this.bdV,
-                    this.kvPool.kAll(li), this.kvPool.vAll(li), qwv, kwv, d0.inv(li),
-                    nH, nKv, hd, qnw != null, qnEps, d.normForm, rowTab, n,
-                    maxSplits, pbQd, a.scale);
+                if (oF16) {
+                    AttnKernel.attendDecodeBatchF16LaunchNoSync(this.bdXh, this.bdQ, this.bdK, this.bdV,
+                        this.kvPool.kAll(li), this.kvPool.vAll(li), qwv, kwv, d0.inv(li),
+                        nH, nKv, hd, qnw != null, qnEps, d.normForm, rowTab, n,
+                        maxSplits, (int64) qd, a.scale);
+                } else {
+                    AttnKernel.attendDecodeBatchLaunchNoSync(this.bdXp, this.bdQ, this.bdK, this.bdV,
+                        this.kvPool.kAll(li), this.kvPool.vAll(li), qwv, kwv, d0.inv(li),
+                        nH, nKv, hd, qnw != null, qnEps, d.normForm, rowTab, n,
+                        maxSplits, pbQd, a.scale);
+                }
             }
             b = 0;
             if (bAttn) { b = n; }
@@ -4158,14 +4180,19 @@ public final class CausalLM extends InfModule {
                 }
                 b = b + 1;
             }
+            KernelBuffer<float32> oDst = this.bdHs;
+            if (d.fourNorm) { oDst = this.bdU; }
+            if (oF16) {
+                a.oProj.matvecColsF16(this.bdXh, (int64) qd, n, oDst, (int64) h, !d.fourNorm);
+            } else {
+                a.oProj.matvecCols(this.bdXp, pbQd, n, oDst, (int64) h, !d.fourNorm);
+            }
             if (d.fourNorm) {
-                a.oProj.matvecCols(this.bdXp, pbQd, n, this.bdU, (int64) h, false);
                 Prim.rmsnormAddBatchDevice(this.bdXn, this.bdU, d.postAttentionLayernorm.deviceWeight(), this.bdHs,
                     (int64) n, (int64) h, d.postAttentionLayernorm.eps, d.normForm);
                 this.batchNormPack(n, d.preFeedforwardLayernorm.deviceWeight(),
                     d.preFeedforwardLayernorm.eps, d.normForm);
             } else {
-                a.oProj.matvecCols(this.bdXp, pbQd, n, this.bdHs, (int64) h, true);
                 this.batchNormPack(n, d.postAttentionLayernorm.deviceWeight(),
                     d.postAttentionLayernorm.eps, d.normForm);
             }
@@ -4180,9 +4207,30 @@ public final class CausalLM extends InfModule {
                 li = li + 1;
                 continue;
             }
-            Linear.matvecGateUpCols(d.mlp.gateProj, d.mlp.upProj, this.bdXp, pbH, n, this.bdG,
-                this.bdU, (int64) inter);
+            if (d.mlp.gateProj.colsF16Ready() && d.mlp.upProj.colsF16Ready()) {
+                QuantKernel.f16SlotPackRowsLaunchNoSync(this.bdXh, this.bdXn, (int64) n, (int64) h,
+                    (int64) h, (int64) h);
+                d.mlp.gateProj.matvecColsF16(this.bdXh, (int64) h, n, this.bdG, (int64) inter, false);
+                d.mlp.upProj.matvecColsF16(this.bdXh, (int64) h, n, this.bdU, (int64) inter, false);
+            } else {
+                Linear.matvecGateUpCols(d.mlp.gateProj, d.mlp.upProj, this.bdXp, pbH, n, this.bdG,
+                    this.bdU, (int64) inter);
+            }
             int64 gn = (int64) n * (int64) inter;
+            if (d.mlp.downProj.colsF16Ready()) {
+                Prim.gluDevice(this.bdG, this.bdU, gn, d.activation);
+                QuantKernel.f16SlotPackRowsLaunchNoSync(this.bdXh, this.bdG, (int64) n, (int64) inter,
+                    (int64) inter, (int64) inter);
+                if (d.fourNorm) {
+                    d.mlp.downProj.matvecColsF16(this.bdXh, (int64) inter, n, this.bdU, (int64) h, false);
+                    Prim.rmsnormAddBatchDevice(this.bdXn, this.bdU, d.postFeedforwardLayernorm.deviceWeight(),
+                        this.bdHs, (int64) n, (int64) h, d.postFeedforwardLayernorm.eps, d.normForm);
+                } else {
+                    d.mlp.downProj.matvecColsF16(this.bdXh, (int64) inter, n, this.bdHs, (int64) h, true);
+                }
+                li = li + 1;
+                continue;
+            }
             if (!Prim.gluPackDevice(this.bdG, this.bdXp, this.bdU, gn, d.activation)) {
                 Prim.gluDevice(this.bdG, this.bdU, gn, d.activation);
                 QuantKernel.q8kPackRowsLaunchNoSync(this.bdXp, this.bdG, (int64) n,
@@ -4209,7 +4257,13 @@ public final class CausalLM extends InfModule {
             b = b + 1;
         }
         this.bdTb4 = Clock.nanoTime();
-        this.lmHead.matvecCols(this.bdXp, pbH, n, this.bdLogits, (int64) vocab, false);
+        if (this.lmHead.colsF16Ready()) {
+            QuantKernel.f16SlotPackRowsLaunchNoSync(this.bdXh, this.bdXn, (int64) n, (int64) h,
+                (int64) h, (int64) h);
+            this.lmHead.matvecColsF16(this.bdXh, (int64) h, n, this.bdLogits, (int64) vocab, false);
+        } else {
+            this.lmHead.matvecCols(this.bdXp, pbH, n, this.bdLogits, (int64) vocab, false);
+        }
         b = 0;
         while (b < n) {
             QuantKernel.argmaxRowLaunchNoSync(tok, b,

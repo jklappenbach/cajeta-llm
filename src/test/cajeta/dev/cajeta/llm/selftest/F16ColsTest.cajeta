@@ -1,0 +1,245 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.Cajeta;
+import cajeta.lang.Math;
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.AttnKernel;
+import dev.cajeta.llm.model.KernelCap;
+import dev.cajeta.llm.model.KvPool;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.ml.kernels.testing.ValueCheck;
+
+/** The batched decode's f16 column route (cajeta-llm 15.2.21.4.3.8.4): the slot-major f16 staging, the Q6_K
+ *  f16 column mat-vec, and the batched attention reduce that writes it. */
+public class F16ColsTest {
+
+    public F16ColsTest() { return; }
+
+    /** Where element `e` of a row of `bpr` blocks sits in the slot-major layout, written apart from the kernels'. */
+    static int64 slotOf(int64 e, int64 bpr) {
+        int64 b = e / 256L;
+        int64 n = e % 256L;
+        int64 g = n / 128L;
+        int64 qi = (n % 128L) / 32L;
+        int64 a = (n % 32L) / 16L;
+        int64 half = (n % 16L) / 8L;
+        int64 cb = (b / 8L) * 8L;
+        int64 cw = bpr - cb;
+        if (cw > 8L) { cw = 8L; }
+        return cb * 256L + (2L * qi + half) * cw * 32L + (b - cb) * 32L + (2L * g + a) * 8L + n % 8L;
+    }
+
+    static boolean here(String kernel) {
+        if (!CensusReachTest.deviceHere()) { return false; }
+        String be #= Device.activeBackend();
+        if (!KernelCap.usable(kernel)) { DeviceSkip.noKernel(kernel, be); return false; }
+        return true;
+    }
+
+    /** Packs `rows` rows of `n` and checks every element's slot, and that no slot is left unwritten. */
+    static void packAt(int64 rows, int64 n) {
+        float32[] x #= heap float32[rows * n];
+        int64 i = 0;
+        while (i < rows * n) { x[i] = (float32) (i % 2000L) - 1000.0f; i = i + 1; }
+        KernelBuffer<float32> xd #= heap KernelBuffer<float32>((uint64) (rows * n));
+        xd.upload(x);
+        float16[] h #= heap float16[rows * n];
+        i = 0;
+        while (i < rows * n) { h[i] = (float16) 5000.0f; i = i + 1; }
+        KernelBuffer<float16> hd #= heap KernelBuffer<float16>((uint64) (rows * n));
+        hd.upload(h);
+        QuantKernel.f16SlotPackRowsLaunchNoSync(hd, xd, rows, n, n, n);
+        QuantKernel.stream().sync();
+        hd.download(h);
+        int64 r = 0;
+        while (r < rows) {
+            int64 e = 0;
+            while (e < n) {
+                float32 got = (float32) h[r * n + F16ColsTest.slotOf(e, n / 256L)];
+                if (got != x[r * n + e]) {
+                    Assert.fail("slot pack at " + n + ": row " + r + " element " + e + " reads " + got
+                        + ", wanted " + x[r * n + e]);
+                    return;
+                }
+                e = e + 1;
+            }
+            r = r + 1;
+        }
+        i = 0;
+        while (i < rows * n) {
+            if ((float32) h[i] == 5000.0f) { Assert.fail("slot pack at " + n + " left slot " + i + " unwritten"); return; }
+            i = i + 1;
+        }
+    }
+
+    @Test
+    public void theSlotPackPutsEachElementWhereTheColumnKernelReadsIt() {
+        if (!F16ColsTest.here("f16SlotPackRowsKernel")) { return; }
+        int64[] vc #= ValueCheck.mark();
+        F16ColsTest.packAt(3L, 4096L);
+        F16ColsTest.packAt(2L, 2560L);
+        F16ColsTest.packAt(1L, 14336L);
+        ValueCheck.credit(vc);
+    }
+
+    /** Every width 1 to 8 of the f16 column kernel at `out x cols`, plain and accumulating, against the one-column
+     *  f32 kernel on the same f16-rounded activations. */
+    static void colsAt(int64 out, int64 cols) {
+        int32 ty = Quant.GG_Q6_K;
+        int64 ncMax = (int64) QuantKernel.WAVE_COLS_MAX;
+        int64 bpr = cols / 256L;
+        int64 nBlocks = out * bpr;
+        int8[] raw #= CensusReachTest.tiled(ty, "q6_k.bin", nBlocks);
+        int8[] res #= heap int8[out * Quant.rowResidentBytes(ty, bpr)];
+        Quant.splitInto(ty, raw, 0L, out, bpr, res, 0L);
+        KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) res.count()));
+        wD.upload(res);
+        float32[] x #= heap float32[ncMax * cols];
+        int64 i = 0;
+        while (i < ncMax * cols) {
+            x[i] = (float32) (float16) ((float32) ((i * 37L + (i / cols) * 11L + 5L) % 67L - 33L) * 0.0173f);
+            i = i + 1;
+        }
+        KernelBuffer<float32> xd #= heap KernelBuffer<float32>((uint64) (ncMax * cols));
+        xd.upload(x);
+        KernelBuffer<float16> xh #= heap KernelBuffer<float16>((uint64) (ncMax * cols));
+        QuantKernel.f16SlotPackRowsLaunchNoSync(xh, xd, ncMax, cols, cols, cols);
+        KernelBuffer<float32> yOne #= heap KernelBuffer<float32>((uint64) (ncMax * out));
+        int64 c = 0;
+        while (c < ncMax) {
+            QuantKernel.q6kF32WaveMatVecLaunchNoSync(yOne, wD, xd, out, cols, c * cols, c * out);
+            c = c + 1;
+        }
+        QuantKernel.stream().sync();
+        float32[] one #= heap float32[ncMax * out];
+        yOne.download(one);
+        float32 mag = 0.0f;
+        i = 0;
+        while (i < ncMax * out) { mag = Math.max(mag, Math.abs(one[i])); i = i + 1; }
+        float32 tol = mag * 1.0e-5f + 1.0e-4f;
+        float32[] got #= heap float32[ncMax * out];
+        KernelBuffer<float32> yD #= heap KernelBuffer<float32>((uint64) (ncMax * out));
+        int32 nc = 1;
+        while (nc <= (int32) ncMax) {
+            int32 pass = 0;
+            while (pass < 2) {
+                float32 seed = pass == 0 ? -1.0f : 0.5f;
+                int64 k = 0;
+                while (k < ncMax * out) { got[k] = seed; k = k + 1; }
+                yD.upload(got);
+                QuantKernel.q6kF16WaveMatVecColsLaunchNoSync(yD, wD, xh, out, cols, 0L, cols, 0L, nc, out, pass == 1);
+                QuantKernel.stream().sync();
+                yD.download(got);
+                k = 0;
+                while (k < ncMax * out) {
+                    if (k < (int64) nc * out) {
+                        float32 want = pass == 1 ? one[k] + 0.5f : one[k];
+                        if (Math.abs(got[k] - want) > tol) {
+                            Assert.fail("q6kF16WaveMatVecColsKernel at " + out + "x" + cols + ", " + nc + " columns"
+                                + (pass == 1 ? " accumulating" : "") + ": column " + (k / out) + " row " + (k % out)
+                                + " is " + got[k] + ", the f32 one-column kernel gives " + want);
+                            return;
+                        }
+                    } else if (got[k] != seed) {
+                        Assert.fail("q6kF16WaveMatVecColsKernel at " + nc + " columns wrote column " + (k / out));
+                        return;
+                    }
+                    k = k + 1;
+                }
+                pass = pass + 1;
+            }
+            nc = nc + 1;
+        }
+    }
+
+    @Test
+    public void theF16ColumnsMatchTheF32OneColumnKernelAtEveryWidth() {
+        if (!F16ColsTest.here("q6kF16WaveMatVecColsKernel") || !F16ColsTest.here("q6kF32WaveMatVecKernel")
+                || !F16ColsTest.here("f16SlotPackRowsKernel")) { return; }
+        int64[] vc #= ValueCheck.mark();
+        F16ColsTest.colsAt(96L, 4096L);
+        F16ColsTest.colsAt(64L, 2560L);
+        F16ColsTest.colsAt(32L, 14336L);
+        ValueCheck.credit(vc);
+    }
+
+    @Test
+    public void theF16AttentionReduceMatchesTheQ8ReduceWithinItsStep() {
+        if (!AttnBatchDecodeTest.kernels() || !F16ColsTest.here("attnReduceF16BatchKernel")) { return; }
+        int32 n = 6;
+        int32 nH = AttnBatchDecodeTest.NH;
+        int32 nKv = AttnBatchDecodeTest.NKV;
+        int32 hd = AttnBatchDecodeTest.HD;
+        int64 qd = (int64) (nH * hd);
+        int64 kvd = (int64) (nKv * hd);
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        float32[] q #= AttnKernelTest.spread(qd * (int64) n, 3);
+        float32[] k #= AttnKernelTest.spread(kvd * (int64) n, 4);
+        float32[] v #= AttnKernelTest.spread(kvd * (int64) n, 6);
+        float32[] inv #= heap float32[(int64) (hd / 2)];
+        int64 i = 0;
+        while (i < (int64) (hd / 2)) { inv[i] = 1.0f / Math.pow(10000.0f, (float32) (2L * i) / (float32) hd); i = i + 1; }
+        KernelBuffer<float32> ib #= heap KernelBuffer<float32>((uint64) (hd / 2));
+        ib.upload(inv);
+        int32[] slots #= heap int32[(int64) n];
+        int32[] pos #= heap int32[(int64) n];
+        int64 pb = Quant.q8kPackedBytes(qd);
+        int8[] packed #= heap int8[pb * (int64) n];
+        float16[] halves #= heap float16[qd * (int64) n];
+        int64[] vc #= ValueCheck.mark();
+        int32 route = 0;
+        while (route < 2) {
+            KvPool p #= AttnBatchDecodeTest.pool(n, nKv);
+            KernelBuffer<float32> qb #= heap KernelBuffer<float32>((uint64) q.count());
+            KernelBuffer<float32> kb #= heap KernelBuffer<float32>((uint64) k.count());
+            KernelBuffer<float32> vb #= heap KernelBuffer<float32>((uint64) v.count());
+            qb.upload(q);
+            kb.upload(k);
+            vb.upload(v);
+            int32 r = 0;
+            while (r < n) { slots[(int64) r] = (int32) p.slotBase(r); pos[(int64) r] = AttnBatchDecodeTest.posOf(r); r = r + 1; }
+            KernelBuffer<int32> tab #= heap KernelBuffer<int32>((uint64) (4 * n));
+            int32 maxSplits = AttnKernel.decodeRowTable(slots, pos, n, nKv, tab);
+            if (route == 0) {
+                KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) (pb * (int64) n));
+                AttnKernel.attendDecodeBatchLaunchNoSync(xp, qb, kb, vb, p.kAll(0), p.vAll(0), ib, ib, ib,
+                    nH, nKv, hd, false, 1.0e-5f, 0, tab, n, maxSplits, pb, scale);
+                QuantKernel.stream().sync();
+                xp.download(packed);
+            } else {
+                KernelBuffer<float16> xh #= heap KernelBuffer<float16>((uint64) (qd * (int64) n));
+                AttnKernel.attendDecodeBatchF16LaunchNoSync(xh, qb, kb, vb, p.kAll(0), p.vAll(0), ib, ib, ib,
+                    nH, nKv, hd, false, 1.0e-5f, 0, tab, n, maxSplits, qd, scale);
+                QuantKernel.stream().sync();
+                xh.download(halves);
+            }
+            route = route + 1;
+        }
+        int64 r2 = 0;
+        while (r2 < (int64) n) {
+            int64 e = 0;
+            while (e < qd) {
+                int64 ob = r2 * pb + (e / 256L) * 320L;
+                int32 bits = ((int32) packed[ob + 288L] & 255) | (((int32) packed[ob + 289L] & 255) << 8)
+                    | (((int32) packed[ob + 290L] & 255) << 16) | (((int32) packed[ob + 291L] & 255) << 24);
+                float32 step = Cajeta.bitsToF32(bits);
+                float32 deq = (float32) packed[ob + e % 256L] * step;
+                float32 got = (float32) halves[r2 * qd + F16ColsTest.slotOf(e, qd / 256L)];
+                if (Math.abs(got - deq) > 0.51f * step + Math.abs(deq) * 0.002f) {
+                    Assert.fail("f16 attention reduce row " + r2 + " element " + e + " is " + got
+                        + ", the q8 reduce dequantizes to " + deq + " (step " + step + ")");
+                    return;
+                }
+                e = e + 1;
+            }
+            r2 = r2 + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+}
