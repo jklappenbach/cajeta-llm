@@ -23,6 +23,7 @@ public class AttnBatchDecodeTest {
     static final int32 HD = 128;
     static final int32 CAP = 704;
     static int32 window = 0;
+    static int32 hdNow = 128;
 
     public AttnBatchDecodeTest() { return; }
 
@@ -48,7 +49,7 @@ public class AttnBatchDecodeTest {
 
     /** A pool of `n` slots whose earlier positions hold spread halves. */
     static #KvPool pool(int32 n, int32 nKv) {
-        int64 kvDim = (int64) (nKv * AttnBatchDecodeTest.HD);
+        int64 kvDim = (int64) (nKv * AttnBatchDecodeTest.hdNow);
         KvPool p #= heap KvPool(1, AttnBatchDecodeTest.CAP, (int32) kvDim);
         p.ensureSlots(n);
         int32 s = 0;
@@ -70,7 +71,7 @@ public class AttnBatchDecodeTest {
 
     /** Runs `n` rows through the batched launches when `batch`, else each row's own; returns the packed rows then the pool's K and V as bytes. */
     static #int8[] run(int32 n, boolean batch, boolean norm, int32 nH, int32 nKv) {
-        int32 hd = AttnBatchDecodeTest.HD;
+        int32 hd = AttnBatchDecodeTest.hdNow;
         int64 qd = (int64) (nH * hd);
         int64 kvd = (int64) (nKv * hd);
         float32 scale = 1.0f / Math.sqrt((float32) hd);
@@ -121,10 +122,20 @@ public class AttnBatchDecodeTest {
                     norm, 1.0e-5f, 0, ps, ps);
                 int32 cnt = ps + 1;
                 if (AttnBatchDecodeTest.window > 0 && cnt > AttnBatchDecodeTest.window) { cnt = AttnBatchDecodeTest.window; }
-                Assert.isTrue(AttnKernel.attendDecodePartialsLaunchNoSync(qr, ks, vs,
-                    KvPage.identity(AttnBatchDecodeTest.CAP), 0, nH, nKv, hd,
-                    cnt, ps + 1 - cnt, scale));
-                AttnKernel.reducePackLaunchNoSync(xr, nH);
+                if (hd == 256) {
+                    KernelBuffer<float32> ao #= heap KernelBuffer<float32>((uint64) qd);
+                    KernelBuffer<float32> sc #= heap KernelBuffer<float32>(1L);
+                    AttnKernel.attendDecodeLaunchNoSync(ao, sc, qr, ks, vs, KvPage.identity(AttnBatchDecodeTest.CAP), 0,
+                        nH, nKv, hd, cnt, ps + 1 - cnt, 1, scale);
+                    QuantKernel.q8kPackRowsLaunchNoSync(xr, ao, 1L, qd, qd);
+                    KernelStream ss = QuantKernel.stream();
+                    ss.sync();
+                } else {
+                    Assert.isTrue(AttnKernel.attendDecodePartialsLaunchNoSync(qr, ks, vs,
+                        KvPage.identity(AttnBatchDecodeTest.CAP), 0, nH, nKv, hd,
+                        cnt, ps + 1 - cnt, scale));
+                    AttnKernel.reducePackLaunchNoSync(xr, nH);
+                }
                 r = r + 1;
             }
         }
@@ -165,7 +176,7 @@ public class AttnBatchDecodeTest {
         int64[] vc #= ValueCheck.mark();
         int8[] got #= AttnBatchDecodeTest.run(n, true, norm, nH, nKv);
         AttnKernel.setFlashDecodeChunk(0);
-        int64 qd = (int64) (nH * AttnBatchDecodeTest.HD);
+        int64 qd = (int64) (nH * AttnBatchDecodeTest.hdNow);
         int64 pbAll = Quant.q8kPackedBytes(qd) * (int64) n;
         Assert.equals((int64) want.count(), (int64) got.count());
         int64 i = 0;
@@ -293,6 +304,27 @@ public class AttnBatchDecodeTest {
         AttnBatchDecodeTest.window = 0;
     }
 
+    /** 15.2.21.8.1.2.3: at head 256 the batch kernel, its reduce and the row pack give each row the single pair's
+     *  bytes, with and without qk-norm and windows of 7 and 100. */
+    @Test
+    public void rowsAtHead256MatchTheirOwnLaunches() {
+        if (!AttnBatchDecodeTest.kernels()) { return; }
+        if (!KernelCap.usable("attnFlashDecodeGqa2Hd256BatchKernel")) {
+            DeviceSkip.noKernel("attnFlashDecodeGqa2Hd256BatchKernel", Device.activeBackend());
+            return;
+        }
+        AttnBatchDecodeTest.hdNow = 256;
+        AttnBatchDecodeTest.same(1, false, 8, 4);
+        AttnBatchDecodeTest.same(6, false, 8, 4);
+        AttnBatchDecodeTest.same(6, true, 8, 4);
+        AttnBatchDecodeTest.window = 7;
+        AttnBatchDecodeTest.same(6, false, 8, 4);
+        AttnBatchDecodeTest.window = 100;
+        AttnBatchDecodeTest.same(6, false, 8, 4);
+        AttnBatchDecodeTest.window = 0;
+        AttnBatchDecodeTest.hdNow = 128;
+    }
+
     /** The row table caps each row's count at its window, leaves rows inside it whole, and splits on the capped count. */
     @Test
     public void theRowTableCapsEachCountAtTheWindow() {
@@ -326,6 +358,8 @@ public class AttnBatchDecodeTest {
         Assert.isTrue(!AttnKernel.batchDecodeServes(12, 2, 128));
         Assert.isTrue(!AttnKernel.batchDecodeServes(8, 2, 64));
         Assert.isTrue(!AttnKernel.batchDecodeServes(8, 8, 128));
+        Assert.isTrue(!AttnKernel.batchDecodeServes(16, 4, 256));
+        Assert.isTrue(KernelCap.usable("attnFlashDecodeGqa2Hd256BatchKernel") == AttnKernel.batchDecodeServes(8, 4, 256));
     }
 
     /** The launcher counts each batched launch set, which BatchDecodeTest reads. */
