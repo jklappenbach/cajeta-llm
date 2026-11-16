@@ -5,6 +5,7 @@ import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llm.EngineOptions;
 import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.gen.SampleParams;
 import dev.cajeta.llm.model.DeviceKv;
 import dev.cajeta.llm.model.KvPool;
@@ -22,6 +23,7 @@ public class KvPoolTest {
     @AfterEach
     public void restore() {
         DeviceKv.setRingSlack(256);
+        KvPool.setBudgetBytes(0L);
         return;
     }
 
@@ -198,20 +200,19 @@ public class KvPoolTest {
         int32 kf = p.kindOf(1);
         int32 kr = p.kindOf(0);
         int32 kw = p.kindOf(3);
-        Assert.equals(16L, (int64) p.freeBlocks(kf));
+        Assert.equals(0L, (int64) p.freeBlocks(kf));
         p.ensureRows(0, 10);
         Assert.equals(1L, (int64) p.drawn(0, kf));
         Assert.equals(1L, (int64) p.drawn(0, kr));
-        Assert.equals(15L, (int64) p.freeBlocks(kf));
         p.ensureRows(0, 70);
         Assert.equals(2L, (int64) p.drawn(0, kf));
         Assert.isTrue(p.entry(p.tableBase(0, kf)) != p.entry(p.tableBase(0, kf) + 1));
         p.ensureRows(0, 512);
         Assert.equals(8L, (int64) p.drawn(0, kf));
         Assert.equals(8L, (int64) p.drawn(0, kr));
-        Assert.equals(8L, (int64) p.freeBlocks(kf));
-        Assert.equals(3L, (int64) p.freeBlocks(kr));
-        Assert.equals(4L, (int64) p.freeBlocks(kw));
+        Assert.equals((int64) (p.capacity(kf) - 8), (int64) p.freeBlocks(kf));
+        Assert.equals((int64) (p.capacity(kr) - 3), (int64) p.freeBlocks(kr));
+        Assert.equals((int64) (p.capacity(kw) - 4), (int64) p.freeBlocks(kw));
         int32 b = 3;
         while (b < 8) {
             Assert.equals((int64) p.entry(p.tableBase(0, kr) + b % 3), (int64) p.entry(p.tableBase(0, kr) + b));
@@ -236,9 +237,11 @@ public class KvPoolTest {
         while (b < 8) { had[(int64) b] = p.entry(p.tableBase(0, kf) + b); b = b + 1; }
         p.release(0);
         Assert.equals(0L, (int64) p.drawn(0, kf));
-        Assert.equals(16L, (int64) p.freeBlocks(kf));
-        Assert.equals(6L, (int64) p.freeBlocks(kr));
+        Assert.equals((int64) p.capacity(kf), (int64) p.freeBlocks(kf));
+        Assert.equals((int64) p.capacity(kr), (int64) p.freeBlocks(kr));
+        int32 grew = p.blockGrowths();
         p.ensureRows(1, 512);
+        Assert.equals((int64) grew, (int64) p.blockGrowths());
         b = 0;
         while (b < 8) {
             Assert.equals((int64) had[(int64) b], (int64) p.entry(p.tableBase(1, kf) + b));
@@ -246,6 +249,73 @@ public class KvPoolTest {
         }
         p.flush();
         KvPoolTest.tableAgrees(p, 2);
+    }
+
+    /** 15.2.21.8.1.3.2: a pool holds no block until a slot draws one, then exactly the blocks drawn; a growth when no
+     *  block is free keeps every live block's rows. */
+    @Test
+    public void blocksGrowOnDemandAndKeepLiveRows() {
+        if (!KvPoolTest.device()) { return; }
+        KvPool p #= KvPoolTest.mixed();
+        p.ensureSlots(2);
+        Assert.equals(0L, p.deviceBytes());
+        int32 l = 0;
+        while (l < 5) { KvPoolTest.write(p, l, 0); l = l + 1; }
+        Assert.equals((int64) (8 * 2 + 3 * 2 + 4) * 64L * 16L * 4L, p.deviceBytes());
+        int32 grew = p.blockGrowths();
+        int64[] vc #= ValueCheck.mark();
+        p.ensureRows(1, 512);
+        p.flush();
+        Assert.isTrue(p.blockGrowths() > grew);
+        l = 0;
+        while (l < 5) {
+            KvPoolTest.holds(p, l, 0, "after slot 1 grew the pool");
+            l = l + 1;
+        }
+        KvPoolTest.tableAgrees(p, 2);
+        ValueCheck.credit(vc);
+    }
+
+    /** Reserving for admitted lengths grows each kind once, exactly, so their draws grow nothing. */
+    @Test
+    public void aReserveForAdmittedLengthsLetsTheirDrawsGrowNothing() {
+        if (!KvPoolTest.device()) { return; }
+        KvPool p #= KvPoolTest.mixed();
+        p.ensureSlots(2);
+        int32[] lens #= heap int32[2L];
+        lens[0L] = 512;
+        lens[1L] = 70;
+        p.reserve(lens, 2);
+        Assert.equals((int64) (10 * 2 + 5 * 2 + 6) * 64L * 16L * 4L, p.deviceBytes());
+        int32 grew = p.blockGrowths();
+        p.ensureRows(0, 512);
+        p.ensureRows(1, 70);
+        Assert.equals((int64) grew, (int64) p.blockGrowths());
+        p.flush();
+        KvPoolTest.tableAgrees(p, 2);
+    }
+
+    /** A growth past the budget is refused by name and leaves the pool as it was. */
+    @Test
+    public void aGrowthPastTheBudgetIsRefused() {
+        if (!KvPoolTest.device()) { return; }
+        KvPool p #= KvPoolTest.mixed();
+        p.ensureSlots(2);
+        p.ensureRows(0, 64);
+        int64 held = p.deviceBytes();
+        KvPool.setBudgetBytes(held + 1L);
+        boolean threw = false;
+        String msg = "";
+        try {
+            p.ensureRows(0, 512);
+        } catch (LlmException ex) {
+            threw = true;
+            msg #= ex.message.substring(0, ex.message.byteLength());
+        }
+        KvPool.setBudgetBytes(0L);
+        Assert.isTrue(threw);
+        Assert.isTrue(msg.indexOf("budget") >= 0L);
+        Assert.equals(held, p.deviceBytes());
     }
 
     @Test

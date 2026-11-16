@@ -1,5 +1,6 @@
 package dev.cajeta.llm.model;
 
+import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.LlmException;
@@ -34,6 +35,117 @@ public final class KvPool {
     int32[] kCap;
     KvFreeList[] free;
     boolean dirty;
+    int32 nBlockGrowths;
+    static int64 budget = 0L;
+
+    /** The most device bytes every pool's K and V may hold together; 0 sets no limit but free memory. */
+    public static void setBudgetBytes(int64 n) { KvPool.budget = n; }
+
+    /** Device bytes this pool's K and V buffers hold. */
+    public int64 deviceBytes() {
+        int64 n = 0L;
+        int32 l = 0;
+        while (l < this.layers) {
+            n = n + (int64) this.kCap[(int64) this.kindOf(l)] * (int64) KvPage.BLOCK * (int64) this.kvDim * 4L;
+            l = l + 1;
+        }
+        return n;
+    }
+
+    /** How many times a kind's buffers grew for blocks. */
+    public int32 blockGrowths() { return this.nBlockGrowths; }
+
+    /** Blocks kind `kd`'s buffers hold. */
+    public int32 capacity(int32 kd) { return this.kCap[(int64) kd]; }
+
+    /** Grow each kind so `n` sequences of `lens[i]` positions draw without growing: their blocks at most, exactly. */
+    public void reserve(int32[] lens, int32 n) {
+        int32 kd = 0;
+        while (kd < this.nKinds) {
+            int32 r = this.kBlocks[(int64) kd];
+            int32 need = 0;
+            int32 i = 0;
+            while (i < n) {
+                int32 len = lens[(int64) i];
+                if (len > this.cap) { len = this.cap; }
+                int32 nb = KvPage.blocksFor(len);
+                if (nb > r) { nb = r; }
+                need = need + nb;
+                i = i + 1;
+            }
+            int32 most = this.nSlots * r;
+            if (need > most) { need = most; }
+            if (need > this.kCap[(int64) kd]) { this.grow(kd, need - this.kCap[(int64) kd], true); }
+            kd = kd + 1;
+        }
+        return;
+    }
+
+    /** Grow kind `kd`'s buffers by at least `need` blocks (exactly when `exact`, else doubling, up to what the slots
+     *  can use), copying every block, one stream sync per 256 MB of old buffers; refused by name past the budget or
+     *  free memory. */
+    void grow(int32 kd, int32 need, boolean exact) {
+        int32 had = this.kCap[(int64) kd];
+        int32 want = had + need;
+        if (!exact && had * 2 > want) { want = had * 2; }
+        int32 most = this.nSlots * this.kBlocks[(int64) kd];
+        if (want > most) { want = most; }
+        if (want < had + need) {
+            throw heap LlmException("kv pool: kind " + kd + " needs " + need + " blocks past its " + most);
+        }
+        int32 nl = 0;
+        int32 l = 0;
+        while (l < this.layers) {
+            if (this.kindOf(l) == kd) { nl = nl + 1; }
+            l = l + 1;
+        }
+        int64 add = (int64) (want - had) * (int64) KvPage.BLOCK * (int64) this.kvDim * 4L * (int64) nl;
+        int64 held = this.deviceBytes();
+        if (KvPool.budget > 0L && held + add > KvPool.budget) {
+            throw heap LlmException("kv pool: growing kind " + kd + " (window " + this.kWin[(int64) kd] + ") to "
+                + want + " blocks adds " + add + " bytes to " + held + ", past the budget of " + KvPool.budget);
+        }
+        int64 freeB = Device.freeMemoryBytes();
+        if (freeB > 0L && add > freeB) {
+            throw heap LlmException("kv pool: growing kind " + kd + " to " + want + " blocks adds " + add
+                + " bytes; the device has " + freeB + " free");
+        }
+        Diag.growth();
+        int64 blockHalves = (int64) KvPage.BLOCK * (int64) this.kvDim;
+        int64 oldBytes = (int64) had * blockHalves * 4L;
+        int64 batch = 1L;
+        if (oldBytes > 0L) { batch = (268435456L + oldBytes - 1L) / oldBytes; }
+        KernelBuffer<float16>[] old #= heap KernelBuffer<float16>[2L * batch];
+        int64 nOld = 0L;
+        KernelStream s = QuantKernel.stream();
+        l = 0;
+        while (l < this.layers) {
+            if (this.kindOf(l) == kd) {
+                KernelBuffer<float16> nk #= heap KernelBuffer<float16>((uint64) ((int64) want * blockHalves));
+                KernelBuffer<float16> nv #= heap KernelBuffer<float16>((uint64) ((int64) want * blockHalves));
+                if (had > 0) {
+                    KvPool.copyLaunchNoSync(nk, this.k[(int64) l], (int64) had * blockHalves);
+                    KvPool.copyLaunchNoSync(nv, this.v[(int64) l], (int64) had * blockHalves);
+                }
+                old[2L * nOld] #= this.k[(int64) l];
+                old[2L * nOld + 1L] #= this.v[(int64) l];
+                this.k[(int64) l] #= nk;
+                this.v[(int64) l] #= nv;
+                nOld = nOld + 1L;
+                if (nOld == batch) {
+                    s.sync();
+                    old #= heap KernelBuffer<float16>[2L * batch];
+                    nOld = 0L;
+                }
+            }
+            l = l + 1;
+        }
+        s.sync();
+        this.free[(int64) kd].pushRange(had, want);
+        this.kCap[(int64) kd] = want;
+        this.nBlockGrowths = this.nBlockGrowths + 1;
+        return;
+    }
 
     /** A pool of `layers` flat K and V buffers holding `cap` positions of `kvDim` a slot; holds no slot until
      *  {@link #ensureSlots}. */
@@ -142,8 +254,10 @@ public final class KvPool {
                     if (b < r) {
                         int32 id = this.free[(int64) kd].pop();
                         if (id < 0) {
-                            throw heap LlmException("kv pool: no free block in kind " + kd + " (window "
-                                + this.kWin[(int64) kd] + ", " + this.kCap[(int64) kd] + " blocks)");
+                            int32 upto = nb;
+                            if (upto > r) { upto = r; }
+                            this.grow(kd, upto - b, false);
+                            id = this.free[(int64) kd].pop();
                         }
                         this.th[(int64) (base + b)] = id;
                     } else {
@@ -251,40 +365,10 @@ public final class KvPool {
         return #p;
     }
 
-    /** Grow to at least `n` slots: table regions for them and, while capacity is preallocated, their kinds' blocks,
-     *  keeping every drawn block's rows; every earlier slice is stale afterwards. */
+    /** Grow to at least `n` slots' table regions, keeping every entry; blocks come as slots draw them. */
     public void ensureSlots(int32 n) {
         if (n <= this.nSlots) { return; }
         Diag.growth();
-        int32 kd = 0;
-        while (kd < this.nKinds) {
-            int32 want = n * this.kBlocks[(int64) kd];
-            this.free[(int64) kd].pushRange(this.kCap[(int64) kd], want);
-            kd = kd + 1;
-        }
-        int32 l = 0;
-        while (l < this.layers) {
-            int32 lk = this.kindOf(l);
-            int64 blockHalves = (int64) KvPage.BLOCK * (int64) this.kvDim;
-            uint64 count = (uint64) ((int64) (n * this.kBlocks[(int64) lk]) * blockHalves);
-            int64 keep = (int64) this.kCap[(int64) lk] * blockHalves;
-            KernelBuffer<float16> nk #= heap KernelBuffer<float16>(count);
-            KernelBuffer<float16> nv #= heap KernelBuffer<float16>(count);
-            if (keep > 0L) {
-                KvPool.copyLaunchNoSync(nk, this.k[(int64) l], keep);
-                KvPool.copyLaunchNoSync(nv, this.v[(int64) l], keep);
-                KernelStream s = QuantKernel.stream();
-                s.sync();
-            }
-            this.k[(int64) l] #= nk;
-            this.v[(int64) l] #= nv;
-            l = l + 1;
-        }
-        kd = 0;
-        while (kd < this.nKinds) {
-            this.kCap[(int64) kd] = n * this.kBlocks[(int64) kd];
-            kd = kd + 1;
-        }
         int64 te = (int64) n * (int64) this.nKinds * (int64) this.nLog;
         int32[] nth #= heap int32[te];
         int64 i = 0L;
