@@ -9,6 +9,7 @@ import cajeta.xpu.Device;
 import cajeta.xpu.KernelBuffer;
 import cajeta.xpu.KernelManifest;
 import dev.cajeta.llm.model.AttnKernel;
+import dev.cajeta.llm.model.KvPage;
 import cajeta.io.file.Path;
 import dev.cajeta.ml.kernels.tune.TuneMode;
 import dev.cajeta.llm.model.Linear;
@@ -405,8 +406,10 @@ public class AttnKernelTest {
         }
         ModelConfig windowed #= AttnKernelTest.kvCfg(2, 8);
         Assert.isTrue(KernelCap.ringHere() == DeviceKv.supports(windowed));
-        Assert.equals(8, DeviceKv.planeRows(windowed, 64, 0));
-        Assert.equals(64, DeviceKv.planeRows(plain, 64, 0));
+        Assert.equals(64, DeviceKv.planeRows(windowed, 64, 0));
+        Assert.equals(384, DeviceKv.planeRows(windowed, 4096, 0));
+        Assert.equals(4096, DeviceKv.planeRows(plain, 4096, 0));
+        Assert.equals(64, DeviceKv.planeRows(plain, 50, 0));
     }
 
     /**
@@ -1814,6 +1817,118 @@ public class AttnKernelTest {
                     + " of 8 attends did");
             }
         } finally { AttnKernel.setCpuPrefillAttend(cpuWas); }
+    }
+
+    /** cajeta-llm 15.2.21.8.1.1: every decode and prefill route reads its planes through the block table, so blocks
+     *  reversed behind a spare and a table base of 3 give the identity layout's answer bit for bit. */
+    @Test
+    public void everyAttendRouteReadsThroughAScrambledTable() {
+        boolean cpuWas = AttnKernel.cpuPrefillAttendOn();
+        boolean tileWas = AttnKernel.prefillTileOn();
+        boolean onlineWas = AttnKernel.prefillOnlineOn();
+        boolean f16Was = AttnKernel.prefillF16On();
+        try {
+            AttnKernelTest.scrambledDecode(8, 2, 128, 150);
+            AttnKernelTest.scrambledDecode(16, 2, 128, 150);
+            AttnKernelTest.scrambledDecode(4, 4, 128, 150);
+            AttnKernelTest.scrambledDecode(8, 4, 256, 150);
+            AttnKernelTest.scrambledDecode(2, 1, 256, 700);
+            AttnKernel.setFlashDecode(false);
+            AttnKernelTest.scrambledDecode(8, 2, 128, 150);
+            AttnKernelTest.scrambledDecode(8, 4, 256, 150);
+            AttnKernel.setFlashDecode(true);
+            AttnKernelTest.scrambledPrefill(70, 8, 2, 128, 60, 0, "default");
+            AttnKernelTest.scrambledPrefill(70, 8, 2, 128, 60, 40, "default");
+            AttnKernelTest.scrambledPrefill(70, 8, 4, 256, 60, 0, "default");
+            AttnKernelTest.scrambledPrefill(70, 8, 4, 256, 60, 40, "default");
+            AttnKernel.setCpuPrefillAttend(false);
+            AttnKernelTest.scrambledPrefill(70, 8, 2, 128, 60, 0, "f16 tile");
+            AttnKernelTest.scrambledPrefill(70, 8, 4, 256, 60, 0, "hd-256 tile");
+            AttnKernelTest.scrambledPrefill(70, 8, 4, 256, 60, 40, "hd-256 tile");
+            AttnKernel.setPrefillF16(false);
+            AttnKernelTest.scrambledPrefill(70, 8, 2, 128, 60, 0, "online");
+            AttnKernelTest.scrambledPrefill(70, 8, 4, 256, 60, 40, "window pair");
+            AttnKernel.setPrefillOnline(false);
+            AttnKernel.setPrefillTilePays(1);
+            AttnKernelTest.scrambledPrefill(70, 8, 2, 128, 60, 0, "two-pass tile");
+            AttnKernel.setPrefillTile(false);
+            AttnKernelTest.scrambledPrefill(70, 8, 2, 128, 60, 0, "flash gqa4");
+            AttnKernelTest.scrambledPrefill(70, 4, 4, 128, 60, 0, "flash");
+            AttnKernel.setAttnFlash(false);
+            AttnKernelTest.scrambledPrefill(70, 8, 2, 128, 60, 0, "v2 pair");
+            AttnKernel.setAttnV2(false);
+            AttnKernelTest.scrambledPrefill(70, 8, 2, 128, 60, 0, "row score");
+            AttnKernel.setRowScore(false);
+            AttnKernelTest.scrambledPrefill(70, 8, 2, 128, 60, 0, "score per position");
+        } finally {
+            KvPage.setScrambled(false);
+            AttnKernel.setFlashDecode(true);
+            AttnKernel.setRowScore(true);
+            AttnKernel.setAttnV2(true);
+            AttnKernel.setAttnFlash(true);
+            AttnKernel.setPrefillTilePays(0);
+            AttnKernel.setPrefillTile(tileWas);
+            AttnKernel.setPrefillOnline(onlineWas);
+            AttnKernel.setPrefillF16(f16Was);
+            AttnKernel.setCpuPrefillAttend(cpuWas);
+        }
+    }
+
+    /** Fails unless `a` and `b` hold the same floats at every index. */
+    static void sameBits(float32[] a, float32[] b, String what) {
+        AttnKernelTest.assertLive(a, what);
+        int64 i = 0L;
+        while (i < (int64) a.count()) {
+            if (a[i] != b[i]) {
+                Assert.fail(what + " at " + i + ": identity " + a[i] + ", scrambled " + b[i]);
+                return;
+            }
+            i = i + 1L;
+        }
+    }
+
+    /** One decode attend of `count` positions on the identity layout and on the scrambled one. */
+    static void scrambledDecode(int32 nH, int32 nKv, int32 hd, int32 count) {
+        int64 kvDim = (int64) (nKv * hd);
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        float32[] q #= AttnKernelTest.spread((int64) (nH * hd), 41);
+        float32[] k #= AttnKernelTest.spread((int64) count * kvDim, 43);
+        float32[] v #= AttnKernelTest.spread((int64) count * kvDim, 47);
+        float32[] a #= heap float32[(int64) (nH * hd)];
+        float32[] b #= heap float32[(int64) (nH * hd)];
+        KvPage.setScrambled(false);
+        AttnKernel.attendDecodeInto(a, q, k, v, nH, nKv, hd, count, scale);
+        KvPage.setScrambled(true);
+        AttnKernel.attendDecodeInto(b, q, k, v, nH, nKv, hd, count, scale);
+        KvPage.setScrambled(false);
+        AttnKernelTest.sameBits(a, b, "decode " + nH + " over " + nKv + " hd " + hd + " count " + count);
+    }
+
+    /** One prefill attend of `rows` rows at `sp` (`window` 0 for none) on the identity layout and the scrambled one. */
+    static void scrambledPrefill(int32 rows, int32 nH, int32 nKv, int32 hd, int32 sp, int32 window, String route) {
+        int32 tMax = sp + rows;
+        int64 kvDim = (int64) (nKv * hd);
+        int64 qn = (int64) rows * (int64) (nH * hd);
+        float32 scale = 1.0f / Math.sqrt((float32) hd);
+        float32[] q #= AttnKernelTest.spread(qn, 53);
+        float32[] k #= AttnKernelTest.spread((int64) tMax * kvDim, 59);
+        float32[] v #= AttnKernelTest.spread((int64) tMax * kvDim, 61);
+        float32[] a #= heap float32[qn];
+        float32[] b #= heap float32[qn];
+        int32 pass = 0;
+        while (pass < 2) {
+            KvPage.setScrambled(pass == 1);
+            float32[] out = pass == 0 ? a : b;
+            if (window > 0) {
+                AttnKernel.attendPrefillWindowInto(out, q, k, v, rows, nH, nKv, hd, sp, scale, window);
+            } else {
+                AttnKernel.attendPrefillInto(out, q, k, v, rows, nH, nKv, hd, sp, scale);
+            }
+            pass = pass + 1;
+        }
+        KvPage.setScrambled(false);
+        AttnKernelTest.sameBits(a, b, "prefill " + route + " " + nH + " over " + nKv + " hd " + hd + " rows " + rows
+            + " at " + sp + " window " + window);
     }
 
     /** Decode attends of `nH` heads over `nKv` at `hd`, one per count, each against the host floor. */

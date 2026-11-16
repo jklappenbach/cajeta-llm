@@ -16,13 +16,15 @@ import dev.cajeta.llm.model.KernelCap;
 import dev.cajeta.llm.model.ModelConfig;
 import dev.cajeta.ml.kernels.testing.ValueCheck;
 
-/** cajeta-llm plan 15.2.21.8: a windowed layer's device K/V is a ring of the window's rows, to the host path's answer. */
+/** cajeta-llm plan 15.2.21.8 and 15.2.21.8.1: a windowed layer's device K/V is a ring of blocks past its window, to the
+ *  host path's answer, with a slack of 64 so the toy's rings wrap. */
 public class WindowRingDeviceTest {
 
     static final String DIR = "tmp/cajeta_llm_ring_dev";
     static final int32 LAYERS = 6;
     static final int32 WINDOW = 8;
-    static final int32 CAP = 128;
+    static final int32 WIDE = 100;
+    static final int32 CAP = 512;
     static final int32 V = 256;
     static boolean written = false;
 
@@ -32,6 +34,7 @@ public class WindowRingDeviceTest {
     public void restore() {
         QuantKernel.setRoutingEnabled(true);
         CausalLM.setDeviceAttention(true);
+        DeviceKv.setRingSlack(256);
         return;
     }
 
@@ -43,6 +46,11 @@ public class WindowRingDeviceTest {
 
     static #String configOf(int32 hd, boolean windowed) {
         return WindowRingDeviceTest.DIR + (windowed ? "/w" : "/n") + hd + ".json";
+    }
+
+    /** The five-to-one config with a window of {@link #WIDE}. */
+    static #String wideConfigOf(int32 hd) {
+        return WindowRingDeviceTest.DIR + "/x" + hd + ".json";
     }
 
     /** Writes, per head size, the weights and two configs: five windowed layers then a full one, and all full. */
@@ -57,6 +65,11 @@ public class WindowRingDeviceTest {
             ToyModel.writeConfigX(WindowRingDeviceTest.configOf(hd, true), "Gemma3ForCausalLM", 512, 512,
                 WindowRingDeviceTest.LAYERS, 512 / hd, 1, hd, WindowRingDeviceTest.V, WindowRingDeviceTest.CAP, true,
                 "\"sliding_window\":" + WindowRingDeviceTest.WINDOW + ",\"layer_types\":[\"sliding_attention\","
+                + "\"sliding_attention\",\"sliding_attention\",\"sliding_attention\",\"sliding_attention\","
+                + "\"full_attention\"]," + tail);
+            ToyModel.writeConfigX(WindowRingDeviceTest.wideConfigOf(hd), "Gemma3ForCausalLM", 512, 512,
+                WindowRingDeviceTest.LAYERS, 512 / hd, 1, hd, WindowRingDeviceTest.V, WindowRingDeviceTest.CAP, true,
+                "\"sliding_window\":" + WindowRingDeviceTest.WIDE + ",\"layer_types\":[\"sliding_attention\","
                 + "\"sliding_attention\",\"sliding_attention\",\"sliding_attention\",\"sliding_attention\","
                 + "\"full_attention\"]," + tail);
             ToyModel.writeConfigX(WindowRingDeviceTest.configOf(hd, false), "Gemma3ForCausalLM", 512, 512,
@@ -75,6 +88,17 @@ public class WindowRingDeviceTest {
     static #CausalLM mk(int32 hd, boolean windowed) {
         WindowRingDeviceTest.writeFixture();
         ModelConfig cfg #= ModelConfig.parse(WindowRingDeviceTest.configOf(hd, windowed));
+        return WindowRingDeviceTest.bound(#cfg, hd);
+    }
+
+    /** The toy of config `path`, bound as {@link #mk}. */
+    static #CausalLM mkAt(String path, int32 hd) {
+        WindowRingDeviceTest.writeFixture();
+        ModelConfig cfg #= ModelConfig.parse(path);
+        return WindowRingDeviceTest.bound(#cfg, hd);
+    }
+
+    static #CausalLM bound(#ModelConfig cfg, int32 hd) {
         CausalLM m #= heap CausalLM(#cfg, WindowRingDeviceTest.CAP, 1, 0);
         Checkpoint ck #= Checkpoint.open(WindowRingDeviceTest.DIR + "/m" + hd + ".safetensors");
         m.bind(ck, false);
@@ -121,12 +145,21 @@ public class WindowRingDeviceTest {
     /** Runs the device model and its host twin through the same schedule and holds the device to the host. */
     static void sameAsHost(int32 hd, int32 first, int32 second, int32 steps, int32 hostFrom, int32 hostTo,
             String what) {
+        WindowRingDeviceTest.sameAsHostAt(WindowRingDeviceTest.configOf(hd, true), hd, first, second, steps, hostFrom,
+            hostTo, 1.0e-6, what);
+    }
+
+    /** {@link #sameAsHost} for the windowed config at `path`, KL to 1e-6 (1e-5 on cpu, whose route packs q8
+     *  activations); the unwindowed control must pass `floor` and ten times the device's KL. */
+    static void sameAsHostAt(String path, int32 hd, int32 first, int32 second, int32 steps, int32 hostFrom,
+            int32 hostTo, float64 floor, String what) {
         if (!FourNormDeviceTest.deviceHere()) {
             RoutableFixtureTest.saySkip();
             return;
         }
+        DeviceKv.setRingSlack(64);
         int32 v = WindowRingDeviceTest.V;
-        CausalLM dev #= WindowRingDeviceTest.mk(hd, true);
+        CausalLM dev #= WindowRingDeviceTest.mkAt(path, hd);
         Assert.isTrue(dev.deviceRoutable());
         Assert.isTrue(dev.batchRoutedFor(first));
         int64[] vc #= ValueCheck.mark();
@@ -135,7 +168,7 @@ public class WindowRingDeviceTest {
         WindowRingDeviceTest.run(dev, first, second, steps, hostFrom, hostTo, td, ld);
 
         QuantKernel.setRoutingEnabled(false);
-        CausalLM host #= WindowRingDeviceTest.mk(hd, true);
+        CausalLM host #= WindowRingDeviceTest.mkAt(path, hd);
         int32[] th = heap int32[steps];
         float32[] lh = heap float32[v];
         WindowRingDeviceTest.run(host, first, second, steps, 0 - 1, 0 - 1, th, lh);
@@ -152,8 +185,12 @@ public class WindowRingDeviceTest {
         System.stdout.println("  15.2.21.8 " + what + " hd " + hd + ": cosine " + cos + " kl " + kl
             + "; unwindowed control kl " + klFlat);
         Assert.isTrue(cos >= 0.99998);
-        Assert.isTrue(kl <= 1.0e-6);
-        Assert.isTrue(klFlat > 1.0e-6);
+        String be #= Device.activeBackend();
+        float64 klMax = 1.0e-6;
+        if (be.equals("cpu")) { klMax = 1.0e-5; }
+        Assert.isTrue(kl <= klMax);
+        Assert.isTrue(klFlat > floor);
+        Assert.isTrue(klFlat > 10.0 * kl);
         int32 t = 0;
         while (t < steps) {
             Assert.equals((int64) th[t], (int64) td[t]);
@@ -176,14 +213,19 @@ public class WindowRingDeviceTest {
     }
 
     @Test
-    public void aWindowedLayerHoldsAWindowOfRows() {
+    public void aWindowedLayerHoldsARingOfBlocks() {
         WindowRingDeviceTest.writeFixture();
+        DeviceKv.setRingSlack(64);
         ModelConfig cfg #= ModelConfig.parse(WindowRingDeviceTest.configOf(128, true));
-        Assert.equals(WindowRingDeviceTest.WINDOW, DeviceKv.planeRows(cfg, WindowRingDeviceTest.CAP, 0));
+        Assert.equals(192, DeviceKv.planeRows(cfg, WindowRingDeviceTest.CAP, 0));
         Assert.equals(WindowRingDeviceTest.CAP, DeviceKv.planeRows(cfg, WindowRingDeviceTest.CAP, 5));
-        Assert.equals(4, DeviceKv.planeRows(cfg, 4, 0));
+        Assert.equals(64, DeviceKv.planeRows(cfg, 4, 0));
+        Assert.equals(192, DeviceKv.planeRows(cfg, 1000, 0));
+        Assert.equals(1024, DeviceKv.planeRows(cfg, 1000, 5));
+        ModelConfig wide #= ModelConfig.parse(WindowRingDeviceTest.wideConfigOf(256));
+        Assert.equals(256, DeviceKv.planeRows(wide, WindowRingDeviceTest.CAP, 0));
         CausalLM m #= heap CausalLM(#cfg, WindowRingDeviceTest.CAP, 1, 0);
-        int64 rows = (int64) (5 * WindowRingDeviceTest.WINDOW + WindowRingDeviceTest.CAP);
+        int64 rows = (int64) (5 * 192 + WindowRingDeviceTest.CAP);
         Assert.equals(2L * rows * 128L * 2L, m.deviceKvPoolBytes());
     }
 
@@ -203,6 +245,32 @@ public class WindowRingDeviceTest {
     public void aSecondChunkAcrossTheRingMatchesTheHost() {
         WindowRingDeviceTest.sameAsHost(128, 12, 10, 4, 0 - 1, 0 - 1, "prefill 12 then 10");
         WindowRingDeviceTest.sameAsHost(256, 6, 5, 4, 0 - 1, 0 - 1, "prefill 6 then 5");
+    }
+
+    @Test
+    public void aPrefillPastTheRingTakesItInPieces() {
+        WindowRingDeviceTest.sameAsHost(128, 200, 0, 4, 0 - 1, 0 - 1, "prefill 200");
+        WindowRingDeviceTest.sameAsHost(256, 200, 0, 4, 0 - 1, 0 - 1, "prefill 200");
+    }
+
+    @Test
+    public void aChunkAcrossTheRingsEndMatchesTheHost() {
+        WindowRingDeviceTest.sameAsHost(128, 150, 60, 4, 0 - 1, 0 - 1, "prefill 150 then 60");
+        WindowRingDeviceTest.sameAsHost(256, 170, 100, 4, 0 - 1, 0 - 1, "prefill 170 then 100");
+    }
+
+    @Test
+    public void aWindowThatIsNoBlockMultipleWrapsItsRing() {
+        WindowRingDeviceTest.sameAsHostAt(WindowRingDeviceTest.wideConfigOf(256), 256, 300, 0, 4, 0 - 1, 0 - 1,
+            1.0e-8, "window 100, prefill 300");
+        WindowRingDeviceTest.sameAsHostAt(WindowRingDeviceTest.wideConfigOf(128), 128, 120, 150, 6, 0 - 1, 0 - 1,
+            1.0e-8, "window 100, prefill 120 then 150");
+    }
+
+    @Test
+    public void decodeAcrossTheRingsEndMatchesTheHost() {
+        WindowRingDeviceTest.sameAsHost(128, 186, 0, 12, 0 - 1, 0 - 1, "decode 186 to 198");
+        WindowRingDeviceTest.sameAsHost(256, 186, 0, 12, 3, 6, "decode 186 to 198, host steps 3 to 5");
     }
 
     @Test

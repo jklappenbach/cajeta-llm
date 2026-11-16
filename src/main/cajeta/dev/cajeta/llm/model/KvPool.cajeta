@@ -7,9 +7,9 @@ import cajeta.xpu.KernelThread;
 import dev.cajeta.llm.io.QuantKernel;
 
 /**
- * The decode slots' K/V planes, one K and one V buffer per layer, slot s at
- * element `s * plane` (cajeta-llm 15.2.12.3.2.1). A kernel handed the whole
- * buffer reaches every slot, so the batch's attention is one launch.
+ * The decode slots' K/V planes, one K and one V buffer per layer, and the block table every slot reads them
+ * through (cajeta-llm 15.2.12.3.2.1, 15.2.21.8.1). A kernel handed the whole buffer and the table reaches every
+ * slot, so the batch's attention is one launch. Slot s holds blocks `s * blocksPerSlot` on.
  */
 @Unfused
 public final class KvPool {
@@ -19,11 +19,15 @@ public final class KvPool {
     int64 plane;
     int32 nSlots;
     int32 nGrowths;
+    int32 bps;
+    KernelBuffer<int32> tab;
 
-    /** A pool of `layers` K and V buffers of `plane` halves a slot; holds no slot until {@link #ensureSlots}. */
-    public KvPool(int32 layers, int64 plane) {
+    /** A pool of `layers` K and V buffers holding `cap` positions of `kvDim` a slot; holds no slot until
+     *  {@link #ensureSlots}. */
+    public KvPool(int32 layers, int32 cap, int32 kvDim) {
         this.layers = layers;
-        this.plane = plane;
+        this.bps = KvPage.blocksFor(cap);
+        this.plane = (int64) this.bps * (int64) KvPage.BLOCK * (int64) kvDim;
         this.nSlots = 0;
         this.nGrowths = 0;
         this.k #= heap KernelBuffer<float16>[(int64) layers];
@@ -39,13 +43,22 @@ public final class KvPool {
     /** Halves a slot's plane takes. */
     public int64 planeElements() { return this.plane; }
 
+    /** Blocks a slot holds, its table's length. */
+    public int32 blocksPerSlot() { return this.bps; }
+
+    /** The physical block of slot `slot`'s logical block `b`. */
+    public int32 blockOf(int32 slot, int32 b) { return slot * this.bps + b; }
+
+    /** Slot `slot`'s first entry in {@link #table}. */
+    public int32 tableBase(int32 slot) { return slot * this.bps; }
+
+    /** The block table of every slot: a BORROW, replaced by a growth. */
+    public KernelBuffer<int32> table() { return this.tab; }
+
     /** Whether `n` slots fit one buffer under 2 GiB. */
     public boolean fits(int32 n) {
         return (int64) n * this.plane * 2L < (1L << 31);
     }
-
-    /** Slot `slot`'s first element in a layer's buffer. */
-    public int64 slotBase(int32 slot) { return (int64) slot * this.plane; }
 
     /** Layer `li`'s K buffer, every slot: a BORROW, replaced by a growth. */
     public KernelBuffer<float16> kAll(int32 li) { return this.k[(int64) li]; }
@@ -53,16 +66,22 @@ public final class KvPool {
     /** Layer `li`'s V buffer, every slot: a BORROW, replaced by a growth. */
     public KernelBuffer<float16> vAll(int32 li) { return this.v[(int64) li]; }
 
-    /** Slot `slot`'s K plane in layer `li`, a view that a growth invalidates. */
+    /** Slot `slot`'s blocks in layer `li`'s K buffer, a view that a growth invalidates. */
     public #KernelBuffer<float16> kSlice(int32 li, int32 slot) {
-        KernelBuffer<float16> s #= this.k[(int64) li].slice((uint64) this.slotBase(slot), (uint64) this.plane);
+        KernelBuffer<float16> s #= this.k[(int64) li].slice((uint64) ((int64) slot * this.plane), (uint64) this.plane);
         return #s;
     }
 
-    /** Slot `slot`'s V plane in layer `li`, a view that a growth invalidates. */
+    /** Slot `slot`'s blocks in layer `li`'s V buffer, a view that a growth invalidates. */
     public #KernelBuffer<float16> vSlice(int32 li, int32 slot) {
-        KernelBuffer<float16> s #= this.v[(int64) li].slice((uint64) this.slotBase(slot), (uint64) this.plane);
+        KernelBuffer<float16> s #= this.v[(int64) li].slice((uint64) ((int64) slot * this.plane), (uint64) this.plane);
         return #s;
+    }
+
+    /** A pool of this one's shape holding no slot. */
+    public #KvPool emptyLike() {
+        KvPool p #= heap KvPool(this.layers, this.bps * KvPage.BLOCK, (int32) (this.plane / ((int64) this.bps * 64L)));
+        return #p;
     }
 
     /** Grow to at least `n` slots, copying the slots already held; every earlier slice is stale afterwards. */
@@ -85,6 +104,19 @@ public final class KvPool {
             this.v[(int64) l] #= nv;
             l = l + 1;
         }
+        int64 te = (int64) n * (int64) this.bps;
+        int32[] th #= heap int32[te];
+        int64 i = 0L;
+        while (i < te) {
+            th[i] = (int32) i;
+            i = i + 1L;
+        }
+        if (this.tab != null) {
+            KernelStream s = QuantKernel.stream();
+            s.sync();
+        }
+        this.tab #= heap KernelBuffer<int32>((uint64) te);
+        this.tab.upload(th, te);
         this.nSlots = n;
         this.nGrowths = this.nGrowths + 1;
         return;
