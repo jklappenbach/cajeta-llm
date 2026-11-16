@@ -42,7 +42,14 @@ public class KvPoolTest {
         return #h;
     }
 
+    /** Draws slot `slot`'s whole plane, so its blocks run in order on a fresh pool and {@link KvPool#kSlice} holds. */
+    static void whole(KvPool p, int32 slot) {
+        p.ensureRows(slot, p.logicalBlocks() * 64);
+        p.flush();
+    }
+
     static void write(KvPool p, int32 li, int32 slot) {
+        KvPoolTest.whole(p, slot);
         float16[] k #= KvPoolTest.pattern(p.planeElements(li), li, slot, 0);
         float16[] v #= KvPoolTest.pattern(p.planeElements(li), li, slot, 1);
         KernelBuffer<float16> ks #= p.kSlice(li, slot);
@@ -105,7 +112,8 @@ public class KvPoolTest {
         KvPoolTest.holds(p, 0, 0, "after writing slot 1");
         KvPoolTest.holds(p, 0, 2, "after writing slot 1");
         Assert.equals(1, p.tableBase(1, 0));
-        Assert.equals(2, p.blockOf(2, 0, 0));
+        Assert.equals(1L, (int64) p.entry(p.tableBase(2, 0)));
+        Assert.equals(2L, (int64) p.entry(p.tableBase(1, 0)));
     }
 
     /** Layers of window 8, none, 8, 100 and 600 at cap 512 and slack 64: three kinds, a window past the cap is none. */
@@ -121,8 +129,7 @@ public class KvPoolTest {
         return #p;
     }
 
-    /** 15.2.21.8.1.2.1: each layer's plane is its kind's size, a ring's entries cycle within its slot, and every
-     *  (slot, kind) region names blocks no other slot holds. */
+    /** 15.2.21.8.1.2.1: each layer's plane is its kind's size and every (slot, kind) has its own table region. */
     @Test
     public void ringedAndFlatKindsShareOnePool() {
         KvPool p #= KvPoolTest.mixed();
@@ -136,26 +143,10 @@ public class KvPoolTest {
         Assert.equals(192L * 16L, p.planeElements(2));
         Assert.equals(8L, (int64) p.logicalBlocks());
         Assert.equals((int64) ((1 * 3 + 2) * 8), (int64) p.tableBase(1, 2));
-        int32 slot = 0;
-        while (slot < 3) {
-            int32 kd = 0;
-            while (kd < p.kinds()) {
-                int32 r = p.rowsOf(kd) / 64;
-                int32 b = 0;
-                while (b < p.logicalBlocks()) {
-                    int32 e = p.blockOf(slot, kd, b);
-                    Assert.isTrue(e >= slot * r && e < (slot + 1) * r);
-                    if (b + r < p.logicalBlocks()) { Assert.equals((int64) e, (int64) p.blockOf(slot, kd, b + r)); }
-                    b = b + 1;
-                }
-                kd = kd + 1;
-            }
-            slot = slot + 1;
-        }
         Assert.isTrue(p.fits(1));
     }
 
-    /** The table a growth uploads names `blockOf` at every (slot, kind) entry, and both kinds keep their rows. */
+    /** The table a growth uploads holds every drawn entry, and both kinds keep their rows. */
     @Test
     public void growingAMixedPoolKeepsBothKindsAndItsTable() {
         if (!KvPoolTest.device()) { return; }
@@ -171,24 +162,90 @@ public class KvPoolTest {
             KvPoolTest.holds(p, l, 0, "after growing to 3");
             l = l + 1;
         }
-        int64 te = 3L * (int64) p.kinds() * (int64) p.logicalBlocks();
+        KvPoolTest.tableAgrees(p, 3);
+        ValueCheck.credit(vc);
+    }
+
+    /** Fails unless the device table holds the host's entry at every drawn (slot, kind, block) of `slots` slots. */
+    static void tableAgrees(KvPool p, int32 slots) {
+        int64 te = (int64) slots * (int64) p.kinds() * (int64) p.logicalBlocks();
         int32[] th #= heap int32[te];
         KernelBuffer<int32> t = p.table();
         t.download(th);
         int32 slot = 0;
-        while (slot < 3) {
+        while (slot < slots) {
             int32 kd = 0;
             while (kd < p.kinds()) {
                 int32 b = 0;
-                while (b < p.logicalBlocks()) {
-                    Assert.equals((int64) p.blockOf(slot, kd, b), (int64) th[(int64) (p.tableBase(slot, kd) + b)]);
+                while (b < p.drawn(slot, kd)) {
+                    int32 i = p.tableBase(slot, kd) + b;
+                    Assert.equals((int64) p.entry(i), (int64) th[(int64) i]);
                     b = b + 1;
                 }
                 kd = kd + 1;
             }
             slot = slot + 1;
         }
-        ValueCheck.credit(vc);
+    }
+
+    /** 15.2.21.8.1.3.1: a slot draws a block a 64 positions as it grows, and a ring's entries past its R blocks repeat
+     *  its first R. */
+    @Test
+    public void aSlotDrawsBlocksAsItGrows() {
+        if (!KvPoolTest.device()) { return; }
+        KvPool p #= KvPoolTest.mixed();
+        p.ensureSlots(2);
+        int32 kf = p.kindOf(1);
+        int32 kr = p.kindOf(0);
+        int32 kw = p.kindOf(3);
+        Assert.equals(16L, (int64) p.freeBlocks(kf));
+        p.ensureRows(0, 10);
+        Assert.equals(1L, (int64) p.drawn(0, kf));
+        Assert.equals(1L, (int64) p.drawn(0, kr));
+        Assert.equals(15L, (int64) p.freeBlocks(kf));
+        p.ensureRows(0, 70);
+        Assert.equals(2L, (int64) p.drawn(0, kf));
+        Assert.isTrue(p.entry(p.tableBase(0, kf)) != p.entry(p.tableBase(0, kf) + 1));
+        p.ensureRows(0, 512);
+        Assert.equals(8L, (int64) p.drawn(0, kf));
+        Assert.equals(8L, (int64) p.drawn(0, kr));
+        Assert.equals(8L, (int64) p.freeBlocks(kf));
+        Assert.equals(3L, (int64) p.freeBlocks(kr));
+        Assert.equals(4L, (int64) p.freeBlocks(kw));
+        int32 b = 3;
+        while (b < 8) {
+            Assert.equals((int64) p.entry(p.tableBase(0, kr) + b % 3), (int64) p.entry(p.tableBase(0, kr) + b));
+            Assert.equals((int64) p.entry(p.tableBase(0, kw) + b % 4), (int64) p.entry(p.tableBase(0, kw) + b));
+            b = b + 1;
+        }
+        p.flush();
+        KvPoolTest.tableAgrees(p, 2);
+    }
+
+    /** A released slot's blocks return to the free lists and are the next slot's draws. */
+    @Test
+    public void aReleasedSlotsBlocksGoToTheNextSlotToDraw() {
+        if (!KvPoolTest.device()) { return; }
+        KvPool p #= KvPoolTest.mixed();
+        p.ensureSlots(2);
+        int32 kf = p.kindOf(1);
+        int32 kr = p.kindOf(0);
+        p.ensureRows(0, 512);
+        int32[] had #= heap int32[8L];
+        int32 b = 0;
+        while (b < 8) { had[(int64) b] = p.entry(p.tableBase(0, kf) + b); b = b + 1; }
+        p.release(0);
+        Assert.equals(0L, (int64) p.drawn(0, kf));
+        Assert.equals(16L, (int64) p.freeBlocks(kf));
+        Assert.equals(6L, (int64) p.freeBlocks(kr));
+        p.ensureRows(1, 512);
+        b = 0;
+        while (b < 8) {
+            Assert.equals((int64) had[(int64) b], (int64) p.entry(p.tableBase(1, kf) + b));
+            b = b + 1;
+        }
+        p.flush();
+        KvPoolTest.tableAgrees(p, 2);
     }
 
     @Test
