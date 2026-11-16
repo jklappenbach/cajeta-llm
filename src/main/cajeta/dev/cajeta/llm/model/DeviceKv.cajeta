@@ -15,8 +15,9 @@ import dev.cajeta.llm.io.QuantKernel;
  * table (15.2.21.8.1): position `t` is at row `tab[base + t / 64] * 64 +
  * t % 64`, the kernels look it up through {@link KvPage#row}, and the host
  * keeps the same entries for the rows it writes. A pooled slot's table is
- * the pool's, an owning slot's its own; a windowed layer's ring names its
- * blocks cyclically, so its table holds no modulo either.
+ * a {@link KvPool}'s: the shared one, or a one-slot pool of its own; a
+ * windowed layer's ring names its blocks cyclically, so its table holds no
+ * modulo either.
  *
  * The price is that the two copies can disagree, and the rule that keeps
  * them honest is explicit rather than clever: while `owns()` is true the
@@ -53,8 +54,8 @@ public final class DeviceKv {
     int32[] rows;
     /** Each layer's window; 0 attends every position. */
     int32[] win;
-    /** The longest ring shorter than the flat planes; 0 when every layer is flat. */
-    int32 ringMax;
+    /** The one-slot pool an owning slot holds its planes in; null for a slot of the shared pool. */
+    KvPool ownPool;
     /** The block table the kernels read, this slot's or the pool's: a BORROW for a pooled slot. */
     KernelBuffer<int32> tabDev;
     /** This slot's table entries; layer `l`'s start at `tbLocal[l]`, at `tbDev[l]` in {@link #tabDev}. */
@@ -95,16 +96,32 @@ public final class DeviceKv {
         return true;
     }
 
-    /** Rows layer `l`'s planes hold at capacity `cap`: whole blocks, and a windowed layer's ring of its window, one
-     *  block and the slack when that is shorter. */
-    public static int32 planeRows(ModelConfig cfg, int32 cap, int32 l) {
+    /** Rows a layer of window `w` (0 for none) holds at capacity `cap`: whole blocks, and a ring of the window,
+     *  one block and the slack when that is shorter. */
+    public static int32 ringRows(int32 w, int32 cap) {
         int32 flat = KvPage.blocksFor(cap) * KvPage.BLOCK;
-        int32 w = cfg.windowForLayer(l);
         if (w > 0) {
             int32 r = (KvPage.blocksFor(w) + 1 + KvPage.blocksFor(DeviceKv.ringSlack)) * KvPage.BLOCK;
             if (r < flat) { return r; }
         }
         return flat;
+    }
+
+    /** Rows layer `l`'s planes hold at capacity `cap`. */
+    public static int32 planeRows(ModelConfig cfg, int32 cap, int32 l) {
+        return DeviceKv.ringRows(cfg.windowForLayer(l), cap);
+    }
+
+    /** A pool for `cfg`'s layers at capacity `cap`, holding no slot. */
+    public static #KvPool poolFor(ModelConfig cfg, int32 cap) {
+        int32[] w #= heap int32[(int64) cfg.numLayers];
+        int32 l = 0;
+        while (l < cfg.numLayers) {
+            w[(int64) l] = cfg.windowForLayer(l);
+            l = l + 1;
+        }
+        KvPool p #= heap KvPool(cap, cfg.kvDim(), w);
+        return #p;
     }
 
     /** Rows over every layer: what one slot's K planes hold. */
@@ -118,67 +135,55 @@ public final class DeviceKv {
         return n;
     }
 
-    /** True when some layer's planes are a ring shorter than the flat planes; such a slot owns its planes. */
+    /** True when some layer's planes are a ring shorter than the flat planes. */
     public static boolean ringed(ModelConfig cfg, int32 cap) {
         return DeviceKv.planeRowsAll(cfg, cap)
             < (int64) cfg.numLayers * (int64) (KvPage.blocksFor(cap) * KvPage.BLOCK);
     }
 
-    /** Fill the per-layer row counts and windows for `cfg` at this slot's capacity. */
-    void shape(ModelConfig cfg) {
+    /** Take slot `slot` of `pool`: each layer's rows from its kind, this slot's table regions, the buffers. */
+    void setup(ModelConfig cfg, int32 cap, KvPool pool, int32 slot) {
+        this.cap = cap;
+        this.kvDim = cfg.kvDim();
+        this.layers = cfg.numLayers;
+        this.nH = cfg.numHeads;
+        this.nKv = cfg.numKvHeads;
+        this.hd = cfg.headDim;
+        this.len = 0;
+        this.hostLen = 0;
+        this.seq = 0 - 1;
         this.rows #= heap int32[(int64) this.layers];
         this.win #= heap int32[(int64) this.layers];
         this.tbLocal #= heap int32[(int64) this.layers];
         this.tbDev #= heap int32[(int64) this.layers];
-        int32 flat = KvPage.blocksFor(this.cap) * KvPage.BLOCK;
-        this.ringMax = 0;
+        int32 nLog = pool.logicalBlocks();
         int32 l = 0;
         while (l < this.layers) {
-            int32 r = DeviceKv.planeRows(cfg, this.cap, l);
-            this.rows[(int64) l] = r;
+            int32 kd = pool.kindOf(l);
+            this.rows[(int64) l] = pool.rowsOf(kd);
             this.win[(int64) l] = cfg.windowForLayer(l);
-            if (r < flat && r > this.ringMax) { this.ringMax = r; }
+            this.tbLocal[(int64) l] = kd * nLog;
+            this.tbDev[(int64) l] = pool.tableBase(slot, kd);
             l = l + 1;
         }
-        return;
-    }
-
-    /** An owning slot's table: one region of `ceil(cap / 64)` entries per distinct plane size, a ring's entry b
-     *  naming its block b % ring. */
-    void ownTable() {
-        int32 nLog = KvPage.blocksFor(this.cap);
-        int32 flat = nLog * KvPage.BLOCK;
-        int32[] kinds #= heap int32[(int64) this.layers];
-        int32 nk = 0;
-        int32 l = 0;
-        while (l < this.layers) {
-            int32 r = this.rows[(int64) l];
-            int32 k = 0;
-            while (k < nk && kinds[(int64) k] != r) { k = k + 1; }
-            if (k == nk) {
-                kinds[(int64) k] = r;
-                nk = nk + 1;
-            }
-            this.tbLocal[(int64) l] = k * nLog;
-            this.tbDev[(int64) l] = k * nLog;
-            l = l + 1;
-        }
-        int64 n = (int64) (nk * nLog);
-        this.tabH #= heap int32[n];
-        int32 k = 0;
-        while (k < nk) {
-            int32 rb = kinds[(int64) k] / KvPage.BLOCK;
+        this.tabH #= heap int32[(int64) (pool.kinds() * nLog)];
+        int32 kd = 0;
+        while (kd < pool.kinds()) {
             int32 b = 0;
             while (b < nLog) {
-                int32 e = b;
-                if (kinds[(int64) k] < flat) { e = b % rb; }
-                this.tabH[(int64) (k * nLog + b)] = e;
+                this.tabH[(int64) (kd * nLog + b)] = pool.blockOf(slot, kd, b);
                 b = b + 1;
             }
-            k = k + 1;
+            kd = kd + 1;
         }
-        this.tabDev #= heap KernelBuffer<int32>((uint64) n);
-        this.tabDev.upload(this.tabH, n);
+        this.kDev #= heap KernelBuffer<float16>[(int64) this.layers];
+        this.vDev #= heap KernelBuffer<float16>[(int64) this.layers];
+        this.invDev #= heap KernelBuffer<float32>[(int64) this.layers];
+        this.bindPool(pool);
+        this.scores #= heap KernelBuffer<float32>(
+            (uint64) ((int64) this.nH * (int64) cap));
+        this.aoDev #= heap KernelBuffer<float32>(
+            (uint64) ((int64) this.nH * (int64) this.hd));
         return;
     }
 
@@ -209,74 +214,18 @@ public final class DeviceKv {
         return;
     }
 
+    /** A slot that holds its planes in a one-slot pool of its own. */
     public DeviceKv(ModelConfig cfg, int32 cap) {
+        this.ownPool #= DeviceKv.poolFor(cfg, cap);
+        this.ownPool.ensureSlots(1);
+        this.setup(cfg, cap, this.ownPool, 0);
         this.poolSlot = 0 - 1;
-        this.cap = cap;
-        this.kvDim = cfg.kvDim();
-        this.layers = cfg.numLayers;
-        this.nH = cfg.numHeads;
-        this.nKv = cfg.numKvHeads;
-        this.hd = cfg.headDim;
-        this.len = 0;
-        this.hostLen = 0;
-        this.seq = 0 - 1;
-        this.shape(cfg);
-        this.ownTable();
-        this.kDev #= heap KernelBuffer<float16>[(int64) this.layers];
-        this.vDev #= heap KernelBuffer<float16>[(int64) this.layers];
-        this.invDev #= heap KernelBuffer<float32>[(int64) this.layers];
-        int32 l = 0;
-        while (l < this.layers) {
-            int64 plane = (int64) this.rows[(int64) l] * (int64) this.kvDim;
-            this.kDev[(int64) l] #= heap KernelBuffer<float16>(
-                (uint64) plane);
-            this.vDev[(int64) l] #= heap KernelBuffer<float16>(
-                (uint64) plane);
-            l = l + 1;
-        }
-        this.scores #= heap KernelBuffer<float32>(
-            (uint64) ((int64) this.nH * (int64) cap));
-        this.aoDev #= heap KernelBuffer<float32>(
-            (uint64) ((int64) this.nH * (int64) this.hd));
     }
 
     /** A slot whose planes are slot `slot` of `pool`, whose plane is `cap` positions. */
     public DeviceKv(ModelConfig cfg, int32 cap, KvPool pool, int32 slot) {
-        this.cap = cap;
-        this.kvDim = cfg.kvDim();
-        this.layers = cfg.numLayers;
-        this.nH = cfg.numHeads;
-        this.nKv = cfg.numKvHeads;
-        this.hd = cfg.headDim;
-        this.len = 0;
-        this.hostLen = 0;
-        this.seq = 0 - 1;
+        this.setup(cfg, cap, pool, slot);
         this.poolSlot = slot;
-        this.shape(cfg);
-        if (this.ringMax > 0) {
-            throw heap LlmException("device kv: a windowed layer's ring cannot live in the shared pool");
-        }
-        this.kDev #= heap KernelBuffer<float16>[(int64) this.layers];
-        this.vDev #= heap KernelBuffer<float16>[(int64) this.layers];
-        this.invDev #= heap KernelBuffer<float32>[(int64) this.layers];
-        int32 nLog = KvPage.blocksFor(cap);
-        this.tabH #= heap int32[(int64) nLog];
-        int32 b = 0;
-        while (b < nLog) {
-            this.tabH[(int64) b] = pool.blockOf(slot, b);
-            b = b + 1;
-        }
-        int32 l = 0;
-        while (l < this.layers) {
-            this.tbLocal[(int64) l] = 0;
-            this.tbDev[(int64) l] = pool.tableBase(slot);
-            l = l + 1;
-        }
-        this.bindPool(pool);
-        this.scores #= heap KernelBuffer<float32>(
-            (uint64) ((int64) this.nH * (int64) cap));
-        this.aoDev #= heap KernelBuffer<float32>(
-            (uint64) ((int64) this.nH * (int64) this.hd));
     }
 
     /** Re-take the pool's buffers and table, after it grows. */

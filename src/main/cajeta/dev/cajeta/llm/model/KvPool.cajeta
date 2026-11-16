@@ -9,29 +9,66 @@ import dev.cajeta.llm.io.QuantKernel;
 /**
  * The decode slots' K/V planes, one K and one V buffer per layer, and the block table every slot reads them
  * through (cajeta-llm 15.2.12.3.2.1, 15.2.21.8.1). A kernel handed the whole buffer and the table reaches every
- * slot, so the batch's attention is one launch. Slot s holds blocks `s * blocksPerSlot` on.
+ * slot, so the batch's attention is one launch. A kind is a distinct effective window; each (slot, kind) has a
+ * table region of {@link #logicalBlocks} entries, and a ring kind's entry b names block `slot * R + b % R`.
  */
 @Unfused
 public final class KvPool {
     KernelBuffer<float16>[] k;
     KernelBuffer<float16>[] v;
     int32 layers;
-    int64 plane;
+    int32 cap;
+    int32 kvDim;
+    int32 nLog;
+    int32 nKinds;
+    int32[] kindOfL;
+    int32[] kWin;
+    int32[] kBlocks;
     int32 nSlots;
     int32 nGrowths;
-    int32 bps;
     KernelBuffer<int32> tab;
 
-    /** A pool of `layers` K and V buffers holding `cap` positions of `kvDim` a slot; holds no slot until
+    /** A pool of `layers` flat K and V buffers holding `cap` positions of `kvDim` a slot; holds no slot until
      *  {@link #ensureSlots}. */
     public KvPool(int32 layers, int32 cap, int32 kvDim) {
-        this.layers = layers;
-        this.bps = KvPage.blocksFor(cap);
-        this.plane = (int64) this.bps * (int64) KvPage.BLOCK * (int64) kvDim;
+        int32[] w #= heap int32[(int64) layers];
+        this.init(cap, kvDim, w);
+    }
+
+    /** A pool whose layer l attends a window of `windows[l]` (0 for none), at the ring sizes of
+     *  {@link DeviceKv#ringRows}; `windows` is copied. */
+    public KvPool(int32 cap, int32 kvDim, int32[] windows) {
+        this.init(cap, kvDim, windows);
+    }
+
+    void init(int32 cap, int32 kvDim, int32[] windows) {
+        this.layers = (int32) windows.count();
+        this.cap = cap;
+        this.kvDim = kvDim;
+        this.nLog = KvPage.blocksFor(cap);
         this.nSlots = 0;
         this.nGrowths = 0;
-        this.k #= heap KernelBuffer<float16>[(int64) layers];
-        this.v #= heap KernelBuffer<float16>[(int64) layers];
+        this.kindOfL #= heap int32[(int64) this.layers];
+        this.kWin #= heap int32[(int64) this.layers];
+        this.kBlocks #= heap int32[(int64) this.layers];
+        this.nKinds = 0;
+        int32 l = 0;
+        while (l < this.layers) {
+            int32 w = windows[(int64) l];
+            if (w < 0 || w >= cap) { w = 0; }
+            int32 kd = 0;
+            while (kd < this.nKinds && this.kWin[(int64) kd] != w) { kd = kd + 1; }
+            if (kd == this.nKinds) {
+                this.kWin[(int64) kd] = w;
+                this.kBlocks[(int64) kd] = DeviceKv.ringRows(w, cap) / KvPage.BLOCK;
+                this.nKinds = this.nKinds + 1;
+            }
+            this.kindOfL[(int64) l] = kd;
+            l = l + 1;
+        }
+        this.k #= heap KernelBuffer<float16>[(int64) this.layers];
+        this.v #= heap KernelBuffer<float16>[(int64) this.layers];
+        return;
     }
 
     /** How many times the buffers were reallocated. */
@@ -40,24 +77,47 @@ public final class KvPool {
     /** Slots the buffers hold. */
     public int32 slots() { return this.nSlots; }
 
-    /** Halves a slot's plane takes. */
-    public int64 planeElements() { return this.plane; }
+    /** Distinct effective windows over the layers. */
+    public int32 kinds() { return this.nKinds; }
 
-    /** Blocks a slot holds, its table's length. */
-    public int32 blocksPerSlot() { return this.bps; }
+    /** Layer `li`'s kind. */
+    public int32 kindOf(int32 li) { return this.kindOfL[(int64) li]; }
 
-    /** The physical block of slot `slot`'s logical block `b`. */
-    public int32 blockOf(int32 slot, int32 b) { return slot * this.bps + b; }
+    /** Kind `kd`'s window, 0 when it attends every position. */
+    public int32 windowOf(int32 kd) { return this.kWin[(int64) kd]; }
 
-    /** Slot `slot`'s first entry in {@link #table}. */
-    public int32 tableBase(int32 slot) { return slot * this.bps; }
+    /** Plane rows a slot holds for kind `kd`. */
+    public int32 rowsOf(int32 kd) { return this.kBlocks[(int64) kd] * KvPage.BLOCK; }
+
+    /** Entries of a (slot, kind) table region: the logical blocks of `cap` positions. */
+    public int32 logicalBlocks() { return this.nLog; }
+
+    /** Halves a slot's plane takes in layer `li`. */
+    public int64 planeElements(int32 li) {
+        return (int64) this.rowsOf(this.kindOf(li)) * (int64) this.kvDim;
+    }
+
+    /** The physical block of slot `slot`'s logical block `b` in kind `kd`'s planes. */
+    public int32 blockOf(int32 slot, int32 kd, int32 b) {
+        int32 r = this.kBlocks[(int64) kd];
+        return slot * r + b % r;
+    }
+
+    /** The first entry of slot `slot`'s kind-`kd` region in {@link #table}. */
+    public int32 tableBase(int32 slot, int32 kd) { return (slot * this.nKinds + kd) * this.nLog; }
 
     /** The block table of every slot: a BORROW, replaced by a growth. */
     public KernelBuffer<int32> table() { return this.tab; }
 
-    /** Whether `n` slots fit one buffer under 2 GiB. */
+    /** Whether `n` slots fit every layer's buffer under 2 GiB. */
     public boolean fits(int32 n) {
-        return (int64) n * this.plane * 2L < (1L << 31);
+        int32 kd = 0;
+        while (kd < this.nKinds) {
+            int64 plane = (int64) this.rowsOf(kd) * (int64) this.kvDim;
+            if ((int64) n * plane * 2L >= (1L << 31)) { return false; }
+            kd = kd + 1;
+        }
+        return true;
     }
 
     /** Layer `li`'s K buffer, every slot: a BORROW, replaced by a growth. */
@@ -68,19 +128,32 @@ public final class KvPool {
 
     /** Slot `slot`'s blocks in layer `li`'s K buffer, a view that a growth invalidates. */
     public #KernelBuffer<float16> kSlice(int32 li, int32 slot) {
-        KernelBuffer<float16> s #= this.k[(int64) li].slice((uint64) ((int64) slot * this.plane), (uint64) this.plane);
+        int64 plane = this.planeElements(li);
+        KernelBuffer<float16> s #= this.k[(int64) li].slice((uint64) ((int64) slot * plane), (uint64) plane);
         return #s;
     }
 
     /** Slot `slot`'s blocks in layer `li`'s V buffer, a view that a growth invalidates. */
     public #KernelBuffer<float16> vSlice(int32 li, int32 slot) {
-        KernelBuffer<float16> s #= this.v[(int64) li].slice((uint64) ((int64) slot * this.plane), (uint64) this.plane);
+        int64 plane = this.planeElements(li);
+        KernelBuffer<float16> s #= this.v[(int64) li].slice((uint64) ((int64) slot * plane), (uint64) plane);
         return #s;
     }
 
-    /** A pool of this one's shape holding no slot. */
+    /** A pool of this one's shape, ring sizes included, holding no slot. */
     public #KvPool emptyLike() {
-        KvPool p #= heap KvPool(this.layers, this.bps * KvPage.BLOCK, (int32) (this.plane / ((int64) this.bps * 64L)));
+        int32[] w #= heap int32[(int64) this.layers];
+        int32 l = 0;
+        while (l < this.layers) {
+            w[(int64) l] = this.kWin[(int64) this.kindOfL[(int64) l]];
+            l = l + 1;
+        }
+        KvPool p #= heap KvPool(this.cap, this.kvDim, w);
+        int32 kd = 0;
+        while (kd < this.nKinds) {
+            p.kBlocks[(int64) kd] = this.kBlocks[(int64) kd];
+            kd = kd + 1;
+        }
         return #p;
     }
 
@@ -88,10 +161,11 @@ public final class KvPool {
     public void ensureSlots(int32 n) {
         if (n <= this.nSlots) { return; }
         Diag.growth();
-        uint64 count = (uint64) ((int64) n * this.plane);
-        int64 keep = (int64) this.nSlots * this.plane;
         int32 l = 0;
         while (l < this.layers) {
+            int64 plane = this.planeElements(l);
+            uint64 count = (uint64) ((int64) n * plane);
+            int64 keep = (int64) this.nSlots * plane;
             KernelBuffer<float16> nk #= heap KernelBuffer<float16>(count);
             KernelBuffer<float16> nv #= heap KernelBuffer<float16>(count);
             if (keep > 0L) {
@@ -104,12 +178,21 @@ public final class KvPool {
             this.v[(int64) l] #= nv;
             l = l + 1;
         }
-        int64 te = (int64) n * (int64) this.bps;
+        int64 te = (int64) n * (int64) this.nKinds * (int64) this.nLog;
         int32[] th #= heap int32[te];
-        int64 i = 0L;
-        while (i < te) {
-            th[i] = (int32) i;
-            i = i + 1L;
+        int32 sl = 0;
+        while (sl < n) {
+            int32 kd = 0;
+            while (kd < this.nKinds) {
+                int32 base = this.tableBase(sl, kd);
+                int32 b = 0;
+                while (b < this.nLog) {
+                    th[(int64) (base + b)] = this.blockOf(sl, kd, b);
+                    b = b + 1;
+                }
+                kd = kd + 1;
+            }
+            sl = sl + 1;
         }
         if (this.tab != null) {
             KernelStream s = QuantKernel.stream();

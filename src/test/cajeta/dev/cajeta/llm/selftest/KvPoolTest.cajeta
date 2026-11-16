@@ -6,8 +6,10 @@ import cajeta.xpu.KernelBuffer;
 import dev.cajeta.llm.EngineOptions;
 import dev.cajeta.llm.LlmEngine;
 import dev.cajeta.llm.gen.SampleParams;
+import dev.cajeta.llm.model.DeviceKv;
 import dev.cajeta.llm.model.KvPool;
 import dev.cajeta.llm.model.Linear;
+import dev.cajeta.unit.AfterEach;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
 import dev.cajeta.ml.kernels.testing.ValueCheck;
@@ -15,9 +17,13 @@ import dev.cajeta.ml.kernels.testing.ValueCheck;
 /** cajeta-llm 15.2.12.3.2.1: decode slots' K/V planes are slices of one pool per layer, grown on demand without losing a byte. */
 public class KvPoolTest {
 
-    static final int64 PLANE = 1024L;
-
     public KvPoolTest() { return; }
+
+    @AfterEach
+    public void restore() {
+        DeviceKv.setRingSlack(256);
+        return;
+    }
 
     static boolean device() {
         String be #= Device.activeBackend();
@@ -25,11 +31,11 @@ public class KvPoolTest {
         return true;
     }
 
-    /** A plane's worth of halves unique to (layer, slot, plane kind). */
-    static #float16[] pattern(int32 li, int32 slot, int32 kind) {
-        float16[] h #= heap float16[KvPoolTest.PLANE];
+    /** `n` halves unique to (layer, slot, plane kind). */
+    static #float16[] pattern(int64 n, int32 li, int32 slot, int32 kind) {
+        float16[] h #= heap float16[n];
         int64 i = 0;
-        while (i < KvPoolTest.PLANE) {
+        while (i < n) {
             h[i] = (float16) (float32) ((i % 97L) + 100L * (int64) slot + 1000L * (int64) li + 7L * (int64) kind);
             i = i + 1;
         }
@@ -37,8 +43,8 @@ public class KvPoolTest {
     }
 
     static void write(KvPool p, int32 li, int32 slot) {
-        float16[] k #= KvPoolTest.pattern(li, slot, 0);
-        float16[] v #= KvPoolTest.pattern(li, slot, 1);
+        float16[] k #= KvPoolTest.pattern(p.planeElements(li), li, slot, 0);
+        float16[] v #= KvPoolTest.pattern(p.planeElements(li), li, slot, 1);
         KernelBuffer<float16> ks #= p.kSlice(li, slot);
         KernelBuffer<float16> vs #= p.vSlice(li, slot);
         ks.upload(k);
@@ -47,16 +53,17 @@ public class KvPoolTest {
 
     /** Fails naming the first element of (layer, slot) that lost its pattern. */
     static void holds(KvPool p, int32 li, int32 slot, String when) {
-        float16[] k #= heap float16[KvPoolTest.PLANE];
-        float16[] v #= heap float16[KvPoolTest.PLANE];
+        int64 n = p.planeElements(li);
+        float16[] k #= heap float16[n];
+        float16[] v #= heap float16[n];
         KernelBuffer<float16> ks #= p.kSlice(li, slot);
         KernelBuffer<float16> vs #= p.vSlice(li, slot);
         ks.download(k);
         vs.download(v);
-        float16[] wk #= KvPoolTest.pattern(li, slot, 0);
-        float16[] wv #= KvPoolTest.pattern(li, slot, 1);
+        float16[] wk #= KvPoolTest.pattern(n, li, slot, 0);
+        float16[] wv #= KvPoolTest.pattern(n, li, slot, 1);
         int64 i = 0;
-        while (i < KvPoolTest.PLANE) {
+        while (i < n) {
             if ((float32) k[i] != (float32) wk[i] || (float32) v[i] != (float32) wv[i]) {
                 Assert.fail(when + ": layer " + li + " slot " + slot + " element " + i
                     + " is k " + (float32) k[i] + " v " + (float32) v[i]
@@ -97,8 +104,91 @@ public class KvPoolTest {
         KvPoolTest.write(p, 0, 1);
         KvPoolTest.holds(p, 0, 0, "after writing slot 1");
         KvPoolTest.holds(p, 0, 2, "after writing slot 1");
-        Assert.equals(1, p.tableBase(1));
-        Assert.equals(2, p.blockOf(2, 0));
+        Assert.equals(1, p.tableBase(1, 0));
+        Assert.equals(2, p.blockOf(2, 0, 0));
+    }
+
+    /** Layers of window 8, none, 8, 100 and 600 at cap 512 and slack 64: three kinds, a window past the cap is none. */
+    static #KvPool mixed() {
+        DeviceKv.setRingSlack(64);
+        int32[] w #= heap int32[5L];
+        w[0L] = 8;
+        w[1L] = 0;
+        w[2L] = 8;
+        w[3L] = 100;
+        w[4L] = 600;
+        KvPool p #= heap KvPool(512, 16, w);
+        return #p;
+    }
+
+    /** 15.2.21.8.1.2.1: each layer's plane is its kind's size, a ring's entries cycle within its slot, and every
+     *  (slot, kind) region names blocks no other slot holds. */
+    @Test
+    public void ringedAndFlatKindsShareOnePool() {
+        KvPool p #= KvPoolTest.mixed();
+        Assert.equals(3L, (int64) p.kinds());
+        Assert.equals((int64) p.kindOf(0), (int64) p.kindOf(2));
+        Assert.equals((int64) p.kindOf(1), (int64) p.kindOf(4));
+        Assert.equals(0L, (int64) p.windowOf(p.kindOf(1)));
+        Assert.equals(192L, (int64) p.rowsOf(p.kindOf(0)));
+        Assert.equals(512L, (int64) p.rowsOf(p.kindOf(1)));
+        Assert.equals(256L, (int64) p.rowsOf(p.kindOf(3)));
+        Assert.equals(192L * 16L, p.planeElements(2));
+        Assert.equals(8L, (int64) p.logicalBlocks());
+        Assert.equals((int64) ((1 * 3 + 2) * 8), (int64) p.tableBase(1, 2));
+        int32 slot = 0;
+        while (slot < 3) {
+            int32 kd = 0;
+            while (kd < p.kinds()) {
+                int32 r = p.rowsOf(kd) / 64;
+                int32 b = 0;
+                while (b < p.logicalBlocks()) {
+                    int32 e = p.blockOf(slot, kd, b);
+                    Assert.isTrue(e >= slot * r && e < (slot + 1) * r);
+                    if (b + r < p.logicalBlocks()) { Assert.equals((int64) e, (int64) p.blockOf(slot, kd, b + r)); }
+                    b = b + 1;
+                }
+                kd = kd + 1;
+            }
+            slot = slot + 1;
+        }
+        Assert.isTrue(p.fits(1));
+    }
+
+    /** The table a growth uploads names `blockOf` at every (slot, kind) entry, and both kinds keep their rows. */
+    @Test
+    public void growingAMixedPoolKeepsBothKindsAndItsTable() {
+        if (!KvPoolTest.device()) { return; }
+        KvPool p #= KvPoolTest.mixed();
+        p.ensureSlots(1);
+        int32 l = 0;
+        while (l < 5) { KvPoolTest.write(p, l, 0); l = l + 1; }
+        int64[] vc #= ValueCheck.mark();
+        p.ensureSlots(3);
+        l = 0;
+        while (l < 5) {
+            KvPoolTest.write(p, l, 2);
+            KvPoolTest.holds(p, l, 0, "after growing to 3");
+            l = l + 1;
+        }
+        int64 te = 3L * (int64) p.kinds() * (int64) p.logicalBlocks();
+        int32[] th #= heap int32[te];
+        KernelBuffer<int32> t = p.table();
+        t.download(th);
+        int32 slot = 0;
+        while (slot < 3) {
+            int32 kd = 0;
+            while (kd < p.kinds()) {
+                int32 b = 0;
+                while (b < p.logicalBlocks()) {
+                    Assert.equals((int64) p.blockOf(slot, kd, b), (int64) th[(int64) (p.tableBase(slot, kd) + b)]);
+                    b = b + 1;
+                }
+                kd = kd + 1;
+            }
+            slot = slot + 1;
+        }
+        ValueCheck.credit(vc);
     }
 
     @Test

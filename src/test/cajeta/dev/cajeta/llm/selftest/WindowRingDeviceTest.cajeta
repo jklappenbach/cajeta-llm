@@ -99,7 +99,12 @@ public class WindowRingDeviceTest {
     }
 
     static #CausalLM bound(#ModelConfig cfg, int32 hd) {
-        CausalLM m #= heap CausalLM(#cfg, WindowRingDeviceTest.CAP, 1, 0);
+        return WindowRingDeviceTest.boundN(#cfg, hd, 1);
+    }
+
+    /** The toy of {@link #bound} holding `seqs` sequences. */
+    static #CausalLM boundN(#ModelConfig cfg, int32 hd, int32 seqs) {
+        CausalLM m #= heap CausalLM(#cfg, WindowRingDeviceTest.CAP, seqs, 0);
         Checkpoint ck #= Checkpoint.open(WindowRingDeviceTest.DIR + "/m" + hd + ".safetensors");
         m.bind(ck, false);
         ck.close();
@@ -166,6 +171,8 @@ public class WindowRingDeviceTest {
         int32[] td = heap int32[steps];
         float32[] ld = heap float32[v];
         WindowRingDeviceTest.run(dev, first, second, steps, hostFrom, hostTo, td, ld);
+        Assert.equals(1L, (int64) dev.kvPoolSlots());
+        Assert.equals(0L, (int64) dev.deviceKvPoolSlotOf(0));
 
         QuantKernel.setRoutingEnabled(false);
         CausalLM host #= WindowRingDeviceTest.mkAt(path, hd);
@@ -271,6 +278,103 @@ public class WindowRingDeviceTest {
     public void decodeAcrossTheRingsEndMatchesTheHost() {
         WindowRingDeviceTest.sameAsHost(128, 186, 0, 12, 0 - 1, 0 - 1, "decode 186 to 198");
         WindowRingDeviceTest.sameAsHost(256, 186, 0, 12, 3, 6, "decode 186 to 198, host steps 3 to 5");
+    }
+
+    /** Prefills `first` rows of one sequence and `first + 7` of the other (swapped between slots 0 and 1 when
+     *  `swap`), then `steps` greedy steps of each in turn; slot 0's tokens at even indices, last logits per slot. */
+    static void runTwo(CausalLM m, int32 first, int32 steps, boolean swap, int32[] toks, float32[] last0,
+            float32[] last1) {
+        int32 l0 = first;
+        int32 l1 = first + 7;
+        int32 s0 = 3;
+        int32 s1 = 11;
+        if (swap) { l0 = first + 7; l1 = first; s0 = 11; s1 = 3; }
+        int32[] p0 #= RoutableFixtureTest.promptOf(l0, s0);
+        int32[] p1 #= RoutableFixtureTest.promptOf(l1, s1);
+        int32 n0 = m.stepSeq(0, p0, 0, l0);
+        int32 n1 = m.stepSeq(1, p1, 0, l1);
+        int32[] one = heap int32[1];
+        int32 g = 0;
+        while (g < steps) {
+            one[0] = n0;
+            n0 = m.stepSeq(0, one, 0, 1);
+            toks[2 * g] = n0;
+            if (g == steps - 1) { FourNormDeviceTest.copyLogits(m, last0); }
+            one[0] = n1;
+            n1 = m.stepSeq(1, one, 0, 1);
+            toks[2 * g + 1] = n1;
+            g = g + 1;
+        }
+        FourNormDeviceTest.copyLogits(m, last1);
+        return;
+    }
+
+    /** A fresh two-sequence device toy at `hd` through {@link #runTwo}; asserts both slots are in one pool. */
+    static void devTwo(int32 hd, boolean swap, int32[] toks, float32[] last0, float32[] last1) {
+        ModelConfig cd #= ModelConfig.parse(WindowRingDeviceTest.configOf(hd, true));
+        CausalLM dev #= WindowRingDeviceTest.boundN(#cd, hd, 2);
+        WindowRingDeviceTest.runTwo(dev, 186, 8, swap, toks, last0, last1);
+        Assert.equals(2L, (int64) dev.kvPoolSlots());
+        Assert.equals(0L, (int64) dev.deviceKvPoolSlotOf(0));
+        Assert.equals(1L, (int64) dev.deviceKvPoolSlotOf(1));
+        return;
+    }
+
+    /** Two windowed sequences in slots 0 and 1 of one pool, the second past its ring's end, answer bit for bit as in
+     *  the other slot, and as the host (1e-4 on cpu, whose q8 activations put one prompt at 1.4e-5 in either slot). */
+    @Test
+    public void twoSequencesShareOnePoolOfRings() {
+        if (!FourNormDeviceTest.deviceHere()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        DeviceKv.setRingSlack(64);
+        WindowRingDeviceTest.writeFixture();
+        int32 v = WindowRingDeviceTest.V;
+        int32 steps = 8;
+        String be #= Device.activeBackend();
+        float64 klMax = 1.0e-6;
+        if (be.equals("cpu")) { klMax = 1.0e-4; }
+        int32 hd = 128;
+        while (hd <= 256) {
+            int64[] vc #= ValueCheck.mark();
+            int32[] td = heap int32[2 * steps];
+            float32[] d0 = heap float32[v];
+            float32[] d1 = heap float32[v];
+            WindowRingDeviceTest.devTwo(hd, false, td, d0, d1);
+            int32[] ts = heap int32[2 * steps];
+            float32[] s0 = heap float32[v];
+            float32[] s1 = heap float32[v];
+            WindowRingDeviceTest.devTwo(hd, true, ts, s0, s1);
+
+            QuantKernel.setRoutingEnabled(false);
+            ModelConfig ch #= ModelConfig.parse(WindowRingDeviceTest.configOf(hd, true));
+            CausalLM host #= WindowRingDeviceTest.boundN(#ch, hd, 2);
+            int32[] th = heap int32[2 * steps];
+            float32[] h0 = heap float32[v];
+            float32[] h1 = heap float32[v];
+            WindowRingDeviceTest.runTwo(host, 186, steps, false, th, h0, h1);
+            QuantKernel.setRoutingEnabled(true);
+
+            float64 kl0 = Metrics.softmaxKl(h0, d0, v);
+            float64 kl1 = Metrics.softmaxKl(h1, d1, v);
+            System.stdout.println("  15.2.21.8.1.2.1 two sequences hd " + hd + ": kl " + kl0 + " and " + kl1);
+            int32 i = 0;
+            while (i < v) {
+                Assert.isTrue(d0[i] == s1[i]);
+                Assert.isTrue(d1[i] == s0[i]);
+                i = i + 1;
+            }
+            Assert.isTrue(kl0 <= klMax);
+            Assert.isTrue(kl1 <= klMax);
+            int32 t = 0;
+            while (t < 2 * steps) {
+                Assert.equals((int64) th[t], (int64) td[t]);
+                t = t + 1;
+            }
+            ValueCheck.credit(vc);
+            hd = hd * 2;
+        }
     }
 
     @Test
