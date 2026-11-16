@@ -2035,16 +2035,10 @@ public final class CausalLM extends InfModule {
         return;
     }
 
-    /** Whether this step's attention can take the batched launches: a served head shape, no window shorter than the
-     *  context, and every row's planes in the pool. */
+    /** Whether this step's attention can take the batched launches: a served head shape, and every row's planes in
+     *  the pool. */
     boolean batchAttnReady(int32[] seqs, int32 n) {
         if (this.kvPool == null || AttnKernel.skipForMeasurement() != 0) { return false; }
-        int32 l = 0;
-        while (l < this.cfg.numLayers) {
-            int32 w = this.cfg.windowForLayer(l);
-            if (w > 0 && w < this.maxSeq) { return false; }
-            l = l + 1;
-        }
         if (!AttnKernel.batchDecodeServes(this.cfg.numHeads, this.cfg.numKvHeads, this.cfg.headDim)) {
             return false;
         }
@@ -3903,6 +3897,8 @@ public final class CausalLM extends InfModule {
 
     /** The most sequences one {@link #stepDecodeBatch} call carries. */
     public static final int32 DECODE_BATCH_MAX = 8;
+    /** Ints a window kind's row table takes: 4 a row, padded to 256 bytes so each kind's view meets any binding offset. */
+    public static final int32 ROW_TAB_STRIDE = 64;
     static int64 bdF16Sites;
     /** Layers whose q, k and v took the batched f16 column route in this process (cajeta-llm 15.2.21.4.3.8.4). */
     public static int64 batchF16Layers() { return CausalLM.bdF16Sites; }
@@ -4094,23 +4090,43 @@ public final class CausalLM extends InfModule {
         int64 pbI = Quant.q8kPackedBytes((int64) inter);
         int32 b = 0;
         boolean bAttn = this.batchAttnReady(seqs, n);
-        int32 maxSplits = 1;
+        int32 nKinds = 1;
+        if (bAttn) { nKinds = this.kvPool.kinds(); }
+        KernelBuffer<int32>[] kTabs #= heap KernelBuffer<int32>[(int64) nKinds];
+        int32[] kSplits #= heap int32[(int64) nKinds];
         if (bAttn) {
+            int32 stride = CausalLM.ROW_TAB_STRIDE;
             int32[] slots #= heap int32[(int64) n];
             int32[] poss #= heap int32[(int64) n];
+            int32[] th #= heap int32[(int64) (nKinds * stride)];
             b = 0;
             while (b < n) {
-                slots[(int64) b] = this.kvPool.tableBase(this.dkvOf(seqs[(int64) b]).poolSlot(), 0);
                 poss[(int64) b] = this.bdPos[(int64) b];
                 b = b + 1;
             }
+            int32 kd = 0;
+            while (kd < nKinds) {
+                b = 0;
+                while (b < n) {
+                    slots[(int64) b] = this.kvPool.tableBase(this.dkvOf(seqs[(int64) b]).poolSlot(), kd);
+                    b = b + 1;
+                }
+                kSplits[(int64) kd] = AttnKernel.decodeRowTableInto(slots, poss, n, this.cfg.numKvHeads,
+                    this.kvPool.windowOf(kd), th, kd * stride);
+                kd = kd + 1;
+            }
             if (rowTab == null) {
                 if (this.bdRowTab == null) {
-                    this.bdRowTab #= heap KernelBuffer<int32>((uint64) (4 * CausalLM.DECODE_BATCH_MAX));
+                    this.bdRowTab #= heap KernelBuffer<int32>((uint64) (nKinds * stride));
                 }
                 rowTab = this.bdRowTab;
             }
-            maxSplits = AttnKernel.decodeRowTable(slots, poss, n, this.cfg.numKvHeads, rowTab);
+            rowTab.upload(th, (int64) (nKinds * stride));
+            kd = 0;
+            while (kd < nKinds) {
+                kTabs[(int64) kd] #= rowTab.slice((uint64) (kd * stride), (uint64) stride);
+                kd = kd + 1;
+            }
         }
         this.bdTb3 = Clock.nanoTime();
         int32 li = 0;
@@ -4140,6 +4156,9 @@ public final class CausalLM extends InfModule {
             }
             boolean oF16 = bAttn && a.oProj.colsF16Ready();
             if (bAttn) {
+                int32 lk = this.kvPool.kindOf(li);
+                KernelBuffer<int32> rt = kTabs[(int64) lk];
+                int32 maxSplits = kSplits[(int64) lk];
                 DeviceKv d0 = this.dkvOf(seqs[0L]);
                 KernelBuffer<float32> qwv = qnw;
                 KernelBuffer<float32> kwv = knw;
@@ -4147,12 +4166,12 @@ public final class CausalLM extends InfModule {
                 if (oF16) {
                     AttnKernel.attendDecodeBatchF16LaunchNoSync(this.bdXh, this.bdQ, this.bdK, this.bdV,
                         this.kvPool.kAll(li), this.kvPool.vAll(li), this.kvPool.table(), qwv, kwv, d0.inv(li),
-                        nH, nKv, hd, qnw != null, qnEps, d.normForm, rowTab, n,
+                        nH, nKv, hd, qnw != null, qnEps, d.normForm, rt, n,
                         maxSplits, (int64) qd, a.scale);
                 } else {
                     AttnKernel.attendDecodeBatchLaunchNoSync(this.bdXp, this.bdQ, this.bdK, this.bdV,
                         this.kvPool.kAll(li), this.kvPool.vAll(li), this.kvPool.table(), qwv, kwv, d0.inv(li),
-                        nH, nKv, hd, qnw != null, qnEps, d.normForm, rowTab, n,
+                        nH, nKv, hd, qnw != null, qnEps, d.normForm, rt, n,
                         maxSplits, pbQd, a.scale);
                 }
             }
@@ -4284,7 +4303,9 @@ public final class CausalLM extends InfModule {
         if (!this.decodeBatchReady()) { return false; }
         if (!this.deviceEmbedReady()) { return false; }
         if (!this.bpHave) {
-            this.bp #= heap BatchPipe((int64) CausalLM.DECODE_BATCH_MAX);
+            KvPool kinds #= DeviceKv.poolFor(this.cfg, this.maxSeq);
+            this.bp #= heap BatchPipe((int64) CausalLM.DECODE_BATCH_MAX,
+                (int64) (CausalLM.ROW_TAB_STRIDE * kinds.kinds()));
             this.bpHave = true;
         }
         return true;

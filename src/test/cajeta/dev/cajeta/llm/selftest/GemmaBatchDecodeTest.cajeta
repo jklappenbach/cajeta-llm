@@ -8,7 +8,9 @@ import dev.cajeta.llm.Diag;
 import dev.cajeta.llm.bench.Metrics;
 import dev.cajeta.llm.io.Checkpoint;
 import dev.cajeta.llm.io.QuantKernel;
+import dev.cajeta.llm.model.AttnKernel;
 import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.DeviceKv;
 import dev.cajeta.llm.model.DecoderLayer;
 import dev.cajeta.llm.model.ModelConfig;
 import dev.cajeta.ml.kernels.testing.ValueCheck;
@@ -25,6 +27,8 @@ public class GemmaBatchDecodeTest {
     public void restore() {
         Diag.register(null);
         QuantKernel.setRoutingEnabled(true);
+        DeviceKv.setRingSlack(256);
+        GemmaBatchDecodeTest.phased = false;
         return;
     }
 
@@ -54,7 +58,17 @@ public class GemmaBatchDecodeTest {
         return #m;
     }
 
-    static int32 promptLen(int32 q) { return 5 + 3 * q; }
+    static boolean phased = false;
+
+    /** Prompt lengths: 5 + 3q, or with {@link #phased} 5, 70, 130 and 200, so rows sit at different ring phases and
+     *  the last runs past its ring's end. */
+    static int32 promptLen(int32 q) {
+        if (!GemmaBatchDecodeTest.phased) { return 5 + 3 * q; }
+        if (q == 0) { return 5; }
+        if (q == 1) { return 70; }
+        if (q == 2) { return 130; }
+        return 200;
+    }
 
     /** Four prompts prefilled, then STEPS batched steps; each row's tokens held equal to the row decoded alone. */
     static void check(int32 hd, boolean windowed) {
@@ -82,6 +96,7 @@ public class GemmaBatchDecodeTest {
             cur[q] = all.stepSeq(q, p, 0, GemmaBatchDecodeTest.promptLen(q));
             q = q + 1;
         }
+        int64 calls0 = AttnKernel.batchDecodeCalls();
         int32 g = 0;
         while (g < steps) {
             all.stepDecodeBatch(seqs, cur, n, out);
@@ -92,6 +107,13 @@ public class GemmaBatchDecodeTest {
                 q = q + 1;
             }
             g = g + 1;
+        }
+        int64 served = AttnKernel.batchDecodeCalls() - calls0;
+        int64 want = 0L;
+        if (AttnKernel.batchDecodeServes(512 / hd, 1, hd)) { want = (int64) (WindowRingDeviceTest.LAYERS * steps); }
+        if (served != want) {
+            Assert.fail("hd " + hd + " windowed " + windowed + ": the batched attend served " + served
+                + " layer steps, want " + want);
         }
         int32 v = WindowRingDeviceTest.V;
         float32[] bl #= heap float32[(int64) n * (int64) v];
@@ -133,8 +155,9 @@ public class GemmaBatchDecodeTest {
             }
             q = q + 1;
         }
-        System.stdout.println("  15.2.21.7.1 hd " + hd + " windowed " + windowed + ": " + n + " sequences x " + steps
-            + " batched steps match each decoded alone; worst last-step kl " + worst);
+        System.stdout.println("  15.2.21.7.1 hd " + hd + " windowed " + windowed + " phased "
+            + GemmaBatchDecodeTest.phased + ": " + n + " sequences x " + steps + " batched steps (" + served
+            + " batched layer steps) match each decoded alone; worst last-step kl " + worst);
         ValueCheck.credit(vc);
     }
 
@@ -145,6 +168,15 @@ public class GemmaBatchDecodeTest {
 
     @Test
     public void aWindowedGemmaAtHead128BatchesToEachSequenceAlone() {
+        GemmaBatchDecodeTest.check(128, true);
+    }
+
+    /** 15.2.21.8.1.2.2: with a ring of 192 rows, rows at four ring phases, one past the ring's end, batch to each
+     *  sequence alone through the batched attend (hd 256 waits on 15.2.21.8.1.2.6). */
+    @Test
+    public void rowsAtDifferentRingPhasesBatchToEachSequenceAlone() {
+        DeviceKv.setRingSlack(64);
+        GemmaBatchDecodeTest.phased = true;
         GemmaBatchDecodeTest.check(128, true);
     }
 
