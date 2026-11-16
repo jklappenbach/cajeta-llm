@@ -1,5 +1,6 @@
 package dev.cajeta.llm.selftest;
 
+import dev.cajeta.unit.AfterEach;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.io.Checkpoint;
@@ -23,6 +24,12 @@ import dev.cajeta.ml.kernels.testing.ValueCheck;
 public class KvCacheTest {
 
     public KvCacheTest() { return; }
+
+    @AfterEach
+    public void restoreArenas() {
+        PagedKvCache.setArenaBytes(0L);
+        return;
+    }
 
     static float64 fabs(float64 x) {
         if (x < 0.0) {
@@ -717,5 +724,103 @@ public class KvCacheTest {
         // here); a quadratic recompute would pay the ~10× prefix ratio.
         // Generous bound to keep timing noise out of the verdict.
         Assert.isTrue(longNs < shortNs * 6);
+    }
+
+    // ── 15.2.21.8.1.4 — host bytes only at first write ──────────────────
+
+    @Test
+    public void aFreshCacheHoldsNoHostBytesUntilAWrite() {
+        ModelConfig cfg #= KvCacheTest.cacheCfg(2, 0);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 2, 32);
+        Assert.equals(0L, c.hostBytes());
+        Tensor<float32> k #= KvCacheTest.row(8, 1.0f);
+        Assert.isTrue(c.appendRow(0, 0, k, 0, k, 0, 0));
+        int64 arena = (int64) c.arenaBlocksN() * (int64) c.blockPayloadBytes();
+        Assert.equals(arena, c.hostBytes());
+        Assert.isTrue(c.appendRow(1, 1, k, 0, k, 0, 0));
+        Assert.equals(arena, c.hostBytes());
+
+        ModelConfig wc #= KvCacheTest.cacheCfg(2, 8);
+        PagedKvCache r = heap PagedKvCache(wc, 64, 2, 1);
+        Assert.equals(0L, r.hostBytes());
+        r.skipTo(0, 0, 5);
+        Assert.equals(0L, r.hostBytes());
+        Assert.isTrue(r.appendRow(0, 1, k, 0, k, 0, 0));
+        Assert.equals(512L, r.hostBytes());
+        Assert.isTrue(r.appendRow(1, 1, k, 0, k, 0, 0));
+        Assert.equals(1024L, r.hostBytes());
+        Assert.isTrue(r.kAt(1, 1, 0, 3) == 4.0f);
+    }
+
+    @Test
+    public void blocksPastAnArenaDrawItsBytesOnceAndReadBackExactly() {
+        PagedKvCache.setArenaBytes(512L);
+        ModelConfig cfg #= KvCacheTest.cacheCfg(1, 0);
+        PagedKvCache c = heap PagedKvCache(cfg, 64, 2, 8);
+        ModelConfig cfg1 #= KvCacheTest.cacheCfg(1, 0);
+        PagedKvCache.setArenaBytes(0L);
+        PagedKvCache one = heap PagedKvCache(cfg1, 64, 1, 8);
+        Assert.equals(2L, (int64) c.arenaBlocksN());
+        Assert.equals(8L, (int64) one.arenaBlocksN());
+        int32 t = 0;
+        while (t < 14) {
+            Tensor<float32> k #= KvCacheTest.row(8, 0.0625f * (float32) ((t * 3 + 2) % 9));
+            Tensor<float32> v #= KvCacheTest.row(8, 0.0625f * (float32) ((t * 11 + 1) % 7));
+            Assert.isTrue(c.appendRow(0, 0, k, 0, v, 0, t));
+            Assert.isTrue(one.appendRow(0, 0, k, 0, v, 0, t));
+            int64 want = 512L;
+            if (t >= 8) { want = 1024L; }
+            Assert.equals(want, c.hostBytes());
+            t = t + 1;
+        }
+        t = 0;
+        while (t < 14) {
+            int32 d = 0;
+            while (d < 8) {
+                Assert.isTrue(c.kAt(0, 0, t, d) == one.kAt(0, 0, t, d));
+                Assert.isTrue(c.vAt(0, 0, t, d) == one.vAt(0, 0, t, d));
+                d = d + 1;
+            }
+            t = t + 1;
+        }
+        int64[] qs = heap int64[1];
+        qs[0] = 16;
+        Tensor<float32> q #= Tensor.zeros<float32>(qs);
+        int64 j = 0;
+        while (j < 16) {
+            q.flatSet(j, 0.125f * (float32) ((j * 5 + 1) % 9) - 0.5f);
+            j = j + 1;
+        }
+        Tensor<float32> scores #= Tensor.zeros<float32>(qs);
+        Tensor<float32> oa #= Tensor.zeros<float32>(qs);
+        Tensor<float32> ob #= Tensor.zeros<float32>(qs);
+        c.attendRow(0, 0, q, 0, 0.35f, scores, oa, 0, 2, 1, 8);
+        one.attendRow(0, 0, q, 0, 0.35f, scores, ob, 0, 2, 1, 8);
+        j = 0;
+        while (j < 16) {
+            Assert.isTrue(oa.flatGet(j) == ob.flatGet(j));
+            j = j + 1;
+        }
+        // A copy-on-write into the third arena leaves the source's rows alone.
+        float32 before = c.kAt(0, 0, 13, 2);
+        c.forkPrefix(0, 1, 14);
+        Tensor<float32> nk #= KvCacheTest.row(8, 900.0f);
+        Assert.isTrue(c.appendRow(1, 0, nk, 0, nk, 0, 14));
+        Assert.equals(1536L, c.hostBytes());
+        Assert.isTrue(c.kAt(0, 0, 13, 2) == before);
+        Assert.isTrue(c.kAt(1, 0, 13, 2) == before);
+        Assert.isTrue(c.kAt(1, 0, 14, 2) == 902.0f);
+        c.release(0);
+        c.release(1);
+        Assert.equals(8L, (int64) c.freeBlocks());
+        Assert.equals(1536L, c.hostBytes());
+        Tensor<float32> kr #= KvCacheTest.row(8, 1.0f);
+        int64 b0 = Cajeta.allocatedBytes();
+        t = 0;
+        while (t < 14) {
+            Assert.isTrue(c.appendRow(0, 0, kr, 0, kr, 0, t));
+            t = t + 1;
+        }
+        Assert.equals(b0, Cajeta.allocatedBytes());
     }
 }

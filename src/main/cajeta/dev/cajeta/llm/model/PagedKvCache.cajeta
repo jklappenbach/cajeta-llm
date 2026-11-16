@@ -25,12 +25,16 @@ import dev.cajeta.llm.LlmException;
  * unwindowed layer's configured maximum context is the caller's error
  * and throws.
  *
- * Everything is preallocated at construction: appends, copy-on-write,
- * forks and releases perform ZERO heap allocations, so the decode path's
- * 6.1.6 invariant extends through the cache.
+ * Blocks live in arenas and rings are per (seq, layer); both are allocated
+ * at their first write (15.2.21.8.1.4), so a cache the device route never
+ * writes back holds no host bytes. After that, appends, copy-on-write, forks
+ * and releases allocate only when a draw opens a new arena.
  */
 public final class PagedKvCache {
-    Tensor<float32> pool;    // [numBlocks · 2 · blockTokens · kvDim] flat
+    Tensor<float32>[] arenas; // arenaBlocks blocks each, null until first drawn
+    int32 arenaBlocks;
+    int64 heldBytes;
+    static int64 arenaTarget = 0;
     int32[] freeList;
     int32 freeCount;
     int32[] refCount;        // per block
@@ -55,10 +59,13 @@ public final class PagedKvCache {
         this.maxSeqs = maxSeqs;
         this.maxSeqCap = maxSeqCap;
         this.numBlocks = numBlocks;
-        int64[] ps = heap int64[1];
-        ps[0] = (int64) numBlocks * 2 * (int64) this.blockTokens
-            * (int64) this.kvDim;
-        this.pool #= Tensor.zeros<float32>(ps);
+        int64 target = PagedKvCache.arenaTarget;
+        if (target <= 0) { target = 4194304L; }
+        int64 ab = target / (this.blockFloats() * 4);
+        if (ab < 1) { ab = 1; }
+        if (ab > (int64) numBlocks) { ab = (int64) numBlocks; }
+        this.arenaBlocks = (int32) ab;
+        this.arenas = heap Tensor<float32>[(numBlocks + this.arenaBlocks - 1) / this.arenaBlocks];
         this.freeList = heap int32[numBlocks];
         int32 b = 0;
         while (b < numBlocks) {
@@ -76,23 +83,63 @@ public final class PagedKvCache {
         this.ringV = heap Tensor<float32>[maxSeqs * cfg.numLayers];
         int32 l = 0;
         while (l < cfg.numLayers) {
-            int32 w = cfg.windowForLayer(l);
-            this.layerWindow[l] = w;
-            if (w > 0) {
-                int32 rows = Math.min<int32>(maxSeqCap, w);
-                int64[] rs = heap int64[1];
-                rs[0] = (int64) rows * (int64) this.kvDim;
-                int32 s = 0;
-                while (s < maxSeqs) {
-                    this.ringK[s * cfg.numLayers + l] #=
-                        Tensor.zeros<float32>(rs);
-                    this.ringV[s * cfg.numLayers + l] #=
-                        Tensor.zeros<float32>(rs);
-                    s = s + 1;
-                }
-            }
+            this.layerWindow[l] = cfg.windowForLayer(l);
             l = l + 1;
         }
+    }
+
+    /** Arena size, in bytes, for caches built after this call; 0 restores the 4 MB default. */
+    public static void setArenaBytes(int64 n) {
+        PagedKvCache.arenaTarget = n;
+        return;
+    }
+
+    /** Host bytes the arenas and rings allocated so far hold. */
+    public int64 hostBytes() {
+        return this.heldBytes;
+    }
+
+    /** Blocks one arena holds. */
+    public int32 arenaBlocksN() {
+        return this.arenaBlocks;
+    }
+
+    int64 blockFloats() {
+        return 2 * (int64) this.blockTokens * (int64) this.kvDim;
+    }
+
+    /** The arena holding block `blk`, allocated at its first use. */
+    Tensor<float32> arenaOf(int32 blk) {
+        int32 a = blk / this.arenaBlocks;
+        if (this.arenas[a] == null) {
+            int32 nb = Math.min<int32>(this.arenaBlocks, this.numBlocks - a * this.arenaBlocks);
+            int64[] s = heap int64[1];
+            s[0] = (int64) nb * this.blockFloats();
+            this.arenas[a] #= Tensor.zeros<float32>(s);
+            this.heldBytes = this.heldBytes + s[0] * 4;
+        }
+        return this.arenas[a];
+    }
+
+    /** Flat base of block `blk` within its arena. */
+    int64 blockBase(int32 blk) {
+        return (int64) (blk % this.arenaBlocks) * this.blockFloats();
+    }
+
+    /** (seq, layer)'s ring, K or V, allocated with its twin at first use. */
+    Tensor<float32> ringOf(int32 sl, boolean isV) {
+        if (this.ringK[sl] == null) {
+            int64[] rs = heap int64[1];
+            rs[0] = (int64) Math.min<int32>(this.maxSeqCap, this.layerWindow[sl % this.layers])
+                * (int64) this.kvDim;
+            this.ringK[sl] #= Tensor.zeros<float32>(rs);
+            this.ringV[sl] #= Tensor.zeros<float32>(rs);
+            this.heldBytes = this.heldBytes + rs[0] * 8;
+        }
+        if (isV) {
+            return this.ringV[sl];
+        }
+        return this.ringK[sl];
     }
 
     // ── observability (spec 6.25 precursor; 8.3.2) ──────────────────────
@@ -162,143 +209,36 @@ public final class PagedKvCache {
             int64 kOff, Tensor<float32> v, int64 vOff, int32 p) {
         // Measurement instrument (Prim.skipMask bit 16).
         if ((Prim.skipMask & 16) != 0) { return true; }
-        int32 sl = seq * this.layers + layer;
-        if (p != this.lenSL[sl]) {
-            // Name the SLOT and layer, not just the numbers: this fires
-            // when a scheduler hands a slot to a second sequence without
-            // the cache having been released, and "position 0 is not the
-            // next position (128)" alone cannot distinguish that from a
-            // position-arithmetic slip in one sequence.
-            throw heap LlmException("kv append: seq " + seq + " layer "
-                + layer + " (slot " + sl + "): position " + p
-                + " is not the next position (" + this.lenSL[sl]
-                + "); a slot reused without release, or a chunk offset "
-                + "that did not advance");
-        }
-        int32 w = this.layerWindow[layer];
-        if (w > 0) {
-            int32 rows = Math.min<int32>(this.maxSeqCap, w);
-            Tensor<float32> rk = this.ringK[sl];
-            Tensor<float32> rv = this.ringV[sl];
-            int64 base = (int64) (p % rows) * (int64) this.kvDim;
-            // Raw buffers — 2 x kvDim accessor calls per layer per token.
-            float32[] rkb = rk.hostBuffer();
-            int64 rkbase = rk.hostBase() + base;
-            float32[] rvb = rv.hostBuffer();
-            int64 rvbase = rv.hostBase() + base;
-            float32[] kb0 = k.hostBuffer();
-            int64 ko0 = k.hostBase() + kOff;
-            float32[] vb0 = v.hostBuffer();
-            int64 vo0 = v.hostBase() + vOff;
-            int64 j = 0;
-            while (j < (int64) this.kvDim) {
-                rkb[rkbase + j] = kb0[ko0 + j];
-                rvb[rvbase + j] = vb0[vo0 + j];
-                j = j + 1;
-            }
-            this.lenSL[sl] = p + 1;
-            return true;
-        }
-        if (p >= this.maxSeqCap) {
-            // Explicit context-limit error, distinct from exhaustion (6.4).
-            throw heap LlmException("kv append: position " + p
-                + " exceeds the configured maximum context "
-                + this.maxSeqCap);
-        }
-        int32 ti = p / this.blockTokens;
-        int32 tBase = sl * this.blocksPerSeq;
-        int32 blk = 0;
-        if (p % this.blockTokens == 0) {
-            // Block boundary: take from the pool (6.2's only draw point).
-            if (this.freeCount == 0) {
-                return false;
-            }
-            this.freeCount = this.freeCount - 1;
-            blk = this.freeList[this.freeCount];
-            this.refCount[blk] = 1;
-            this.tables[tBase + ti] = blk;
-        } else {
-            blk = this.tables[tBase + ti];
-            if (this.refCount[blk] > 1) {
-                // Copy-on-write (6.15): never mutate shared history.
-                if (this.freeCount == 0) {
-                    return false;
-                }
-                this.freeCount = this.freeCount - 1;
-                int32 fresh = this.freeList[this.freeCount];
-                this.refCount[fresh] = 1;
-                int64 srcB = (int64) blk * 2 * (int64) this.blockTokens
-                    * (int64) this.kvDim;
-                int64 dstB = (int64) fresh * 2 * (int64) this.blockTokens
-                    * (int64) this.kvDim;
-                int64 n = 2 * (int64) this.blockTokens * (int64) this.kvDim;
-                float32[] pb0 = this.pool.hostBuffer();
-                int64 pbase0 = this.pool.hostBase();
-                int64 j = 0;
-                while (j < n) {
-                    pb0[pbase0 + dstB + j] = pb0[pbase0 + srcB + j];
-                    j = j + 1;
-                }
-                this.refCount[blk] = this.refCount[blk] - 1;
-                this.tables[tBase + ti] = fresh;
-                blk = fresh;
-            }
-        }
-        int32 slot = p % this.blockTokens;
-        int64 kBase = ((int64) blk * 2 * (int64) this.blockTokens
-            + (int64) slot) * (int64) this.kvDim;
-        int64 vBase = ((int64) blk * 2 * (int64) this.blockTokens
-            + (int64) this.blockTokens + (int64) slot) * (int64) this.kvDim;
-        float32[] pb = this.pool.hostBuffer();
-        int64 pbase = this.pool.hostBase();
-        float32[] kb1 = k.hostBuffer();
-        int64 ko1 = k.hostBase() + kOff;
-        float32[] vb1 = v.hostBuffer();
-        int64 vo1 = v.hostBase() + vOff;
-        int64 j = 0;
-        while (j < (int64) this.kvDim) {
-            pb[pbase + kBase + j] = kb1[ko1 + j];
-            pb[pbase + vBase + j] = vb1[vo1 + j];
-            j = j + 1;
-        }
-        this.lenSL[sl] = p + 1;
-        return true;
+        return this.appendRowRaw(seq, layer, k.hostBuffer(), k.hostBase() + kOff, v.hostBuffer(),
+            v.hostBase() + vOff, p);
     }
 
-    /**
-     * Copy positions `[from, to)` of `(seq, layer)` into CONTIGUOUS host
-     * planes — `kOut[i·kvDim..]` for position `from + i`, and the same for
-     * V (plan 10.11.2).
-     *
-     * The device K/V planes are flat `[cap x kvDim]`, with no block table
-     * and no ring, so seeding them from the paged cache means walking the
-     * indirection once here rather than teaching a kernel about it. Reads
-     * go through raw buffers and one `rowBase` per position, not `kAt`
-     * per element: at 512 positions of an 8B model that is 1M accessor
-     * calls a layer, and the accessor is what `attendRow` measured as the
-     * cost, not the arithmetic.
-     */
+    /** Copy positions `[from, to)` of `(seq, layer)` into contiguous host planes, position `from + i` at
+     *  `kOut[i·kvDim..]` and the same for V (plan 10.11.2). */
     public void copyRowsTo(int32 seq, int32 layer, int32 from, int32 to,
             float32[] kOut, float32[] vOut) {
         int32 sl = seq * this.layers + layer;
-        Tensor<float32> srcK = this.srcOf(sl, false);
-        Tensor<float32> srcV = this.srcOf(sl, true);
-        float32[] kb = srcK.hostBuffer();
-        int64 kbase = srcK.hostBase();
-        float32[] vb = srcV.hostBuffer();
-        int64 vbase = srcV.hostBase();
         int32 t = from;
         while (t < to) {
-            int64 dst = (int64) (t - from) * (int64) this.kvDim;
-            int64 kr = kbase + this.rowBase(sl, t, false);
-            int64 vr = vbase + this.rowBase(sl, t, true);
-            int64 j = 0;
-            while (j < (int64) this.kvDim) {
-                kOut[dst + j] = kb[kr + j];
-                vOut[dst + j] = vb[vr + j];
-                j = j + 1;
+            int32 end = Math.min<int32>(to, t + this.runOf(sl, t));
+            Tensor<float32> srcK = this.rowSrc(sl, t, false);
+            Tensor<float32> srcV = this.rowSrc(sl, t, true);
+            float32[] kb = srcK.hostBuffer();
+            float32[] vb = srcV.hostBuffer();
+            int64 kr = srcK.hostBase() + this.rowBase(sl, t, false);
+            int64 vr = srcV.hostBase() + this.rowBase(sl, t, true);
+            while (t < end) {
+                int64 dst = (int64) (t - from) * (int64) this.kvDim;
+                int64 j = 0;
+                while (j < (int64) this.kvDim) {
+                    kOut[dst + j] = kb[kr + j];
+                    vOut[dst + j] = vb[vr + j];
+                    j = j + 1;
+                }
+                kr = kr + (int64) this.kvDim;
+                vr = vr + (int64) this.kvDim;
+                t = t + 1;
             }
-            t = t + 1;
         }
         return;
     }
@@ -322,35 +262,35 @@ public final class PagedKvCache {
     public boolean appendRowRaw(int32 seq, int32 layer, float32[] kb,
             int64 kOff, float32[] vb, int64 vOff, int32 p) {
         int32 sl = seq * this.layers + layer;
+        if (!this.claim(seq, layer, p)) { return false; }
+        Tensor<float32> dk = this.rowSrc(sl, p, false);
+        Tensor<float32> dv = this.rowSrc(sl, p, true);
+        float32[] kd = dk.hostBuffer();
+        float32[] vd = dv.hostBuffer();
+        int64 ko = dk.hostBase() + this.rowBase(sl, p, false);
+        int64 vo = dv.hostBase() + this.rowBase(sl, p, true);
+        int64 j = 0;
+        while (j < (int64) this.kvDim) {
+            kd[ko + j] = kb[kOff + j];
+            vd[vo + j] = vb[vOff + j];
+            j = j + 1;
+        }
+        this.lenSL[sl] = p + 1;
+        return true;
+    }
+
+    /** Make position `p` of (seq, layer) writable: checks it is the next position, draws a block at a boundary
+     *  and copies a shared one (6.15). False when the pool has no free block. */
+    boolean claim(int32 seq, int32 layer, int32 p) {
+        int32 sl = seq * this.layers + layer;
         if (p != this.lenSL[sl]) {
-            // Name the SLOT and layer, not just the numbers: this fires
-            // when a scheduler hands a slot to a second sequence without
-            // the cache having been released, and "position 0 is not the
-            // next position (128)" alone cannot distinguish that from a
-            // position-arithmetic slip in one sequence.
             throw heap LlmException("kv append: seq " + seq + " layer "
                 + layer + " (slot " + sl + "): position " + p
                 + " is not the next position (" + this.lenSL[sl]
                 + "); a slot reused without release, or a chunk offset "
                 + "that did not advance");
         }
-        int32 w = this.layerWindow[layer];
-        if (w > 0) {
-            int32 rows = Math.min<int32>(this.maxSeqCap, w);
-            Tensor<float32> rk = this.ringK[sl];
-            Tensor<float32> rv = this.ringV[sl];
-            int64 base = (int64) (p % rows) * (int64) this.kvDim;
-            float32[] rkb = rk.hostBuffer();
-            int64 rkbase = rk.hostBase() + base;
-            float32[] rvb = rv.hostBuffer();
-            int64 rvbase = rv.hostBase() + base;
-            int64 j = 0;
-            while (j < (int64) this.kvDim) {
-                rkb[rkbase + j] = kb[kOff + j];
-                rvb[rvbase + j] = vb[vOff + j];
-                j = j + 1;
-            }
-            this.lenSL[sl] = p + 1;
+        if (this.layerWindow[layer] > 0) {
             return true;
         }
         if (p >= this.maxSeqCap) {
@@ -358,53 +298,36 @@ public final class PagedKvCache {
                 + " exceeds the configured maximum context "
                 + this.maxSeqCap);
         }
-        int32 ti = p / this.blockTokens;
-        int32 tBase = sl * this.blocksPerSeq;
-        int32 blk = 0;
+        int32 ti = sl * this.blocksPerSeq + p / this.blockTokens;
         if (p % this.blockTokens == 0) {
             if (this.freeCount == 0) { return false; }
             this.freeCount = this.freeCount - 1;
-            blk = this.freeList[this.freeCount];
+            int32 blk = this.freeList[this.freeCount];
             this.refCount[blk] = 1;
-            this.tables[tBase + ti] = blk;
-        } else {
-            blk = this.tables[tBase + ti];
-            if (this.refCount[blk] > 1) {
-                if (this.freeCount == 0) { return false; }
-                this.freeCount = this.freeCount - 1;
-                int32 fresh = this.freeList[this.freeCount];
-                this.refCount[fresh] = 1;
-                int64 srcB = (int64) blk * 2 * (int64) this.blockTokens
-                    * (int64) this.kvDim;
-                int64 dstB = (int64) fresh * 2 * (int64) this.blockTokens
-                    * (int64) this.kvDim;
-                int64 n = 2 * (int64) this.blockTokens * (int64) this.kvDim;
-                float32[] pb0 = this.pool.hostBuffer();
-                int64 pbase0 = this.pool.hostBase();
-                int64 j = 0;
-                while (j < n) {
-                    pb0[pbase0 + dstB + j] = pb0[pbase0 + srcB + j];
-                    j = j + 1;
-                }
-                this.refCount[blk] = this.refCount[blk] - 1;
-                this.tables[tBase + ti] = fresh;
-                blk = fresh;
+            this.tables[ti] = blk;
+            return true;
+        }
+        int32 blk = this.tables[ti];
+        if (this.refCount[blk] > 1) {
+            if (this.freeCount == 0) { return false; }
+            this.freeCount = this.freeCount - 1;
+            int32 fresh = this.freeList[this.freeCount];
+            this.refCount[fresh] = 1;
+            Tensor<float32> sa = this.arenaOf(blk);
+            Tensor<float32> da = this.arenaOf(fresh);
+            float32[] sb = sa.hostBuffer();
+            float32[] db = da.hostBuffer();
+            int64 so = sa.hostBase() + this.blockBase(blk);
+            int64 dof = da.hostBase() + this.blockBase(fresh);
+            int64 n = this.blockFloats();
+            int64 j = 0;
+            while (j < n) {
+                db[dof + j] = sb[so + j];
+                j = j + 1;
             }
+            this.refCount[blk] = this.refCount[blk] - 1;
+            this.tables[ti] = fresh;
         }
-        int32 slot = p % this.blockTokens;
-        int64 kBase = ((int64) blk * 2 * (int64) this.blockTokens
-            + (int64) slot) * (int64) this.kvDim;
-        int64 vBase = ((int64) blk * 2 * (int64) this.blockTokens
-            + (int64) this.blockTokens + (int64) slot) * (int64) this.kvDim;
-        float32[] pb = this.pool.hostBuffer();
-        int64 pbase = this.pool.hostBase();
-        int64 j2 = 0;
-        while (j2 < (int64) this.kvDim) {
-            pb[pbase + kBase + j2] = kb[kOff + j2];
-            pb[pbase + vBase + j2] = vb[vOff + j2];
-            j2 = j2 + 1;
-        }
-        this.lenSL[sl] = p + 1;
         return true;
     }
 
@@ -435,21 +358,9 @@ public final class PagedKvCache {
                     + " is outside the live window [" + (len - rows)
                     + ", " + len + ")");
             }
-            Tensor<float32> r = this.ringV[sl];
-            if (!isV) {
-                r = this.ringK[sl];
-            }
-            return r.flatGet((int64) (t % rows) * (int64) this.kvDim
-                + (int64) d);
         }
-        int32 blk = this.tables[sl * this.blocksPerSeq + t / this.blockTokens];
-        int64 half = 0;
-        if (isV) {
-            half = (int64) this.blockTokens;
-        }
-        return this.pool.flatGet(((int64) blk * 2 * (int64) this.blockTokens
-            + half + (int64) (t % this.blockTokens)) * (int64) this.kvDim
-            + (int64) d);
+        Tensor<float32> r = this.rowSrc(sl, t, isV);
+        return r.flatGet(this.rowBase(sl, t, isV) + (int64) d);
     }
 
     // ── in-place attention reads (6.13 precursor; 8.2.5) ────────────────
@@ -475,26 +386,6 @@ public final class PagedKvCache {
         }
         int32 group = nHeads / nKv;
         int32 count = p + 1 - from;
-        // `srcOf` depends only on (sl, isV) — hoisted out of every loop.
-        // It was called once per (h, t) for K and once per (h, t, d) for V.
-        Tensor<float32> srcK = this.srcOf(sl, false);
-        Tensor<float32> srcV = this.srcOf(sl, true);
-        // RAW BUFFERS, not `flatGet`/`flatSet`. This loop performs ~3.1M
-        // multiply-accumulates per token (12 positions x 32 heads x 128 dims
-        // x 32 layers, K and V), which is ~6M accessor calls — and the
-        // accessor, not the arithmetic, was the cost: it measured 105
-        // ms/token, more than all 224 projections together. `MatvecProbe`
-        // already carries a "raw arrays, no Tensor/Storage accessors" arm
-        // for exactly this reason, and `Linear.matvecInto` already reads
-        // `hostBuffer()`/`hostBase()`.
-        //
-        // Hoisting `srcOf`/`rowBase` out of the inner body was tried FIRST
-        // and changed nothing (272.5 vs 263.8 ms) — LLVM was already
-        // sinking them. The accessors were what remained.
-        float32[] kb = srcK.hostBuffer();
-        int64 kbase = srcK.hostBase();
-        float32[] vb = srcV.hostBuffer();
-        int64 vbase = srcV.hostBase();
         float32[] qb = q.hostBuffer();
         int64 qbase0 = q.hostBase();
         float32[] sb = scores.hostBuffer();
@@ -506,19 +397,25 @@ public final class PagedKvCache {
             int32 kvh = h / group;
             int64 qBase = qOff + (int64) (h * headDim);
             int64 kvHead = (int64) (kvh * headDim);
+            int64 qr = qbase0 + qBase;
             int64 t = 0;
             while (t < (int64) count) {
                 int32 tp = from + (int32) t;
-                float32 s = 0.0f;
-                int64 kRow = kbase + this.rowBase(sl, tp, false) + kvHead;
-                int64 qr = qbase0 + qBase;
-                int64 d = 0;
-                while (d < (int64) headDim) {
-                    s = s + qb[qr + d] * kb[kRow + d];
-                    d = d + 1;
+                int64 end = Math.min<int64>((int64) count, t + (int64) this.runOf(sl, tp));
+                Tensor<float32> srcK = this.rowSrc(sl, tp, false);
+                float32[] kb = srcK.hostBuffer();
+                int64 kRow = srcK.hostBase() + this.rowBase(sl, tp, false) + kvHead;
+                while (t < end) {
+                    float32 s = 0.0f;
+                    int64 d = 0;
+                    while (d < (int64) headDim) {
+                        s = s + qb[qr + d] * kb[kRow + d];
+                        d = d + 1;
+                    }
+                    sb[sbase + t] = s * scale;
+                    kRow = kRow + (int64) this.kvDim;
+                    t = t + 1;
                 }
-                sb[sbase + t] = s * scale;
-                t = t + 1;
             }
             float32 mx = sb[sbase];
             t = 1;
@@ -538,18 +435,6 @@ public final class PagedKvCache {
                 t = t + 1;
             }
             float32 rs = 1.0f / sum;
-            // POSITION-OUTER, not dim-outer. The dim-outer form called
-            // `srcOf` and `rowBase` from the INNERMOST body, where both are
-            // invariant in `d` — 128 x count of them per head, ~1.57M
-            // `rowBase` calls per token, each a modulo plus two array reads
-            // plus a branch. It measured 105 ms/token, more than all 224
-            // projections put together, for twelve positions of context.
-            //
-            // Bit-identity is preserved and that is why this shape was
-            // chosen over a wider rewrite: each output element still
-            // accumulates `t = 0..count-1` ASCENDING starting from 0.0f and
-            // is scaled by `rs` at the end, exactly as before. Only the
-            // traversal order of independent elements changed.
             int64 obase = obase0 + outOff + (int64) (h * headDim);
             int64 d = 0;
             while (d < (int64) headDim) {
@@ -559,14 +444,20 @@ public final class PagedKvCache {
             t = 0;
             while (t < (int64) count) {
                 int32 tp = from + (int32) t;
-                int64 vRow = vbase + this.rowBase(sl, tp, true) + kvHead;
-                float32 sc = sb[sbase + t];
-                d = 0;
-                while (d < (int64) headDim) {
-                    ob[obase + d] = ob[obase + d] + sc * vb[vRow + d];
-                    d = d + 1;
+                int64 end = Math.min<int64>((int64) count, t + (int64) this.runOf(sl, tp));
+                Tensor<float32> srcV = this.rowSrc(sl, tp, true);
+                float32[] vb = srcV.hostBuffer();
+                int64 vRow = srcV.hostBase() + this.rowBase(sl, tp, true) + kvHead;
+                while (t < end) {
+                    float32 sc = sb[sbase + t];
+                    d = 0;
+                    while (d < (int64) headDim) {
+                        ob[obase + d] = ob[obase + d] + sc * vb[vRow + d];
+                        d = d + 1;
+                    }
+                    vRow = vRow + (int64) this.kvDim;
+                    t = t + 1;
                 }
-                t = t + 1;
             }
             d = 0;
             while (d < (int64) headDim) {
@@ -578,34 +469,37 @@ public final class PagedKvCache {
         return;
     }
 
-    /** The tensor holding (seq, layer)'s K or V rows. */
-    Tensor<float32> srcOf(int32 sl, boolean isV) {
-        int32 layer = sl % this.layers;
-        if (this.layerWindow[layer] > 0) {
-            if (isV) {
-                return this.ringV[sl];
-            }
-            return this.ringK[sl];
+    /** The tensor holding position `tp` of (seq, layer)'s K or V rows. */
+    Tensor<float32> rowSrc(int32 sl, int32 tp, boolean isV) {
+        if (this.layerWindow[sl % this.layers] > 0) {
+            return this.ringOf(sl, isV);
         }
-        return this.pool;
+        return this.arenaOf(this.tables[sl * this.blocksPerSeq + tp / this.blockTokens]);
     }
 
-    /** Flat base of position `tp`'s K or V row within {@link #srcOf}. */
+    /** Flat base of position `tp`'s K or V row within {@link #rowSrc}. */
     int64 rowBase(int32 sl, int32 tp, boolean isV) {
-        int32 layer = sl % this.layers;
-        int32 w = this.layerWindow[layer];
+        int32 w = this.layerWindow[sl % this.layers];
         if (w > 0) {
             int32 rows = Math.min<int32>(this.maxSeqCap, w);
             return (int64) (tp % rows) * (int64) this.kvDim;
         }
-        int32 blk = this.tables[sl * this.blocksPerSeq
-            + tp / this.blockTokens];
+        int32 blk = this.tables[sl * this.blocksPerSeq + tp / this.blockTokens];
         int64 half = 0;
         if (isV) {
             half = (int64) this.blockTokens;
         }
-        return ((int64) blk * 2 * (int64) this.blockTokens + half
-            + (int64) (tp % this.blockTokens)) * (int64) this.kvDim;
+        return this.blockBase(blk) + (half + (int64) (tp % this.blockTokens)) * (int64) this.kvDim;
+    }
+
+    /** Positions from `tp` on that sit in consecutive rows of one tensor. */
+    int32 runOf(int32 sl, int32 tp) {
+        int32 w = this.layerWindow[sl % this.layers];
+        if (w > 0) {
+            int32 rows = Math.min<int32>(this.maxSeqCap, w);
+            return rows - tp % rows;
+        }
+        return this.blockTokens - tp % this.blockTokens;
     }
 
     // ── sharing (6.14, 6.15) and lifecycle (6.24 precursor) ─────────────
@@ -631,12 +525,12 @@ public final class PagedKvCache {
                     + " exceeds source length " + this.lenSL[ssl]);
             }
             int32 w = this.layerWindow[l];
-            if (w > 0) {
+            if (w > 0 && (this.ringK[ssl] != null || this.ringK[dsl] != null)) {
                 int32 rows = Math.min<int32>(this.maxSeqCap, w);
-                Tensor<float32> sk = this.ringK[ssl];
-                Tensor<float32> sv = this.ringV[ssl];
-                Tensor<float32> dk = this.ringK[dsl];
-                Tensor<float32> dv = this.ringV[dsl];
+                Tensor<float32> sk = this.ringOf(ssl, false);
+                Tensor<float32> sv = this.ringOf(ssl, true);
+                Tensor<float32> dk = this.ringOf(dsl, false);
+                Tensor<float32> dv = this.ringOf(dsl, true);
                 int64 n = (int64) rows * (int64) this.kvDim;
                 int64 j = 0;
                 while (j < n) {
@@ -644,7 +538,7 @@ public final class PagedKvCache {
                     dv.flatSet(j, sv.flatGet(j));
                     j = j + 1;
                 }
-            } else {
+            } else if (w == 0) {
                 int32 nb = (prefixTokens + this.blockTokens - 1)
                     / this.blockTokens;
                 int32 bi = 0;
@@ -683,12 +577,12 @@ public final class PagedKvCache {
         }
         int32 sl = seq * this.layers + layer;
         int32 blk = this.tables[sl * this.blocksPerSeq + bi];
-        int64 base = (int64) blk * 2 * (int64) this.blockTokens
-            * (int64) this.kvDim;
-        int64 n = 2 * (int64) this.blockTokens * (int64) this.kvDim;
+        Tensor<float32> ar = this.arenaOf(blk);
+        int64 base = this.blockBase(blk);
+        int64 n = this.blockFloats();
         int64 j = 0;
         while (j < n) {
-            int32 bits = Cajeta.f32ToBits(this.pool.flatGet(base + j));
+            int32 bits = Cajeta.f32ToBits(ar.flatGet(base + j));
             int32 at = (int32) (j * 4);
             dst[at] = (int8) (bits & 255);
             dst[at + 1] = (int8) ((bits >>> 8) & 255);
@@ -722,9 +616,9 @@ public final class PagedKvCache {
         int32 blk = this.freeList[this.freeCount];
         this.refCount[blk] = 1;
         this.tables[sl * this.blocksPerSeq + bi] = blk;
-        int64 base = (int64) blk * 2 * (int64) this.blockTokens
-            * (int64) this.kvDim;
-        int64 n = 2 * (int64) this.blockTokens * (int64) this.kvDim;
+        Tensor<float32> ar = this.arenaOf(blk);
+        int64 base = this.blockBase(blk);
+        int64 n = this.blockFloats();
         int64 j = 0;
         while (j < n) {
             int32 at = (int32) (j * 4);
@@ -732,7 +626,7 @@ public final class PagedKvCache {
                 | (((int32) src[at + 1] & 255) << 8)
                 | (((int32) src[at + 2] & 255) << 16)
                 | (((int32) src[at + 3] & 255) << 24);
-            this.pool.flatSet(base + j, Cajeta.bitsToF32(bits));
+            ar.flatSet(base + j, Cajeta.bitsToF32(bits));
             j = j + 1;
         }
         this.lenSL[sl] = (bi + 1) * this.blockTokens;
