@@ -5,8 +5,10 @@ import cajeta.xpu.Device;
 import dev.cajeta.unit.AfterEach;
 import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
+import dev.cajeta.llm.LlmException;
 import dev.cajeta.llm.bench.Metrics;
 import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.DeviceKv;
 import dev.cajeta.llm.model.KvPool;
 import dev.cajeta.llm.sched.Request;
 import dev.cajeta.llm.sched.Scheduler;
@@ -23,6 +25,7 @@ public class KvPagingTest {
     @AfterEach
     public void restore() {
         KvPool.setBudgetBytes(0L);
+        DeviceKv.setRingSlack(256);
         return;
     }
 
@@ -99,5 +102,97 @@ public class KvPagingTest {
         System.stdout.println("  kv-paging 1.1: preempted " + pre + ", held " + heldB[0] + " of budget " + budget
             + " (unbudgeted " + heldFree[0] + "), worst step kl " + worst);
         Assert.isTrue(worst <= klMax);
+    }
+
+    static final int32 STEPS = 16;
+
+    /** Prefills `prompt` rows of the windowed toy, then {@link #STEPS} greedy steps; with `evictAt` >= 0 the sequence
+     *  is evicted after that many steps, a step refuses, and it resumes by recomputing every position. Each step's
+     *  logits land in `logits`; returns the device bytes the eviction freed. */
+    static int64 decodeRing(int32 prompt, int32 evictAt, int32[] toks, float32[] logits) {
+        int32 v = WindowRingDeviceTest.V;
+        CausalLM m #= WindowRingDeviceTest.mk(128, true);
+        int32[] all = heap int32[(int64) (prompt + KvPagingTest.STEPS + 1)];
+        int32[] p #= RoutableFixtureTest.promptOf(prompt, 3);
+        int32 i = 0;
+        while (i < prompt) { all[(int64) i] = p[(int64) i]; i = i + 1; }
+        int32 nxt = m.prefill(p, prompt);
+        int32[] one = heap int32[1];
+        float32[] last = heap float32[(int64) v];
+        int64 freed = 0L;
+        int32 g = 0;
+        while (g < KvPagingTest.STEPS) {
+            if (g == evictAt) {
+                freed = m.evictSeq(0);
+                one[0] = nxt;
+                boolean threw = false;
+                String msg = "";
+                try {
+                    m.stepSeq(0, one, 0, 1);
+                } catch (LlmException ex) {
+                    threw = true;
+                    msg #= ex.message.substring(0, ex.message.byteLength());
+                }
+                Assert.isTrue(threw);
+                Assert.isTrue(msg.indexOf("evicted") >= 0L);
+                m.releaseSeq(0);
+                int32 again = m.prefill(all, prompt + g);
+                Assert.equals((int64) nxt, (int64) again);
+            }
+            all[(int64) (prompt + g)] = nxt;
+            one[0] = nxt;
+            nxt = m.stepSeq(0, one, 0, 1);
+            toks[g] = nxt;
+            FourNormDeviceTest.copyLogits(m, last);
+            int64 j = 0L;
+            while (j < (int64) v) { logits[(int64) g * (int64) v + j] = last[j]; j = j + 1L; }
+            g = g + 1;
+        }
+        return freed;
+    }
+
+    /** kv-paging 2.2: a windowed sequence (rings included) evicted mid-decode refuses a step by name, then resumes by
+     *  recompute to its unevicted twin's tokens and logits, at prefill 70 and at 200 where the rings have wrapped. */
+    @Test
+    public void anEvictedRingSequenceResumesByRecomputeToItsTwin() {
+        if (!FourNormDeviceTest.deviceHere()) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        DeviceKv.setRingSlack(64);
+        int32 v = WindowRingDeviceTest.V;
+        String be #= Device.activeBackend();
+        float64 klMax = 1.0e-6;
+        if (be.equals("cpu")) { klMax = 1.0e-5; }
+        int32[] prompts = heap int32[2L];
+        prompts[0L] = 70;
+        prompts[1L] = 200;
+        int64 c = 0L;
+        while (c < 2L) {
+            int32 pr = prompts[c];
+            int32[] tt = heap int32[(int64) KvPagingTest.STEPS];
+            float32[] lt = heap float32[(int64) KvPagingTest.STEPS * (int64) v];
+            KvPagingTest.decodeRing(pr, 0 - 1, tt, lt);
+            int32[] te = heap int32[(int64) KvPagingTest.STEPS];
+            float32[] le = heap float32[(int64) KvPagingTest.STEPS * (int64) v];
+            int64 freed = KvPagingTest.decodeRing(pr, KvPagingTest.STEPS / 2, te, le);
+            Assert.isTrue(freed > 0L);
+            float64 worst = 0.0;
+            int64 g = 0L;
+            while (g < (int64) KvPagingTest.STEPS) {
+                Assert.equals((int64) tt[g], (int64) te[g]);
+                float32[] x = heap float32[(int64) v];
+                float32[] y = heap float32[(int64) v];
+                int64 j = 0L;
+                while (j < (int64) v) { x[j] = lt[g * (int64) v + j]; y[j] = le[g * (int64) v + j]; j = j + 1L; }
+                float64 kl = Metrics.softmaxKl(x, y, v);
+                if (kl > worst) { worst = kl; }
+                g = g + 1L;
+            }
+            System.stdout.println("  kv-paging 2.2: prefill " + pr + ", evicted " + freed + " bytes at step "
+                + (KvPagingTest.STEPS / 2) + ", worst step kl " + worst);
+            Assert.isTrue(worst <= klMax);
+            c = c + 1L;
+        }
     }
 }

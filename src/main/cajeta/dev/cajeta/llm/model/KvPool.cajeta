@@ -32,6 +32,7 @@ public final class KvPool {
     KernelBuffer<int32> tab;
     int32[] th;
     int32[] logical;
+    boolean[] gone;
     int32[] kCap;
     int32[] kHi;
     int64 nCopied;
@@ -195,6 +196,7 @@ public final class KvPool {
         this.v #= heap KernelBuffer<float16>[(int64) this.layers];
         this.th #= heap int32[0L];
         this.logical #= heap int32[0L];
+        this.gone #= heap boolean[0L];
         this.kCap #= heap int32[(int64) this.nKinds];
         this.kHi #= heap int32[(int64) this.nKinds];
         this.free #= heap KvFreeList[(int64) this.nKinds];
@@ -232,6 +234,7 @@ public final class KvPool {
     /** {@link #ensureRows}, or false with nothing drawn when some kind lacks the blocks even after growing within
      *  {@link #growRoom} (kv-paging 1). */
     public boolean tryEnsureRows(int32 slot, int32 upTo) {
+        this.refuseEvicted(slot);
         int32 nb = KvPage.blocksFor(upTo);
         if (nb > this.nLog) {
             throw heap LlmException("kv pool: " + upTo + " positions exceed the capacity " + this.cap);
@@ -304,6 +307,7 @@ public final class KvPool {
     /** Give slot `slot` the blocks its positions `[0, upTo)` fall in, from each kind's free list; a ring kind draws
      *  at most its R and repeats them. The table is uploaded at the next {@link #flush}. */
     public void ensureRows(int32 slot, int32 upTo) {
+        this.refuseEvicted(slot);
         int32 nb = KvPage.blocksFor(upTo);
         if (nb > this.nLog) {
             throw heap LlmException("kv pool: " + upTo + " positions exceed the capacity " + this.cap);
@@ -358,7 +362,73 @@ public final class KvPool {
             this.logical[(int64) at] = 0;
             kd = kd + 1;
         }
+        this.gone[(int64) slot] = false;
         return;
+    }
+
+    /** Throws, naming the slot, when slot `slot` was evicted and not yet released: its rows are not resident. */
+    public void refuseEvicted(int32 slot) {
+        if (slot >= 0 && slot < this.nSlots && this.gone[(int64) slot]) {
+            throw heap LlmException("kv pool: slot " + slot + " is evicted; restore or recompute it before a step");
+        }
+        return;
+    }
+
+    /** Whether slot `slot` was evicted and not yet released. */
+    public boolean isEvicted(int32 slot) {
+        return slot >= 0 && slot < this.nSlots && this.gone[(int64) slot];
+    }
+
+    /** Distinct blocks slot `slot` holds in kind `kd`: its drawn blocks, at most a ring's R (kv-paging 2.1). */
+    public int32 unitBlocks(int32 slot, int32 kd) {
+        int32 n = this.logical[(int64) (slot * this.nKinds + kd)];
+        int32 r = this.kBlocks[(int64) kd];
+        if (n > r) { n = r; }
+        return n;
+    }
+
+    /** The block ids of slot `slot`'s unit, kind by kind in table order. */
+    public #int32[] unitOf(int32 slot) {
+        int32 total = 0;
+        int32 kd = 0;
+        while (kd < this.nKinds) { total = total + this.unitBlocks(slot, kd); kd = kd + 1; }
+        int32[] ids #= heap int32[(int64) total];
+        int32 at = 0;
+        kd = 0;
+        while (kd < this.nKinds) {
+            int32 base = this.tableBase(slot, kd);
+            int32 b = 0;
+            while (b < this.unitBlocks(slot, kd)) {
+                ids[(int64) at] = this.th[(int64) (base + b)];
+                at = at + 1;
+                b = b + 1;
+            }
+            kd = kd + 1;
+        }
+        return #ids;
+    }
+
+    /** Device bytes slot `slot`'s unit holds over every layer, K and V. */
+    public int64 unitBytes(int32 slot) {
+        int64 n = 0L;
+        int32 l = 0;
+        while (l < this.layers) {
+            n = n + (int64) this.unitBlocks(slot, this.kindOf(l)) * (int64) KvPage.BLOCK * (int64) this.kvDim * 4L;
+            l = l + 1;
+        }
+        return n;
+    }
+
+    /** Return slot `slot`'s whole unit to the free lists and mark it evicted, so a draw for it refuses until
+     *  {@link #release}; returns the blocks freed. */
+    public int32 evict(int32 slot) {
+        if (slot < 0 || slot >= this.nSlots) { return 0; }
+        int32 n = 0;
+        int32 kd = 0;
+        while (kd < this.nKinds) { n = n + this.unitBlocks(slot, kd); kd = kd + 1; }
+        this.release(slot);
+        this.gone[(int64) slot] = true;
+        return n;
     }
 
     /** Upload the table if a draw changed it, after the stream drains so no step in flight reads it half written. */
@@ -445,6 +515,10 @@ public final class KvPool {
         i = 0L;
         while (i < this.logical.count()) { nlg[i] = this.logical[i]; i = i + 1L; }
         this.logical #= nlg;
+        boolean[] ng #= heap boolean[(int64) n];
+        i = 0L;
+        while (i < this.gone.count()) { ng[i] = this.gone[i]; i = i + 1L; }
+        this.gone #= ng;
         if (this.tab != null) {
             KernelStream s = QuantKernel.stream();
             s.sync();
