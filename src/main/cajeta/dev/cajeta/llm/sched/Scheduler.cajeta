@@ -100,6 +100,7 @@ public final class Scheduler {
         this.tok = null;
         this.tailIds #= heap int32[16];
         this.logitsHashSteps = 0;
+        this.keepLogits = false;
     }
 
     /** Fingerprint each request's logits bit for bit for its first `steps` steps
@@ -107,8 +108,16 @@ public final class Scheduler {
      *  logits and run unpipelined, so this is an instrument, not a mode. */
     public void setLogitsHash(int32 steps) {
         this.logitsHashSteps = steps;
+        this.keepLogits = false;
     }
     int32 logitsHashSteps;
+    boolean keepLogits;
+
+    /** {@link #setLogitsHash}, also keeping each of those steps' logits (`Request.keptLogits`). */
+    public void setLogitsKeep(int32 steps) {
+        this.logitsHashSteps = steps;
+        this.keepLogits = steps > 0;
+    }
 
     boolean hashesStep(Request r) {
         return this.logitsHashSteps > 0 && r.genCount < this.logitsHashSteps;
@@ -119,6 +128,14 @@ public final class Scheduler {
         Tensor<float32> t = this.model.logits();
         if (r.logitsHashes == null) { r.logitsHashes = heap int64[this.logitsHashSteps]; }
         r.logitsHashes[r.logitsHashN] = HostOps.bitFingerprint(t.hostBuffer(), t.hostBase(), v);
+        if (this.keepLogits) {
+            if (r.logitsKept == null) { r.logitsKept = heap float32[(int64) this.logitsHashSteps * v]; }
+            float32[] tb = t.hostBuffer();
+            int64 tb0 = t.hostBase();
+            int64 at = (int64) r.logitsHashN * v;
+            int64 j = 0L;
+            while (j < v) { r.logitsKept[at + j] = tb[tb0 + j]; j = j + 1L; }
+        }
         r.logitsHashN = r.logitsHashN + 1;
         return;
     }
@@ -450,7 +467,8 @@ public final class Scheduler {
                 // Per-item headroom: preempt YOUNGER requests until this
                 // item fits; if this request is itself the youngest, it
                 // yields (preempts itself) instead (6.22).
-                while (cache.blocksNeededFor(r.slot, n) > cache.freeBlocks()) {
+                while (cache.blocksNeededFor(r.slot, n) > cache.freeBlocks()
+                        || !this.model.tryDeviceKvRows(r.slot, r.cachedLen + n)) {
                     int32 victim = this.youngestRunning();
                     if (victim < 0) {
                         throw heap LlmException(
@@ -1069,6 +1087,14 @@ public final class Scheduler {
             if (bt > cache.freeBlocks()) {
                 return;
             }
+            // kv-paging 1: on the device route the pool's blocks, not the host cache's, bound admission.
+            if (!this.model.tryDeviceKvRows(slot, r.totalLen + 1)) {
+                if (this.youngestRunning() < 0) {
+                    throw heap LlmException("scheduler: request " + pick + " needs " + (r.totalLen + 1)
+                        + " positions of device KV, more than the pool can hold with nothing else running");
+                }
+                return;
+            }
             this.slotReq[slot] = pick;
             // Unit 30: a new occupant's routing starts from zero.
             if (Diag.on()) {
@@ -1175,6 +1201,10 @@ public final class Scheduler {
     /** Write `r`'s FULL cached blocks to the store (6.16). */
     void saveBlocks(Request r) {
         if (this.store == null) {
+            return;
+        }
+        // The host cache trails device planes until a writeback; the device route's store tier is kv-paging 5.
+        if (this.model.deviceKvHolds(r.slot)) {
             return;
         }
         PagedKvCache cache = this.model.kvCache();

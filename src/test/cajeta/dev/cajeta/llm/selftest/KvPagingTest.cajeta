@@ -1,0 +1,103 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.lang.String;
+import cajeta.xpu.Device;
+import dev.cajeta.unit.AfterEach;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+import dev.cajeta.llm.bench.Metrics;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.model.KvPool;
+import dev.cajeta.llm.sched.Request;
+import dev.cajeta.llm.sched.Scheduler;
+
+/** kv-paging unit 1: on the device route, admission and preemption count the device pool, so a pool that cannot
+ *  hold every sequence preempts and recomputes rather than refusing a growth. */
+public class KvPagingTest {
+
+    static final int32 PROMPT = 20;
+    static final int32 GEN = 100;
+
+    public KvPagingTest() { return; }
+
+    @AfterEach
+    public void restore() {
+        KvPool.setBudgetBytes(0L);
+        return;
+    }
+
+    /** Runs two requests of PROMPT + GEN through a fresh two-slot model, keeping every step's logits; returns the
+     *  scheduler's preemption count, the model's held device KV bytes in `held[0]`. */
+    static int32 runTwo(int64 budget, int32[] toks, float32[] logits, int64[] held) {
+        KvPool.setBudgetBytes(budget);
+        CausalLM m #= RoutableFixtureTest.mk(2);
+        Scheduler s = heap Scheduler(m, 4);
+        s.setLogitsKeep(KvPagingTest.GEN);
+        int32[] pa #= RoutableFixtureTest.promptOf(KvPagingTest.PROMPT, 9);
+        int32[] pb #= RoutableFixtureTest.promptOf(KvPagingTest.PROMPT, 4);
+        int32 a = s.submit(pa, KvPagingTest.PROMPT, KvPagingTest.GEN);
+        int32 b = s.submit(pb, KvPagingTest.PROMPT, KvPagingTest.GEN);
+        s.runAll(2000);
+        Assert.isTrue(s.allDone());
+        int64 v = (int64) m.vocabSize();
+        int32 q = 0;
+        while (q < 2) {
+            Request r = s.request(q == 0 ? a : b);
+            Assert.equals((int64) KvPagingTest.GEN, (int64) r.generatedCount());
+            float32[] kept = r.keptLogits();
+            int64 i = 0L;
+            while (i < (int64) KvPagingTest.GEN) {
+                toks[(int64) q * (int64) KvPagingTest.GEN + i] = r.generatedAt((int32) i);
+                i = i + 1L;
+            }
+            int64 base = (int64) q * (int64) KvPagingTest.GEN * v;
+            int64 j = 0L;
+            while (j < (int64) KvPagingTest.GEN * v) { logits[base + j] = kept[j]; j = j + 1L; }
+            q = q + 1;
+        }
+        held[0] = m.deviceKvHeldBytes();
+        return s.preemptedCount();
+    }
+
+    /** kv-paging 1.1: a device budget of one and a half sequences admits two; the younger is preempted and
+     *  recomputed instead of a growth being refused, and both match the unbudgeted run by token and by KL. */
+    @Test
+    public void aDevicePoolShortOfBothSequencesPreemptsAndRecomputes() {
+        CausalLM probe #= RoutableFixtureTest.mk(2);
+        if (!RoutableFixtureTest.deviceHere(probe)) {
+            RoutableFixtureTest.saySkip();
+            return;
+        }
+        int64 v = (int64) probe.vocabSize();
+        int64 n = 2L * (int64) KvPagingTest.GEN;
+        int32[] tf = heap int32[n];
+        float32[] lf = heap float32[n * v];
+        int64[] heldFree = heap int64[1L];
+        Assert.equals(0L, (int64) KvPagingTest.runTwo(0L, tf, lf, heldFree));
+        int64 budget = heldFree[0] * 3L / 4L;
+        int32[] tb = heap int32[n];
+        float32[] lb = heap float32[n * v];
+        int64[] heldB = heap int64[1L];
+        int32 pre = KvPagingTest.runTwo(budget, tb, lb, heldB);
+        Assert.isTrue(pre >= 1);
+        Assert.isTrue(heldB[0] <= budget);
+        String be #= Device.activeBackend();
+        float64 klMax = 1.0e-6;
+        if (be.equals("cpu")) { klMax = 1.0e-5; }
+        float64 worst = 0.0;
+        int64 i = 0L;
+        while (i < n) {
+            Assert.equals((int64) tf[i], (int64) tb[i]);
+            float32[] x = heap float32[v];
+            float32[] y = heap float32[v];
+            int64 j = 0L;
+            while (j < v) { x[j] = lf[i * v + j]; y[j] = lb[i * v + j]; j = j + 1L; }
+            float64 kl = Metrics.softmaxKl(x, y, (int32) v);
+            if (kl > worst) { worst = kl; }
+            i = i + 1L;
+        }
+        System.stdout.println("  kv-paging 1.1: preempted " + pre + ", held " + heldB[0] + " of budget " + budget
+            + " (unbudgeted " + heldFree[0] + "), worst step kl " + worst);
+        Assert.isTrue(worst <= klMax);
+    }
+}
