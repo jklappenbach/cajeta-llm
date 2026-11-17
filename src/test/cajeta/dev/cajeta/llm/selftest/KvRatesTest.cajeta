@@ -1,0 +1,241 @@
+package dev.cajeta.llm.selftest;
+
+import cajeta.collection.ArrayList;
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import cajeta.time.Clock;
+import cajeta.wire.Encoder;
+import cajeta.xpu.Autotune;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.sched.KvRateProbe;
+import dev.cajeta.llm.sched.KvRates;
+import dev.cajeta.llm.sched.ModelRateProbe;
+import dev.cajeta.llm.sched.Scheduler;
+import dev.cajeta.llm.store.BlockStore;
+import dev.cajeta.llm.store.I64Codec;
+import dev.cajeta.unit.Assert;
+import dev.cajeta.unit.Test;
+
+/** kv-paging unit 3: measured rates, kept in the tune dir, decide whether an evicted unit is kept or recomputed. */
+public class KvRatesTest {
+
+    public KvRatesTest() { return; }
+
+    static #String freshDir(String tag) {
+        return #("/tmp/cajeta_llm_kvrates_" + tag + "_" + Clock.nanoTime());
+    }
+
+    static void rmTree(String dir) {
+        Path p #= Path.of(dir);
+        if (!p.exists()) { return; }
+        if (p.isDir()) {
+            ArrayList<Path> kids #= p.list();
+            int32 i = 0;
+            while (i < kids.count()) {
+                String k #= kids.get(i).toString();
+                KvRatesTest.rmTree(k);
+                i = i + 1;
+            }
+        }
+        p.delete();
+        return;
+    }
+
+    /** Proton-shaped rates: 25 GB/s up with 10 us per transfer, a 2 GB/s store, prefill 3000/2500/1500 tok/s. */
+    static #KvRates typical() {
+        KvRates r = heap KvRates();
+        r.setTransfer(KvRates.H2D, 10000, 25000);
+        r.setTransfer(KvRates.D2H, 10000, 25000);
+        r.setTransfer(KvRates.STORE_WRITE, 50000, 2000);
+        r.setTransfer(KvRates.STORE_READ, 50000, 2000);
+        r.setPrefill(0, 3000);
+        r.setPrefill(1, 2500);
+        r.setPrefill(2, 1500);
+        return #r;
+    }
+
+    /** 3.1: a long unit is kept in the cheapest tier with room; a unit cheaper to recompute is dropped. */
+    @Test
+    public void aUnitIsKeptInTheCheapestTierWithRoomUnlessRecomputeCostsLess() {
+        KvRates r #= KvRatesTest.typical();
+        int64 big = 200000000L;
+        // 4096 tokens: about 1.9 s to recompute against 8 ms from host or 108 ms from the store.
+        Assert.equals((int64) KvRates.HOST, (int64) r.choose(big, 4096, true, true));
+        Assert.equals((int64) KvRates.STORE, (int64) r.choose(big, 4096, false, true));
+        Assert.equals((int64) KvRates.DROP, (int64) r.choose(big, 4096, false, false));
+        Assert.equals((int64) 2167, r.prefillRate(4096));
+        // A slow store: 200 MB at 100 MB/s is 2 s, more than recomputing 4096 tokens.
+        r.setTransfer(KvRates.STORE_READ, 50000, 100);
+        Assert.equals((int64) KvRates.DROP, (int64) r.choose(big, 4096, false, true));
+        Assert.equals((int64) KvRates.HOST, (int64) r.choose(big, 4096, true, true));
+        // A 20 ms fixed cost per transfer against 16 tokens recomputed in 5.3 ms.
+        r.setTransfer(KvRates.H2D, 20000000, 25000);
+        Assert.equals((int64) KvRates.DROP, (int64) r.choose(2000000L, 16, true, false));
+        Assert.equals((int64) KvRates.HOST, (int64) r.choose(big, 4096, true, false));
+    }
+
+    /** 3.1: before anything is measured the choice keeps whenever a tier has room. */
+    @Test
+    public void withNoRatesMeasuredAUnitIsKeptWhenATierHasRoom() {
+        KvRates r = heap KvRates();
+        Assert.isFalse(r.measured());
+        Assert.equals((int64) KvRates.HOST, (int64) r.choose(16L, 1, true, true));
+        Assert.equals((int64) KvRates.STORE, (int64) r.choose(16L, 1, false, true));
+        Assert.equals((int64) KvRates.DROP, (int64) r.choose(16L, 1, false, false));
+        // Transfers measured, prefill not: still keep.
+        r.setTransfer(KvRates.H2D, 20000000, 25000);
+        r.setTransfer(KvRates.STORE_READ, 20000000, 25000);
+        Assert.equals((int64) KvRates.HOST, (int64) r.choose(16L, 1, true, true));
+        Assert.equals((int64) -1, r.recomputeNs(16));
+    }
+
+    /** 3.2: rates are measured once, written under this device's key in the tune dir, and reloaded without probing. */
+    @Test
+    public void ratesAreMeasuredOnceAndReloadedFromTheTuneDir() {
+        String dir #= KvRatesTest.freshDir("once");
+        FakeRateProbe p = heap FakeRateProbe(8192);
+        KvRates a #= KvRates.ensure(dir, "toy/F16 a", p);
+        Assert.isTrue(a.measured());
+        Assert.equals((int64) (KvRates.OPS * 2 * KvRates.REPS + KvRates.PF_POINTS * KvRates.PF_REPS), (int64) p.calls);
+        Assert.equals((int64) a.probeCalls(), (int64) p.calls);
+        // The fake's truth: 25 GB/s and 10 us up, 12 GB/s and 15 us down, a 2 GB/s and 1.5 GB/s store at 40 us.
+        Assert.isTrue(a.megabytesPerSec(KvRates.H2D) >= 24900 && a.megabytesPerSec(KvRates.H2D) <= 25100);
+        Assert.isTrue(a.latencyNs(KvRates.H2D) >= 9900 && a.latencyNs(KvRates.H2D) <= 10100);
+        Assert.isTrue(a.megabytesPerSec(KvRates.D2H) >= 11900 && a.megabytesPerSec(KvRates.D2H) <= 12100);
+        Assert.isTrue(a.megabytesPerSec(KvRates.STORE_READ) >= 1990 && a.megabytesPerSec(KvRates.STORE_READ) <= 2010);
+        Assert.isTrue(a.megabytesPerSec(KvRates.STORE_WRITE) >= 1490 && a.megabytesPerSec(KvRates.STORE_WRITE) <= 1510);
+        Assert.equals((int64) 3000, (int64) a.prefillTokensPerSec(0));
+        Assert.equals((int64) 2500, (int64) a.prefillTokensPerSec(1));
+        Assert.equals((int64) 1500, (int64) a.prefillTokensPerSec(2));
+        String home #= dir + "/" + Autotune.deviceKey();
+        Path m0 #= Path.of(home + "/kvrate.mbs.0");
+        Path pf #= Path.of(home + "/kvrate.pf.toy_F16_a.8192");
+        Assert.isTrue(m0.exists());
+        Assert.isTrue(pf.exists());
+
+        FakeRateProbe q = heap FakeRateProbe(8192);
+        KvRates b #= KvRates.ensure(dir, "toy/F16 a", q);
+        Assert.equals((int64) 0, (int64) q.calls);
+        Assert.equals((int64) a.megabytesPerSec(KvRates.H2D), (int64) b.megabytesPerSec(KvRates.H2D));
+        Assert.equals((int64) a.latencyNs(KvRates.STORE_READ), (int64) b.latencyNs(KvRates.STORE_READ));
+        Assert.equals((int64) 1500, (int64) b.prefillTokensPerSec(2));
+
+        // Another model on the same machine measures only its prefill, up to what it can hold.
+        FakeRateProbe s = heap FakeRateProbe(2048);
+        KvRates c #= KvRates.ensure(dir, "toy/F16 b", s);
+        Assert.equals((int64) (2 * KvRates.PF_REPS), (int64) s.calls);
+        Assert.equals((int64) 0, (int64) c.prefillTokensPerSec(2));
+        Assert.equals((int64) 2500, c.prefillRate(8192));
+        KvRatesTest.rmTree(dir);
+    }
+
+    /** 3.2: with no tune dir the rates are measured for this run and nothing is written. */
+    @Test
+    public void withNoTuneDirRatesAreMeasuredAndNotKept() {
+        FakeRateProbe p = heap FakeRateProbe(512);
+        KvRates a #= KvRates.ensure("", "toy", p);
+        Assert.isTrue(a.measured());
+        FakeRateProbe q = heap FakeRateProbe(512);
+        KvRates b #= KvRates.ensure("", "toy", q);
+        Assert.isTrue(q.calls > 0);
+    }
+
+    /** 3.3: the store path is skipped for a unit the rates say to recompute, and output still matches solo runs. */
+    @Test
+    public void aPreemptionTheRatesSayToRecomputeSkipsTheStore() {
+        String base = "/tmp/cajeta_llama_store_rates";
+        StoreTest.wipe(base);
+        CausalLM m #= StoreTest.mk("rates", 2, 20);
+        Encoder<int64> enc = heap I64Codec();
+        BlockStore s = heap BlockStore(base, m.kvCache().blockPayloadBytes(), 0, enc);
+        Scheduler sch = heap Scheduler(m, 4);
+        sch.attachStore(s, "toyR", "F32", "none");
+        KvRates slow = heap KvRates();
+        slow.setTransfer(KvRates.H2D, 1000000000, 1);
+        slow.setTransfer(KvRates.STORE_READ, 1000000000, 1);
+        slow.setPrefill(0, 1000000);
+        sch.useRates(slow);
+        int32[] pa #= SchedulerTest.promptOf(2, 9);
+        int32[] pb #= SchedulerTest.promptOf(8, 4);
+        int32 a = sch.submit(pa, 2, 30);
+        int32 b = sch.submit(pb, 8, 24);
+        sch.runAll(600);
+        Assert.isTrue(sch.preemptedCount() >= 1);
+        Assert.equals((int64) 0, (int64) sch.evictionsKept());
+        Assert.equals((int64) 0, (int64) sch.adoptedBlocks());
+        SchedulerTest.assertMatchesSolo(sch, a, pa, 2, 30);
+        SchedulerTest.assertMatchesSolo(sch, b, pb, 8, 24);
+        s.close();
+
+        String base2 = "/tmp/cajeta_llama_store_rates2";
+        StoreTest.wipe(base2);
+        CausalLM m2 #= StoreTest.mk("rates2", 2, 20);
+        BlockStore s2 = heap BlockStore(base2, m2.kvCache().blockPayloadBytes(), 0, enc);
+        Scheduler sch2 = heap Scheduler(m2, 4);
+        sch2.attachStore(s2, "toyR", "F32", "none");
+        KvRates fast #= KvRatesTest.typical();
+        sch2.useRates(fast);
+        int32 a2 = sch2.submit(pa, 2, 30);
+        int32 b2 = sch2.submit(pb, 8, 24);
+        sch2.runAll(600);
+        Assert.isTrue(sch2.preemptedCount() >= 1);
+        Assert.isTrue(sch2.evictionsKept() >= 1);
+        Assert.isTrue(sch2.adoptedBlocks() > 0);
+        SchedulerTest.assertMatchesSolo(sch2, a2, pa, 2, 30);
+        SchedulerTest.assertMatchesSolo(sch2, b2, pb, 8, 24);
+        s2.close();
+    }
+
+    /** 3.3: the model probe times every path and prefill on a toy model and removes its scratch file. */
+    @Test
+    public void theModelProbeMeasuresEveryRateOnAToyModel() {
+        String dir #= KvRatesTest.freshDir("probe");
+        CausalLM m #= StoreTest.mk("probe", 2, 0);
+        ModelRateProbe p = heap ModelRateProbe(m, 1, dir + "/scratch");
+        Assert.equals((int64) 64, (int64) p.maxPrefill());
+        KvRates r #= KvRates.ensure(dir, "toyP", p);
+        p.close();
+        int32 op = 0;
+        while (op < KvRates.OPS) {
+            Assert.isTrue(r.megabytesPerSec(op) > 0);
+            op = op + 1;
+        }
+        // The toy holds 64 positions, so no probe length fits and prefill stays unmeasured.
+        Assert.equals((int64) 0, r.prefillRate(512));
+        Path f #= Path.of(dir + "/scratch/kvrate-probe.bin");
+        Assert.isFalse(f.exists());
+        int64 t = p.prefillNs(48);
+        Assert.isTrue(t > 0L);
+        KvRatesTest.rmTree(dir);
+    }
+}
+
+/** Transfers at a fixed latency and bandwidth per path, prefill at 3000/2500/1500 tok/s; counts every call. */
+class FakeRateProbe implements KvRateProbe {
+    int32 calls;
+    int32 maxLen;
+
+    FakeRateProbe(int32 maxLen) {
+        this.calls = 0;
+        this.maxLen = maxLen;
+        return;
+    }
+
+    public int64 transferNs(int32 op, int64 bytes) {
+        this.calls = this.calls + 1;
+        if (op == KvRates.H2D) { return 10000L + bytes * 1000L / 25000L; }
+        if (op == KvRates.D2H) { return 15000L + bytes * 1000L / 12000L; }
+        if (op == KvRates.STORE_WRITE) { return 40000L + bytes * 1000L / 1500L; }
+        return 40000L + bytes * 1000L / 2000L;
+    }
+
+    public int64 prefillNs(int32 tokens) {
+        this.calls = this.calls + 1;
+        int64 rate = 3000L;
+        if (tokens >= 2048) { rate = 2500L; }
+        if (tokens >= 8192) { rate = 1500L; }
+        return (int64) tokens * 1000000000L / rate;
+    }
+
+    public int32 maxPrefill() { return this.maxLen; }
+}

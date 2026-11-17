@@ -56,6 +56,8 @@ public final class Scheduler {
     int32 steps;
     // Optional prefix block store (Unit 11; null = disabled, 6.32).
     BlockStore store;         // borrow; the caller keeps it alive
+    KvRates rates;
+    int32 keptN;
     String modelId;
     String modelDtype;
     String modelQuant;
@@ -94,6 +96,8 @@ public final class Scheduler {
         this.stamp = 0;
         this.steps = 0;
         this.store = null;
+        this.rates = null;
+        this.keptN = 0;
         this.modelId = null;
         this.modelDtype = null;
         this.modelQuant = null;
@@ -172,6 +176,16 @@ public final class Scheduler {
         this.modelDtype = "" + dtype;
         this.modelQuant = "" + quant;
         this.blockBuf = heap int8[this.model.kvCache().blockPayloadBytes()];
+    }
+
+    /** Decide each eviction with `rates` (kv-paging 3); without them a tier with room keeps the unit. */
+    public void useRates(KvRates rates) {
+        this.rates #= rates;
+    }
+
+    /** Evictions whose unit went to a tier rather than being dropped for recompute. */
+    public int32 evictionsKept() {
+        return this.keptN;
     }
 
     public int32 adoptedBlocks() {
@@ -1261,15 +1275,33 @@ public final class Scheduler {
         return best;
     }
 
+    /** Where `r`'s unit goes on eviction: the store when it holds the host route's full blocks and the rates do not
+     *  say recompute is cheaper, else {@link KvRates#DROP}. */
+    int32 evictTier(Request r) {
+        boolean storeRoom = this.store != null && !this.model.deviceKvHolds(r.slot)
+            && this.model.kvCache().fullLayers() == this.model.layerCount();
+        if (!storeRoom) { return KvRates.DROP; }
+        if (this.rates == null) { return KvRates.STORE; }
+        PagedKvCache cache = this.model.kvCache();
+        int64 bytes = (int64) (r.cachedLen / cache.blockTokensN()) * (int64) cache.blockPayloadBytes()
+            * (int64) this.model.layerCount();
+        return this.rates.choose(bytes, r.cachedLen, false, true);
+    }
+
     void preempt(int32 id) {
         Request r = this.reqs.get(id);
         // With a store attached, eviction is a WRITE, not a discard
         // (spec 13.16); without one, resume recomputes (6.32).
-        this.saveBlocks(r);
+        int32 tier = this.evictTier(r);
+        if (tier == KvRates.STORE) {
+            this.saveBlocks(r);
+            this.keptN = this.keptN + 1;
+        }
         int64 freed = this.model.evictSeq(r.slot);
         this.evictedBytesN = this.evictedBytesN + freed;
         if (Diag.on()) {
-            Diag.emit("sched-evict", id, null, (int64) this.steps, (int64) r.slot, (int64) r.cachedLen, freed, 0L, 0L);
+            Diag.emit("sched-evict", id, null, (int64) this.steps, (int64) r.slot, (int64) r.cachedLen, freed,
+                (int64) tier, 0L);
         }
         this.model.releaseSeq(r.slot);
         this.slotReq[r.slot] = -1;

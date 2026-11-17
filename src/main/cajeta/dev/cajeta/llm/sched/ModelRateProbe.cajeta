@@ -1,0 +1,106 @@
+package dev.cajeta.llm.sched;
+
+import cajeta.io.file.File;
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import cajeta.time.Clock;
+import cajeta.xpu.KernelBuffer;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.model.CausalLM;
+
+/**
+ * Times this machine for {@link KvRates}: host to device and back through a device buffer, the store path as a file
+ * written and read in `scratchDir` (through the page cache), and prefill on the free slot `seq` of `model`.
+ */
+public final class ModelRateProbe implements KvRateProbe {
+    CausalLM model;
+    int32 seq;
+    String scratch;
+    KernelBuffer<int8> dev;
+    int8[] host;
+    int64 onDisk;
+
+    public ModelRateProbe(CausalLM model, int32 seq, String scratchDir) {
+        this.model #= model;
+        this.seq = seq;
+        this.scratch = "" + scratchDir;
+        this.dev = null;
+        this.host = null;
+        this.onDisk = -1L;
+        return;
+    }
+
+    public int64 transferNs(int32 op, int64 bytes) {
+        this.buffers();
+        if (op == KvRates.H2D || op == KvRates.D2H) {
+            KernelStream.current().sync();
+            int64 t0 = Clock.nanoTime();
+            if (op == KvRates.H2D) { this.dev.upload(this.host, bytes); }
+            else { this.dev.download(this.host, bytes); }
+            KernelStream.current().sync();
+            return Clock.nanoTime() - t0;
+        }
+        String p #= this.path();
+        if (op == KvRates.STORE_WRITE || this.onDisk != bytes) {
+            Path d #= Path.of(this.scratch);
+            d.mkdirs();
+            int64 t0 = Clock.nanoTime();
+            File.writeAllBytes(p, this.host, bytes);
+            this.onDisk = bytes;
+            if (op == KvRates.STORE_WRITE) { return Clock.nanoTime() - t0; }
+        }
+        int64 t1 = Clock.nanoTime();
+        int8[] back #= File.readAllBytes(p);
+        int64 t = Clock.nanoTime() - t1;
+        if (back == null || (int64) back.count() != bytes) { return -1L; }
+        return t;
+    }
+
+    public int64 prefillNs(int32 tokens) {
+        int32[] ids = heap int32[(int64) tokens];
+        int32 v = this.model.vocabSize() - 16;
+        int32 i = 0;
+        while (i < tokens) {
+            ids[(int64) i] = 8 + (i * 7919) % v;
+            i = i + 1;
+        }
+        this.model.releaseSeq(this.seq);
+        KernelStream.current().sync();
+        int64 t0 = Clock.nanoTime();
+        int32 off = 0;
+        while (off < tokens) {
+            int32 n = tokens - off;
+            if (n > CausalLM.CHUNK_MAX) { n = CausalLM.CHUNK_MAX; }
+            this.model.stepSeq(this.seq, ids, off, n);
+            off = off + n;
+        }
+        KernelStream.current().sync();
+        int64 t = Clock.nanoTime() - t0;
+        this.model.releaseSeq(this.seq);
+        return t;
+    }
+
+    public int32 maxPrefill() { return this.model.maxSequenceLength(); }
+
+    /** Remove the scratch file the store timing wrote. */
+    public void close() {
+        Path p #= Path.of(this.path());
+        if (p.exists()) { p.delete(); }
+        this.onDisk = -1L;
+        return;
+    }
+
+    #String path() { return #(this.scratch + "/kvrate-probe.bin"); }
+
+    void buffers() {
+        if (this.host != null) { return; }
+        this.host = heap int8[KvRates.LARGE];
+        int64 i = 0L;
+        while (i < KvRates.LARGE) {
+            this.host[i] = (int8) (i % 127L);
+            i = i + 4096L;
+        }
+        this.dev = heap KernelBuffer<int8>((uint64) KvRates.LARGE);
+        return;
+    }
+}

@@ -1,0 +1,107 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelStream;
+import dev.cajeta.llm.EngineOptions;
+import dev.cajeta.llm.LlmEngine;
+import dev.cajeta.llm.model.CausalLM;
+import dev.cajeta.llm.sched.KvRates;
+import dev.cajeta.llm.sched.ModelRateProbe;
+
+/** kv-paging 3.4: this machine's KV rates for a model, kept in the tune dir, and restore against recompute by length. */
+public final class KvRatesBench {
+    private KvRatesBench() { }
+
+    /** `<model.gguf> [tune=DIR] [ctx=N]`: measure or reload the rates, then print the choice at each length. */
+    public static void run(String[] args) {
+        if (args.count() < 1) {
+            System.stdout.println("usage: <model.gguf> [tune=DIR] [ctx=N]");
+            return;
+        }
+        String path = args[0];
+        EngineOptions o #= heap EngineOptions(path);
+        o.ctx = SchedThroughput.intArg(args, "ctx=", 8256);
+        o.maxSeqs = 1;
+        String t #= SchedThroughput.strArg(args, "tune=");
+        if (t.byteLength() > 0) { o.tuneDir #= t.clone(); }
+        LlmEngine e #= LlmEngine.load(#o);
+        CausalLM m = e.model();
+        String tune #= LlmEngine.resolveTuneDir(t);
+        Path pp #= Path.of(path);
+        String model #= pp.name();
+        System.stdout.println("backend " + Device.activeBackend() + "  tune " + tune + "  model " + model);
+        ModelRateProbe probe = heap ModelRateProbe(m, 0, tune + "/kvrate-scratch");
+        int64 t0 = Clock.nanoTime();
+        KvRates r #= KvRates.ensure(tune, model, probe);
+        probe.close();
+        System.stdout.println("probe calls " + r.probeCalls() + "  ms " + (Clock.nanoTime() - t0) / 1000000L);
+        String[] names = heap String[4];
+        names[0] = "h2d"; names[1] = "d2h"; names[2] = "store-write"; names[3] = "store-read";
+        int32 op = 0;
+        while (op < KvRates.OPS) {
+            System.stdout.println("rate " + names[op] + "  MB/s " + r.megabytesPerSec(op) + "  latency us "
+                + r.latencyNs(op) / 1000);
+            op = op + 1;
+        }
+        int32 i = 0;
+        while (i < 3) {
+            System.stdout.println("rate prefill " + r.prefillLength(i) + "  tok/s " + r.prefillTokensPerSec(i));
+            i = i + 1;
+        }
+        int32[] lens = heap int32[9];
+        lens[0] = 1; lens[1] = 16; lens[2] = 64; lens[3] = 256; lens[4] = 512;
+        lens[5] = 1024; lens[6] = 2048; lens[7] = 4096; lens[8] = 8192;
+        int64 unit1 = 0L;
+        int32 k = 0;
+        while (k < 9) {
+            int32 len = lens[k];
+            if (len <= m.maxSequenceLength()) {
+                int64 bytes = KvRatesBench.unitAfter(m, len);
+                if (len == 1) { unit1 = bytes; }
+                System.stdout.println("len " + len + "  unit MB " + bytes / 1000000L
+                    + "  host-restore us " + r.restoreNs(KvRates.HOST, bytes) / 1000L
+                    + "  store-restore us " + r.restoreNs(KvRates.STORE, bytes) / 1000L
+                    + "  recompute us " + r.recomputeNs(len) / 1000L
+                    + "  choice host+store " + r.choose(bytes, len, true, true)
+                    + "  store only " + r.choose(bytes, len, false, true));
+            }
+            k = k + 1;
+        }
+        System.stdout.println("crossing host " + KvRatesBench.crossing(r, KvRates.HOST, unit1)
+            + "  crossing store " + KvRatesBench.crossing(r, KvRates.STORE, unit1) + "  (tokens, first block)");
+        return;
+    }
+
+    /** The first token count in the first block at which recompute costs at least a restore of `unit` from `tier`. */
+    static int32 crossing(KvRates r, int32 tier, int64 unit) {
+        int32 t = 1;
+        while (t <= 64) {
+            if (r.recomputeNs(t) >= r.restoreNs(tier, unit)) { return t; }
+            t = t + 1;
+        }
+        return 65;
+    }
+
+    /** Prefill `len` tokens on slot 0 and return the unit's device bytes, leaving the slot released. */
+    static int64 unitAfter(CausalLM m, int32 len) {
+        int32[] ids = heap int32[(int64) len];
+        int32 i = 0;
+        while (i < len) { ids[(int64) i] = 8 + (i * 7919) % (m.vocabSize() - 16); i = i + 1; }
+        m.releaseSeq(0);
+        int32 off = 0;
+        while (off < len) {
+            int32 n = len - off;
+            if (n > CausalLM.CHUNK_MAX) { n = CausalLM.CHUNK_MAX; }
+            m.stepSeq(0, ids, off, n);
+            off = off + n;
+        }
+        KernelStream.current().sync();
+        int64 b = m.unitBytesOf(0);
+        m.releaseSeq(0);
+        return b;
+    }
+}

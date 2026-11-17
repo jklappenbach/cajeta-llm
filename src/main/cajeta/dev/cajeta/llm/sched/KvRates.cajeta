@@ -1,0 +1,290 @@
+package dev.cajeta.llm.sched;
+
+import cajeta.error.Exception;
+import cajeta.io.file.File;
+import cajeta.io.file.Path;
+import cajeta.lang.String;
+import cajeta.lang.StringBuilder;
+import cajeta.xpu.Autotune;
+
+/**
+ * Measured restore and recompute rates for one machine, backend and model, kept in the tune dir, and the
+ * keep-or-drop choice made with them at eviction (kv-paging spec 4).
+ */
+public final class KvRates {
+    public static final int32 H2D = 0;
+    public static final int32 D2H = 1;
+    public static final int32 STORE_WRITE = 2;
+    public static final int32 STORE_READ = 3;
+    public static final int32 OPS = 4;
+    public static final int32 DROP = -1;
+    public static final int32 HOST = 0;
+    public static final int32 STORE = 1;
+    public static final int64 SMALL = 65536L;
+    public static final int64 LARGE = 67108864L;
+    public static final int32 REPS = 3;
+    public static final int32 PF_REPS = 2;
+    public static final int32 PF_POINTS = 3;
+
+    int32[] latNs;
+    int32[] mbs;
+    int32[] pfLen;
+    int32[] pfTokS;
+    int32 probeCalls;
+
+    public KvRates() {
+        this.latNs = heap int32[KvRates.OPS];
+        this.mbs = heap int32[KvRates.OPS];
+        this.pfLen = heap int32[KvRates.PF_POINTS];
+        this.pfTokS = heap int32[KvRates.PF_POINTS];
+        this.pfLen[0] = 512;
+        this.pfLen[1] = 2048;
+        this.pfLen[2] = 8192;
+        this.probeCalls = 0;
+        return;
+    }
+
+    /** Inject a path's rate: a fixed cost per transfer and a bandwidth in MB/s (10^6 bytes); 0 MB/s is unmeasured. */
+    public void setTransfer(int32 op, int32 latencyNs, int32 megabytesPerSec) {
+        this.latNs[op] = latencyNs;
+        this.mbs[op] = megabytesPerSec;
+        return;
+    }
+
+    /** Inject the prefill rate at the `i`th probe length (512, 2048, 8192); 0 is unmeasured. */
+    public void setPrefill(int32 i, int32 tokensPerSec) {
+        this.pfTokS[i] = tokensPerSec;
+        return;
+    }
+
+    public int32 latencyNs(int32 op) { return this.latNs[op]; }
+    public int32 megabytesPerSec(int32 op) { return this.mbs[op]; }
+    public int32 prefillLength(int32 i) { return this.pfLen[i]; }
+    public int32 prefillTokensPerSec(int32 i) { return this.pfTokS[i]; }
+
+    /** Probe calls this instance made; 0 when every rate came from the tune dir. */
+    public int32 probeCalls() { return this.probeCalls; }
+
+    /** Whether every path and at least one prefill length is measured. */
+    public boolean measured() {
+        int32 op = 0;
+        while (op < KvRates.OPS) {
+            if (this.mbs[op] <= 0) { return false; }
+            op = op + 1;
+        }
+        return this.recomputeNs(1) >= 0L;
+    }
+
+    /** Nanoseconds to move `bytes` on `op`, or -1 when that path is unmeasured. */
+    public int64 transferNs(int32 op, int64 bytes) {
+        if (this.mbs[op] <= 0) { return -1L; }
+        return (int64) this.latNs[op] + bytes * 1000L / (int64) this.mbs[op];
+    }
+
+    /** Nanoseconds to bring `bytes` back to the device from `tier`, or -1 when a path it uses is unmeasured. */
+    public int64 restoreNs(int32 tier, int64 bytes) {
+        int64 up = this.transferNs(KvRates.H2D, bytes);
+        if (up < 0L) { return -1L; }
+        if (tier == KvRates.HOST) { return up; }
+        int64 rd = this.transferNs(KvRates.STORE_READ, bytes);
+        if (rd < 0L) { return -1L; }
+        return rd + up;
+    }
+
+    /** Prefill tok/s at `tokens`, linear between measured lengths and clamped outside them; 0 when none is measured. */
+    public int64 prefillRate(int32 tokens) {
+        int32 lo = -1;
+        int32 hi = -1;
+        int32 i = 0;
+        while (i < KvRates.PF_POINTS) {
+            if (this.pfTokS[i] > 0) {
+                if (this.pfLen[i] <= tokens) { lo = i; }
+                if (this.pfLen[i] >= tokens && hi < 0) { hi = i; }
+            }
+            i = i + 1;
+        }
+        if (lo < 0 && hi < 0) { return 0L; }
+        if (lo < 0) { return (int64) this.pfTokS[hi]; }
+        if (hi < 0 || hi == lo) { return (int64) this.pfTokS[lo]; }
+        int64 r0 = (int64) this.pfTokS[lo];
+        int64 r1 = (int64) this.pfTokS[hi];
+        int64 span = (int64) (this.pfLen[hi] - this.pfLen[lo]);
+        return r0 + (r1 - r0) * (int64) (tokens - this.pfLen[lo]) / span;
+    }
+
+    /** Nanoseconds to prefill `tokens` again, or -1 when no prefill rate is measured. */
+    public int64 recomputeNs(int32 tokens) {
+        int64 r = this.prefillRate(tokens);
+        if (r <= 0L) { return -1L; }
+        return (int64) tokens * 1000000000L / r;
+    }
+
+    /**
+     * Where an evicted unit of `bytes` holding `tokens` positions goes: the tier with room whose restore is cheapest,
+     * or {@link #DROP} when recomputing costs less than that restore or no tier has room. Unmeasured rates keep.
+     */
+    public int32 choose(int64 bytes, int32 tokens, boolean hostRoom, boolean storeRoom) {
+        int32 best = KvRates.DROP;
+        int64 bestNs = -1L;
+        if (hostRoom) {
+            best = KvRates.HOST;
+            bestNs = this.restoreNs(KvRates.HOST, bytes);
+        }
+        if (storeRoom) {
+            int64 s = this.restoreNs(KvRates.STORE, bytes);
+            if (best == KvRates.DROP || (s >= 0L && (bestNs < 0L || s < bestNs))) {
+                best = KvRates.STORE;
+                bestNs = s;
+            }
+        }
+        if (best == KvRates.DROP || bestNs < 0L) { return best; }
+        int64 again = this.recomputeNs(tokens);
+        if (again >= 0L && again < bestNs) { return KvRates.DROP; }
+        return best;
+    }
+
+    /** The rates kept in `dir` for this device and `model`; unmeasured entries stay 0. */
+    public static #KvRates load(String dir, String model) {
+        KvRates r = heap KvRates();
+        if (dir.byteLength() == 0) { return #r; }
+        String d #= KvRates.home(dir);
+        int32 op = 0;
+        while (op < KvRates.OPS) {
+            int32 m = KvRates.readInt(d + "/kvrate.mbs." + op);
+            int32 l = KvRates.readInt(d + "/kvrate.lat." + op);
+            if (m > 0 && l >= 0) { r.setTransfer(op, l, m); }
+            op = op + 1;
+        }
+        String mk #= KvRates.fileSafe(model);
+        int32 i = 0;
+        while (i < KvRates.PF_POINTS) {
+            int32 t = KvRates.readInt(d + "/kvrate.pf." + mk + "." + r.pfLen[i]);
+            if (t > 0) { r.setPrefill(i, t); }
+            i = i + 1;
+        }
+        return #r;
+    }
+
+    /** The rates in `dir`, with each one missing measured once by `probe` and written back (`dir` "" keeps none). */
+    public static #KvRates ensure(String dir, String model, KvRateProbe probe) {
+        KvRates r #= KvRates.load(dir, model);
+        String d #= dir.byteLength() == 0 ? "" : KvRates.home(dir);
+        int32 op = 0;
+        while (op < KvRates.OPS) {
+            if (r.mbs[op] <= 0) {
+                r.measureTransfer(op, probe);
+                KvRates.writeInt(d, "kvrate.lat." + op, r.latNs[op]);
+                KvRates.writeInt(d, "kvrate.mbs." + op, r.mbs[op]);
+            }
+            op = op + 1;
+        }
+        String mk #= KvRates.fileSafe(model);
+        int32 i = 0;
+        while (i < KvRates.PF_POINTS) {
+            if (r.pfTokS[i] <= 0 && r.pfLen[i] <= probe.maxPrefill()) {
+                r.measurePrefill(i, probe);
+                KvRates.writeInt(d, "kvrate.pf." + mk + "." + r.pfLen[i], r.pfTokS[i]);
+            }
+            i = i + 1;
+        }
+        return #r;
+    }
+
+    void measureTransfer(int32 op, KvRateProbe probe) {
+        int64 ts = this.fastest(op, KvRates.SMALL, probe);
+        int64 tl = this.fastest(op, KvRates.LARGE, probe);
+        int64 m = 0L;
+        int64 lat = 0L;
+        if (tl > ts) {
+            m = (KvRates.LARGE - KvRates.SMALL) * 1000L / (tl - ts);
+            if (m < 1L) { m = 1L; }
+            lat = ts - KvRates.SMALL * 1000L / m;
+            if (lat < 0L) { lat = 0L; }
+        } else {
+            if (tl < 1L) { tl = 1L; }
+            m = KvRates.LARGE * 1000L / tl;
+        }
+        if (m < 1L) { m = 1L; }
+        if (m > 2000000000L) { m = 2000000000L; }
+        if (lat > 2000000000L) { lat = 2000000000L; }
+        this.setTransfer(op, (int32) lat, (int32) m);
+        return;
+    }
+
+    int64 fastest(int32 op, int64 bytes, KvRateProbe probe) {
+        int64 best = -1L;
+        int32 k = 0;
+        while (k < KvRates.REPS) {
+            int64 t = probe.transferNs(op, bytes);
+            this.probeCalls = this.probeCalls + 1;
+            if (best < 0L || t < best) { best = t; }
+            k = k + 1;
+        }
+        return best;
+    }
+
+    void measurePrefill(int32 i, KvRateProbe probe) {
+        int64 best = -1L;
+        int32 k = 0;
+        while (k < KvRates.PF_REPS) {
+            int64 t = probe.prefillNs(this.pfLen[i]);
+            this.probeCalls = this.probeCalls + 1;
+            if (best < 0L || t < best) { best = t; }
+            k = k + 1;
+        }
+        if (best < 1L) { best = 1L; }
+        int64 r = (int64) this.pfLen[i] * 1000000000L / best;
+        if (r < 1L) { r = 1L; }
+        if (r > 2000000000L) { r = 2000000000L; }
+        this.pfTokS[i] = (int32) r;
+        return;
+    }
+
+    static #String home(String dir) {
+        String key #= Autotune.deviceKey();
+        return #(dir + "/" + key);
+    }
+
+    static #String fileSafe(String s) {
+        StringBuilder sb = heap StringBuilder();
+        int8[] b #= s.toBytes();
+        int64 i = 0L;
+        while (i < (int64) b.count()) {
+            int8 c = b[i];
+            boolean ok = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46;
+            if (ok) { sb.appendBytes(b, (int32) i, 1); } else { sb.append("_"); }
+            i = i + 1L;
+        }
+        return #sb.toString();
+    }
+
+    static int32 readInt(String path) {
+        Path f #= Path.of(path);
+        if (!f.exists()) { return -1; }
+        int8[] b #= File.readAllBytes(path);
+        if (b == null || b.count() == 0) { return -1; }
+        int64 v = 0L;
+        int64 i = 0L;
+        while (i < (int64) b.count()) {
+            int8 c = b[i];
+            if (c < 48 || c > 57) { return -1; }
+            v = v * 10L + (int64) (c - 48);
+            if (v > 2147483647L) { return -1; }
+            i = i + 1L;
+        }
+        return (int32) v;
+    }
+
+    static void writeInt(String d, String name, int32 v) {
+        if (d.byteLength() == 0 || v < 0) { return; }
+        String text #= "" + v;
+        int8[] b #= text.toBytes();
+        try {
+            Path dp #= Path.of(d);
+            dp.mkdirs();
+            File.writeAllBytes(d + "/" + name, b, (int64) b.count());
+        } catch (Exception e) {
+        }
+        return;
+    }
+}
