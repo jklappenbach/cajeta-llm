@@ -15,8 +15,8 @@ import dev.cajeta.unit.Assert;
 import dev.cajeta.unit.Test;
 import dev.cajeta.ml.kernels.testing.ValueCheck;
 
-/** The batched decode's f16 column route (cajeta-llm 15.2.21.4.3.8.4): the slot-major f16 staging, the Q6_K
- *  f16 column mat-vec, and the batched attention reduce that writes it. */
+/** The batched decode's f16 column route (cajeta-llm 15.2.21.4.3.8.4, .5): the slot-major f16 staging, the Q6_K
+ *  and Q8_0 f16 column mat-vecs, and the batched attention reduce that writes it. */
 public class F16ColsTest {
 
     public F16ColsTest() { return; }
@@ -90,12 +90,16 @@ public class F16ColsTest {
 
     /** Every width 1 to 8 of the f16 column kernel at `out x cols`, plain and accumulating, against the one-column
      *  f32 kernel on the same f16-rounded activations. */
-    static void colsAt(int64 out, int64 cols) {
-        int32 ty = Quant.GG_Q6_K;
+    static void colsAt(int64 out, int64 cols) { F16ColsTest.colsOf(Quant.GG_Q6_K, false, out, cols); }
+
+    /** {@link #colsAt} for weight type `ty`, Q6_K or Q8_0, on the whole-block or the `half`-block kernel. */
+    static void colsOf(int32 ty, boolean half, int64 out, int64 cols) {
+        boolean q8 = ty == Quant.GG_Q8_0;
+        String kn = (q8 ? "q80F16" : "q6kF16") + (half ? "Half" : "") + "WaveMatVecColsKernel";
         int64 ncMax = (int64) QuantKernel.WAVE_COLS_MAX;
-        int64 bpr = cols / 256L;
+        int64 bpr = cols / (int64) Quant.blockElems(ty);
         int64 nBlocks = out * bpr;
-        int8[] raw #= CensusReachTest.tiled(ty, "q6_k.bin", nBlocks);
+        int8[] raw #= CensusReachTest.tiled(ty, q8 ? "q8_0.bin" : "q6_k.bin", nBlocks);
         int8[] res #= heap int8[out * Quant.rowResidentBytes(ty, bpr)];
         Quant.splitInto(ty, raw, 0L, out, bpr, res, 0L);
         KernelBuffer<int8> wD #= heap KernelBuffer<int8>((uint64) ((int64) res.count()));
@@ -113,7 +117,11 @@ public class F16ColsTest {
         KernelBuffer<float32> yOne #= heap KernelBuffer<float32>((uint64) (ncMax * out));
         int64 c = 0;
         while (c < ncMax) {
-            QuantKernel.q6kF32WaveMatVecLaunchNoSync(yOne, wD, xd, out, cols, c * cols, c * out);
+            if (q8) {
+                QuantKernel.q80F32WaveMatVecLaunchNoSync(yOne, wD, xd, out, cols, c * cols, c * out);
+            } else {
+                QuantKernel.q6kF32WaveMatVecLaunchNoSync(yOne, wD, xd, out, cols, c * cols, c * out);
+            }
             c = c + 1;
         }
         QuantKernel.stream().sync();
@@ -133,7 +141,15 @@ public class F16ColsTest {
                 int64 k = 0;
                 while (k < ncMax * out) { got[k] = seed; k = k + 1; }
                 yD.upload(got);
-                QuantKernel.q6kF16WaveMatVecColsLaunchNoSync(yD, wD, xh, out, cols, 0L, cols, 0L, nc, out, pass == 1);
+                if (q8 && half) {
+                    QuantKernel.q80F16HalfWaveMatVecColsLaunchNoSync(yD, wD, xh, out, cols, 0L, cols, 0L, nc, out, pass == 1);
+                } else if (q8) {
+                    QuantKernel.q80F16WaveMatVecColsLaunchNoSync(yD, wD, xh, out, cols, 0L, cols, 0L, nc, out, pass == 1);
+                } else if (half) {
+                    QuantKernel.q6kF16HalfWaveMatVecColsLaunchNoSync(yD, wD, xh, out, cols, 0L, cols, 0L, nc, out, pass == 1);
+                } else {
+                    QuantKernel.q6kF16WaveMatVecColsLaunchNoSync(yD, wD, xh, out, cols, 0L, cols, 0L, nc, out, pass == 1);
+                }
                 QuantKernel.stream().sync();
                 yD.download(got);
                 k = 0;
@@ -141,13 +157,13 @@ public class F16ColsTest {
                     if (k < (int64) nc * out) {
                         float32 want = pass == 1 ? one[k] + 0.5f : one[k];
                         if (Math.abs(got[k] - want) > tol) {
-                            Assert.fail("q6kF16WaveMatVecColsKernel at " + out + "x" + cols + ", " + nc + " columns"
+                            Assert.fail(kn + " at " + out + "x" + cols + ", " + nc + " columns"
                                 + (pass == 1 ? " accumulating" : "") + ": column " + (k / out) + " row " + (k % out)
                                 + " is " + got[k] + ", the f32 one-column kernel gives " + want);
                             return;
                         }
                     } else if (got[k] != seed) {
-                        Assert.fail("q6kF16WaveMatVecColsKernel at " + nc + " columns wrote column " + (k / out));
+                        Assert.fail(kn + " at " + nc + " columns wrote column " + (k / out));
                         return;
                     }
                     k = k + 1;
@@ -167,6 +183,47 @@ public class F16ColsTest {
         F16ColsTest.colsAt(64L, 2560L);
         F16ColsTest.colsAt(32L, 14336L);
         ValueCheck.credit(vc);
+    }
+
+    /** 15.2.21.4.3.8.5: the Q8_0 twin, against the Q8_0 f32 one-column kernel. */
+    @Test
+    public void theQ80F16ColumnsMatchTheF32OneColumnKernelAtEveryWidth() {
+        if (!F16ColsTest.here("q80F16WaveMatVecColsKernel") || !F16ColsTest.here("q80F32WaveMatVecKernel")
+                || !F16ColsTest.here("f16SlotPackRowsKernel")) { return; }
+        int64[] vc #= ValueCheck.mark();
+        F16ColsTest.colsOf(Quant.GG_Q8_0, false, 96L, 4096L);
+        F16ColsTest.colsOf(Quant.GG_Q8_0, false, 64L, 2560L);
+        F16ColsTest.colsOf(Quant.GG_Q8_0, false, 32L, 14336L);
+        ValueCheck.credit(vc);
+    }
+
+    /** 15.2.21.4.3.8.7: the half-block kernels, Q6_K and Q8_0, against the f32 one-column kernels. */
+    @Test
+    public void theHalfBlockF16ColumnsMatchTheF32OneColumnKernelAtEveryWidth() {
+        if (!F16ColsTest.here("q6kF16HalfWaveMatVecColsKernel") || !F16ColsTest.here("q80F16HalfWaveMatVecColsKernel")
+                || !F16ColsTest.here("q6kF32WaveMatVecKernel") || !F16ColsTest.here("q80F32WaveMatVecKernel")
+                || !F16ColsTest.here("f16SlotPackRowsKernel")) { return; }
+        int64[] vc #= ValueCheck.mark();
+        int32 t = 0;
+        while (t < 2) {
+            int32 ty = t == 0 ? Quant.GG_Q6_K : Quant.GG_Q8_0;
+            F16ColsTest.colsOf(ty, true, 96L, 4096L);
+            F16ColsTest.colsOf(ty, true, 64L, 2560L);
+            F16ColsTest.colsOf(ty, true, 32L, 14336L);
+            t = t + 1;
+        }
+        ValueCheck.credit(vc);
+    }
+
+    /** The half-block form is taken where the whole-block form leaves a short last pass, and only there. */
+    @Test
+    public void theHalfBlockFormIsTakenWhereTheLastPassIsShort() {
+        if (QuantKernel.waveWidth() != 32) { return; }
+        Assert.isTrue(QuantKernel.f16ColsHalfPays(10L));
+        Assert.isFalse(QuantKernel.f16ColsHalfPays(16L));
+        Assert.isFalse(QuantKernel.f16ColsHalfPays(40L));
+        Assert.isFalse(QuantKernel.f16ColsHalfPays(56L));
+        Assert.isTrue(QuantKernel.f16ColsHalfPays(4L));
     }
 
     @Test
