@@ -1,0 +1,102 @@
+package dev.cajeta.llm.bench;
+
+import cajeta.lang.String;
+import cajeta.lang.System;
+import cajeta.time.Clock;
+import cajeta.xpu.Device;
+import cajeta.xpu.KernelBuffer;
+import dev.cajeta.llm.io.Quant;
+import dev.cajeta.llm.io.QuantKernel;
+
+/** Times the batched decode's column mat-vecs per projection at `nc` columns: the integer route and the f16 whole- and
+ *  half-block kernels, Q6_K and Q8_0, on Gemma 3 4B's and Llama 3.1 8B's shapes (cajeta-llm 15.2.21.4.3.8.8). */
+public final class F16ColsProbe {
+
+    public F16ColsProbe() { return; }
+
+    /** `[reps=N] [nc=N]`; prints one line a shape and type, microseconds a launch, the weight cycled through copies
+     *  totalling 256 MB or more so each launch reads it cold. */
+    public static void run(String[] args) {
+        int32 reps = 50;
+        int32 nc = 4;
+        int32 i = 0;
+        while (i < (int32) args.count()) {
+            if (args[i].startsWith("reps=")) { String v #= args[i].substring(5, args[i].byteLength()); reps = Integer.parseInt(v); }
+            if (args[i].startsWith("nc=")) { String v #= args[i].substring(3, args[i].byteLength()); nc = Integer.parseInt(v); }
+            i = i + 1;
+        }
+        String be #= Device.activeBackend();
+        System.stdout.println("f16cols probe: backend " + be + ", " + nc + " columns, " + reps + " launches a figure");
+        int32 t = 0;
+        while (t < 2) {
+            int32 ty = t == 0 ? Quant.GG_Q8_0 : Quant.GG_Q6_K;
+            F16ColsProbe.shape("gemma q", ty, 2048L, 2560L, nc, reps);
+            F16ColsProbe.shape("gemma kv", ty, 1024L, 2560L, nc, reps);
+            F16ColsProbe.shape("gemma o", ty, 2560L, 2048L, nc, reps);
+            F16ColsProbe.shape("gemma gate", ty, 10240L, 2560L, nc, reps);
+            F16ColsProbe.shape("gemma down", ty, 2560L, 10240L, nc, reps);
+            F16ColsProbe.shape("gemma head", ty, 262144L, 2560L, nc, reps);
+            F16ColsProbe.shape("llama q", ty, 4096L, 4096L, nc, reps);
+            F16ColsProbe.shape("llama gate", ty, 14336L, 4096L, nc, reps);
+            F16ColsProbe.shape("llama down", ty, 4096L, 14336L, nc, reps);
+            t = t + 1;
+        }
+    }
+
+    static int64 timeArm(int32 arm, int32 ty, KernelBuffer<float32> y, KernelBuffer<int8>[] ws, KernelBuffer<int8> xp,
+            KernelBuffer<float16> xh, int64 out, int64 cols, int32 nc, int32 reps) {
+        int64 xps = Quant.q8kPackedBytes(cols);
+        int32 k = 0 - 3;
+        int64 t0 = 0L;
+        int32 nw = (int32) ws.count();
+        while (k < reps) {
+            if (k == 0) { QuantKernel.stream().sync(); t0 = Clock.nanoTime(); }
+            KernelBuffer<int8> w = ws[(int64) ((k + 3) % nw)];
+            boolean q8 = ty == Quant.GG_Q8_0;
+            if (arm == 0 && q8) { QuantKernel.q80Q8WaveMatVecColsLaunchNoSync(y, w, xp, out, cols, 0L, nc, out, xps, false); }
+            if (arm == 0 && !q8) { QuantKernel.q6kQ8WaveMatVecColsLaunchNoSync(y, w, xp, out, cols, 0L, nc, out, xps, false); }
+            if (arm == 1 && q8) { QuantKernel.q80F16WaveMatVecColsLaunchNoSync(y, w, xh, out, cols, 0L, cols, 0L, nc, out, false); }
+            if (arm == 1 && !q8) { QuantKernel.q6kF16WaveMatVecColsLaunchNoSync(y, w, xh, out, cols, 0L, cols, 0L, nc, out, false); }
+            if (arm == 2 && q8) { QuantKernel.q80F16HalfWaveMatVecColsLaunchNoSync(y, w, xh, out, cols, 0L, cols, 0L, nc, out, false); }
+            if (arm == 2 && !q8) { QuantKernel.q6kF16HalfWaveMatVecColsLaunchNoSync(y, w, xh, out, cols, 0L, cols, 0L, nc, out, false); }
+            k = k + 1;
+        }
+        QuantKernel.stream().sync();
+        return (Clock.nanoTime() - t0) / (int64) reps;
+    }
+
+    static void shape(String name, int32 ty, int64 out, int64 cols, int32 nc, int32 reps) {
+        int64 bpr = cols / (int64) Quant.blockElems(ty);
+        int64 wBytes = out * Quant.rowResidentBytes(ty, bpr);
+        int8[] wh #= heap int8[wBytes];
+        int64 i = 0;
+        while (i < wBytes) { wh[i] = (int8) ((i * 31L + 7L) % 97L - 48L); i = i + 1; }
+        int64 copies = (268435456L + wBytes - 1L) / wBytes;
+        if (copies > 16L) { copies = 16L; }
+        KernelBuffer<int8>[] ws #= heap KernelBuffer<int8>[copies];
+        int64 cpi = 0;
+        while (cpi < copies) {
+            ws[cpi] #= heap KernelBuffer<int8>((uint64) wBytes);
+            ws[cpi].upload(wh);
+            cpi = cpi + 1;
+        }
+        int64 n = (int64) nc * cols;
+        float32[] xf #= heap float32[n];
+        i = 0;
+        while (i < n) { xf[i] = (float32) ((i * 37L) % 67L - 33L) * 0.0173f; i = i + 1; }
+        KernelBuffer<float32> x #= heap KernelBuffer<float32>((uint64) n);
+        x.upload(xf);
+        KernelBuffer<int8> xp #= heap KernelBuffer<int8>((uint64) ((int64) nc * Quant.q8kPackedBytes(cols)));
+        QuantKernel.q8kPackRowsLaunchNoSync(xp, x, (int64) nc, cols, cols);
+        KernelBuffer<float16> xh #= heap KernelBuffer<float16>((uint64) n);
+        QuantKernel.f16SlotPackRowsLaunchNoSync(xh, x, (int64) nc, cols, cols, cols);
+        KernelBuffer<float32> y #= heap KernelBuffer<float32>((uint64) ((int64) nc * out));
+        int64 ti = F16ColsProbe.timeArm(0, ty, y, ws, xp, xh, out, cols, nc, reps);
+        int64 tw = F16ColsProbe.timeArm(1, ty, y, ws, xp, xh, out, cols, nc, reps);
+        int64 th = F16ColsProbe.timeArm(2, ty, y, ws, xp, xh, out, cols, nc, reps);
+        String tn = ty == Quant.GG_Q8_0 ? "Q8_0" : "Q6_K";
+        System.stdout.println("  " + tn + " " + name + " " + out + "x" + cols + ": int " + (float64) ti / 1000.0
+            + " us  f16 " + (float64) tw / 1000.0 + "  f16-half " + (float64) th / 1000.0
+            + (QuantKernel.f16ColsHalfPays(cols / 256L) ? "  (half taken)" : ""));
+    }
+}
