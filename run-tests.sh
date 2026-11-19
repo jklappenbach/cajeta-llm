@@ -379,7 +379,7 @@ if [[ -z "$unit_cja" && -d "$UNIT_REPO" ]]; then
     unit_cja="$(cajeta_artifact_path "$UNIT_REPO" dev.cajeta.unit 2>/dev/null)"
 fi
 if [[ -z "$unit_cja" ]]; then
-    UNIT_VER="$(sed -n 's/.*"dev\.cajeta\.unit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    UNIT_VER="$(sed -n 's/.*"dev\.cajeta\.unit"[[:space:]]*:[[:space:]]*"=\{0,1\}\([^"]*\)".*/\1/p' \
         "$here/cajeta.json" | head -1)"
     [[ -n "$UNIT_VER" ]] || { echo "no dev.cajeta.unit pin in cajeta.json" >&2; exit 1; }
     store_cja="$OLLA_HOME/dev.cajeta.unit/$UNIT_VER/dev.cajeta.unit-$UNIT_VER.cja"
@@ -404,7 +404,7 @@ echo ">> cajeta-unit: $unit_cja"
 # dev.cajeta.codec (ProtobufCursor for raw tokenizer.model, spec 7.10):
 # sibling checkout first (the cajeta-unit pattern), then store, then a
 # sha256-verified Olla fetch.
-CODEC_VER="$(sed -n 's/.*"dev\.cajeta\.codec"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+CODEC_VER="$(sed -n 's/.*"dev\.cajeta\.codec"[[:space:]]*:[[:space:]]*"=\{0,1\}\([^"]*\)".*/\1/p' \
     "$here/cajeta.json" | head -1)"
 CODEC_REPO="${CODEC_REPO:-$here/../cajeta-codec}"
 codec_cja=""
@@ -436,7 +436,7 @@ echo ">> dev.cajeta.codec: $codec_cja"
 # dev.cajeta.jinja (the chat-template engine, jinja plan Unit 9 /
 # llama 13.18): sibling checkout first, then store, then a
 # sha256-verified Olla fetch (once 9.2.1 publishes it).
-JINJA_VER="$(sed -n 's/.*"dev\.cajeta\.jinja"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+JINJA_VER="$(sed -n 's/.*"dev\.cajeta\.jinja"[[:space:]]*:[[:space:]]*"=\{0,1\}\([^"]*\)".*/\1/p' \
     "$here/cajeta.json" | head -1)"
 JINJA_REPO="${JINJA_REPO:-$here/../cajeta-jinja}"
 jinja_cja=""
@@ -468,7 +468,7 @@ echo ">> dev.cajeta.jinja: $jinja_cja"
 # dev.cajeta.logging — the CLI's diagnostics backend (Julian, 2026-08-30).
 # Same three-step resolution as codec/jinja: sibling checkout, then store,
 # then a sha256-verified Olla fetch.
-LOGGING_VER="$(sed -n 's/.*"dev\.cajeta\.logging"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+LOGGING_VER="$(sed -n 's/.*"dev\.cajeta\.logging"[[:space:]]*:[[:space:]]*"=\{0,1\}\([^"]*\)".*/\1/p' \
     "$here/cajeta.json" | head -1)"
 LOGGING_REPO="${LOGGING_REPO:-$here/../cajeta-logging}"
 logging_cja=""
@@ -500,7 +500,7 @@ echo ">> dev.cajeta.logging: $logging_cja"
 # dev.cajeta.ml.kernels (the census gate, ValueCheck, DeviceSkip and the launch
 # budget this suite runs under, and the tile families and tune mode the library
 # itself builds on): the same ladder.
-KERNELS_VER="$(sed -n 's/.*"dev\.cajeta\.ml\.kernels"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+KERNELS_VER="$(sed -n 's/.*"dev\.cajeta\.ml\.kernels"[[:space:]]*:[[:space:]]*"=\{0,1\}\([^"]*\)".*/\1/p' \
     "$here/cajeta.json" | head -1)"
 KERNELS_REPO="${KERNELS_REPO:-$here/../cajeta-ml/kernels}"
 kernels_cja="${KERNELS_CJA:-}"
