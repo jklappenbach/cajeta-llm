@@ -266,6 +266,8 @@ run_leg() {
 SPILL_TRACKED=(
     "dev.cajeta.ml.kernels.Gemm.gemm256Bf16|cajeta-ml-gpu 23.2.2"
     "dev.cajeta.ml.kernels.Gemm.gemm256<float16>|cajeta-ml-gpu 23.2.2"
+    "dev.cajeta.ml.kernels.Gemm.gemm256Bf16Out16|cajeta-ml-gpu 23.2.2"
+    "dev.cajeta.ml.kernels.Gemm.gemm256Out16<float16>|cajeta-ml-gpu 23.2.2"
     "dev.cajeta.ml.kernels.Gemm.gemmWideUnrolled<bfloat16>|cajeta-ml-gpu 23.2.4"
 )
 spill_tracked_item() {
